@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,6 +34,7 @@ type taskPollingFetchAdaptor struct {
 
 type sunoFailurePollingAdaptor struct {
 	failReason string
+	data       json.RawMessage
 }
 
 func (a *sunoFailurePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
@@ -45,6 +48,7 @@ func (a *sunoFailurePollingAdaptor) FetchTask(_ string, _ string, body map[strin
 			Status:     string(model.TaskStatusFailure),
 			FailReason: a.failReason,
 			FinishTime: time.Now().Unix(),
+			Data:       a.data,
 		})
 	}
 
@@ -66,6 +70,41 @@ func (a *sunoFailurePollingAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskIn
 }
 
 func (a *sunoFailurePollingAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	return 0
+}
+
+type videoFailurePollingAdaptor struct {
+	reason string
+}
+
+func (a *videoFailurePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a *videoFailurePollingAdaptor) FetchTask(_ string, _ string, body map[string]any, _ string) (*http.Response, error) {
+	taskID, _ := body["task_id"].(string)
+	responseBody, err := common.Marshal(dto.TaskResponse[model.Task]{
+		Code: dto.TaskSuccessCode,
+		Data: model.Task{
+			TaskID:     taskID,
+			Status:     model.TaskStatus(model.TaskStatusFailure),
+			Progress:   "100%",
+			FailReason: a.reason,
+			Data:       json.RawMessage(`{"provider":"sanitized"}`),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(responseBody)),
+	}, nil
+}
+
+func (a *videoFailurePollingAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return nil, errors.New("unexpected parse fallback")
+}
+
+func (a *videoFailurePollingAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
 	return 0
 }
 
@@ -426,6 +465,250 @@ func TestUpdateSunoTasksStalePollsRefundExactlyOnce(t *testing.T) {
 	assert.Equal(t, int64(1), countLogs(t))
 }
 
+func TestDurableSunoFailurePreservesLatestQueuedTaskColumns(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 861, 961, 1061
+	const requestID = "durable-suno-narrow-queued"
+	attempt := seedDurableBillingAttempt(t, requestID, userID, tokenID, 0)
+	task := linkDurableBillingAttempt(t, attempt, requestID)
+	baseURL := "https://suno-durable.invalid"
+	require.NoError(t, model.DB.Create(&model.Channel{
+		Id:      channelID,
+		Type:    constant.ChannelTypeSunoAPI,
+		Name:    "durable_suno_narrow",
+		Key:     "sk-suno-channel",
+		Status:  common.ChannelStatusEnabled,
+		BaseURL: &baseURL,
+	}).Error)
+
+	initialPrivate := task.PrivateData
+	initialPrivate.Key = "STALE_KEY"
+	initialPrivate.UpstreamTaskID = "STALE_SUNO_UPSTREAM"
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).
+		Updates(map[string]any{
+			"channel_id":   channelID,
+			"platform":     constant.TaskPlatformSuno,
+			"status":       model.TaskStatusQueued,
+			"progress":     "20%",
+			"private_data": initialPrivate,
+			"properties": model.Properties{
+				Input:             "STALE_INPUT",
+				UpstreamModelName: "STALE_UPSTREAM_MODEL",
+			},
+			"data": json.RawMessage(`{"stale":"discovery"}`),
+		}).Error)
+
+	var stale model.Task
+	require.NoError(t, model.DB.First(&stale, task.ID).Error)
+	latestPrivate := stale.PrivateData
+	latestPrivate.Key = "LATEST_KEY"
+	latestPrivate.UpstreamTaskID = "LATEST_SUNO_UPSTREAM"
+	latestPrivate.ResultURL = "LATEST_RESULT"
+	latestPrivate.NodeName = "LATEST_NODE"
+	latestPrivate.BillingContext = &model.TaskBillingContext{
+		ModelPrice:      9,
+		GroupRatio:      8,
+		ModelRatio:      7,
+		OtherRatios:     map[string]float64{"latest": 6},
+		OriginModelName: "LATEST_MODEL",
+		PerCallBilling:  true,
+	}
+	latestProperties := model.Properties{
+		Input:             "LATEST_INPUT",
+		UpstreamModelName: "LATEST_UPSTREAM_MODEL",
+		OriginModelName:   "LATEST_ORIGIN_MODEL",
+	}
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).
+		Updates(map[string]any{
+			"private_data": latestPrivate,
+			"properties":   latestProperties,
+			"data":         json.RawMessage(`{"latest":"before-poll"}`),
+		}).Error)
+
+	adaptor := &sunoFailurePollingAdaptor{
+		failReason: "durable suno failed",
+		data:       json.RawMessage(`{"sanitized":"suno"}`),
+	}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	require.NoError(t, updateSunoTasks(
+		context.Background(),
+		channelID,
+		[]string{"STALE_SUNO_UPSTREAM"},
+		map[string]*model.Task{"STALE_SUNO_UPSTREAM": &stale},
+	))
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), reloaded.Status)
+	assert.Equal(t, "100%", reloaded.Progress)
+	assert.Equal(t, "LATEST_KEY", reloaded.PrivateData.Key)
+	assert.Equal(t, "LATEST_SUNO_UPSTREAM", reloaded.PrivateData.UpstreamTaskID)
+	assert.Equal(t, "LATEST_RESULT", reloaded.PrivateData.ResultURL)
+	assert.Equal(t, "LATEST_NODE", reloaded.PrivateData.NodeName)
+	require.NotNil(t, reloaded.PrivateData.BillingContext)
+	assert.Equal(t, "LATEST_MODEL", reloaded.PrivateData.BillingContext.OriginModelName)
+	assert.Equal(t, latestProperties, reloaded.Properties)
+	assert.JSONEq(t, `{"sanitized":"suno"}`, string(reloaded.Data))
+}
+
+func TestDurableVideoFailurePreservesLatestInProgressTaskColumns(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 862, 962, 1062
+	const requestID = "durable-video-narrow-in-progress"
+	attempt := seedDurableBillingAttempt(t, requestID, userID, tokenID, 0)
+	task := linkDurableBillingAttempt(t, attempt, requestID)
+	seedTaskPollingChannel(t, channelID, true)
+
+	initialPrivate := task.PrivateData
+	initialPrivate.Key = "STALE_VIDEO_KEY"
+	initialPrivate.UpstreamTaskID = "STALE_VIDEO_UPSTREAM"
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).
+		Updates(map[string]any{
+			"channel_id":   channelID,
+			"platform":     constant.TaskPlatform("kling"),
+			"status":       model.TaskStatusInProgress,
+			"progress":     "50%",
+			"private_data": initialPrivate,
+			"properties": model.Properties{
+				Input:             "STALE_VIDEO_INPUT",
+				UpstreamModelName: "STALE_VIDEO_MODEL",
+			},
+			"data": json.RawMessage(`{"stale":"video-discovery"}`),
+		}).Error)
+
+	var stale model.Task
+	require.NoError(t, model.DB.First(&stale, task.ID).Error)
+	latestPrivate := stale.PrivateData
+	latestPrivate.Key = "LATEST_VIDEO_KEY"
+	latestPrivate.UpstreamTaskID = "LATEST_VIDEO_UPSTREAM"
+	latestPrivate.ResultURL = "LATEST_VIDEO_RESULT"
+	latestPrivate.NodeName = "LATEST_VIDEO_NODE"
+	latestPrivate.BillingContext = &model.TaskBillingContext{
+		ModelPrice:      19,
+		GroupRatio:      18,
+		ModelRatio:      17,
+		OtherRatios:     map[string]float64{"latest": 16},
+		OriginModelName: "LATEST_VIDEO_MODEL",
+		PerCallBilling:  true,
+	}
+	latestProperties := model.Properties{
+		Input:             "LATEST_VIDEO_INPUT",
+		UpstreamModelName: "LATEST_VIDEO_UPSTREAM_MODEL",
+		OriginModelName:   "LATEST_VIDEO_ORIGIN_MODEL",
+	}
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).
+		Updates(map[string]any{
+			"private_data": latestPrivate,
+			"properties":   latestProperties,
+			"data":         json.RawMessage(`{"latest":"video-before-poll"}`),
+		}).Error)
+
+	var channel model.Channel
+	require.NoError(t, model.DB.First(&channel, channelID).Error)
+	err := updateVideoSingleTask(
+		context.Background(),
+		&videoFailurePollingAdaptor{reason: "durable video failed"},
+		&channel,
+		"STALE_VIDEO_UPSTREAM",
+		map[string]*model.Task{"STALE_VIDEO_UPSTREAM": &stale},
+	)
+	require.NoError(t, err)
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), reloaded.Status)
+	assert.Equal(t, "100%", reloaded.Progress)
+	assert.Equal(t, "LATEST_VIDEO_KEY", reloaded.PrivateData.Key)
+	assert.Equal(t, "LATEST_VIDEO_UPSTREAM", reloaded.PrivateData.UpstreamTaskID)
+	assert.Equal(t, "LATEST_VIDEO_RESULT", reloaded.PrivateData.ResultURL)
+	assert.Equal(t, "LATEST_VIDEO_NODE", reloaded.PrivateData.NodeName)
+	require.NotNil(t, reloaded.PrivateData.BillingContext)
+	assert.Equal(t, "LATEST_VIDEO_MODEL", reloaded.PrivateData.BillingContext.OriginModelName)
+	assert.Equal(t, latestProperties, reloaded.Properties)
+	assert.Contains(t, string(reloaded.Data), `"code":"success"`)
+	assert.Contains(t, string(reloaded.Data), `"status":"FAILURE"`)
+}
+
+func TestMissingSunoChannelRefundsDurableAttemptThroughFailurePrimitive(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, missingChannelID = 863, 963, 1063
+	const requestID = "durable-suno-missing-channel"
+	attempt := seedDurableBillingAttempt(t, requestID, userID, tokenID, 0)
+	task := linkDurableBillingAttempt(t, attempt, requestID)
+	privateData := task.PrivateData
+	privateData.UpstreamTaskID = "MISSING_CHANNEL_UPSTREAM"
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).
+		Updates(map[string]any{
+			"channel_id":   missingChannelID,
+			"platform":     constant.TaskPlatformSuno,
+			"status":       model.TaskStatusQueued,
+			"progress":     "20%",
+			"private_data": privateData,
+		}).Error)
+	var stale model.Task
+	require.NoError(t, model.DB.First(&stale, task.ID).Error)
+
+	_ = updateSunoTasks(
+		context.Background(),
+		missingChannelID,
+		[]string{"MISSING_CHANNEL_UPSTREAM"},
+		map[string]*model.Task{"MISSING_CHANNEL_UPSTREAM": &stale},
+	)
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), reloaded.Status)
+	assert.Equal(t, "100%", reloaded.Progress)
+	assert.NotZero(t, reloaded.FinishTime)
+	reloadedAttempt, err := model.GetTaskBillingAttemptByRequestID(requestID)
+	require.NoError(t, err)
+	assert.NotZero(t, reloadedAttempt.RefundCompletedAt)
+}
+
+func TestMissingVideoChannelRefundsDurableAttemptThroughFailurePrimitive(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, missingChannelID = 864, 964, 1064
+	const requestID = "durable-video-missing-channel"
+	attempt := seedDurableBillingAttempt(t, requestID, userID, tokenID, 0)
+	task := linkDurableBillingAttempt(t, attempt, requestID)
+	privateData := task.PrivateData
+	privateData.UpstreamTaskID = "MISSING_VIDEO_CHANNEL_UPSTREAM"
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).
+		Updates(map[string]any{
+			"channel_id":   missingChannelID,
+			"platform":     constant.TaskPlatform("kling"),
+			"status":       model.TaskStatusInProgress,
+			"progress":     "45%",
+			"private_data": privateData,
+		}).Error)
+	var stale model.Task
+	require.NoError(t, model.DB.First(&stale, task.ID).Error)
+
+	require.Error(t, updateVideoTasks(
+		context.Background(),
+		constant.TaskPlatform("kling"),
+		missingChannelID,
+		[]string{"MISSING_VIDEO_CHANNEL_UPSTREAM"},
+		map[string]*model.Task{"MISSING_VIDEO_CHANNEL_UPSTREAM": &stale},
+	))
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), reloaded.Status)
+	assert.Equal(t, "100%", reloaded.Progress)
+	assert.NotZero(t, reloaded.FinishTime)
+	reloadedAttempt, err := model.GetTaskBillingAttemptByRequestID(requestID)
+	require.NoError(t, err)
+	assert.NotZero(t, reloadedAttempt.RefundCompletedAt)
+}
+
 func TestSweepUnrefundedFailedTasksRefundsModernTaskAndSkipsLegacy(t *testing.T) {
 	truncate(t)
 
@@ -557,4 +840,29 @@ func TestStaleRequestOwnedAttemptSweepRecoversPartialPreconsume(t *testing.T) {
 			assert.Equal(t, 1_000, getTokenRemainQuota(t, testCase.tokenID))
 		})
 	}
+}
+
+func TestRecoverySweepConvergesWalletRefundAfterUserSoftDelete(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, quota = 865, 965, 125
+	const requestID = "soft-deleted-wallet-recovery"
+	attempt := seedDurableBillingAttempt(t, requestID, userID, tokenID, quota)
+	require.NoError(t, model.DB.Delete(&model.User{Id: userID}).Error)
+	require.NoError(t, model.DB.Model(&model.TaskBillingAttempt{}).
+		Where("id = ?", attempt.ID).
+		Update("updated_at", time.Now().Add(-time.Minute).Unix()).Error)
+
+	sweepUnrefundedFailedTasks(context.Background())
+	sweepUnrefundedFailedTasks(context.Background())
+
+	reloadedAttempt, err := model.GetTaskBillingAttemptByRequestID(requestID)
+	require.NoError(t, err)
+	assert.NotZero(t, reloadedAttempt.FundingRefundedAt)
+	assert.NotZero(t, reloadedAttempt.TokenRefundedAt)
+	assert.NotZero(t, reloadedAttempt.RefundCompletedAt)
+	var deletedUser model.User
+	require.NoError(t, model.DB.Unscoped().Where("id = ?", userID).First(&deletedUser).Error)
+	assert.Equal(t, 10_000, deletedUser.Quota)
+	assert.Equal(t, 10_000, getTokenRemainQuota(t, tokenID))
 }

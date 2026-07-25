@@ -1,8 +1,13 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"sync"
 
@@ -24,6 +29,7 @@ var (
 	ErrTaskBillingAttemptConflict = errors.New("task billing attempt immutable identity conflict")
 	ErrTaskBillingAttemptState    = errors.New("task billing attempt state conflict")
 	ErrTaskBillingIdentityDrift   = errors.New("task billing identity drift")
+	ErrTaskBillingSubjectInUse    = errors.New("task billing subject has an active attempt")
 )
 
 // TaskBillingAttemptSnapshot is the immutable financial identity captured before
@@ -39,6 +45,7 @@ type TaskBillingAttemptSnapshot struct {
 	FundingAmount  int
 	TokenID        int
 	TokenAmount    int
+	BillingContext *TaskBillingContext
 }
 
 // TaskBillingAttempt is the main-database component ledger for one task
@@ -58,6 +65,10 @@ type TaskBillingAttempt struct {
 	FundingAmount  int    `json:"-"`
 	TokenID        int    `json:"-" gorm:"index"`
 	TokenAmount    int    `json:"-"`
+	// BillingContextDigest is a canonical SHA-256 identity. The ledger never
+	// stores Task credentials, prompt/media input, or provider payloads.
+	BillingContextDigest string `json:"-" gorm:"type:char(64)"`
+	PrepareVersion       int64  `json:"-"`
 
 	FundingConsumedAt     int64 `json:"-" gorm:"index"`
 	TokenConsumedAt       int64 `json:"-" gorm:"index"`
@@ -121,89 +132,216 @@ func taskBillingTimestamp() int64 {
 	return now
 }
 
-func validateTaskBillingSnapshot(snapshot TaskBillingAttemptSnapshot) error {
-	if snapshot.RequestID == "" || strings.TrimSpace(snapshot.RequestID) != snapshot.RequestID {
+type taskBillingAttemptIdentity struct {
+	RequestID            string
+	PublicTaskID         string
+	SubmitTime           int64
+	IsFree               bool
+	UserID               int
+	FundingSource        string
+	SubscriptionID       int
+	FundingAmount        int
+	TokenID              int
+	TokenAmount          int
+	BillingContextDigest string
+}
+
+const taskBillingContextDigestDomain = "new-api/task-billing-context/v1"
+
+// DigestTaskBillingContext returns a canonical SHA-256 identity over the
+// non-secret billing fields needed to verify a durable Task link. It does not
+// accept a Task or TaskPrivateData, so credentials and provider/request
+// payloads cannot enter the digest input.
+func DigestTaskBillingContext(context *TaskBillingContext) (string, error) {
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte(taskBillingContextDigestDomain))
+	_, _ = hasher.Write([]byte{0})
+
+	writeUint64 := func(value uint64) {
+		var encoded [8]byte
+		binary.BigEndian.PutUint64(encoded[:], value)
+		_, _ = hasher.Write(encoded[:])
+	}
+	writeString := func(value string) {
+		writeUint64(uint64(len(value)))
+		_, _ = hasher.Write([]byte(value))
+	}
+	canonicalFloat := func(name string, value float64) (uint64, error) {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0, fmt.Errorf("%w: %s is not finite", ErrTaskBillingIdentityDrift, name)
+		}
+		if value == 0 {
+			value = 0 // normalize negative zero to the sole zero representation
+		}
+		return math.Float64bits(value), nil
+	}
+
+	if context == nil {
+		_, _ = hasher.Write([]byte{0})
+		return hex.EncodeToString(hasher.Sum(nil)), nil
+	}
+	_, _ = hasher.Write([]byte{1})
+
+	modelPrice, err := canonicalFloat("billing model price", context.ModelPrice)
+	if err != nil {
+		return "", err
+	}
+	groupRatio, err := canonicalFloat("billing group ratio", context.GroupRatio)
+	if err != nil {
+		return "", err
+	}
+	modelRatio, err := canonicalFloat("billing model ratio", context.ModelRatio)
+	if err != nil {
+		return "", err
+	}
+	writeUint64(modelPrice)
+	writeUint64(groupRatio)
+	writeUint64(modelRatio)
+	writeString(context.OriginModelName)
+	if context.PerCallBilling {
+		_, _ = hasher.Write([]byte{1})
+	} else {
+		_, _ = hasher.Write([]byte{0})
+	}
+
+	keys := make([]string, 0, len(context.OtherRatios))
+	for key := range context.OtherRatios {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	writeUint64(uint64(len(keys)))
+	for _, key := range keys {
+		ratio, err := canonicalFloat("billing other ratio "+key, context.OtherRatios[key])
+		if err != nil {
+			return "", err
+		}
+		writeString(key)
+		writeUint64(ratio)
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func validateTaskBillingContextDigest(digest string) error {
+	if len(digest) != sha256.Size*2 || strings.ToLower(digest) != digest {
+		return fmt.Errorf("%w: invalid billing context digest", ErrTaskBillingIdentityDrift)
+	}
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != sha256.Size {
+		return fmt.Errorf("%w: invalid billing context digest", ErrTaskBillingIdentityDrift)
+	}
+	return nil
+}
+
+func taskBillingIdentityFromSnapshot(
+	snapshot TaskBillingAttemptSnapshot,
+) (taskBillingAttemptIdentity, error) {
+	digest, err := DigestTaskBillingContext(snapshot.BillingContext)
+	if err != nil {
+		return taskBillingAttemptIdentity{}, err
+	}
+	identity := taskBillingAttemptIdentity{
+		RequestID:            snapshot.RequestID,
+		PublicTaskID:         snapshot.PublicTaskID,
+		SubmitTime:           snapshot.SubmitTime,
+		IsFree:               snapshot.IsFree,
+		UserID:               snapshot.UserID,
+		FundingSource:        snapshot.FundingSource,
+		SubscriptionID:       snapshot.SubscriptionID,
+		FundingAmount:        snapshot.FundingAmount,
+		TokenID:              snapshot.TokenID,
+		TokenAmount:          snapshot.TokenAmount,
+		BillingContextDigest: digest,
+	}
+	if err := validateTaskBillingIdentity(identity); err != nil {
+		return taskBillingAttemptIdentity{}, err
+	}
+	return identity, nil
+}
+
+func taskBillingIdentityFromAttempt(attempt *TaskBillingAttempt) taskBillingAttemptIdentity {
+	if attempt == nil {
+		return taskBillingAttemptIdentity{}
+	}
+	return taskBillingAttemptIdentity{
+		RequestID:            attempt.RequestID,
+		PublicTaskID:         attempt.PublicTaskID,
+		SubmitTime:           attempt.SubmitTime,
+		IsFree:               attempt.IsFree,
+		UserID:               attempt.UserID,
+		FundingSource:        attempt.FundingSource,
+		SubscriptionID:       attempt.SubscriptionID,
+		FundingAmount:        attempt.FundingAmount,
+		TokenID:              attempt.TokenID,
+		TokenAmount:          attempt.TokenAmount,
+		BillingContextDigest: attempt.BillingContextDigest,
+	}
+}
+
+func validateTaskBillingIdentity(identity taskBillingAttemptIdentity) error {
+	if identity.RequestID == "" || strings.TrimSpace(identity.RequestID) != identity.RequestID {
 		return fmt.Errorf("%w: request id is empty or not canonical", ErrTaskBillingIdentityDrift)
 	}
-	if len(snapshot.RequestID) > 64 {
+	if len(identity.RequestID) > 64 {
 		return fmt.Errorf("%w: request id is too long", ErrTaskBillingIdentityDrift)
 	}
-	if snapshot.PublicTaskID == "" || strings.TrimSpace(snapshot.PublicTaskID) != snapshot.PublicTaskID {
+	if identity.PublicTaskID == "" || strings.TrimSpace(identity.PublicTaskID) != identity.PublicTaskID {
 		return fmt.Errorf("%w: public task id is empty or not canonical", ErrTaskBillingIdentityDrift)
 	}
-	if len(snapshot.PublicTaskID) > 64 || snapshot.SubmitTime <= 0 {
+	if len(identity.PublicTaskID) > 64 || identity.SubmitTime <= 0 {
 		return fmt.Errorf("%w: invalid public task identity", ErrTaskBillingIdentityDrift)
 	}
-	if snapshot.FundingAmount < 0 || snapshot.TokenAmount < 0 || snapshot.TokenID < 0 {
+	if identity.FundingAmount < 0 || identity.TokenAmount < 0 || identity.TokenID < 0 {
 		return fmt.Errorf("%w: negative amount or token identity", ErrTaskBillingIdentityDrift)
 	}
-	if snapshot.FundingAmount > common.MaxQuota || snapshot.TokenAmount > common.MaxQuota {
+	if identity.FundingAmount > common.MaxQuota || identity.TokenAmount > common.MaxQuota {
 		return fmt.Errorf("%w: amount exceeds database quota range", ErrTaskBillingIdentityDrift)
 	}
-	if snapshot.IsFree {
-		if snapshot.UserID < 0 || snapshot.FundingSource != "" || snapshot.SubscriptionID != 0 ||
-			snapshot.FundingAmount != 0 || snapshot.TokenAmount != 0 {
+	if err := validateTaskBillingContextDigest(identity.BillingContextDigest); err != nil {
+		return err
+	}
+	if identity.IsFree {
+		if identity.UserID < 0 || identity.FundingSource != "" || identity.SubscriptionID != 0 ||
+			identity.FundingAmount != 0 || identity.TokenAmount != 0 {
 			return fmt.Errorf("%w: invalid free attempt shape", ErrTaskBillingIdentityDrift)
 		}
 		return nil
 	}
-	if snapshot.UserID <= 0 {
+	if identity.UserID <= 0 {
 		return fmt.Errorf("%w: paid attempt has no user", ErrTaskBillingIdentityDrift)
 	}
-	switch snapshot.FundingSource {
+	switch identity.FundingSource {
 	case taskBillingFundingWallet:
-		if snapshot.SubscriptionID != 0 {
+		if identity.SubscriptionID != 0 {
 			return fmt.Errorf("%w: wallet attempt has a subscription", ErrTaskBillingIdentityDrift)
 		}
 	case taskBillingFundingSubscription:
-		if snapshot.SubscriptionID <= 0 {
+		if identity.SubscriptionID <= 0 {
 			return fmt.Errorf("%w: subscription attempt has no subscription", ErrTaskBillingIdentityDrift)
 		}
 	default:
 		return fmt.Errorf("%w: invalid funding source", ErrTaskBillingIdentityDrift)
 	}
-	if snapshot.TokenAmount > 0 && snapshot.TokenID <= 0 {
+	if identity.TokenAmount > 0 && identity.TokenID <= 0 {
 		return fmt.Errorf("%w: token amount has no token", ErrTaskBillingIdentityDrift)
 	}
 	return nil
-}
-
-func snapshotFromTaskBillingAttempt(attempt *TaskBillingAttempt) TaskBillingAttemptSnapshot {
-	if attempt == nil {
-		return TaskBillingAttemptSnapshot{}
-	}
-	return TaskBillingAttemptSnapshot{
-		RequestID:      attempt.RequestID,
-		PublicTaskID:   attempt.PublicTaskID,
-		SubmitTime:     attempt.SubmitTime,
-		IsFree:         attempt.IsFree,
-		UserID:         attempt.UserID,
-		FundingSource:  attempt.FundingSource,
-		SubscriptionID: attempt.SubscriptionID,
-		FundingAmount:  attempt.FundingAmount,
-		TokenID:        attempt.TokenID,
-		TokenAmount:    attempt.TokenAmount,
-	}
-}
-
-func taskBillingSnapshotsEqual(first, second TaskBillingAttemptSnapshot) bool {
-	return first == second
 }
 
 func validateTaskBillingAttempt(attempt *TaskBillingAttempt) error {
 	if attempt == nil {
 		return fmt.Errorf("%w: attempt is nil", ErrTaskBillingIdentityDrift)
 	}
-	if err := validateTaskBillingSnapshot(snapshotFromTaskBillingAttempt(attempt)); err != nil {
+	if err := validateTaskBillingIdentity(taskBillingIdentityFromAttempt(attempt)); err != nil {
 		return err
 	}
 	switch attempt.Owner {
 	case TaskBillingOwnerRequest:
-		if attempt.TaskID != nil || attempt.OwnerTransferredAt != 0 {
+		if attempt.TaskID != nil || attempt.OwnerTransferredAt != 0 || attempt.PrepareVersion != 0 {
 			return fmt.Errorf("%w: request owner has a task link", ErrTaskBillingIdentityDrift)
 		}
 	case TaskBillingOwnerTask:
-		if attempt.TaskID == nil || *attempt.TaskID <= 0 || attempt.OwnerTransferredAt == 0 {
+		if attempt.TaskID == nil || *attempt.TaskID <= 0 || attempt.OwnerTransferredAt == 0 ||
+			attempt.PrepareVersion <= 0 {
 			return fmt.Errorf("%w: task owner has no task link", ErrTaskBillingIdentityDrift)
 		}
 	default:
@@ -226,19 +364,81 @@ func validateTaskBillingAttempt(attempt *TaskBillingAttempt) error {
 }
 
 func sameTaskBillingSnapshot(attempt *TaskBillingAttempt, snapshot TaskBillingAttemptSnapshot) error {
-	if !taskBillingSnapshotsEqual(snapshotFromTaskBillingAttempt(attempt), snapshot) {
+	identity, err := taskBillingIdentityFromSnapshot(snapshot)
+	if err != nil {
+		return err
+	}
+	if taskBillingIdentityFromAttempt(attempt) != identity {
 		return ErrTaskBillingAttemptConflict
 	}
 	return nil
 }
 
+// lockTaskBillingBeginSubjects runs after the new ledger row has been inserted
+// in the same transaction. This preserves the global ledger-before-balance-row
+// lock order while synchronizing with hard deletion gates. If deletion wins the
+// subject lock first, the lookup fails and the uncommitted ledger is rolled
+// back; if Begin wins, deletion observes the committed active attempt.
+func lockTaskBillingBeginSubjects(tx *gorm.DB, snapshot TaskBillingAttemptSnapshot) error {
+	if tx == nil {
+		return ErrTaskBillingIdentityDrift
+	}
+	if snapshot.UserID > 0 {
+		var user User
+		if err := lockForUpdate(tx).
+			Select("id").
+			Where("id = ?", snapshot.UserID).
+			First(&user).Error; err != nil {
+			return err
+		}
+	}
+	if snapshot.FundingSource == taskBillingFundingSubscription {
+		var subscription UserSubscription
+		if err := lockForUpdate(tx).
+			Select("id", "user_id").
+			Where("id = ? AND user_id = ?", snapshot.SubscriptionID, snapshot.UserID).
+			First(&subscription).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hasActiveTaskBillingAttempt(
+	tx *gorm.DB,
+	column string,
+	subjectID int,
+) (bool, error) {
+	if tx == nil || subjectID <= 0 {
+		return false, ErrTaskBillingIdentityDrift
+	}
+	switch column {
+	case "user_id", "subscription_id":
+	default:
+		return false, ErrTaskBillingIdentityDrift
+	}
+	var attemptID int64
+	query := tx.Model(&TaskBillingAttempt{}).
+		Select("id").
+		Where(column+" = ?", subjectID).
+		Where("succeeded_at = ? AND refund_completed_at = ?", 0, 0).
+		Order("id").
+		Limit(1).
+		Scan(&attemptID)
+	if query.Error != nil {
+		return false, query.Error
+	}
+	return attemptID != 0, nil
+}
+
 func BeginTaskBillingAttempt(snapshot TaskBillingAttemptSnapshot) (*TaskBillingAttempt, error) {
-	if err := validateTaskBillingSnapshot(snapshot); err != nil {
+	identity, err := taskBillingIdentityFromSnapshot(snapshot)
+	if err != nil {
 		return nil, err
 	}
 
 	var result TaskBillingAttempt
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	err = DB.Transaction(func(tx *gorm.DB) error {
 		query := lockForUpdate(tx).
 			Where("request_id = ?", snapshot.RequestID).
 			Limit(1).
@@ -255,26 +455,30 @@ func BeginTaskBillingAttempt(snapshot TaskBillingAttemptSnapshot) (*TaskBillingA
 
 		now := taskBillingTimestamp()
 		result = TaskBillingAttempt{
-			RequestID:      snapshot.RequestID,
-			Owner:          TaskBillingOwnerRequest,
-			PublicTaskID:   snapshot.PublicTaskID,
-			SubmitTime:     snapshot.SubmitTime,
-			IsFree:         snapshot.IsFree,
-			UserID:         snapshot.UserID,
-			FundingSource:  snapshot.FundingSource,
-			SubscriptionID: snapshot.SubscriptionID,
-			FundingAmount:  snapshot.FundingAmount,
-			TokenID:        snapshot.TokenID,
-			TokenAmount:    snapshot.TokenAmount,
-			CreatedAt:      now,
-			UpdatedAt:      now,
+			RequestID:            snapshot.RequestID,
+			Owner:                TaskBillingOwnerRequest,
+			PublicTaskID:         snapshot.PublicTaskID,
+			SubmitTime:           snapshot.SubmitTime,
+			IsFree:               snapshot.IsFree,
+			UserID:               snapshot.UserID,
+			FundingSource:        snapshot.FundingSource,
+			SubscriptionID:       snapshot.SubscriptionID,
+			FundingAmount:        snapshot.FundingAmount,
+			TokenID:              snapshot.TokenID,
+			TokenAmount:          snapshot.TokenAmount,
+			BillingContextDigest: identity.BillingContextDigest,
+			CreatedAt:            now,
+			UpdatedAt:            now,
 		}
 		if snapshot.IsFree {
 			result.FundingConsumedAt = now
 			result.TokenConsumedAt = now
 			result.PreconsumeCompletedAt = now
 		}
-		return tx.Create(&result).Error
+		if err := tx.Create(&result).Error; err != nil {
+			return err
+		}
+		return lockTaskBillingBeginSubjects(tx, snapshot)
 	})
 	if err == nil {
 		return &result, nil
@@ -677,9 +881,7 @@ func ApplyTaskTokenPreconsume(requestID string) (TaskBillingApplyResult, error) 
 		attempt = primary
 		applied = false
 	}
-	if tokenKey != "" {
-		invalidateTaskBillingTokenCache(tokenKey)
-	}
+	invalidateTaskBillingTokenCacheForID(attempt.TokenID, tokenKey)
 	return taskBillingApplyResult(attempt, applied, attempt.PreconsumeCompletedAt != 0), nil
 }
 
@@ -860,23 +1062,27 @@ func applyTaskFundingRefundTx(requestID string) (*TaskBillingAttempt, bool, bool
 			return err
 		}
 
-		if result.FundingConsumedAt != 0 && result.FundingAmount > 0 {
+		if result.FundingConsumedAt != 0 && !result.IsFree {
 			switch result.FundingSource {
 			case taskBillingFundingWallet:
-				var user User
-				if err := lockForUpdate(tx).Where("id = ?", result.UserID).First(&user).Error; err != nil {
-					return err
-				}
-				if int64(user.Quota)+int64(result.FundingAmount) > int64(common.MaxQuota) {
-					return ErrTaskBillingIdentityDrift
-				}
-				update := tx.Model(&User{}).Where("id = ?", result.UserID).
-					Update("quota", gorm.Expr("quota + ?", result.FundingAmount))
-				if update.Error != nil {
-					return update.Error
-				}
-				if update.RowsAffected != 1 {
-					return ErrTaskBillingIdentityDrift
+				if result.FundingAmount > 0 {
+					var user User
+					if err := lockForUpdate(tx.Unscoped()).
+						Where("id = ?", result.UserID).
+						First(&user).Error; err != nil {
+						return err
+					}
+					if int64(user.Quota)+int64(result.FundingAmount) > int64(common.MaxQuota) {
+						return ErrTaskBillingIdentityDrift
+					}
+					update := tx.Unscoped().Model(&User{}).Where("id = ?", result.UserID).
+						Update("quota", gorm.Expr("quota + ?", result.FundingAmount))
+					if update.Error != nil {
+						return update.Error
+					}
+					if update.RowsAffected != 1 {
+						return ErrTaskBillingIdentityDrift
+					}
 				}
 			case taskBillingFundingSubscription:
 				var record SubscriptionPreConsumeRecord
@@ -903,7 +1109,8 @@ func applyTaskFundingRefundTx(requestID string) (*TaskBillingAttempt, bool, bool
 					subscription.QuotaResetVersion < *record.SubscriptionResetVersion {
 					return ErrTaskBillingIdentityDrift
 				}
-				if subscription.QuotaResetVersion == *record.SubscriptionResetVersion {
+				if subscription.QuotaResetVersion == *record.SubscriptionResetVersion &&
+					result.FundingAmount > 0 {
 					if subscription.AmountUsed < int64(result.FundingAmount) {
 						return ErrTaskBillingIdentityDrift
 					}
@@ -1093,9 +1300,7 @@ func ApplyTaskTokenRefund(requestID string) (TaskBillingApplyResult, error) {
 		attempt = primary
 		applied = false
 	}
-	if tokenKey != "" {
-		invalidateTaskBillingTokenCache(tokenKey)
-	}
+	invalidateTaskBillingTokenCacheForID(attempt.TokenID, tokenKey)
 	return taskBillingApplyResult(attempt, applied, attempt.RefundCompletedAt != 0), nil
 }
 
@@ -1115,4 +1320,29 @@ func invalidateTaskBillingTokenCache(tokenKey string) {
 	if err := cacheDeleteToken(tokenKey); err != nil {
 		common.SysLog("failed to invalidate durable task token cache: " + err.Error())
 	}
+}
+
+func invalidateTaskBillingTokenCacheForID(tokenID int, tokenKey string) {
+	if tokenID <= 0 || !common.RedisEnabled {
+		return
+	}
+	if tokenKey == "" {
+		var token Token
+		err := DB.Unscoped().
+			Select("id", commonKeyCol).
+			Where("id = ?", tokenID).
+			First(&token).Error
+		if err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				common.SysLog(fmt.Sprintf(
+					"failed to resolve durable task token cache identity (tokenId=%d): %v",
+					tokenID,
+					err,
+				))
+			}
+			return
+		}
+		tokenKey = token.Key
+	}
+	invalidateTaskBillingTokenCache(tokenKey)
 }
