@@ -1,8 +1,10 @@
 package model
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
-	"reflect"
+	"math"
 	"sync"
 
 	"gorm.io/gorm"
@@ -58,6 +60,13 @@ func validateTaskCandidateAgainstAttempt(candidate *Task, attempt *TaskBillingAt
 		candidate.SubmitTime != attempt.SubmitTime {
 		return ErrTaskBillingIdentityDrift
 	}
+	billingContextDigest, err := DigestTaskBillingContext(candidate.PrivateData.BillingContext)
+	if err != nil {
+		return err
+	}
+	if billingContextDigest != attempt.BillingContextDigest {
+		return ErrTaskBillingIdentityDrift
+	}
 	if candidate.Status != TaskStatusSubmitting || candidate.Progress != "0%" ||
 		candidate.PrivateData.UpstreamTaskID != "" {
 		return ErrTaskSubmissionStateConflict
@@ -84,8 +93,14 @@ func validateTaskRetryIdentity(current, candidate *Task, attempt *TaskBillingAtt
 		current.PrivateData.SubscriptionId != candidate.PrivateData.SubscriptionId ||
 		current.PrivateData.TokenId != candidate.PrivateData.TokenId ||
 		current.PrivateData.NodeName != candidate.PrivateData.NodeName ||
-		current.Properties.OriginModelName != candidate.Properties.OriginModelName ||
-		!reflect.DeepEqual(current.PrivateData.BillingContext, candidate.PrivateData.BillingContext) {
+		current.Properties.OriginModelName != candidate.Properties.OriginModelName {
+		return ErrTaskBillingIdentityDrift
+	}
+	currentBillingContextDigest, err := DigestTaskBillingContext(current.PrivateData.BillingContext)
+	if err != nil {
+		return err
+	}
+	if currentBillingContextDigest != attempt.BillingContextDigest {
 		return ErrTaskBillingIdentityDrift
 	}
 	if err := validateTaskCandidateAgainstAttempt(candidate, attempt); err != nil {
@@ -99,19 +114,28 @@ func validateTaskRetryIdentity(current, candidate *Task, attempt *TaskBillingAtt
 }
 
 func readPreparedTaskSubmission(requestID string) (*Task, *TaskBillingAttempt, error) {
-	attempt, err := GetTaskBillingAttemptByRequestID(requestID)
-	if err != nil {
-		return nil, nil, err
-	}
-	if attempt.Owner != TaskBillingOwnerTask || attempt.TaskID == nil {
-		return nil, attempt, ErrTaskSubmissionStateConflict
-	}
+	var attempt TaskBillingAttempt
 	var task Task
-	if err := DB.Where("id = ? AND task_id = ?", *attempt.TaskID, attempt.PublicTaskID).
-		First(&task).Error; err != nil {
-		return nil, attempt, err
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).
+			Where("request_id = ?", requestID).
+			First(&attempt).Error; err != nil {
+			return err
+		}
+		if err := validateTaskBillingAttempt(&attempt); err != nil {
+			return err
+		}
+		if attempt.Owner != TaskBillingOwnerTask || attempt.TaskID == nil {
+			return ErrTaskSubmissionStateConflict
+		}
+		return lockForUpdate(tx).
+			Where("id = ? AND task_id = ?", *attempt.TaskID, attempt.PublicTaskID).
+			First(&task).Error
+	})
+	if err != nil {
+		return nil, &attempt, err
 	}
-	return &task, attempt, nil
+	return &task, &attempt, nil
 }
 
 func PrepareTaskSubmissionAttempt(
@@ -126,6 +150,7 @@ func PrepareTaskSubmissionAttempt(
 	var prepared Task
 	var attempt TaskBillingAttempt
 	transactionMayHaveCommitted := false
+	expectedPrepareVersion := int64(0)
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		if err := lockForUpdate(tx).Where("request_id = ?", requestID).First(&attempt).Error; err != nil {
 			return err
@@ -166,13 +191,21 @@ func PrepareTaskSubmissionAttempt(
 			attempt.TaskID = &prepared.ID
 			attempt.Owner = TaskBillingOwnerTask
 			attempt.OwnerTransferredAt = now
+			attempt.PrepareVersion = 1
 			attempt.UpdatedAt = now
+			expectedPrepareVersion = attempt.PrepareVersion
 			update := tx.Model(&TaskBillingAttempt{}).
-				Where("id = ? AND owner = ? AND task_id IS NULL", attempt.ID, TaskBillingOwnerRequest).
+				Where(
+					"id = ? AND owner = ? AND task_id IS NULL AND prepare_version = ?",
+					attempt.ID,
+					TaskBillingOwnerRequest,
+					0,
+				).
 				Updates(map[string]any{
 					"task_id":              prepared.ID,
 					"owner":                TaskBillingOwnerTask,
 					"owner_transferred_at": now,
+					"prepare_version":      expectedPrepareVersion,
 					"updated_at":           now,
 				})
 			if update.Error != nil {
@@ -197,6 +230,11 @@ func PrepareTaskSubmissionAttempt(
 			if err := validateTaskRetryIdentity(&prepared, candidate, &attempt); err != nil {
 				return err
 			}
+			if attempt.PrepareVersion == math.MaxInt64 {
+				return ErrTaskSubmissionStateConflict
+			}
+			previousPrepareVersion := attempt.PrepareVersion
+			expectedPrepareVersion = previousPrepareVersion + 1
 
 			latestPrivate := prepared.PrivateData
 			latestPrivate.Key = candidate.PrivateData.Key
@@ -221,6 +259,26 @@ func PrepareTaskSubmissionAttempt(
 			prepared.PrivateData = latestPrivate
 			prepared.Properties = latestProperties
 			prepared.UpdatedAt = now
+			versionUpdate := tx.Model(&TaskBillingAttempt{}).
+				Where(
+					"id = ? AND owner = ? AND task_id = ? AND prepare_version = ?",
+					attempt.ID,
+					TaskBillingOwnerTask,
+					prepared.ID,
+					previousPrepareVersion,
+				).
+				Updates(map[string]any{
+					"prepare_version": expectedPrepareVersion,
+					"updated_at":      now,
+				})
+			if versionUpdate.Error != nil {
+				return versionUpdate.Error
+			}
+			if versionUpdate.RowsAffected != 1 {
+				return ErrTaskSubmissionStateConflict
+			}
+			attempt.PrepareVersion = expectedPrepareVersion
+			attempt.UpdatedAt = now
 		}
 		if err := runTaskSubmissionFailpoint("prepare", "before_commit"); err != nil {
 			return err
@@ -238,21 +296,26 @@ func PrepareTaskSubmissionAttempt(
 		if !transactionMayHaveCommitted {
 			return nil, nil, err
 		}
+		if readbackErr := runTaskSubmissionFailpoint("prepare", "before_readback"); readbackErr != nil {
+			return nil, nil, readbackErr
+		}
 		readTask, readAttempt, readErr := readPreparedTaskSubmission(requestID)
 		if readErr != nil {
 			return nil, nil, err
 		}
+		if readAttempt.PrepareVersion != expectedPrepareVersion {
+			return nil, nil, ErrTaskSubmissionStateConflict
+		}
 		if persistentID != 0 && readTask.ID != persistentID {
-			return nil, nil, err
+			return nil, nil, ErrTaskSubmissionStateConflict
 		}
 		if validationErr := validateTaskCandidateAgainstAttempt(readTask, readAttempt); validationErr != nil {
 			return nil, nil, err
 		}
-		if persistentID != 0 &&
-			(readTask.ChannelId != candidate.ChannelId ||
-				readTask.PrivateData.Key != candidate.PrivateData.Key ||
-				readTask.Properties.UpstreamModelName != candidate.Properties.UpstreamModelName) {
-			return nil, nil, err
+		if readTask.ChannelId != candidate.ChannelId ||
+			readTask.PrivateData.Key != candidate.PrivateData.Key ||
+			readTask.Properties.UpstreamModelName != candidate.Properties.UpstreamModelName {
+			return nil, nil, ErrTaskSubmissionStateConflict
 		}
 		return readTask, readAttempt, nil
 	}
@@ -471,7 +534,14 @@ func TransitionTaskSubmissionToFailure(
 			return err
 		}
 		switch result.Status {
-		case TaskStatusSubmitting, TaskStatusSubmitted:
+		case TaskStatusSubmitting:
+			if result.Progress != "0%" {
+				return ErrTaskSubmissionStateConflict
+			}
+		case TaskStatusSubmitted:
+			if result.Progress != "10%" {
+				return ErrTaskSubmissionStateConflict
+			}
 		case TaskStatusFailure:
 			if result.Progress != "100%" {
 				return ErrTaskSubmissionStateConflict
@@ -479,72 +549,162 @@ func TransitionTaskSubmissionToFailure(
 		default:
 			return ErrTaskSubmissionStateConflict
 		}
-
-		privateChanged := false
-		if upstreamTaskID != "" {
-			switch storedID := result.PrivateData.UpstreamTaskID; {
-			case storedID == "":
-				result.PrivateData.UpstreamTaskID = upstreamTaskID
-				privateChanged = true
-			case storedID != upstreamTaskID:
-				return ErrTaskUpstreamIDConflict
-			}
-		}
-
-		now := taskBillingTimestamp()
-		if result.Status != TaskStatusFailure {
-			result.Status = TaskStatusFailure
-			result.Progress = "100%"
-			result.FinishTime = now
-			if message != "" {
-				result.FailReason = message
-			} else {
-				result.FailReason = code
-			}
-			result.UpdatedAt = now
-			updates := map[string]any{
-				"status":      result.Status,
-				"progress":    result.Progress,
-				"finish_time": result.FinishTime,
-				"fail_reason": result.FailReason,
-				"updated_at":  result.UpdatedAt,
-			}
-			if privateChanged {
-				updates["private_data"] = result.PrivateData
-			}
-			update := tx.Model(&Task{}).
-				Where("id = ? AND task_id = ?", result.ID, result.TaskID).
-				Updates(updates)
-			if update.Error != nil {
-				return update.Error
-			}
-			if update.RowsAffected != 1 {
-				return ErrTaskSubmissionStateConflict
-			}
-			return nil
-		}
-		if !privateChanged {
-			return nil
-		}
-		result.UpdatedAt = now
-		update := tx.Model(&Task{}).
-			Where("id = ? AND task_id = ?", result.ID, result.TaskID).
-			Updates(map[string]any{
-				"private_data": result.PrivateData,
-				"updated_at":   result.UpdatedAt,
-			})
-		if update.Error != nil {
-			return update.Error
-		}
-		if update.RowsAffected != 1 {
-			return ErrTaskSubmissionStateConflict
-		}
-		return nil
+		return transitionTaskToFailureLocked(tx, &result, TaskFailureTransition{
+			ExpectedStatus:   result.Status,
+			ExpectedProgress: result.Progress,
+			UpstreamTaskID:   upstreamTaskID,
+			Code:             code,
+			Message:          message,
+		})
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &result, nil
+}
+
+// TaskFailureTransition names the exact durable state observed by a caller.
+// Data and ResultURL are opt-in so a terminal failure never rewrites mutable
+// polling columns from a stale in-memory Task by accident.
+type TaskFailureTransition struct {
+	ExpectedStatus   TaskStatus
+	ExpectedProgress string
+	UpstreamTaskID   string
+	Code             string
+	Message          string
+	Data             *json.RawMessage
+	ResultURL        *string
+}
+
+func validateTaskFailureExpectedState(transition TaskFailureTransition) error {
+	switch transition.ExpectedStatus {
+	case TaskStatusSubmitting:
+		if transition.ExpectedProgress != "0%" {
+			return ErrTaskSubmissionStateConflict
+		}
+	case TaskStatusSubmitted:
+		if transition.ExpectedProgress != "10%" {
+			return ErrTaskSubmissionStateConflict
+		}
+	case TaskStatusQueued, TaskStatusInProgress:
+		if transition.ExpectedProgress == "" {
+			return ErrTaskSubmissionStateConflict
+		}
+	case TaskStatusFailure:
+		if transition.ExpectedProgress != "100%" {
+			return ErrTaskSubmissionStateConflict
+		}
+	default:
+		return ErrTaskSubmissionStateConflict
+	}
+	return nil
+}
+
+// TransitionTaskToFailure locks and reloads the current Task before applying a
+// terminal failure. The expected status and progress are both exact guards;
+// callers that discovered stale polling state lose without modifying the row.
+func TransitionTaskToFailure(
+	id int64,
+	publicTaskID string,
+	transition TaskFailureTransition,
+) (*Task, error) {
+	if id <= 0 || publicTaskID == "" {
+		return nil, ErrTaskSubmissionStateConflict
+	}
+	if err := validateTaskFailureExpectedState(transition); err != nil {
+		return nil, err
+	}
+	var result Task
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).
+			Where("id = ? AND task_id = ?", id, publicTaskID).
+			First(&result).Error; err != nil {
+			return err
+		}
+		if result.Status != transition.ExpectedStatus ||
+			result.Progress != transition.ExpectedProgress {
+			return ErrTaskSubmissionStateConflict
+		}
+		return transitionTaskToFailureLocked(tx, &result, transition)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func transitionTaskToFailureLocked(
+	tx *gorm.DB,
+	result *Task,
+	transition TaskFailureTransition,
+) error {
+	if tx == nil || result == nil {
+		return ErrTaskSubmissionStateConflict
+	}
+	privateChanged := false
+	if transition.UpstreamTaskID != "" {
+		switch storedID := result.PrivateData.UpstreamTaskID; {
+		case storedID == "":
+			result.PrivateData.UpstreamTaskID = transition.UpstreamTaskID
+			privateChanged = true
+		case storedID != transition.UpstreamTaskID:
+			return ErrTaskUpstreamIDConflict
+		}
+	}
+	if transition.ResultURL != nil &&
+		result.PrivateData.ResultURL != *transition.ResultURL {
+		result.PrivateData.ResultURL = *transition.ResultURL
+		privateChanged = true
+	}
+
+	dataChanged := transition.Data != nil && !bytes.Equal(result.Data, *transition.Data)
+	wasFailure := result.Status == TaskStatusFailure
+	if wasFailure && !privateChanged && !dataChanged {
+		return nil
+	}
+
+	now := taskBillingTimestamp()
+	updates := make(map[string]any, 7)
+	if !wasFailure {
+		result.Status = TaskStatusFailure
+		result.Progress = "100%"
+		result.FinishTime = now
+		if transition.Message != "" {
+			result.FailReason = transition.Message
+		} else {
+			result.FailReason = transition.Code
+		}
+		updates["status"] = result.Status
+		updates["progress"] = result.Progress
+		updates["finish_time"] = result.FinishTime
+		updates["fail_reason"] = result.FailReason
+	}
+	if privateChanged {
+		updates["private_data"] = result.PrivateData
+	}
+	if transition.Data != nil {
+		result.Data = append(json.RawMessage(nil), (*transition.Data)...)
+		updates["data"] = result.Data
+	}
+	result.UpdatedAt = now
+	updates["updated_at"] = result.UpdatedAt
+
+	update := tx.Model(&Task{}).
+		Where(
+			"id = ? AND task_id = ? AND status = ? AND progress = ?",
+			result.ID,
+			result.TaskID,
+			transition.ExpectedStatus,
+			transition.ExpectedProgress,
+		).
+		Updates(updates)
+	if update.Error != nil {
+		return update.Error
+	}
+	if update.RowsAffected != 1 {
+		return ErrTaskSubmissionStateConflict
+	}
+	return nil
 }
 
 func markTaskBillingAttemptTerminal(requestID string, finalSuccess bool) error {

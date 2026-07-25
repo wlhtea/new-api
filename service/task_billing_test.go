@@ -865,6 +865,13 @@ func TestSettle_NonPerCallBilling_AppliesAdaptorAdjustment(t *testing.T) {
 	assert.Equal(t, model.LogTypeRefund, log.Type)
 }
 
+func durableBillingContextFixture() *model.TaskBillingContext {
+	return &model.TaskBillingContext{
+		OriginModelName: "fixture-model",
+		GroupRatio:      1,
+	}
+}
+
 func seedDurableBillingAttempt(
 	t *testing.T,
 	requestID string,
@@ -876,14 +883,15 @@ func seedDurableBillingAttempt(
 	seedUser(t, userID, 10_000)
 	seedToken(t, tokenID, userID, "sk-"+requestID, 10_000)
 	attempt, err := model.BeginTaskBillingAttempt(model.TaskBillingAttemptSnapshot{
-		RequestID:     requestID,
-		PublicTaskID:  "task_" + requestID,
-		SubmitTime:    time.Now().Unix(),
-		UserID:        userID,
-		FundingSource: BillingSourceWallet,
-		FundingAmount: quota,
-		TokenID:       tokenID,
-		TokenAmount:   quota,
+		RequestID:      requestID,
+		PublicTaskID:   "task_" + requestID,
+		SubmitTime:     time.Now().Unix(),
+		UserID:         userID,
+		FundingSource:  BillingSourceWallet,
+		FundingAmount:  quota,
+		TokenID:        tokenID,
+		TokenAmount:    quota,
+		BillingContext: durableBillingContextFixture(),
 	})
 	require.NoError(t, err)
 	_, err = model.ApplyTaskFundingPreconsume(requestID)
@@ -911,12 +919,9 @@ func linkDurableBillingAttempt(
 		SubmitTime: attempt.SubmitTime,
 		Progress:   "0%",
 		PrivateData: model.TaskPrivateData{
-			BillingSource: attempt.FundingSource,
-			TokenId:       attempt.TokenID,
-			BillingContext: &model.TaskBillingContext{
-				OriginModelName: "fixture-model",
-				GroupRatio:      1,
-			},
+			BillingSource:  attempt.FundingSource,
+			TokenId:        attempt.TokenID,
+			BillingContext: durableBillingContextFixture(),
 		},
 	}, 0, requestID)
 	require.NoError(t, err)
@@ -961,14 +966,15 @@ func TestPaidZeroRefundIsSelectedWithZeroTaskQuota(t *testing.T) {
 	seedUser(t, userID, 0)
 	seedToken(t, tokenID, userID, "sk-paid-zero", 0)
 	attempt, err := model.BeginTaskBillingAttempt(model.TaskBillingAttemptSnapshot{
-		RequestID:     "paid-zero-recovery",
-		PublicTaskID:  "task_paid_zero_recovery",
-		SubmitTime:    time.Now().Add(-time.Minute).Unix(),
-		UserID:        userID,
-		FundingSource: BillingSourceWallet,
-		FundingAmount: 0,
-		TokenID:       tokenID,
-		TokenAmount:   0,
+		RequestID:      "paid-zero-recovery",
+		PublicTaskID:   "task_paid_zero_recovery",
+		SubmitTime:     time.Now().Add(-time.Minute).Unix(),
+		UserID:         userID,
+		FundingSource:  BillingSourceWallet,
+		FundingAmount:  0,
+		TokenID:        tokenID,
+		TokenAmount:    0,
+		BillingContext: durableBillingContextFixture(),
 	})
 	require.NoError(t, err)
 	_, err = model.ApplyTaskFundingPreconsume(attempt.RequestID)

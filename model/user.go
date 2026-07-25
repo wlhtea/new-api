@@ -881,7 +881,20 @@ func (user *User) HardDelete() error {
 	var tokens []Token
 	var deletedAuthVersion int64
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		var err error
+		var locked User
+		if err := lockForUpdate(tx.Unscoped()).
+			Select("id").
+			Where("id = ?", user.Id).
+			First(&locked).Error; err != nil {
+			return err
+		}
+		active, err := hasActiveTaskBillingAttempt(tx, "user_id", user.Id)
+		if err != nil {
+			return err
+		}
+		if active {
+			return fmt.Errorf("%w: user %d", ErrTaskBillingSubjectInUse, user.Id)
+		}
 		deletedAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
 		if err != nil {
 			return err

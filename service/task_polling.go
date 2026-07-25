@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -43,6 +44,39 @@ const (
 	refundReconciliationGracePeriod = 30 * time.Second
 )
 
+func transitionDurablePollingFailure(
+	task *model.Task,
+	expectedStatus model.TaskStatus,
+	expectedProgress string,
+	code string,
+	message string,
+	data *json.RawMessage,
+) (*model.Task, bool, error) {
+	if task == nil {
+		return nil, false, model.ErrTaskSubmissionStateConflict
+	}
+	_, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	switch {
+	case err == nil:
+		failed, transitionErr := model.TransitionTaskToFailure(
+			task.ID,
+			task.TaskID,
+			model.TaskFailureTransition{
+				ExpectedStatus:   expectedStatus,
+				ExpectedProgress: expectedProgress,
+				Code:             code,
+				Message:          message,
+				Data:             data,
+			},
+		)
+		return failed, true, transitionErr
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return nil, false, nil
+	default:
+		return nil, true, err
+	}
+}
+
 // sweepTimedOutTasks 在主轮询之前独立清理超时任务。
 // 每次最多处理 100 条，剩余的下个周期继续处理。
 // 使用 per-task CAS (UpdateWithStatus) 防止覆盖被正常轮询已推进的任务。
@@ -71,14 +105,16 @@ func sweepTimedOutTasks(ctx context.Context) {
 			))
 			continue
 		}
-		if attemptErr == nil &&
-			(task.Status == model.TaskStatusSubmitting || task.Status == model.TaskStatusSubmitted) {
-			failed, transitionErr := model.TransitionTaskSubmissionToFailure(
+		if attemptErr == nil {
+			failed, transitionErr := model.TransitionTaskToFailure(
 				task.ID,
 				task.TaskID,
-				task.PrivateData.UpstreamTaskID,
-				"task_timeout",
-				reason,
+				model.TaskFailureTransition{
+					ExpectedStatus:   task.Status,
+					ExpectedProgress: task.Progress,
+					Code:             "task_timeout",
+					Message:          reason,
+				},
 			)
 			if transitionErr != nil {
 				logger.LogError(ctx, fmt.Sprintf(
@@ -329,22 +365,47 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 	ch, err := model.CacheGetChannel(channelId)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("CacheGetChannel: %v", err))
-		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
+		channelErr := err
+		// Durable tasks must transition through the locked narrow primitive so
+		// their component-ledger refund remains recoverable. Keep the historical
+		// bulk behavior only for tasks with no durable attempt.
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
+				reason := fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId)
+				failed, durable, transitionErr := transitionDurablePollingFailure(
+					t,
+					t.Status,
+					t.Progress,
+					"task_channel_unavailable",
+					reason,
+					nil,
+				)
+				if durable {
+					if transitionErr != nil {
+						logger.LogError(ctx, fmt.Sprintf(
+							"UpdateSunoTask durable transition error task %s: %v",
+							t.TaskID,
+							transitionErr,
+						))
+					} else {
+						RefundTaskQuota(ctx, failed, reason)
+					}
+					continue
+				}
 				failedIDs = append(failedIDs, t.ID)
 			}
 		}
-		err = model.TaskBulkUpdateByID(failedIDs, map[string]any{
+		updateErr := model.TaskBulkUpdateByID(failedIDs, map[string]any{
 			"fail_reason": fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId),
 			"status":      "FAILURE",
 			"progress":    "100%",
 		})
-		if err != nil {
-			common.SysLog(fmt.Sprintf("UpdateSunoTask error: %v", err))
+		if updateErr != nil {
+			common.SysLog(fmt.Sprintf("UpdateSunoTask error: %v", updateErr))
+			return updateErr
 		}
-		return err
+		return channelErr
 	}
 	adaptor := GetTaskAdaptorFunc(constant.TaskPlatformSuno)
 	if adaptor == nil {
@@ -393,6 +454,7 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 		}
 
 		prevStatus := task.Status
+		prevProgress := task.Progress
 		task.Status = lo.If(model.TaskStatus(responseItem.Status) != "", model.TaskStatus(responseItem.Status)).Else(task.Status)
 		task.FailReason = lo.If(responseItem.FailReason != "", responseItem.FailReason).Else(task.FailReason)
 		task.SubmitTime = lo.If(responseItem.SubmitTime != 0, responseItem.SubmitTime).Else(task.SubmitTime)
@@ -408,6 +470,30 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 			task.Progress = "100%"
 		}
 		task.Data = responseItem.Data
+
+		if isFailure {
+			failed, durable, transitionErr := transitionDurablePollingFailure(
+				task,
+				prevStatus,
+				prevProgress,
+				"provider_failure",
+				task.FailReason,
+				&task.Data,
+			)
+			if durable {
+				if transitionErr != nil {
+					logger.LogError(ctx, fmt.Sprintf(
+						"UpdateSunoTask durable transition error task %s: %v",
+						task.TaskID,
+						transitionErr,
+					))
+					continue
+				}
+				*task = *failed
+				RefundTaskQuota(ctx, failed, failed.FailReason)
+				continue
+			}
+		}
 
 		// 持久化走 CAS，防止重叠轮询/sweep/多实例/持久化失败重试导致重复退款或覆盖终态。
 		won, err := task.UpdateWithStatus(prevStatus)
@@ -501,15 +587,38 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	}
 	cacheGetChannel, err := model.CacheGetChannel(channelId)
 	if err != nil {
-		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
+		reason := fmt.Sprintf("Failed to get channel info, channel ID: %d", channelId)
+		// Preserve the legacy bulk path only for tasks without a durable
+		// billing owner. Ledger-backed tasks need the locked narrow transition
+		// and component refund.
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
+				failed, durable, transitionErr := transitionDurablePollingFailure(
+					t,
+					t.Status,
+					t.Progress,
+					"task_channel_unavailable",
+					reason,
+					nil,
+				)
+				if durable {
+					if transitionErr != nil {
+						logger.LogError(ctx, fmt.Sprintf(
+							"UpdateVideoTask durable transition error task %s: %v",
+							t.TaskID,
+							transitionErr,
+						))
+					} else {
+						RefundTaskQuota(ctx, failed, reason)
+					}
+					continue
+				}
 				failedIDs = append(failedIDs, t.ID)
 			}
 		}
 		errUpdate := model.TaskBulkUpdateByID(failedIDs, map[string]any{
-			"fail_reason": fmt.Sprintf("Failed to get channel info, channel ID: %d", channelId),
+			"fail_reason": reason,
 			"status":      "FAILURE",
 			"progress":    "100%",
 		})
@@ -677,6 +786,29 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 	if taskResult.Progress != "" {
 		task.Progress = taskResult.Progress
+	}
+
+	if shouldRefund {
+		failed, durable, transitionErr := transitionDurablePollingFailure(
+			task,
+			snap.Status,
+			snap.Progress,
+			"provider_failure",
+			task.FailReason,
+			&task.Data,
+		)
+		if durable {
+			if transitionErr != nil {
+				return fmt.Errorf(
+					"durable failure transition failed for task %s: %w",
+					task.TaskID,
+					transitionErr,
+				)
+			}
+			task = failed
+			RefundTaskQuota(ctx, failed, failed.FailReason)
+			return nil
+		}
 	}
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure

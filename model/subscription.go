@@ -971,14 +971,42 @@ func AdminDeleteUserSubscription(userSubscriptionId int) (string, error) {
 	now := common.GetTimestamp()
 	cacheGroup := ""
 	downgradeGroup := ""
-	var userId int
+	var subject UserSubscription
+	if err := DB.Select("id", "user_id").
+		Where("id = ?", userSubscriptionId).
+		First(&subject).Error; err != nil {
+		return "", err
+	}
+	userId := subject.UserId
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		var sub UserSubscription
-		if err := lockForUpdate(tx).
-			Where("id = ?", userSubscriptionId).First(&sub).Error; err != nil {
+		// BeginTaskBillingAttempt locks User before UserSubscription. Preserve
+		// that order here so a concurrent begin/delete converges without a
+		// user<->subscription deadlock. The unlocked identity lookup above is
+		// revalidated after both subject locks are acquired.
+		var user User
+		if err := lockForUpdate(tx.Unscoped()).
+			Select("id").
+			Where("id = ?", userId).
+			First(&user).Error; err != nil {
 			return err
 		}
-		userId = sub.UserId
+		var sub UserSubscription
+		if err := lockForUpdate(tx).
+			Where("id = ? AND user_id = ?", userSubscriptionId, userId).
+			First(&sub).Error; err != nil {
+			return err
+		}
+		active, err := hasActiveTaskBillingAttempt(tx, "subscription_id", userSubscriptionId)
+		if err != nil {
+			return err
+		}
+		if active {
+			return fmt.Errorf(
+				"%w: subscription %d",
+				ErrTaskBillingSubjectInUse,
+				userSubscriptionId,
+			)
+		}
 		target, err := downgradeUserGroupForSubscriptionTx(tx, &sub, now)
 		if err != nil {
 			return err

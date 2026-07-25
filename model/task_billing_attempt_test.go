@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,14 +19,15 @@ import (
 
 func billingSnapshot(requestID string, amount int) TaskBillingAttemptSnapshot {
 	return TaskBillingAttemptSnapshot{
-		RequestID:     requestID,
-		PublicTaskID:  "task_" + requestID,
-		SubmitTime:    1_750_000_000,
-		UserID:        501,
-		FundingSource: "wallet",
-		FundingAmount: amount,
-		TokenID:       601,
-		TokenAmount:   amount,
+		RequestID:      requestID,
+		PublicTaskID:   "task_" + requestID,
+		SubmitTime:     1_750_000_000,
+		UserID:         501,
+		FundingSource:  "wallet",
+		FundingAmount:  amount,
+		TokenID:        601,
+		TokenAmount:    amount,
+		BillingContext: &TaskBillingContext{},
 	}
 }
 
@@ -67,6 +69,113 @@ func loadBillingToken(t *testing.T, tokenID int) Token {
 	return token
 }
 
+func cloneTaskBillingContextForTest(context *TaskBillingContext) *TaskBillingContext {
+	if context == nil {
+		return nil
+	}
+	cloned := *context
+	if context.OtherRatios != nil {
+		cloned.OtherRatios = make(map[string]float64, len(context.OtherRatios))
+		for key, ratio := range context.OtherRatios {
+			cloned.OtherRatios[key] = ratio
+		}
+	}
+	return &cloned
+}
+
+func TestDigestTaskBillingContextCanonicalization(t *testing.T) {
+	nilDigest, err := DigestTaskBillingContext(nil)
+	require.NoError(t, err)
+	require.Len(t, nilDigest, 64)
+
+	emptyContextDigest, err := DigestTaskBillingContext(&TaskBillingContext{})
+	require.NoError(t, err)
+	assert.NotEqual(t, nilDigest, emptyContextDigest, "nil and a present zero-value context are distinct identities")
+
+	first := &TaskBillingContext{
+		ModelPrice:      0.015,
+		GroupRatio:      1.25,
+		ModelRatio:      2,
+		OtherRatios:     map[string]float64{"seconds": 1.5, "resolution": 2.25},
+		OriginModelName: "seedance-v1-pro",
+		PerCallBilling:  true,
+	}
+	second := cloneTaskBillingContextForTest(first)
+	second.OtherRatios = make(map[string]float64)
+	second.OtherRatios["resolution"] = 2.25
+	second.OtherRatios["seconds"] = 1.5
+
+	firstDigest, err := DigestTaskBillingContext(first)
+	require.NoError(t, err)
+	secondDigest, err := DigestTaskBillingContext(second)
+	require.NoError(t, err)
+	assert.Equal(t, firstDigest, secondDigest, "map insertion order must not affect the digest")
+
+	nilRatios := cloneTaskBillingContextForTest(first)
+	nilRatios.OtherRatios = nil
+	emptyRatios := cloneTaskBillingContextForTest(first)
+	emptyRatios.OtherRatios = map[string]float64{}
+	nilRatiosDigest, err := DigestTaskBillingContext(nilRatios)
+	require.NoError(t, err)
+	emptyRatiosDigest, err := DigestTaskBillingContext(emptyRatios)
+	require.NoError(t, err)
+	assert.Equal(t, nilRatiosDigest, emptyRatiosDigest, "nil and empty ratio maps are the same billing identity")
+
+	positiveZero := cloneTaskBillingContextForTest(first)
+	positiveZero.ModelPrice = 0
+	positiveZero.OtherRatios = map[string]float64{"zero": 0}
+	negativeZero := cloneTaskBillingContextForTest(positiveZero)
+	negativeZero.ModelPrice = math.Copysign(0, -1)
+	negativeZero.OtherRatios["zero"] = math.Copysign(0, -1)
+	positiveZeroDigest, err := DigestTaskBillingContext(positiveZero)
+	require.NoError(t, err)
+	negativeZeroDigest, err := DigestTaskBillingContext(negativeZero)
+	require.NoError(t, err)
+	assert.Equal(t, positiveZeroDigest, negativeZeroDigest, "negative zero must canonicalize to positive zero")
+}
+
+func TestDigestTaskBillingContextRejectsNonFiniteValues(t *testing.T) {
+	testCases := []struct {
+		name   string
+		mutate func(*TaskBillingContext)
+	}{
+		{name: "model price nan", mutate: func(context *TaskBillingContext) {
+			context.ModelPrice = math.NaN()
+		}},
+		{name: "group ratio positive infinity", mutate: func(context *TaskBillingContext) {
+			context.GroupRatio = math.Inf(1)
+		}},
+		{name: "model ratio negative infinity", mutate: func(context *TaskBillingContext) {
+			context.ModelRatio = math.Inf(-1)
+		}},
+		{name: "other ratio nan", mutate: func(context *TaskBillingContext) {
+			context.OtherRatios["seconds"] = math.NaN()
+		}},
+		{name: "other ratio positive infinity", mutate: func(context *TaskBillingContext) {
+			context.OtherRatios["seconds"] = math.Inf(1)
+		}},
+		{name: "other ratio negative infinity", mutate: func(context *TaskBillingContext) {
+			context.OtherRatios["seconds"] = math.Inf(-1)
+		}},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			context := &TaskBillingContext{
+				ModelPrice:      0.015,
+				GroupRatio:      1,
+				ModelRatio:      2,
+				OtherRatios:     map[string]float64{"seconds": 1.5},
+				OriginModelName: "seedance-v1-pro",
+			}
+			testCase.mutate(context)
+
+			digest, err := DigestTaskBillingContext(context)
+			require.Error(t, err)
+			assert.Empty(t, digest)
+		})
+	}
+}
+
 func TestBeginTaskBillingAttemptPrecedesAnyBalanceMutation(t *testing.T) {
 	truncateTables(t)
 	snapshot := billingSnapshot("begin-before-balance", 120)
@@ -84,6 +193,7 @@ func TestBeginTaskBillingAttemptPrecedesAnyBalanceMutation(t *testing.T) {
 func TestBeginTaskBillingAttemptIsUniqueByRequestID(t *testing.T) {
 	truncateTables(t)
 	snapshot := billingSnapshot("unique-request", 10)
+	seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
 	first, err := BeginTaskBillingAttempt(snapshot)
 	require.NoError(t, err)
 	second, err := BeginTaskBillingAttempt(snapshot)
@@ -99,6 +209,7 @@ func TestBeginTaskBillingAttemptIsUniqueByRequestID(t *testing.T) {
 func TestBeginTaskBillingAttemptRejectsImmutableDrift(t *testing.T) {
 	truncateTables(t)
 	snapshot := billingSnapshot("immutable-drift", 10)
+	seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
 	first, err := BeginTaskBillingAttempt(snapshot)
 	require.NoError(t, err)
 
@@ -108,6 +219,34 @@ func TestBeginTaskBillingAttemptRejectsImmutableDrift(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, snapshot.FundingAmount, loadBillingAttempt(t, snapshot.RequestID).FundingAmount)
 	assert.Equal(t, TaskBillingOwnerRequest, first.Owner)
+}
+
+func TestBeginTaskBillingAttemptRejectsBillingContextDigestDrift(t *testing.T) {
+	truncateTables(t)
+	firstContext := &TaskBillingContext{
+		ModelPrice:      0.015,
+		GroupRatio:      1,
+		ModelRatio:      2,
+		OtherRatios:     map[string]float64{"seconds": 1.5},
+		OriginModelName: "seedance-v1-pro",
+	}
+	firstDigest, err := DigestTaskBillingContext(firstContext)
+	require.NoError(t, err)
+	snapshot := billingSnapshot("billing-context-immutable-drift", 10)
+	snapshot.BillingContext = firstContext
+	seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+	first, err := BeginTaskBillingAttempt(snapshot)
+	require.NoError(t, err)
+	assert.Equal(t, firstDigest, first.BillingContextDigest)
+
+	driftedContext := cloneTaskBillingContextForTest(firstContext)
+	driftedContext.PerCallBilling = true
+	drifted := snapshot
+	drifted.BillingContext = driftedContext
+
+	_, err = BeginTaskBillingAttempt(drifted)
+	assert.ErrorIs(t, err, ErrTaskBillingAttemptConflict)
+	assert.Equal(t, firstDigest, loadBillingAttempt(t, snapshot.RequestID).BillingContextDigest)
 }
 
 func TestFreeAndPaidZeroAttemptShapes(t *testing.T) {
@@ -665,15 +804,19 @@ func TestPaidZeroApplyValidatesPrimaryIdentity(t *testing.T) {
 	truncateTables(t)
 	snapshot := billingSnapshot("paid-zero-missing-identity", 0)
 	snapshot.TokenAmount = 0
+	require.NoError(t, DB.Create(&User{
+		Id:       snapshot.UserID,
+		Username: "paid-zero-present-user",
+	}).Error)
 	_, err := BeginTaskBillingAttempt(snapshot)
 	require.NoError(t, err)
 
 	_, err = ApplyTaskFundingPreconsume(snapshot.RequestID)
-	require.Error(t, err)
+	require.NoError(t, err)
 	_, err = ApplyTaskTokenPreconsume(snapshot.RequestID)
 	require.Error(t, err)
 	attempt := loadBillingAttempt(t, snapshot.RequestID)
-	assert.Zero(t, attempt.FundingConsumedAt)
+	assert.NotZero(t, attempt.FundingConsumedAt)
 	assert.Zero(t, attempt.TokenConsumedAt)
 }
 
@@ -965,8 +1108,9 @@ func TestTaskQuotaClearAndSecondRefundMarkerAreAtomic(t *testing.T) {
 		SubmitTime: snapshot.SubmitTime,
 		Progress:   "0%",
 		PrivateData: TaskPrivateData{
-			BillingSource: snapshot.FundingSource,
-			TokenId:       snapshot.TokenID,
+			BillingSource:  snapshot.FundingSource,
+			TokenId:        snapshot.TokenID,
+			BillingContext: snapshot.BillingContext,
 		},
 	}
 	task, _, err := PrepareTaskSubmissionAttempt(candidate, 0, snapshot.RequestID)
@@ -1022,8 +1166,9 @@ func TestPaidZeroTaskRefundCompletesWhenQuotaUpdateReportsNoChangedRow(t *testin
 		SubmitTime: snapshot.SubmitTime,
 		Progress:   "0%",
 		PrivateData: TaskPrivateData{
-			BillingSource: snapshot.FundingSource,
-			TokenId:       snapshot.TokenID,
+			BillingSource:  snapshot.FundingSource,
+			TokenId:        snapshot.TokenID,
+			BillingContext: snapshot.BillingContext,
 		},
 	}, 0, snapshot.RequestID)
 	require.NoError(t, err)
@@ -1075,8 +1220,9 @@ func TestTaskOwnedRefundRejectsFinancialDrift(t *testing.T) {
 		SubmitTime: snapshot.SubmitTime,
 		Progress:   "0%",
 		PrivateData: TaskPrivateData{
-			BillingSource: snapshot.FundingSource,
-			TokenId:       snapshot.TokenID,
+			BillingSource:  snapshot.FundingSource,
+			TokenId:        snapshot.TokenID,
+			BillingContext: snapshot.BillingContext,
 		},
 	}, 0, snapshot.RequestID)
 	require.NoError(t, err)
@@ -1213,6 +1359,7 @@ func TestSubscriptionRecordOlderThanSevenDaysRetainedForActiveTaskAttempt(t *tes
 			BillingSource:  snapshot.FundingSource,
 			SubscriptionId: snapshot.SubscriptionID,
 			TokenId:        snapshot.TokenID,
+			BillingContext: snapshot.BillingContext,
 		},
 	}, 0, snapshot.RequestID)
 	require.NoError(t, err)
@@ -1328,4 +1475,330 @@ func TestCacheInvalidationFailureDoesNotReplayDurableMutation(t *testing.T) {
 	assert.Equal(t, 900, token.RemainQuota)
 	assert.Equal(t, 100, token.UsedQuota)
 	assert.NotZero(t, loadBillingAttempt(t, snapshot.RequestID).PreconsumeCompletedAt)
+}
+
+func TestTokenPreconsumeRetryRepairsStaleCacheAfterInvalidationFailure(t *testing.T) {
+	truncateTables(t)
+	server := useUserCacheMiniRedis(t)
+	snapshot := billingSnapshot("token-preconsume-cache-repair", 100)
+	seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+	_, err := BeginTaskBillingAttempt(snapshot)
+	require.NoError(t, err)
+	_, err = ApplyTaskFundingPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+
+	before := loadBillingToken(t, snapshot.TokenID)
+	require.NoError(t, cacheSetToken(before))
+	cacheKey := fmt.Sprintf("token:%s", common.GenerateHMAC(before.Key))
+	assert.True(t, server.Exists(cacheKey))
+
+	server.Close()
+	_, err = ApplyTaskTokenPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	assert.Equal(t, 900, loadBillingToken(t, snapshot.TokenID).RemainQuota)
+
+	require.NoError(t, server.Restart())
+	stale, err := cacheGetTokenByKey(before.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 1_000, stale.RemainQuota)
+
+	_, err = ApplyTaskTokenPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	assert.False(t, server.Exists(cacheKey))
+	reloaded, err := GetTokenByKey(before.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, 900, reloaded.RemainQuota)
+	require.Eventually(t, func() bool {
+		return server.Exists(cacheKey)
+	}, time.Second, 10*time.Millisecond)
+	refilled, err := cacheGetTokenByKey(before.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 900, refilled.RemainQuota)
+}
+
+func TestTokenRefundRetryRepairsStaleCacheAfterInvalidationFailure(t *testing.T) {
+	truncateTables(t)
+	server := useUserCacheMiniRedis(t)
+	snapshot := billingSnapshot("token-refund-cache-repair", 100)
+	seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+	_, err := BeginTaskBillingAttempt(snapshot)
+	require.NoError(t, err)
+	_, err = ApplyTaskFundingPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskFundingRefund(snapshot.RequestID)
+	require.NoError(t, err)
+
+	consumed := loadBillingToken(t, snapshot.TokenID)
+	require.NoError(t, cacheSetToken(consumed))
+	cacheKey := fmt.Sprintf("token:%s", common.GenerateHMAC(consumed.Key))
+	assert.True(t, server.Exists(cacheKey))
+
+	server.Close()
+	_, err = ApplyTaskTokenRefund(snapshot.RequestID)
+	require.NoError(t, err)
+	assert.Equal(t, 1_000, loadBillingToken(t, snapshot.TokenID).RemainQuota)
+
+	require.NoError(t, server.Restart())
+	stale, err := cacheGetTokenByKey(consumed.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 900, stale.RemainQuota)
+
+	_, err = ApplyTaskTokenRefund(snapshot.RequestID)
+	require.NoError(t, err)
+	assert.False(t, server.Exists(cacheKey))
+	reloaded, err := GetTokenByKey(consumed.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, 1_000, reloaded.RemainQuota)
+	require.Eventually(t, func() bool {
+		return server.Exists(cacheKey)
+	}, time.Second, 10*time.Millisecond)
+	refilled, err := cacheGetTokenByKey(consumed.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 1_000, refilled.RemainQuota)
+}
+
+func TestWalletRefundAfterUserSoftDeleteConverges(t *testing.T) {
+	truncateTables(t)
+	snapshot := billingSnapshot("wallet-refund-soft-deleted-user", 100)
+	seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+	_, err := BeginTaskBillingAttempt(snapshot)
+	require.NoError(t, err)
+	_, err = ApplyTaskFundingPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	require.NoError(t, DB.Delete(&User{Id: snapshot.UserID}).Error)
+
+	_, err = ApplyTaskFundingRefund(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenRefund(snapshot.RequestID)
+	require.NoError(t, err)
+
+	var user User
+	require.NoError(t, DB.Unscoped().Where("id = ?", snapshot.UserID).First(&user).Error)
+	assert.Equal(t, 1_000, user.Quota)
+	attempt := loadBillingAttempt(t, snapshot.RequestID)
+	assert.NotZero(t, attempt.FundingRefundedAt)
+	assert.NotZero(t, attempt.TokenRefundedAt)
+	assert.NotZero(t, attempt.RefundCompletedAt)
+}
+
+func TestActiveAttemptBlocksUserHardDeleteUntilRefundCompletes(t *testing.T) {
+	truncateTables(t)
+	snapshot := billingSnapshot("active-attempt-user-delete-gate", 100)
+	seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+	_, err := BeginTaskBillingAttempt(snapshot)
+	require.NoError(t, err)
+	_, err = ApplyTaskFundingPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+
+	err = HardDeleteUserById(snapshot.UserID)
+	require.ErrorIs(t, err, ErrTaskBillingSubjectInUse)
+	var count int64
+	require.NoError(t, DB.Unscoped().Model(&User{}).
+		Where("id = ?", snapshot.UserID).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+
+	_, err = ApplyTaskFundingRefund(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenRefund(snapshot.RequestID)
+	require.NoError(t, err)
+	require.NoError(t, HardDeleteUserById(snapshot.UserID))
+	require.NoError(t, DB.Unscoped().Model(&User{}).
+		Where("id = ?", snapshot.UserID).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestActiveAttemptBlocksSubscriptionDeleteUntilRefundCompletes(t *testing.T) {
+	truncateTables(t)
+	now := time.Now().Unix()
+	snapshot := billingSnapshot("active-attempt-subscription-delete-gate", 100)
+	snapshot.FundingSource = taskBillingFundingSubscription
+	snapshot.SubscriptionID = 705
+	seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+	require.NoError(t, DB.Create(&UserSubscription{
+		Id:          snapshot.SubscriptionID,
+		UserId:      snapshot.UserID,
+		AmountTotal: 1_000,
+		Status:      "active",
+		StartTime:   now - 10,
+		EndTime:     now + 3_600,
+	}).Error)
+	_, err := BeginTaskBillingAttempt(snapshot)
+	require.NoError(t, err)
+	_, err = ApplyTaskFundingPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+
+	_, err = AdminDeleteUserSubscription(snapshot.SubscriptionID)
+	require.ErrorIs(t, err, ErrTaskBillingSubjectInUse)
+	var count int64
+	require.NoError(t, DB.Model(&UserSubscription{}).
+		Where("id = ?", snapshot.SubscriptionID).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+
+	_, err = ApplyTaskFundingRefund(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenRefund(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = AdminDeleteUserSubscription(snapshot.SubscriptionID)
+	require.NoError(t, err)
+	require.NoError(t, DB.Model(&UserSubscription{}).
+		Where("id = ?", snapshot.SubscriptionID).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestAdminDeleteSubscriptionLocksUserBeforeRevalidatedSubscription(t *testing.T) {
+	truncateTables(t)
+	const (
+		userID         = 501
+		subscriptionID = 707
+	)
+	require.NoError(t, DB.Create(&User{
+		Id:       userID,
+		Username: "subscription-delete-lock-order",
+		Group:    "vip",
+	}).Error)
+	require.NoError(t, DB.Create(&UserSubscription{
+		Id:             subscriptionID,
+		UserId:         userID,
+		AmountTotal:    1_000,
+		Status:         "active",
+		StartTime:      time.Now().Unix() - 10,
+		EndTime:        time.Now().Unix() + 3_600,
+		UpgradeGroup:   "vip",
+		PrevUserGroup:  "default",
+		DowngradeGroup: "default",
+	}).Error)
+
+	type queryEvent struct {
+		table string
+		sql   string
+	}
+	var (
+		eventsMu sync.Mutex
+		events   []queryEvent
+	)
+	callbackName := "task-billing-subscription-delete-lock-order"
+	require.NoError(t, DB.Callback().Query().After("gorm:query").Register(
+		callbackName,
+		func(tx *gorm.DB) {
+			table := tx.Statement.Table
+			if table != "users" && table != "user_subscriptions" {
+				return
+			}
+			eventsMu.Lock()
+			events = append(events, queryEvent{
+				table: table,
+				sql:   tx.Statement.SQL.String(),
+			})
+			eventsMu.Unlock()
+		},
+	))
+	t.Cleanup(func() {
+		_ = DB.Callback().Query().Remove(callbackName)
+	})
+
+	_, err := AdminDeleteUserSubscription(subscriptionID)
+	require.NoError(t, err)
+
+	eventsMu.Lock()
+	captured := append([]queryEvent(nil), events...)
+	eventsMu.Unlock()
+	userLockIndex := -1
+	revalidatedSubscriptionIndex := -1
+	for index, event := range captured {
+		normalizedSQL := strings.NewReplacer("`", "", `"`, "").
+			Replace(strings.ToLower(event.sql))
+		whereIndex := strings.Index(normalizedSQL, " where ")
+		if event.table == "users" && userLockIndex < 0 {
+			userLockIndex = index
+		}
+		if event.table == "user_subscriptions" && whereIndex >= 0 {
+			whereSQL := normalizedSQL[whereIndex:]
+			if strings.Contains(whereSQL, "where id =") &&
+				strings.Contains(whereSQL, "user_id =") {
+				revalidatedSubscriptionIndex = index
+				break
+			}
+		}
+	}
+	require.NotEqual(t, -1, userLockIndex, "captured queries: %+v", captured)
+	require.NotEqual(t, -1, revalidatedSubscriptionIndex, "captured queries: %+v", captured)
+	assert.Less(t, userLockIndex, revalidatedSubscriptionIndex, "captured queries: %+v", captured)
+}
+
+func TestBeginTaskBillingAttemptRejectsMissingFundingSubject(t *testing.T) {
+	t.Run("wallet user", func(t *testing.T) {
+		truncateTables(t)
+		snapshot := billingSnapshot("begin-missing-wallet-user", 100)
+
+		_, err := BeginTaskBillingAttempt(snapshot)
+		require.Error(t, err)
+		var count int64
+		require.NoError(t, DB.Model(&TaskBillingAttempt{}).
+			Where("request_id = ?", snapshot.RequestID).Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	t.Run("subscription", func(t *testing.T) {
+		truncateTables(t)
+		snapshot := billingSnapshot("begin-missing-subscription", 100)
+		snapshot.FundingSource = taskBillingFundingSubscription
+		snapshot.SubscriptionID = 706
+		seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+
+		_, err := BeginTaskBillingAttempt(snapshot)
+		require.Error(t, err)
+		var count int64
+		require.NoError(t, DB.Model(&TaskBillingAttempt{}).
+			Where("request_id = ?", snapshot.RequestID).Count(&count).Error)
+		assert.Zero(t, count)
+	})
+}
+
+func TestPaidZeroSubscriptionRefundMarksRecordRefunded(t *testing.T) {
+	truncateTables(t)
+	now := time.Now().Unix()
+	snapshot := billingSnapshot("paid-zero-subscription-refund", 0)
+	snapshot.FundingSource = taskBillingFundingSubscription
+	snapshot.SubscriptionID = 707
+	seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+	require.NoError(t, DB.Create(&UserSubscription{
+		Id:          snapshot.SubscriptionID,
+		UserId:      snapshot.UserID,
+		AmountTotal: 1_000,
+		AmountUsed:  75,
+		Status:      "active",
+		StartTime:   now - 10,
+		EndTime:     now + 3_600,
+	}).Error)
+	_, err := BeginTaskBillingAttempt(snapshot)
+	require.NoError(t, err)
+	_, err = ApplyTaskFundingPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+
+	_, err = ApplyTaskFundingRefund(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskFundingRefund(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenRefund(snapshot.RequestID)
+	require.NoError(t, err)
+
+	var record SubscriptionPreConsumeRecord
+	require.NoError(t, DB.Where("request_id = ?", snapshot.RequestID).First(&record).Error)
+	assert.Zero(t, record.PreConsumed)
+	assert.Equal(t, "refunded", record.Status)
+	var subscription UserSubscription
+	require.NoError(t, DB.First(&subscription, snapshot.SubscriptionID).Error)
+	assert.Equal(t, int64(75), subscription.AmountUsed)
+	attempt := loadBillingAttempt(t, snapshot.RequestID)
+	assert.NotZero(t, attempt.RefundCompletedAt)
 }

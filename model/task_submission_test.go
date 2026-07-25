@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/stretchr/testify/assert"
@@ -15,7 +18,13 @@ import (
 
 func preparedSubmissionFixture(t *testing.T, requestID string, quota int) (*Task, *TaskBillingAttempt) {
 	t.Helper()
+	billingContext := &TaskBillingContext{
+		GroupRatio:      1,
+		OriginModelName: "fixture-model",
+		OtherRatios:     map[string]float64{"seconds": 1},
+	}
 	snapshot := billingSnapshot(requestID, quota)
+	snapshot.BillingContext = billingContext
 	if quota == 0 {
 		snapshot.IsFree = true
 		snapshot.UserID = 0
@@ -50,11 +59,7 @@ func preparedSubmissionFixture(t *testing.T, requestID string, quota int) (*Task
 			SubscriptionId: snapshot.SubscriptionID,
 			TokenId:        snapshot.TokenID,
 			NodeName:       "node-a",
-			BillingContext: &TaskBillingContext{
-				GroupRatio:      1,
-				OriginModelName: "fixture-model",
-				OtherRatios:     map[string]float64{"seconds": 1},
-			},
+			BillingContext: billingContext,
 		},
 		Data: json.RawMessage(`{"latest":"initial"}`),
 	}
@@ -63,7 +68,8 @@ func preparedSubmissionFixture(t *testing.T, requestID string, quota int) (*Task
 
 func TestPrepareTaskSubmissionLinksAttemptAndTransfersOwnerAtomically(t *testing.T) {
 	truncateTables(t)
-	candidate, _ := preparedSubmissionFixture(t, "prepare-link", 100)
+	candidate, requestAttempt := preparedSubmissionFixture(t, "prepare-link", 100)
+	assert.Zero(t, requestAttempt.PrepareVersion)
 
 	prepared, attempt, err := PrepareTaskSubmissionAttempt(candidate, 0, "prepare-link")
 	require.NoError(t, err)
@@ -71,6 +77,7 @@ func TestPrepareTaskSubmissionLinksAttemptAndTransfersOwnerAtomically(t *testing
 	require.NotNil(t, attempt.TaskID)
 	assert.Equal(t, prepared.ID, *attempt.TaskID)
 	assert.Equal(t, TaskBillingOwnerTask, attempt.Owner)
+	assert.Equal(t, int64(1), attempt.PrepareVersion)
 	assert.NotZero(t, attempt.OwnerTransferredAt)
 	assert.Equal(t, TaskStatusSubmitting, prepared.Status)
 	assert.Equal(t, "0%", prepared.Progress)
@@ -92,6 +99,7 @@ func TestPrepareTaskSubmissionCommitAmbiguityUsesDurableOwner(t *testing.T) {
 	require.NotNil(t, attempt.TaskID)
 	assert.Equal(t, prepared.ID, *attempt.TaskID)
 	assert.Equal(t, TaskBillingOwnerTask, attempt.Owner)
+	assert.Equal(t, int64(1), attempt.PrepareVersion)
 }
 
 func TestPrepareTaskSubmissionDBUnreadableDoesNotBareRefund(t *testing.T) {
@@ -117,6 +125,83 @@ func TestPrepareTaskSubmissionDBUnreadableDoesNotBareRefund(t *testing.T) {
 	assert.Zero(t, attempt.RefundStartedAt)
 }
 
+func TestPrepareTaskSubmissionAmbiguousReadBackUnavailableLeavesTaskForRecovery(t *testing.T) {
+	truncateTables(t)
+	candidate, snapshotAttempt := preparedSubmissionFixture(t, "prepare-readback-unavailable", 100)
+	preRefundUserQuota := loadBillingUserQuota(t, snapshotAttempt.UserID)
+	preRefundToken := loadBillingToken(t, snapshotAttempt.TokenID)
+	ambiguousErr := errors.New("ambiguous prepare commit")
+	readbackErr := errors.New("primary database unavailable during prepare readback")
+
+	restore := setTaskSubmissionFailpointForTest(func(operation, point string) error {
+		if operation != "prepare" {
+			return nil
+		}
+		switch point {
+		case "after_commit":
+			return ambiguousErr
+		case "before_readback":
+			return readbackErr
+		default:
+			return nil
+		}
+	})
+	_, _, err := PrepareTaskSubmissionAttempt(candidate, 0, candidate.TaskID[len("task_"):])
+	restore()
+	require.ErrorIs(t, err, readbackErr)
+
+	attempt := loadBillingAttempt(t, "prepare-readback-unavailable")
+	require.Equal(t, TaskBillingOwnerTask, attempt.Owner)
+	require.NotNil(t, attempt.TaskID)
+	assert.Equal(t, int64(1), attempt.PrepareVersion)
+	assert.Zero(t, attempt.RefundStartedAt)
+	assert.Zero(t, attempt.RefundCompletedAt)
+	assert.Equal(t, preRefundUserQuota, loadBillingUserQuota(t, snapshotAttempt.UserID))
+	assert.Equal(t, preRefundToken.RemainQuota, loadBillingToken(t, snapshotAttempt.TokenID).RemainQuota)
+
+	var linked Task
+	require.NoError(t, DB.First(&linked, *attempt.TaskID).Error)
+	assert.Equal(t, TaskStatusSubmitting, linked.Status)
+	assert.Equal(t, "0%", linked.Progress)
+	assert.Equal(t, snapshotAttempt.FundingAmount, linked.Quota)
+
+	recoverable, err := ListRecoverableTaskBillingAttempts(
+		taskBillingTimestamp(),
+		linked.SubmitTime,
+		10,
+	)
+	require.NoError(t, err)
+	require.Len(t, recoverable, 1)
+	assert.Equal(t, attempt.ID, recoverable[0].ID)
+
+	failed, err := TransitionTaskSubmissionToFailure(
+		linked.ID,
+		linked.TaskID,
+		"",
+		"prepare_readback_unavailable",
+		"prepare owner readback unavailable",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, TaskStatus(TaskStatusFailure), failed.Status)
+	_, err = ApplyTaskFundingRefund(attempt.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenRefund(attempt.RequestID)
+	require.NoError(t, err)
+
+	recovered := loadBillingAttempt(t, attempt.RequestID)
+	assert.NotZero(t, recovered.FundingRefundedAt)
+	assert.NotZero(t, recovered.TokenRefundedAt)
+	assert.NotZero(t, recovered.RefundCompletedAt)
+	assert.Equal(t, preRefundUserQuota+snapshotAttempt.FundingAmount, loadBillingUserQuota(t, snapshotAttempt.UserID))
+	assert.Equal(
+		t,
+		preRefundToken.RemainQuota+snapshotAttempt.TokenAmount,
+		loadBillingToken(t, snapshotAttempt.TokenID).RemainQuota,
+	)
+	require.NoError(t, DB.First(&linked, linked.ID).Error)
+	assert.Zero(t, linked.Quota)
+}
+
 func TestPrepareTaskSubmissionRejectsFinancialDrift(t *testing.T) {
 	truncateTables(t)
 	candidate, _ := preparedSubmissionFixture(t, "prepare-financial-drift", 100)
@@ -130,6 +215,128 @@ func TestPrepareTaskSubmissionRejectsFinancialDrift(t *testing.T) {
 	attempt := loadBillingAttempt(t, "prepare-financial-drift")
 	assert.Equal(t, TaskBillingOwnerRequest, attempt.Owner)
 	assert.Nil(t, attempt.TaskID)
+}
+
+func TestPrepareTaskSubmissionRejectsBillingContextFieldDrift(t *testing.T) {
+	testCases := []struct {
+		name   string
+		mutate func(*Task)
+	}{
+		{name: "nil versus present", mutate: func(candidate *Task) {
+			candidate.PrivateData.BillingContext = nil
+		}},
+		{name: "model price", mutate: func(candidate *Task) {
+			candidate.PrivateData.BillingContext.ModelPrice = 0.015
+		}},
+		{name: "group ratio", mutate: func(candidate *Task) {
+			candidate.PrivateData.BillingContext.GroupRatio = 1.25
+		}},
+		{name: "model ratio", mutate: func(candidate *Task) {
+			candidate.PrivateData.BillingContext.ModelRatio = 2
+		}},
+		{name: "other ratios", mutate: func(candidate *Task) {
+			candidate.PrivateData.BillingContext.OtherRatios["resolution"] = 2.25
+		}},
+		{name: "origin model name", mutate: func(candidate *Task) {
+			candidate.PrivateData.BillingContext.OriginModelName = "fixture-model-v2"
+		}},
+		{name: "per call billing", mutate: func(candidate *Task) {
+			candidate.PrivateData.BillingContext.PerCallBilling = true
+		}},
+	}
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			truncateTables(t)
+			requestID := fmt.Sprintf("prepare-billing-context-drift-%d", index)
+			candidate, _ := preparedSubmissionFixture(t, requestID, 0)
+			candidate.PrivateData.BillingContext =
+				cloneTaskBillingContextForTest(candidate.PrivateData.BillingContext)
+			testCase.mutate(candidate)
+
+			_, _, err := PrepareTaskSubmissionAttempt(candidate, 0, requestID)
+			assert.ErrorIs(t, err, ErrTaskBillingIdentityDrift)
+			var count int64
+			require.NoError(t, DB.Model(&Task{}).
+				Where("task_id = ?", candidate.TaskID).
+				Count(&count).Error)
+			assert.Zero(t, count)
+			attempt := loadBillingAttempt(t, requestID)
+			assert.Equal(t, TaskBillingOwnerRequest, attempt.Owner)
+			assert.Nil(t, attempt.TaskID)
+			assert.Zero(t, attempt.PrepareVersion)
+		})
+	}
+}
+
+func TestPrepareTaskSubmissionRetryValidatesBillingContextAgainstAttempt(t *testing.T) {
+	truncateTables(t)
+	const requestID = "prepare-retry-billing-context-drift"
+	candidate, _ := preparedSubmissionFixture(t, requestID, 0)
+	prepared, attempt, err := PrepareTaskSubmissionAttempt(candidate, 0, requestID)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), attempt.PrepareVersion)
+
+	tamperedPrivate := prepared.PrivateData
+	tamperedPrivate.BillingContext = cloneTaskBillingContextForTest(prepared.PrivateData.BillingContext)
+	tamperedPrivate.BillingContext.GroupRatio = 3
+	require.NoError(t, DB.Model(&Task{}).
+		Where("id = ?", prepared.ID).
+		Update("private_data", tamperedPrivate).Error)
+
+	retry := *prepared
+	retry.ChannelId = 92
+	retry.PrivateData = tamperedPrivate
+	retry.PrivateData.Key = "KEY_B"
+	retry.Properties = prepared.Properties
+	retry.Properties.UpstreamModelName = "route-b"
+	_, _, err = PrepareTaskSubmissionAttempt(&retry, prepared.ID, requestID)
+	assert.ErrorIs(t, err, ErrTaskBillingIdentityDrift)
+
+	reloadedAttempt := loadBillingAttempt(t, requestID)
+	assert.Equal(t, int64(1), reloadedAttempt.PrepareVersion)
+	var reloaded Task
+	require.NoError(t, DB.First(&reloaded, prepared.ID).Error)
+	assert.Equal(t, prepared.ChannelId, reloaded.ChannelId)
+	assert.Equal(t, prepared.PrivateData.Key, reloaded.PrivateData.Key)
+	assert.Equal(t, prepared.Properties.UpstreamModelName, reloaded.Properties.UpstreamModelName)
+}
+
+func TestPrepareTaskSubmissionAmbiguousReadBackValidatesBillingContextAgainstAttempt(t *testing.T) {
+	truncateTables(t)
+	const requestID = "prepare-ambiguous-billing-context-drift"
+	candidate, _ := preparedSubmissionFixture(t, requestID, 0)
+	ambiguousErr := errors.New("ambiguous prepare commit")
+
+	restore := setTaskSubmissionFailpointForTest(func(operation, point string) error {
+		if operation != "prepare" || point != "after_commit" {
+			return nil
+		}
+		attempt := loadBillingAttempt(t, requestID)
+		if attempt.TaskID == nil {
+			return errors.New("linked task is missing")
+		}
+		var linked Task
+		if err := DB.First(&linked, *attempt.TaskID).Error; err != nil {
+			return err
+		}
+		privateData := linked.PrivateData
+		privateData.BillingContext = cloneTaskBillingContextForTest(linked.PrivateData.BillingContext)
+		privateData.BillingContext.PerCallBilling = !privateData.BillingContext.PerCallBilling
+		if err := DB.Model(&Task{}).
+			Where("id = ?", linked.ID).
+			Update("private_data", privateData).Error; err != nil {
+			return err
+		}
+		return ambiguousErr
+	})
+	_, _, err := PrepareTaskSubmissionAttempt(candidate, 0, requestID)
+	restore()
+	require.Error(t, err)
+
+	attempt := loadBillingAttempt(t, requestID)
+	assert.Equal(t, TaskBillingOwnerTask, attempt.Owner)
+	assert.Equal(t, int64(1), attempt.PrepareVersion)
+	assert.Zero(t, attempt.RefundStartedAt)
 }
 
 func TestPrepareTaskSubmissionPreservesFirstSubmitTime(t *testing.T) {
@@ -155,6 +362,7 @@ func TestPrepareTaskSubmissionPreservesFirstSubmitTime(t *testing.T) {
 	assert.Equal(t, 92, refreshed.ChannelId)
 	assert.Equal(t, "KEY_B", refreshed.PrivateData.Key)
 	assert.Equal(t, "route-b", refreshed.Properties.UpstreamModelName)
+	assert.Equal(t, int64(2), loadBillingAttempt(t, "prepare-time").PrepareVersion)
 }
 
 func TestPrepareTaskSubmissionRetryAcceptsNoChangedRouteRow(t *testing.T) {
@@ -188,6 +396,128 @@ func TestPrepareTaskSubmissionRetryAcceptsNoChangedRouteRow(t *testing.T) {
 	require.NotNil(t, attempt)
 	assert.Equal(t, prepared.ID, refreshed.ID)
 	assert.Equal(t, TaskBillingOwnerTask, attempt.Owner)
+	assert.Equal(t, int64(2), attempt.PrepareVersion)
+}
+
+func TestPrepareTaskSubmissionRetryRejectsPrepareVersionOverflow(t *testing.T) {
+	truncateTables(t)
+	const requestID = "prepare-version-overflow"
+	candidate, _ := preparedSubmissionFixture(t, requestID, 0)
+	prepared, _, err := PrepareTaskSubmissionAttempt(candidate, 0, requestID)
+	require.NoError(t, err)
+	require.NoError(t, DB.Model(&TaskBillingAttempt{}).
+		Where("request_id = ?", requestID).
+		Update("prepare_version", int64(math.MaxInt64)).Error)
+
+	retry := *prepared
+	retry.ChannelId = 92
+	retry.PrivateData = prepared.PrivateData
+	retry.PrivateData.Key = "KEY_OVERFLOW"
+	retry.Properties = prepared.Properties
+	retry.Properties.UpstreamModelName = "route-overflow"
+	_, _, err = PrepareTaskSubmissionAttempt(&retry, prepared.ID, requestID)
+	assert.ErrorIs(t, err, ErrTaskSubmissionStateConflict)
+
+	attempt := loadBillingAttempt(t, requestID)
+	assert.Equal(t, int64(math.MaxInt64), attempt.PrepareVersion)
+	var reloaded Task
+	require.NoError(t, DB.First(&reloaded, prepared.ID).Error)
+	assert.Equal(t, prepared.ChannelId, reloaded.ChannelId)
+	assert.Equal(t, prepared.PrivateData.Key, reloaded.PrivateData.Key)
+	assert.Equal(t, prepared.Properties.UpstreamModelName, reloaded.Properties.UpstreamModelName)
+}
+
+func TestPrepareTaskSubmissionAmbiguousFirstCommitRejectsConcurrentRouteRefresh(t *testing.T) {
+	truncateTables(t)
+	const requestID = "prepare-ambiguous-concurrent-route"
+	candidate, _ := preparedSubmissionFixture(t, requestID, 0)
+	ambiguousErr := errors.New("ambiguous first prepare commit")
+	firstCommitted := make(chan struct{})
+	releaseFirstReadBack := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() {
+			close(releaseFirstReadBack)
+		})
+	})
+
+	var afterCommitCalls atomic.Int32
+	restore := setTaskSubmissionFailpointForTest(func(operation, point string) error {
+		if operation != "prepare" || point != "after_commit" {
+			return nil
+		}
+		if afterCommitCalls.Add(1) != 1 {
+			return nil
+		}
+		close(firstCommitted)
+		<-releaseFirstReadBack
+		return ambiguousErr
+	})
+	t.Cleanup(restore)
+
+	type prepareResult struct {
+		task    *Task
+		attempt *TaskBillingAttempt
+		err     error
+	}
+	firstResult := make(chan prepareResult, 1)
+	go func() {
+		task, attempt, err := PrepareTaskSubmissionAttempt(candidate, 0, requestID)
+		firstResult <- prepareResult{task: task, attempt: attempt, err: err}
+	}()
+
+	select {
+	case <-firstCommitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first Prepare did not reach the deterministic after-commit barrier")
+	}
+
+	linkedAttempt := loadBillingAttempt(t, requestID)
+	require.NotNil(t, linkedAttempt.TaskID)
+	assert.Equal(t, int64(1), linkedAttempt.PrepareVersion)
+	retry := *candidate
+	retry.ChannelId = 92
+	retry.PrivateData = candidate.PrivateData
+	retry.PrivateData.Key = "KEY_B"
+	retry.Properties = candidate.Properties
+	retry.Properties.UpstreamModelName = "route-b"
+	refreshed, refreshedAttempt, err := PrepareTaskSubmissionAttempt(
+		&retry,
+		*linkedAttempt.TaskID,
+		requestID,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, refreshed)
+	require.NotNil(t, refreshedAttempt)
+	assert.Equal(t, int64(2), refreshedAttempt.PrepareVersion)
+
+	releaseOnce.Do(func() {
+		close(releaseFirstReadBack)
+	})
+	var ambiguousResult prepareResult
+	select {
+	case ambiguousResult = <-firstResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ambiguous first Prepare did not finish after releasing read-back")
+	}
+	assert.ErrorIs(t, ambiguousResult.err, ErrTaskSubmissionStateConflict)
+	assert.Nil(t, ambiguousResult.task)
+	assert.Nil(t, ambiguousResult.attempt)
+
+	finalAttempt := loadBillingAttempt(t, requestID)
+	assert.Equal(t, TaskBillingOwnerTask, finalAttempt.Owner)
+	assert.Equal(t, int64(2), finalAttempt.PrepareVersion)
+	assert.Zero(t, finalAttempt.RefundStartedAt)
+	var finalTask Task
+	require.NoError(t, DB.First(&finalTask, *finalAttempt.TaskID).Error)
+	assert.Equal(t, TaskStatusSubmitting, finalTask.Status)
+	assert.Equal(t, "0%", finalTask.Progress)
+	assert.Equal(t, 92, finalTask.ChannelId)
+	assert.Equal(t, "KEY_B", finalTask.PrivateData.Key)
+	assert.Equal(t, "route-b", finalTask.Properties.UpstreamModelName)
+	var taskCount int64
+	require.NoError(t, DB.Model(&Task{}).Where("task_id = ?", candidate.TaskID).Count(&taskCount).Error)
+	assert.Equal(t, int64(1), taskCount)
 }
 
 func TestAttachTaskUpstreamResultStateMatrix(t *testing.T) {
@@ -265,6 +595,150 @@ func TestTransitionTaskSubmissionToFailureUsesNarrowUpdate(t *testing.T) {
 	assert.Equal(t, "LATEST_NODE", failed.PrivateData.NodeName)
 	assert.JSONEq(t, `{"latest":"data"}`, string(failed.Data))
 	assert.Equal(t, 17, failed.Quota)
+}
+
+func TestTransitionTaskSubmissionToFailureRejectsInvalidProgressMatrix(t *testing.T) {
+	testCases := []struct {
+		name     string
+		status   TaskStatus
+		progress string
+	}{
+		{name: "submitting", status: TaskStatusSubmitting, progress: "1%"},
+		{name: "submitted", status: TaskStatusSubmitted, progress: "11%"},
+		{name: "failure", status: TaskStatusFailure, progress: "99%"},
+	}
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			truncateTables(t)
+			requestID := fmt.Sprintf("failure-progress-matrix-%d", index)
+			candidate, _ := preparedSubmissionFixture(t, requestID, 0)
+			prepared, _, err := PrepareTaskSubmissionAttempt(candidate, 0, requestID)
+			require.NoError(t, err)
+			require.NoError(t, DB.Model(&Task{}).Where("id = ?", prepared.ID).
+				Updates(map[string]any{
+					"status":   testCase.status,
+					"progress": testCase.progress,
+				}).Error)
+
+			_, err = TransitionTaskSubmissionToFailure(
+				prepared.ID,
+				prepared.TaskID,
+				"",
+				"invalid_progress",
+				"must fail closed",
+			)
+			assert.ErrorIs(t, err, ErrTaskSubmissionStateConflict)
+
+			var reloaded Task
+			require.NoError(t, DB.First(&reloaded, prepared.ID).Error)
+			assert.Equal(t, testCase.status, reloaded.Status)
+			assert.Equal(t, testCase.progress, reloaded.Progress)
+		})
+	}
+}
+
+func TestTransitionTaskToFailureUsesExactExpectedStateAndLatestRow(t *testing.T) {
+	testCases := []struct {
+		name     string
+		status   TaskStatus
+		progress string
+	}{
+		{name: "queued", status: TaskStatusQueued, progress: "20%"},
+		{name: "in progress", status: TaskStatusInProgress, progress: "55%"},
+	}
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			truncateTables(t)
+			requestID := fmt.Sprintf("polled-failure-latest-%d", index)
+			candidate, _ := preparedSubmissionFixture(t, requestID, 0)
+			prepared, _, err := PrepareTaskSubmissionAttempt(candidate, 0, requestID)
+			require.NoError(t, err)
+
+			latestPrivate := TaskPrivateData{
+				Key:            "LATEST_KEY",
+				UpstreamTaskID: "LATEST_UPSTREAM",
+				ResultURL:      "LATEST_RESULT",
+				BillingSource:  prepared.PrivateData.BillingSource,
+				SubscriptionId: prepared.PrivateData.SubscriptionId,
+				TokenId:        prepared.PrivateData.TokenId,
+				NodeName:       "LATEST_NODE",
+				BillingContext: &TaskBillingContext{
+					ModelPrice:      9,
+					GroupRatio:      8,
+					ModelRatio:      7,
+					OtherRatios:     map[string]float64{"latest": 6},
+					OriginModelName: "LATEST_MODEL",
+					PerCallBilling:  true,
+				},
+			}
+			latestProperties := Properties{
+				Input:             "LATEST_INPUT",
+				UpstreamModelName: "LATEST_UPSTREAM_MODEL",
+				OriginModelName:   "LATEST_ORIGIN_MODEL",
+			}
+			require.NoError(t, DB.Model(&Task{}).Where("id = ?", prepared.ID).
+				Updates(map[string]any{
+					"status":       testCase.status,
+					"progress":     testCase.progress,
+					"private_data": latestPrivate,
+					"properties":   latestProperties,
+					"data":         json.RawMessage(`{"latest":"before-poll"}`),
+				}).Error)
+
+			polledData := json.RawMessage(`{"sanitized":"failure"}`)
+			failed, err := TransitionTaskToFailure(
+				prepared.ID,
+				prepared.TaskID,
+				TaskFailureTransition{
+					ExpectedStatus:   testCase.status,
+					ExpectedProgress: testCase.progress,
+					Code:             "provider_failure",
+					Message:          "provider failed",
+					Data:             &polledData,
+				},
+			)
+			require.NoError(t, err)
+			assert.Equal(t, TaskStatus(TaskStatusFailure), failed.Status)
+			assert.Equal(t, "100%", failed.Progress)
+			assert.Equal(t, "LATEST_KEY", failed.PrivateData.Key)
+			assert.Equal(t, "LATEST_UPSTREAM", failed.PrivateData.UpstreamTaskID)
+			assert.Equal(t, "LATEST_RESULT", failed.PrivateData.ResultURL)
+			assert.Equal(t, "LATEST_NODE", failed.PrivateData.NodeName)
+			require.NotNil(t, failed.PrivateData.BillingContext)
+			assert.Equal(t, "LATEST_MODEL", failed.PrivateData.BillingContext.OriginModelName)
+			assert.Equal(t, latestProperties, failed.Properties)
+			assert.JSONEq(t, `{"sanitized":"failure"}`, string(failed.Data))
+		})
+	}
+}
+
+func TestTransitionTaskToFailureRejectsExpectedProgressDrift(t *testing.T) {
+	truncateTables(t)
+	candidate, _ := preparedSubmissionFixture(t, "polled-failure-progress-drift", 0)
+	prepared, _, err := PrepareTaskSubmissionAttempt(candidate, 0, "polled-failure-progress-drift")
+	require.NoError(t, err)
+	require.NoError(t, DB.Model(&Task{}).Where("id = ?", prepared.ID).
+		Updates(map[string]any{
+			"status":   TaskStatusQueued,
+			"progress": "25%",
+		}).Error)
+
+	_, err = TransitionTaskToFailure(
+		prepared.ID,
+		prepared.TaskID,
+		TaskFailureTransition{
+			ExpectedStatus:   TaskStatusQueued,
+			ExpectedProgress: "20%",
+			Code:             "stale_poll",
+			Message:          "must not win",
+		},
+	)
+	assert.ErrorIs(t, err, ErrTaskSubmissionStateConflict)
+
+	var reloaded Task
+	require.NoError(t, DB.First(&reloaded, prepared.ID).Error)
+	assert.Equal(t, TaskStatus(TaskStatusQueued), reloaded.Status)
+	assert.Equal(t, "25%", reloaded.Progress)
 }
 
 func TestFailureTransitionPreservesConcurrentAttachedID(t *testing.T) {
