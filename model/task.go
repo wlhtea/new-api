@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -481,6 +482,124 @@ func (Task *Task) Update() error {
 
 func (t *Task) UpdateQuota() error {
 	return DB.Model(t).Update("quota", t.Quota).Error
+}
+
+// TaskSuccessTransition is the exact state observed by a polling worker plus
+// the narrow terminal fields obtained from the provider's sanitized status
+// response.
+type TaskSuccessTransition struct {
+	ExpectedStatus   TaskStatus
+	ExpectedProgress string
+	ResultURL        string
+	Data             *json.RawMessage
+}
+
+// TransitionTaskToSuccess locks the durable billing attempt and its linked
+// Task, verifies that no refund has started, and writes only the terminal Task
+// columns. Final billing settlement and SucceededAt are deliberately owned by
+// the service polling orchestration and happen after this transition commits.
+func TransitionTaskToSuccess(
+	id int64,
+	publicTaskID string,
+	transition TaskSuccessTransition,
+) (*Task, *TaskBillingAttempt, error) {
+	if id <= 0 || publicTaskID == "" ||
+		transition.ExpectedProgress == "" ||
+		transition.ResultURL == "" {
+		return nil, nil, ErrTaskSubmissionStateConflict
+	}
+	switch transition.ExpectedStatus {
+	case TaskStatusSubmitted, TaskStatusQueued, TaskStatusInProgress:
+	default:
+		return nil, nil, ErrTaskSubmissionStateConflict
+	}
+
+	var task Task
+	var attempt TaskBillingAttempt
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).
+			Where("task_id = ?", id).
+			First(&attempt).Error; err != nil {
+			return err
+		}
+		if err := validateTaskBillingAttempt(&attempt); err != nil {
+			return err
+		}
+		if attempt.Owner != TaskBillingOwnerTask ||
+			attempt.TaskID == nil ||
+			*attempt.TaskID != id ||
+			attempt.PublicTaskID != publicTaskID ||
+			attempt.FundingConsumedAt == 0 ||
+			attempt.TokenConsumedAt == 0 ||
+			attempt.PreconsumeCompletedAt == 0 ||
+			attempt.SubmissionSettledAt == 0 ||
+			attempt.SucceededAt != 0 ||
+			attempt.RefundStartedAt != 0 ||
+			attempt.RefundCompletedAt != 0 {
+			return ErrTaskBillingAttemptState
+		}
+		if err := lockForUpdate(tx).
+			Where("id = ? AND task_id = ?", id, publicTaskID).
+			First(&task).Error; err != nil {
+			return err
+		}
+		if task.Status != transition.ExpectedStatus ||
+			task.Progress != transition.ExpectedProgress {
+			return ErrTaskSubmissionStateConflict
+		}
+		if task.UserId != attempt.UserID ||
+			task.SubmitTime != attempt.SubmitTime ||
+			task.Quota != attempt.FundingAmount ||
+			task.PrivateData.BillingSource != attempt.FundingSource ||
+			task.PrivateData.SubscriptionId != attempt.SubscriptionID ||
+			task.PrivateData.TokenId != attempt.TokenID {
+			return ErrTaskBillingIdentityDrift
+		}
+		digest, err := DigestTaskBillingContext(task.PrivateData.BillingContext)
+		if err != nil {
+			return err
+		}
+		if digest != attempt.BillingContextDigest {
+			return ErrTaskBillingIdentityDrift
+		}
+
+		task.Status = TaskStatusSuccess
+		task.Progress = "100%"
+		task.FinishTime = taskBillingTimestamp()
+		task.UpdatedAt = task.FinishTime
+		task.PrivateData.ResultURL = transition.ResultURL
+		updates := map[string]any{
+			"status":       task.Status,
+			"progress":     task.Progress,
+			"finish_time":  task.FinishTime,
+			"updated_at":   task.UpdatedAt,
+			"private_data": task.PrivateData,
+		}
+		if transition.Data != nil {
+			task.Data = append(json.RawMessage(nil), (*transition.Data)...)
+			updates["data"] = task.Data
+		}
+		update := tx.Model(&Task{}).
+			Where(
+				"id = ? AND task_id = ? AND status = ? AND progress = ?",
+				id,
+				publicTaskID,
+				transition.ExpectedStatus,
+				transition.ExpectedProgress,
+			).
+			Updates(updates)
+		if update.Error != nil {
+			return update.Error
+		}
+		if update.RowsAffected != 1 {
+			return ErrTaskSubmissionStateConflict
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return &task, &attempt, nil
 }
 
 // ClaimQuotaForRefund atomically clears an expected non-zero quota. A true

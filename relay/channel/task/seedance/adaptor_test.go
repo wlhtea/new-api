@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	taskcommon "github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,15 +31,7 @@ var _ channel.FullPrepaidTaskSubmitter = (*TaskAdaptor)(nil)
 var _ channel.DurableTaskSubmitter = (*TaskAdaptor)(nil)
 var _ channel.DeferredTaskSubmitResponder = (*TaskAdaptor)(nil)
 var _ channel.TaskSubmitFailureClassifier = (*TaskAdaptor)(nil)
-var _ interface {
-	FetchTaskWithContext(
-		context.Context,
-		string,
-		string,
-		map[string]any,
-		string,
-	) (*http.Response, error)
-} = (*TaskAdaptor)(nil)
+var _ service.TaskFetcherWithContext = (*TaskAdaptor)(nil)
 
 type errorReadCloser struct {
 	err    error
@@ -552,22 +545,18 @@ func TestFetchTaskWithContextRejectsMissingTaskID(t *testing.T) {
 	require.EqualError(t, err, "task_id is required")
 }
 
-func TestFetchTaskSuccessfulResponseOwnsContextUntilBodyClose(t *testing.T) {
-	responseStarted := make(chan struct{})
-	disconnected := make(chan struct{})
+func TestFetchTaskSuccessfulResponseReturnsOwnedSanitizedBody(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(
 		writer http.ResponseWriter,
 		_ *http.Request,
 	) {
-		hijackAndWaitForClientClose(
-			t,
-			writer,
-			"HTTP/1.1 200 OK\r\n"+
-				"Content-Type: application/json\r\n"+
-				"Transfer-Encoding: chunked\r\n\r\n",
-			responseStarted,
-			disconnected,
-		)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{
+			"requestId":"REQUEST_ID",
+			"task_id":"UPSTREAM_TASK_ID",
+			"status":"processing",
+			"optimized_prompt":"SECRET_PROMPT"
+		}`)
 	}))
 	defer upstream.Close()
 
@@ -579,17 +568,118 @@ func TestFetchTaskSuccessfulResponseOwnsContextUntilBodyClose(t *testing.T) {
 		"",
 	)
 	require.NoError(t, err)
-	<-responseStarted
-	select {
-	case <-disconnected:
-		t.Fatal("successful response canceled before body close")
-	default:
-	}
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"requestId":"REQUEST_ID",
+		"status":"processing"
+	}`, string(body))
 	require.NoError(t, resp.Body.Close())
-	select {
-	case <-disconnected:
-	case <-time.After(time.Second):
-		t.Fatal("response body close did not cancel derived context")
+}
+
+func TestSeedDanceStatusFetchSanitizesProviderResponse(t *testing.T) {
+	var statusCalls atomic.Int32
+	var videoCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		req *http.Request,
+	) {
+		switch {
+		case strings.HasPrefix(req.URL.Path, "/status/"):
+			statusCalls.Add(1)
+			assert.Equal(t, "/status/UPSTREAM_TASK_ID", req.URL.Path)
+			assert.Equal(t, "Bearer TOKEN", req.Header.Get("Authorization"))
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{
+				"requestId":"REQUEST_ID",
+				"task_id":"UPSTREAM_TASK_ID",
+				"success":true,
+				"status":"completed",
+				"message":"safe message",
+				"optimized_prompt":"SECRET_PROMPT",
+				"video_base64":"SECRET_BASE64",
+				"data":{"image_base64":"NESTED_SECRET_BASE64"}
+			}`)
+		case strings.HasPrefix(req.URL.Path, "/video/"):
+			videoCalls.Add(1)
+			http.Error(writer, "unexpected video request", http.StatusInternalServerError)
+		default:
+			http.NotFound(writer, req)
+		}
+	}))
+	defer upstream.Close()
+
+	resp, err := (&TaskAdaptor{}).FetchTaskWithContext(
+		context.Background(),
+		upstream.URL,
+		"TOKEN",
+		map[string]any{"task_id": "UPSTREAM_TASK_ID"},
+		"",
+	)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.JSONEq(t, `{
+		"requestId":"REQUEST_ID",
+		"success":true,
+		"status":"completed",
+		"message":"safe message"
+	}`, string(body))
+	assert.NotContains(t, string(body), "UPSTREAM_TASK_ID")
+	assert.NotContains(t, string(body), "SECRET_PROMPT")
+	assert.NotContains(t, string(body), "SECRET_BASE64")
+	assert.Equal(t, int32(1), statusCalls.Load())
+	assert.Zero(t, videoCalls.Load())
+}
+
+func TestSeedDanceStatusFetchRejectsHTTPAndAmbiguousBusinessErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{
+			name:       "HTTP error",
+			statusCode: http.StatusBadGateway,
+			body:       `{"status":"processing","message":"SECRET_PROVIDER_RESPONSE"}`,
+		},
+		{
+			name:       "business error without task state",
+			statusCode: http.StatusOK,
+			body:       `{"success":false,"errCode":"BAD_STATUS","errMessage":"safe failure"}`,
+		},
+		{
+			name:       "unknown task state",
+			statusCode: http.StatusOK,
+			body:       `{"success":true,"status":"future_state"}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(
+				writer http.ResponseWriter,
+				_ *http.Request,
+			) {
+				writer.WriteHeader(test.statusCode)
+				_, _ = io.WriteString(writer, test.body)
+			}))
+			defer upstream.Close()
+
+			resp, err := (&TaskAdaptor{}).FetchTaskWithContext(
+				context.Background(),
+				upstream.URL,
+				"TOKEN",
+				map[string]any{"task_id": "UPSTREAM_TASK_ID"},
+				"",
+			)
+			require.Error(t, err)
+			assert.Nil(t, resp)
+			assert.NotContains(t, err.Error(), "TOKEN")
+			assert.NotContains(t, err.Error(), "SECRET_PROVIDER_RESPONSE")
+		})
 	}
 }
 

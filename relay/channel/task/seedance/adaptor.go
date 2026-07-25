@@ -29,6 +29,15 @@ type TaskAdaptor struct {
 	baseURL string
 }
 
+type cleanedStatusData struct {
+	RequestID  string `json:"requestId,omitempty"`
+	Success    *bool  `json:"success,omitempty"`
+	ErrCode    string `json:"errCode,omitempty"`
+	ErrMessage string `json:"errMessage,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Message    string `json:"message,omitempty"`
+}
+
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 	a.apiKey = info.ApiKey
 	a.baseURL = strings.TrimRight(info.ChannelBaseUrl, "/")
@@ -476,6 +485,9 @@ func (a *TaskAdaptor) FetchTaskWithContext(
 	if taskID == "" {
 		return nil, errors.New("task_id is required")
 	}
+	if parent == nil {
+		parent = context.Background()
+	}
 	ctx, cancel := context.WithTimeout(parent, statusTimeout)
 	req, err := http.NewRequestWithContext(
 		ctx,
@@ -503,7 +515,52 @@ func (a *TaskAdaptor) FetchTaskWithContext(
 		cancel()
 		return nil, err
 	}
-	return bindCancelToBody(resp, cancel), nil
+	if resp == nil || resp.Body == nil {
+		cancel()
+		return nil, errors.New("empty Seed Dance status response")
+	}
+	defer cancel()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf(
+			"Seed Dance status request returned HTTP %d",
+			resp.StatusCode,
+		)
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read Seed Dance status response: %w", err)
+	}
+	var provider providerEnvelope
+	if err := common.Unmarshal(responseBody, &provider); err != nil {
+		return nil, fmt.Errorf("decode Seed Dance status response: %w", err)
+	}
+	if provider.Success != nil &&
+		!*provider.Success &&
+		!strings.EqualFold(provider.Status, "failed") {
+		return nil, errors.New("Seed Dance status business request failed")
+	}
+	cleaned := cleanedStatusData{
+		RequestID:  provider.RequestID,
+		Success:    provider.Success,
+		ErrCode:    rawErrorCode(provider.ErrCode),
+		ErrMessage: provider.ErrMessage,
+		Status:     provider.Status,
+		Message:    provider.Message,
+	}
+	cleanedBody, err := common.Marshal(cleaned)
+	if err != nil {
+		return nil, fmt.Errorf("encode cleaned Seed Dance status: %w", err)
+	}
+	if _, err := a.ParseTaskResult(cleanedBody); err != nil {
+		return nil, err
+	}
+	result := *resp
+	result.Body = io.NopCloser(bytes.NewReader(cleanedBody))
+	result.ContentLength = int64(len(cleanedBody))
+	result.Header = resp.Header.Clone()
+	result.Header.Set("Content-Length", strconv.Itoa(len(cleanedBody)))
+	return &result, nil
 }
 
 func (a *TaskAdaptor) FetchTask(
