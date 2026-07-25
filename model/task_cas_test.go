@@ -36,6 +36,7 @@ func TestMain(m *testing.M) {
 
 	if err := db.AutoMigrate(
 		&Task{},
+		&TaskBillingAttempt{},
 		&User{},
 		&UserSession{},
 		&AuthFlow{},
@@ -52,6 +53,7 @@ func TestMain(m *testing.M) {
 		&SubscriptionPlan{},
 		&SubscriptionOrder{},
 		&UserSubscription{},
+		&SubscriptionPreConsumeRecord{},
 		&UserOAuthBinding{},
 		&PerfMetric{},
 		&SystemInstance{},
@@ -67,6 +69,8 @@ func TestMain(m *testing.M) {
 func truncateTables(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
+		DB.Exec("DELETE FROM task_billing_attempts")
+		DB.Exec("DELETE FROM subscription_pre_consume_records")
 		DB.Exec("DELETE FROM tasks")
 		DB.Exec("DELETE FROM auth_flows")
 		DB.Exec("DELETE FROM external_identity_claims")
@@ -359,5 +363,42 @@ func TestHasTaskPollingWork_IncludesOnlyRefundableFailedTasks(t *testing.T) {
 		Data:       json.RawMessage(`{}`),
 	}
 	insertTask(t, refundable)
+	assert.True(t, HasTaskPollingWork())
+}
+
+func TestHasTaskPollingWorkIncludesAttemptMarkerRecovery(t *testing.T) {
+	truncateTables(t)
+	snapshot := TaskBillingAttemptSnapshot{
+		RequestID:     "polling-attempt-recovery",
+		PublicTaskID:  "task_polling_attempt_recovery",
+		SubmitTime:    time.Now().Add(-time.Minute).Unix(),
+		UserID:        981,
+		FundingSource: "wallet",
+		FundingAmount: 0,
+		TokenID:       982,
+		TokenAmount:   0,
+	}
+	require.NoError(t, DB.Create(&User{
+		Id:       snapshot.UserID,
+		Username: "polling-attempt-user",
+		AffCode:  "polling-attempt-aff",
+	}).Error)
+	require.NoError(t, DB.Create(&Token{
+		Id:          snapshot.TokenID,
+		UserId:      snapshot.UserID,
+		Key:         "polling-attempt-token",
+		Status:      common.TokenStatusEnabled,
+		ExpiredTime: -1,
+	}).Error)
+	attempt, err := BeginTaskBillingAttempt(snapshot)
+	require.NoError(t, err)
+	_, err = ApplyTaskFundingPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	assert.False(t, HasTaskPollingWork(), "fresh request-owned attempts wait for the recovery grace period")
+
+	require.NoError(t, DB.Model(&TaskBillingAttempt{}).Where("id = ?", attempt.ID).
+		Update("updated_at", time.Now().Add(-time.Minute).Unix()).Error)
 	assert.True(t, HasTaskPollingWork())
 }

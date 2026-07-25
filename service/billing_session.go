@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -32,7 +33,22 @@ type BillingSession struct {
 	fundingSettled   bool // funding.Settle 已成功，资金来源已提交
 	settled          bool // Settle 全部完成（资金 + 令牌）
 	refunded         bool // Refund 已调用
+	durable          bool
+	durableVerified  bool
+	durableRequestID string
+	durablePlan      DurableTaskBillingPlan
 	mu               sync.Mutex
+}
+
+// DurableTaskBillingPlan is a mutation-free funding decision used to create
+// the immutable model.TaskBillingAttempt before synchronous preconsume.
+type DurableTaskBillingPlan struct {
+	IsFree         bool
+	FundingSource  string
+	SubscriptionID int
+	FundingAmount  int
+	TokenID        int
+	TokenAmount    int
 }
 
 // Settle 根据实际消耗额度进行结算。
@@ -41,6 +57,23 @@ type BillingSession struct {
 func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.durable {
+		if !s.durableVerified {
+			return errors.New("durable task billing attempt is not verified")
+		}
+		if actualQuota != s.preConsumedQuota {
+			return fmt.Errorf(
+				"durable task billing requires zero-delta settlement: actual=%d preconsumed=%d",
+				actualQuota,
+				s.preConsumedQuota,
+			)
+		}
+		if s.settled {
+			return nil
+		}
+		s.settled = true
+		return nil
+	}
 	if s.settled {
 		return nil
 	}
@@ -81,6 +114,10 @@ func (s *BillingSession) Settle(actualQuota int) error {
 // Refund 退还所有预扣费，幂等安全，异步执行。
 func (s *BillingSession) Refund(c *gin.Context) {
 	s.mu.Lock()
+	if s.durable {
+		s.mu.Unlock()
+		return
+	}
 	if s.settled || s.refunded || !s.needsRefundLocked() {
 		s.mu.Unlock()
 		return
@@ -130,6 +167,9 @@ func (s *BillingSession) NeedsRefund() bool {
 }
 
 func (s *BillingSession) needsRefundLocked() bool {
+	if s.durable {
+		return false
+	}
 	if s.settled || s.refunded || s.fundingSettled {
 		// fundingSettled 时资金来源已提交结算，不能再退预扣费
 		return false
@@ -153,6 +193,12 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.durable {
+		if targetQuota == s.preConsumedQuota {
+			return nil
+		}
+		return errors.New("durable task billing amount is immutable")
+	}
 	if s.settled || s.refunded || s.trusted || targetQuota <= s.preConsumedQuota {
 		return nil
 	}
@@ -173,6 +219,232 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	s.preConsumedQuota += delta
 	s.tokenConsumed += delta
 	s.extraReserved += delta
+	s.syncRelayInfo()
+	return nil
+}
+
+func durableTaskBillingPlanError(err error, code types.ErrorCode, status int) *types.NewAPIError {
+	return types.NewErrorWithStatusCode(
+		err,
+		code,
+		status,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithNoRecordErrorLog(),
+	)
+}
+
+// NewDurableTaskBillingSession selects an exact primary funding source without
+// mutating wallet, subscription, Token, cache, or batch state.
+func NewDurableTaskBillingSession(
+	_ *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	quota int,
+) (*BillingSession, *DurableTaskBillingPlan, *types.NewAPIError) {
+	if relayInfo == nil {
+		return nil, nil, durableTaskBillingPlanError(
+			errors.New("relayInfo is nil"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+		)
+	}
+	if relayInfo.QuotaClamp != nil {
+		return nil, nil, durableTaskBillingPlanError(
+			relayInfo.QuotaClamp,
+			types.ErrorCodeModelPriceError,
+			http.StatusBadRequest,
+		)
+	}
+	if quota < 0 {
+		return nil, nil, durableTaskBillingPlanError(
+			fmt.Errorf("pre-consume quota cannot be negative: %d", quota),
+			types.ErrorCodeModelPriceError,
+			http.StatusBadRequest,
+		)
+	}
+
+	tokenAmount := quota
+	if relayInfo.IsPlayground {
+		tokenAmount = 0
+	}
+	plan := &DurableTaskBillingPlan{
+		IsFree:        relayInfo.PriceData.FreeModel,
+		FundingAmount: quota,
+		TokenID:       relayInfo.TokenId,
+		TokenAmount:   tokenAmount,
+	}
+	if plan.IsFree {
+		if quota != 0 {
+			return nil, nil, durableTaskBillingPlanError(
+				errors.New("free durable task must have zero quota"),
+				types.ErrorCodeModelPriceError,
+				http.StatusInternalServerError,
+			)
+		}
+		plan.TokenAmount = 0
+		if err := ValidateDurableTaskTokenPlan(relayInfo, plan.TokenAmount); err != nil {
+			return nil, nil, durableTaskBillingPlanError(
+				err,
+				types.ErrorCodePreConsumeTokenQuotaFailed,
+				http.StatusForbidden,
+			)
+		}
+		return nil, plan, nil
+	}
+
+	if relayInfo.UserId <= 0 {
+		return nil, nil, durableTaskBillingPlanError(
+			errors.New("durable task billing user is missing"),
+			types.ErrorCodeQueryDataError,
+			http.StatusInternalServerError,
+		)
+	}
+	if err := ValidateDurableTaskTokenPlan(relayInfo, plan.TokenAmount); err != nil {
+		return nil, nil, durableTaskBillingPlanError(
+			err,
+			types.ErrorCodePreConsumeTokenQuotaFailed,
+			http.StatusForbidden,
+		)
+	}
+
+	type plannedFunding struct {
+		source         string
+		subscriptionID int
+	}
+	tryWallet := func() (*plannedFunding, *types.NewAPIError) {
+		walletQuota, err := model.GetUserQuotaForTaskBillingPlan(relayInfo.UserId)
+		if err != nil {
+			return nil, durableTaskBillingPlanError(
+				err,
+				types.ErrorCodeQueryDataError,
+				http.StatusInternalServerError,
+			)
+		}
+		if walletQuota < quota {
+			return nil, durableTaskBillingPlanError(
+				fmt.Errorf(
+					"预扣费额度失败, 用户剩余额度: %s, 需要预扣费额度: %s",
+					logger.FormatQuota(walletQuota),
+					logger.FormatQuota(quota),
+				),
+				types.ErrorCodeInsufficientUserQuota,
+				http.StatusForbidden,
+			)
+		}
+		return &plannedFunding{source: BillingSourceWallet}, nil
+	}
+	trySubscription := func() (*plannedFunding, *types.NewAPIError) {
+		subscription, err := model.PlanUserSubscriptionForTaskBilling(relayInfo.UserId, int64(quota))
+		if err != nil {
+			return nil, durableTaskBillingPlanError(
+				err,
+				types.ErrorCodeInsufficientUserQuota,
+				http.StatusForbidden,
+			)
+		}
+		return &plannedFunding{
+			source:         BillingSourceSubscription,
+			subscriptionID: subscription.Id,
+		}, nil
+	}
+
+	var funding *plannedFunding
+	var apiErr *types.NewAPIError
+	switch common.NormalizeBillingPreference(relayInfo.UserSetting.BillingPreference) {
+	case "subscription_only":
+		funding, apiErr = trySubscription()
+	case "wallet_only":
+		funding, apiErr = tryWallet()
+	case "wallet_first":
+		funding, apiErr = tryWallet()
+		if apiErr != nil && apiErr.GetErrorCode() == types.ErrorCodeInsufficientUserQuota {
+			funding, apiErr = trySubscription()
+		}
+	case "subscription_first":
+		fallthrough
+	default:
+		funding, apiErr = trySubscription()
+		if apiErr != nil && apiErr.GetErrorCode() == types.ErrorCodeInsufficientUserQuota {
+			allowWallet, overflowErr := model.UserActiveSubscriptionsAllowWalletOverflow(relayInfo.UserId)
+			if overflowErr != nil {
+				return nil, nil, durableTaskBillingPlanError(
+					overflowErr,
+					types.ErrorCodeQueryDataError,
+					http.StatusInternalServerError,
+				)
+			}
+			if allowWallet {
+				funding, apiErr = tryWallet()
+			}
+		}
+	}
+	if apiErr != nil {
+		return nil, nil, apiErr
+	}
+
+	plan.FundingSource = funding.source
+	plan.SubscriptionID = funding.subscriptionID
+	source, sourceErr := newDurablePlannedFunding(relayInfo, *plan)
+	if sourceErr != nil {
+		return nil, nil, durableTaskBillingPlanError(
+			sourceErr,
+			types.ErrorCodeUpdateDataError,
+			http.StatusInternalServerError,
+		)
+	}
+	session := &BillingSession{
+		relayInfo:        relayInfo,
+		funding:          source,
+		preConsumedQuota: quota,
+		durable:          true,
+		durableRequestID: relayInfo.RequestId,
+		durablePlan:      *plan,
+	}
+	return session, plan, nil
+}
+
+// VerifyDurableTaskBillingAttempt binds a planned session to a primary ledger
+// only after both synchronous component markers have committed.
+func (s *BillingSession) VerifyDurableTaskBillingAttempt(requestID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.durable || requestID == "" {
+		return errors.New("not a durable task billing session")
+	}
+	if s.relayInfo == nil || s.durableRequestID == "" || requestID != s.durableRequestID {
+		return model.ErrTaskBillingIdentityDrift
+	}
+	if s.durableVerified {
+		return nil
+	}
+	attempt, err := model.VerifyTaskBillingAttemptPreconsumed(requestID)
+	if err != nil {
+		return err
+	}
+	plan := s.durablePlan
+	if attempt.IsFree != plan.IsFree ||
+		attempt.FundingSource != plan.FundingSource ||
+		attempt.SubscriptionID != plan.SubscriptionID ||
+		attempt.FundingAmount != plan.FundingAmount ||
+		attempt.TokenID != plan.TokenID ||
+		attempt.TokenAmount != plan.TokenAmount ||
+		attempt.UserID != s.relayInfo.UserId {
+		return model.ErrTaskBillingIdentityDrift
+	}
+	s.durableVerified = true
+	s.tokenConsumed = plan.TokenAmount
+	switch funding := s.funding.(type) {
+	case *WalletFunding:
+		funding.consumed = plan.FundingAmount
+	case *SubscriptionFunding:
+		funding.preConsumed = int64(plan.FundingAmount)
+		if subscription, lookupErr := model.PlanUserSubscriptionForTaskBilling(
+			s.relayInfo.UserId,
+			int64(plan.FundingAmount),
+		); lookupErr == nil && subscription.Id == plan.SubscriptionID {
+			funding.AmountTotal = subscription.AmountTotal
+			funding.AmountUsedAfter = subscription.AmountUsed
+		}
+	}
 	s.syncRelayInfo()
 	return nil
 }

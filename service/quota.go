@@ -408,6 +408,42 @@ func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
 	return nil
 }
 
+// ValidateDurableTaskTokenPlan checks the exact primary Token identity and
+// available quota without changing database, cache, or batch state.
+func ValidateDurableTaskTokenPlan(relayInfo *relaycommon.RelayInfo, tokenAmount int) error {
+	if relayInfo == nil {
+		return errors.New("relayInfo is nil")
+	}
+	if tokenAmount < 0 {
+		return errors.New("token amount cannot be negative")
+	}
+	if relayInfo.TokenId <= 0 {
+		if tokenAmount == 0 {
+			return nil
+		}
+		return errors.New("task token identity is missing")
+	}
+	token, err := model.GetTokenForTaskBillingPlan(relayInfo.TokenId)
+	if err != nil {
+		return err
+	}
+	if token.UserId != relayInfo.UserId {
+		return errors.New("task token identity mismatch")
+	}
+	if token.Status != common.TokenStatusEnabled ||
+		(token.ExpiredTime != -1 && token.ExpiredTime < common.GetTimestamp()) {
+		return errors.New("task token is unavailable")
+	}
+	if !token.UnlimitedQuota && token.RemainQuota < tokenAmount {
+		return fmt.Errorf(
+			"token quota is not enough, token remain quota: %s, need quota: %s",
+			logger.FormatQuota(token.RemainQuota),
+			logger.FormatQuota(tokenAmount),
+		)
+	}
+	return nil
+}
+
 func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int, sendEmail bool) (err error) {
 
 	// 1) Consume from wallet quota OR subscription item

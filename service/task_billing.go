@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
@@ -160,10 +162,97 @@ func taskModelName(task *model.Task) string {
 	return task.Properties.OriginModelName
 }
 
-// RefundTaskQuota 统一的任务失败退款逻辑。
-// 当异步任务失败时，将预扣的 quota 退还给用户（支持钱包和订阅），并退还令牌额度。
-// 返回资金来源是否已成功退还；失败时保留 quota 作为后续对账标记。
+// RefundTaskBillingAttempt converges both independent durable components. Main
+// database mutations are idempotent at their model markers; logs remain
+// best-effort derived state.
+func RefundTaskBillingAttempt(
+	ctx context.Context,
+	requestID string,
+	reason string,
+) (*model.TaskBillingAttempt, error) {
+	if requestID == "" {
+		return nil, model.ErrTaskBillingIdentityDrift
+	}
+	before, err := model.GetTaskBillingAttemptByRequestID(requestID)
+	if err != nil {
+		return nil, err
+	}
+	wasComplete := before.RefundCompletedAt != 0
+
+	_, fundingErr := model.ApplyTaskFundingRefund(requestID)
+	_, tokenErr := model.ApplyTaskTokenRefund(requestID)
+	after, readErr := model.GetTaskBillingAttemptByRequestID(requestID)
+	if readErr != nil {
+		return nil, errors.Join(fundingErr, tokenErr, readErr)
+	}
+	if fundingErr != nil || tokenErr != nil {
+		return after, errors.Join(fundingErr, tokenErr)
+	}
+	if after.FundingRefundedAt == 0 || after.TokenRefundedAt == 0 ||
+		after.RefundCompletedAt == 0 {
+		return after, model.ErrTaskBillingAttemptState
+	}
+
+	if !wasComplete && after.Owner == model.TaskBillingOwnerTask && after.TaskID != nil {
+		if task, taskErr := model.GetTaskByPrimaryID(*after.TaskID); taskErr == nil {
+			other := taskBillingOther(task)
+			other["task_id"] = task.TaskID
+			other["reason"] = reason
+			model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
+				UserId:    task.UserId,
+				LogType:   model.LogTypeRefund,
+				ChannelId: task.ChannelId,
+				ModelName: taskModelName(task),
+				Quota:     after.FundingAmount,
+				TokenId:   task.PrivateData.TokenId,
+				Group:     task.Group,
+				Other:     other,
+				NodeName:  task.PrivateData.NodeName,
+			})
+		} else {
+			logger.LogWarn(ctx, fmt.Sprintf(
+				"durable task refund log skipped because linked task could not be read (requestId=%s): %v",
+				requestID,
+				taskErr,
+			))
+		}
+	}
+	return after, nil
+}
+
+// RefundTaskQuota routes linked durable Tasks through TaskBillingAttempt and
+// selects the historical path only after an actual primary lookup returns
+// gorm.ErrRecordNotFound.
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
+	if task == nil {
+		return false
+	}
+	attempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	switch {
+	case err == nil:
+		_, refundErr := RefundTaskBillingAttempt(ctx, attempt.RequestID, reason)
+		if refundErr != nil {
+			logger.LogWarn(ctx, fmt.Sprintf(
+				"durable task refund incomplete task %s: %v",
+				task.TaskID,
+				refundErr,
+			))
+			return false
+		}
+		return true
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return refundLegacyTaskQuota(ctx, task, reason)
+	default:
+		logger.LogError(ctx, fmt.Sprintf(
+			"task billing attempt lookup failed closed task %s: %v",
+			task.TaskID,
+			err,
+		))
+		return false
+	}
+}
+
+func refundLegacyTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
 	quota := task.Quota
 	if quota == 0 {
 		return true

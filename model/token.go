@@ -259,6 +259,23 @@ func GetTokenById(id int) (*Token, error) {
 	return &token, err
 }
 
+// GetTokenForTaskBillingPlan reads only the non-secret primary fields needed
+// to plan a durable task charge. It deliberately bypasses cache fill and does
+// not return the Token Key.
+func GetTokenForTaskBillingPlan(id int) (*Token, error) {
+	if id <= 0 {
+		return nil, fmt.Errorf("%w: invalid task billing token", ErrTaskBillingIdentityDrift)
+	}
+	var token Token
+	if err := DB.Select(
+		"id", "user_id", "status", "expired_time", "remain_quota",
+		"unlimited_quota", "used_quota",
+	).Where("id = ?", id).First(&token).Error; err != nil {
+		return nil, err
+	}
+	return &token, nil
+}
+
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read

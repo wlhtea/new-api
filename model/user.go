@@ -1153,6 +1153,20 @@ func GetUserQuota(id int, fromDB bool) (quota int, err error) {
 	return quota, nil
 }
 
+// GetUserQuotaForTaskBillingPlan reads the primary wallet row without filling
+// or mutating any derived cache. Durable task planning must happen before its
+// billing-attempt ledger and therefore has no cache side effects.
+func GetUserQuotaForTaskBillingPlan(id int) (int, error) {
+	if id <= 0 {
+		return 0, fmt.Errorf("%w: invalid task billing user", ErrTaskBillingIdentityDrift)
+	}
+	var user User
+	if err := DB.Select("id", "quota").Where("id = ?", id).First(&user).Error; err != nil {
+		return 0, err
+	}
+	return user.Quota, nil
+}
+
 func GetUserUsedQuota(id int) (quota int, err error) {
 	err = DB.Model(&User{}).Where("id = ?", id).Select("used_quota").Find(&quota).Error
 	return quota, err
