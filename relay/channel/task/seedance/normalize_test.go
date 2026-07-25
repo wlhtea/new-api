@@ -1,8 +1,11 @@
 package seedance
 
 import (
+	"bytes"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -17,6 +20,38 @@ func jsonContext(t *testing.T, body string) *gin.Context {
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	return c
+}
+
+func multipartRequest(
+	t *testing.T,
+	fields map[string]string,
+	fileField string,
+	fileName string,
+	fileBytes []byte,
+) (*bytes.Buffer, string) {
+	t.Helper()
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	for name, value := range fields {
+		require.NoError(t, writer.WriteField(name, value))
+	}
+	if fileField != "" {
+		part, err := writer.CreateFormFile(fileField, fileName)
+		require.NoError(t, err)
+		_, err = part.Write(fileBytes)
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+	return body, writer.FormDataContentType()
+}
+
+func multipartContext(t *testing.T, body *bytes.Buffer, contentType string) *gin.Context {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", bytes.NewReader(body.Bytes()))
+	c.Request.Header.Set("Content-Type", contentType)
 	return c
 }
 
@@ -123,4 +158,114 @@ func TestNormalizeJSONRejectsStringBoolean(t *testing.T) {
 	_, taskErr = normalizeScalars(input)
 	require.NotNil(t, taskErr)
 	assert.Equal(t, "invalid_request", taskErr.Code)
+}
+
+func TestNormalizeMultipartRemovesTemporaryFilesAndCachesResult(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+
+	body, contentType := multipartRequest(t, map[string]string{
+		"prompt":   "flower",
+		"duration": "10",
+		"metadata": `{"strict_duration":"false","multi_shot":"true"}`,
+	}, "input_reference", "input.png", testPNG(t, 240, 240))
+	c := multipartContext(t, body, contentType)
+
+	first, taskErr := normalizeRequest(c)
+	require.Nil(t, taskErr)
+	second, taskErr := normalizeRequest(c)
+	require.Nil(t, taskErr)
+	assert.Same(t, first, second)
+	assert.Equal(t, 10, first.Duration)
+	require.NotNil(t, first.StrictDuration)
+	assert.False(t, *first.StrictDuration)
+	require.NotNil(t, first.MultiShot)
+	assert.True(t, *first.MultiShot)
+
+	entries, err := os.ReadDir(tempDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestNormalizeMultipartRejectsMultipleInputReferenceFiles(t *testing.T) {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	require.NoError(t, writer.WriteField("prompt", "flower"))
+	for _, name := range []string{"first.png", "second.png"} {
+		part, err := writer.CreateFormFile("input_reference", name)
+		require.NoError(t, err)
+		_, err = part.Write(testPNG(t, 240, 240))
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+
+	_, taskErr := normalizeRequest(multipartContext(t, body, writer.FormDataContentType()))
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "invalid_image", taskErr.Code)
+}
+
+func TestNormalizeMultipartRejectsInvalidBooleanText(t *testing.T) {
+	body, contentType := multipartRequest(t, map[string]string{
+		"prompt":   "flower",
+		"metadata": `{"strict_duration":"yes"}`,
+	}, "", "", nil)
+
+	_, taskErr := normalizeRequest(multipartContext(t, body, contentType))
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "invalid_request", taskErr.Code)
+}
+
+func TestNormalizeMultipartMatchesJSONScalarContract(t *testing.T) {
+	body, contentType := multipartRequest(t, map[string]string{
+		"prompt":   " flower ",
+		"duration": "10",
+		"seconds":  "10",
+		"size":     "1920x1080",
+		"metadata": `{"duration":"10","resolution":"1080p","prompt_optimization":"false","negative_prompt":"blur"}`,
+	}, "", "", nil)
+
+	got, taskErr := normalizeRequest(multipartContext(t, body, contentType))
+	require.Nil(t, taskErr)
+	assert.Equal(t, "flower", got.Prompt)
+	assert.Equal(t, 10, got.Duration)
+	assert.Equal(t, "1080P", got.Resolution)
+	require.NotNil(t, got.PromptOptimization)
+	assert.False(t, *got.PromptOptimization)
+	assert.Equal(t, "blur", got.NegativePrompt)
+}
+
+func TestNormalizeRequestRejectsInvalidCachedValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+	}{
+		{"wrong type", "not a normalized request"},
+		{"nil pointer", (*NormalizedRequest)(nil)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := jsonContext(t, `{"prompt":"p"}`)
+			c.Set(normalizedRequestContextKey, test.value)
+			_, taskErr := normalizeRequest(c)
+			require.NotNil(t, taskErr)
+			assert.Equal(t, "invalid_request", taskErr.Code)
+		})
+	}
+}
+
+func TestGetNormalizedRequestRequiresValidCachedValue(t *testing.T) {
+	c := jsonContext(t, `{"prompt":"p"}`)
+	_, err := getNormalizedRequest(c)
+	require.EqualError(t, err, "Seed Dance request was not normalized")
+
+	c.Set(normalizedRequestContextKey, "wrong")
+	_, err = getNormalizedRequest(c)
+	require.EqualError(t, err, "invalid Seed Dance normalized request")
+
+	want := &NormalizedRequest{Prompt: "p"}
+	c.Set(normalizedRequestContextKey, want)
+	got, err := getNormalizedRequest(c)
+	require.NoError(t, err)
+	assert.Same(t, want, got)
 }
