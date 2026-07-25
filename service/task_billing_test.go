@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -10,9 +11,12 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
@@ -41,12 +45,14 @@ func TestMain(m *testing.M) {
 
 	if err := db.AutoMigrate(
 		&model.Task{},
+		&model.TaskBillingAttempt{},
 		&model.User{},
 		&model.Token{},
 		&model.Log{},
 		&model.Channel{},
 		&model.TopUp{},
 		&model.UserSubscription{},
+		&model.SubscriptionPreConsumeRecord{},
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
 	); err != nil {
@@ -63,6 +69,8 @@ func TestMain(m *testing.M) {
 func truncate(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
+		model.DB.Exec("DELETE FROM task_billing_attempts")
+		model.DB.Exec("DELETE FROM subscription_pre_consume_records")
 		model.DB.Exec("DELETE FROM tasks")
 		model.DB.Exec("DELETE FROM users")
 		model.DB.Exec("DELETE FROM tokens")
@@ -77,7 +85,13 @@ func truncate(t *testing.T) {
 
 func seedUser(t *testing.T, id int, quota int) {
 	t.Helper()
-	user := &model.User{Id: id, Username: "test_user", Quota: quota, Status: common.UserStatusEnabled}
+	user := &model.User{
+		Id:       id,
+		Username: fmt.Sprintf("test_user_%d", id),
+		AffCode:  fmt.Sprintf("test_aff_%d", id),
+		Quota:    quota,
+		Status:   common.UserStatusEnabled,
+	}
 	require.NoError(t, model.DB.Create(user).Error)
 }
 
@@ -91,6 +105,7 @@ func seedToken(t *testing.T, id int, userId int, key string, remainQuota int) {
 		Status:      common.TokenStatusEnabled,
 		RemainQuota: remainQuota,
 		UsedQuota:   0,
+		ExpiredTime: -1,
 	}
 	require.NoError(t, model.DB.Create(token).Error)
 }
@@ -371,6 +386,7 @@ func TestRefundTaskQuota_ZeroQuota(t *testing.T) {
 	seedUser(t, userID, 5000)
 
 	task := makeTask(userID, 0, 0, 0, BillingSourceWallet, 0)
+	require.NoError(t, model.DB.Create(task).Error)
 
 	assert.True(t, RefundTaskQuota(ctx, task, "zero quota task"))
 
@@ -847,4 +863,303 @@ func TestSettle_NonPerCallBilling_AppliesAdaptorAdjustment(t *testing.T) {
 	log := getLastLog(t)
 	require.NotNil(t, log)
 	assert.Equal(t, model.LogTypeRefund, log.Type)
+}
+
+func seedDurableBillingAttempt(
+	t *testing.T,
+	requestID string,
+	userID int,
+	tokenID int,
+	quota int,
+) *model.TaskBillingAttempt {
+	t.Helper()
+	seedUser(t, userID, 10_000)
+	seedToken(t, tokenID, userID, "sk-"+requestID, 10_000)
+	attempt, err := model.BeginTaskBillingAttempt(model.TaskBillingAttemptSnapshot{
+		RequestID:     requestID,
+		PublicTaskID:  "task_" + requestID,
+		SubmitTime:    time.Now().Unix(),
+		UserID:        userID,
+		FundingSource: BillingSourceWallet,
+		FundingAmount: quota,
+		TokenID:       tokenID,
+		TokenAmount:   quota,
+	})
+	require.NoError(t, err)
+	_, err = model.ApplyTaskFundingPreconsume(requestID)
+	require.NoError(t, err)
+	_, err = model.ApplyTaskTokenPreconsume(requestID)
+	require.NoError(t, err)
+	return attempt
+}
+
+func linkDurableBillingAttempt(
+	t *testing.T,
+	attempt *model.TaskBillingAttempt,
+	requestID string,
+) *model.Task {
+	t.Helper()
+	task, _, err := model.PrepareTaskSubmissionAttempt(&model.Task{
+		TaskID:     attempt.PublicTaskID,
+		Platform:   constant.TaskPlatform("fixture"),
+		UserId:     attempt.UserID,
+		Group:      "default",
+		ChannelId:  88,
+		Quota:      attempt.FundingAmount,
+		Action:     "generate",
+		Status:     model.TaskStatusSubmitting,
+		SubmitTime: attempt.SubmitTime,
+		Progress:   "0%",
+		PrivateData: model.TaskPrivateData{
+			BillingSource: attempt.FundingSource,
+			TokenId:       attempt.TokenID,
+			BillingContext: &model.TaskBillingContext{
+				OriginModelName: "fixture-model",
+				GroupRatio:      1,
+			},
+		},
+	}, 0, requestID)
+	require.NoError(t, err)
+	return task
+}
+
+func TestRequestAndTaskRefundUseSameAttemptMarkers(t *testing.T) {
+	truncate(t)
+
+	requestAttempt := seedDurableBillingAttempt(t, "request-owned-refund", 801, 901, 120)
+	refunded, err := RefundTaskBillingAttempt(context.Background(), requestAttempt.RequestID, "request failed")
+	require.NoError(t, err)
+	assert.NotZero(t, refunded.FundingRefundedAt)
+	assert.NotZero(t, refunded.TokenRefundedAt)
+	assert.NotZero(t, refunded.RefundCompletedAt)
+	assert.Equal(t, 10_000, getUserQuota(t, requestAttempt.UserID))
+	assert.Equal(t, 10_000, getTokenRemainQuota(t, requestAttempt.TokenID))
+
+	taskAttempt := seedDurableBillingAttempt(t, "task-owned-refund", 802, 902, 140)
+	task := linkDurableBillingAttempt(t, taskAttempt, taskAttempt.RequestID)
+	_, err = model.TransitionTaskSubmissionToFailure(
+		task.ID, task.TaskID, "", "submit_failed", "submission failed",
+	)
+	require.NoError(t, err)
+	assert.True(t, RefundTaskQuota(context.Background(), task, "submission failed"))
+
+	reloadedAttempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.NotZero(t, reloadedAttempt.FundingRefundedAt)
+	assert.NotZero(t, reloadedAttempt.TokenRefundedAt)
+	assert.NotZero(t, reloadedAttempt.RefundCompletedAt)
+	var reloadedTask model.Task
+	require.NoError(t, model.DB.First(&reloadedTask, task.ID).Error)
+	assert.Zero(t, reloadedTask.Quota)
+	assert.Equal(t, 10_000, getUserQuota(t, taskAttempt.UserID))
+	assert.Equal(t, 10_000, getTokenRemainQuota(t, taskAttempt.TokenID))
+}
+
+func TestPaidZeroRefundIsSelectedWithZeroTaskQuota(t *testing.T) {
+	truncate(t)
+	const userID, tokenID = 803, 903
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-paid-zero", 0)
+	attempt, err := model.BeginTaskBillingAttempt(model.TaskBillingAttemptSnapshot{
+		RequestID:     "paid-zero-recovery",
+		PublicTaskID:  "task_paid_zero_recovery",
+		SubmitTime:    time.Now().Add(-time.Minute).Unix(),
+		UserID:        userID,
+		FundingSource: BillingSourceWallet,
+		FundingAmount: 0,
+		TokenID:       tokenID,
+		TokenAmount:   0,
+	})
+	require.NoError(t, err)
+	_, err = model.ApplyTaskFundingPreconsume(attempt.RequestID)
+	require.NoError(t, err)
+	_, err = model.ApplyTaskTokenPreconsume(attempt.RequestID)
+	require.NoError(t, err)
+	task := linkDurableBillingAttempt(t, attempt, attempt.RequestID)
+	_, err = model.TransitionTaskSubmissionToFailure(
+		task.ID, task.TaskID, "", "timeout", "timed out",
+	)
+	require.NoError(t, err)
+
+	sweepUnrefundedFailedTasks(context.Background())
+
+	reloaded, err := model.GetTaskBillingAttemptByRequestID(attempt.RequestID)
+	require.NoError(t, err)
+	assert.NotZero(t, reloaded.FundingRefundedAt)
+	assert.NotZero(t, reloaded.TokenRefundedAt)
+	assert.NotZero(t, reloaded.RefundCompletedAt)
+}
+
+func TestAttemptLookupDBErrorDoesNotRunLegacyRefund(t *testing.T) {
+	truncate(t)
+	const userID, quota = 804, 250
+	seedUser(t, userID, 1_000)
+	task := makeTask(userID, 0, quota, 0, BillingSourceWallet, 0)
+	task.Status = model.TaskStatusFailure
+	task.Progress = "100%"
+	require.NoError(t, model.DB.Create(task).Error)
+	require.NoError(t, model.DB.Migrator().DropTable(&model.TaskBillingAttempt{}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.AutoMigrate(&model.TaskBillingAttempt{}))
+	})
+
+	assert.False(t, RefundTaskQuota(context.Background(), task, "lookup unavailable"))
+	assert.Equal(t, 1_000, getUserQuota(t, userID))
+
+	require.NoError(t, model.DB.AutoMigrate(&model.TaskBillingAttempt{}))
+}
+
+func TestDurableBillingPlanDoesNotMutateBeforeAttempt(t *testing.T) {
+	truncate(t)
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(nil)
+	const userID, tokenID, quota = 805, 905, 300
+	seedUser(t, userID, 1_000)
+	seedToken(t, tokenID, userID, "sk-plan-only", 1_000)
+	info := &relaycommon.RelayInfo{
+		UserId:          userID,
+		TokenId:         tokenID,
+		TokenKey:        "sk-plan-only",
+		OriginModelName: "fixture-model",
+		UserSetting: dto.UserSetting{
+			BillingPreference: "wallet_only",
+		},
+	}
+
+	session, plan, apiErr := NewDurableTaskBillingSession(c, info, quota)
+	require.Nil(t, apiErr)
+	require.NotNil(t, session)
+	require.NotNil(t, plan)
+	assert.Equal(t, BillingSourceWallet, plan.FundingSource)
+	assert.Equal(t, quota, plan.FundingAmount)
+	assert.Equal(t, quota, plan.TokenAmount)
+	assert.Equal(t, 1_000, getUserQuota(t, userID))
+	assert.Equal(t, 1_000, getTokenRemainQuota(t, tokenID))
+	var count int64
+	require.NoError(t, model.DB.Model(&model.TaskBillingAttempt{}).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestDurableSubscriptionPlanPinsIdentityWithoutMutation(t *testing.T) {
+	truncate(t)
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(nil)
+	const userID, tokenID, subscriptionID = 806, 906, 706
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-subscription-plan", 0)
+	seedSubscription(t, subscriptionID, userID, 1_000, 400)
+	info := &relaycommon.RelayInfo{
+		UserId:          userID,
+		TokenId:         tokenID,
+		TokenKey:        "sk-subscription-plan",
+		OriginModelName: "fixture-model",
+		UserSetting: dto.UserSetting{
+			BillingPreference: "subscription_only",
+		},
+	}
+
+	session, plan, apiErr := NewDurableTaskBillingSession(c, info, 0)
+	require.Nil(t, apiErr)
+	require.NotNil(t, session)
+	require.NotNil(t, plan)
+	assert.False(t, plan.IsFree)
+	assert.Equal(t, BillingSourceSubscription, plan.FundingSource)
+	assert.Equal(t, subscriptionID, plan.SubscriptionID)
+	assert.Zero(t, plan.FundingAmount)
+	assert.Zero(t, plan.TokenAmount)
+	assert.Equal(t, int64(400), getSubscriptionUsed(t, subscriptionID))
+	var count int64
+	require.NoError(t, model.DB.Model(&model.SubscriptionPreConsumeRecord{}).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestDurableBillingSessionOnlySettlesVerifiedZeroDelta(t *testing.T) {
+	truncate(t)
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(nil)
+	const userID, tokenID, quota = 807, 907, 200
+	seedUser(t, userID, 1_000)
+	seedToken(t, tokenID, userID, "sk-durable-session", 1_000)
+	info := &relaycommon.RelayInfo{
+		UserId:          userID,
+		TokenId:         tokenID,
+		TokenKey:        "sk-durable-session",
+		RequestId:       "durable-session-zero-delta",
+		OriginModelName: "fixture-model",
+		UserSetting: dto.UserSetting{
+			BillingPreference: "wallet_only",
+		},
+	}
+	session, plan, apiErr := NewDurableTaskBillingSession(c, info, quota)
+	require.Nil(t, apiErr)
+	require.NotNil(t, session)
+	_, err := model.BeginTaskBillingAttempt(model.TaskBillingAttemptSnapshot{
+		RequestID:     info.RequestId,
+		PublicTaskID:  "task_durable_session_zero_delta",
+		SubmitTime:    time.Now().Unix(),
+		UserID:        userID,
+		FundingSource: plan.FundingSource,
+		FundingAmount: plan.FundingAmount,
+		TokenID:       plan.TokenID,
+		TokenAmount:   plan.TokenAmount,
+	})
+	require.NoError(t, err)
+	_, err = model.ApplyTaskFundingPreconsume(info.RequestId)
+	require.NoError(t, err)
+	_, err = model.ApplyTaskTokenPreconsume(info.RequestId)
+	require.NoError(t, err)
+
+	require.Error(t, session.Settle(quota))
+	require.NoError(t, session.VerifyDurableTaskBillingAttempt(info.RequestId))
+	require.Error(t, session.Settle(quota+1))
+	require.NoError(t, session.Settle(quota))
+	require.Error(t, session.Settle(quota+1))
+	session.Refund(c)
+	assert.Equal(t, 800, getUserQuota(t, userID))
+	assert.Equal(t, 800, getTokenRemainQuota(t, tokenID))
+
+	_, err = RefundTaskBillingAttempt(context.Background(), info.RequestId, "explicit ledger recovery")
+	require.NoError(t, err)
+	assert.Equal(t, 1_000, getUserQuota(t, userID))
+	assert.Equal(t, 1_000, getTokenRemainQuota(t, tokenID))
+}
+
+func TestDurableBillingSessionRejectsDifferentRequestAttempt(t *testing.T) {
+	truncate(t)
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(nil)
+	const userID, tokenID, quota = 808, 908, 200
+	seedUser(t, userID, 1_000)
+	seedToken(t, tokenID, userID, "sk-durable-request-binding", 1_000)
+	info := &relaycommon.RelayInfo{
+		UserId:          userID,
+		TokenId:         tokenID,
+		RequestId:       "durable-session-expected-request",
+		OriginModelName: "fixture-model",
+		UserSetting: dto.UserSetting{
+			BillingPreference: "wallet_only",
+		},
+	}
+	session, plan, apiErr := NewDurableTaskBillingSession(c, info, quota)
+	require.Nil(t, apiErr)
+	require.NotNil(t, session)
+
+	const otherRequestID = "durable-session-other-request"
+	_, err := model.BeginTaskBillingAttempt(model.TaskBillingAttemptSnapshot{
+		RequestID:     otherRequestID,
+		PublicTaskID:  "task_durable_session_other_request",
+		SubmitTime:    time.Now().Unix(),
+		UserID:        userID,
+		FundingSource: plan.FundingSource,
+		FundingAmount: plan.FundingAmount,
+		TokenID:       plan.TokenID,
+		TokenAmount:   plan.TokenAmount,
+	})
+	require.NoError(t, err)
+	_, err = model.ApplyTaskFundingPreconsume(otherRequestID)
+	require.NoError(t, err)
+	_, err = model.ApplyTaskTokenPreconsume(otherRequestID)
+	require.NoError(t, err)
+
+	assert.Error(t, session.VerifyDurableTaskBillingAttempt(otherRequestID))
 }

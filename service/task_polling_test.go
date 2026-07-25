@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -495,4 +496,65 @@ func TestSweepUnrefundedFailedTasksRestoresMarkerAfterFundingFailure(t *testing.
 	assert.Zero(t, afterSuccessfulRetry.Quota)
 	assert.Equal(t, subscriptionUsed-int64(taskQuota), getSubscriptionUsed(t, subscriptionID))
 	assert.Equal(t, int64(1), countLogs(t))
+}
+
+func TestStaleRequestOwnedAttemptSweepRecoversPartialPreconsume(t *testing.T) {
+	truncate(t)
+
+	testCases := []struct {
+		name           string
+		userID         int
+		tokenID        int
+		quota          int
+		consumeFunding bool
+		consumeToken   bool
+	}{
+		{name: "funding only", userID: 851, tokenID: 951, quota: 100, consumeFunding: true},
+		{name: "token only", userID: 852, tokenID: 952, quota: 110, consumeToken: true},
+		{name: "both", userID: 853, tokenID: 953, quota: 120, consumeFunding: true, consumeToken: true},
+		{name: "paid zero", userID: 854, tokenID: 954, quota: 0, consumeFunding: true, consumeToken: true},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			seedUser(t, testCase.userID, 1_000)
+			seedToken(t, testCase.tokenID, testCase.userID, "sk-stale-"+testCase.name, 1_000)
+			requestID := fmt.Sprintf("stale-request-%d", testCase.userID)
+			attempt, err := model.BeginTaskBillingAttempt(model.TaskBillingAttemptSnapshot{
+				RequestID:     requestID,
+				PublicTaskID:  "task_" + requestID,
+				SubmitTime:    time.Now().Add(-time.Minute).Unix(),
+				UserID:        testCase.userID,
+				FundingSource: BillingSourceWallet,
+				FundingAmount: testCase.quota,
+				TokenID:       testCase.tokenID,
+				TokenAmount:   testCase.quota,
+			})
+			require.NoError(t, err)
+			if testCase.consumeFunding {
+				_, err = model.ApplyTaskFundingPreconsume(requestID)
+				require.NoError(t, err)
+			}
+			if testCase.consumeToken {
+				_, err = model.ApplyTaskTokenPreconsume(requestID)
+				require.NoError(t, err)
+			}
+			require.NoError(t, model.DB.Model(&model.TaskBillingAttempt{}).
+				Where("id = ?", attempt.ID).
+				Update("updated_at", time.Now().Add(-time.Minute).Unix()).Error)
+
+			sweepUnrefundedFailedTasks(context.Background())
+			sweepUnrefundedFailedTasks(context.Background())
+
+			reloaded, err := model.GetTaskBillingAttemptByRequestID(requestID)
+			require.NoError(t, err)
+			assert.Equal(t, model.TaskBillingOwnerRequest, reloaded.Owner)
+			assert.Nil(t, reloaded.TaskID)
+			assert.NotZero(t, reloaded.RefundStartedAt)
+			assert.NotZero(t, reloaded.FundingRefundedAt)
+			assert.NotZero(t, reloaded.TokenRefundedAt)
+			assert.NotZero(t, reloaded.RefundCompletedAt)
+			assert.Equal(t, 1_000, getUserQuota(t, testCase.userID))
+			assert.Equal(t, 1_000, getTokenRemainQuota(t, testCase.tokenID))
+		})
+	}
 }

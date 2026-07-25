@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -257,6 +258,10 @@ type UserSubscription struct {
 
 	AmountTotal int64 `json:"amount_total" gorm:"type:bigint;not null;default:0"`
 	AmountUsed  int64 `json:"amount_used" gorm:"type:bigint;not null;default:0"`
+	// QuotaResetVersion advances whenever AmountUsed is reset for a new quota
+	// generation. Pre-consume records capture it so a later refund cannot debit
+	// usage accumulated after that reset.
+	QuotaResetVersion int64 `json:"quota_reset_version" gorm:"type:bigint;not null;default:0"`
 
 	StartTime int64  `json:"start_time" gorm:"bigint"`
 	EndTime   int64  `json:"end_time" gorm:"bigint;index;index:idx_user_sub_active,priority:3"`
@@ -999,9 +1004,26 @@ func AdminDeleteUserSubscription(userSubscriptionId int) (string, error) {
 	return "", nil
 }
 
+func advanceSubscriptionResetVersion(sub *UserSubscription) error {
+	if sub == nil {
+		return errors.New("subscription is nil")
+	}
+	if sub.QuotaResetVersion < 0 {
+		return errors.New("subscription reset version is negative")
+	}
+	if sub.QuotaResetVersion == math.MaxInt64 {
+		return errors.New("subscription reset version overflow")
+	}
+	sub.QuotaResetVersion++
+	return nil
+}
+
 func resetUserSubscriptionTx(tx *gorm.DB, sub *UserSubscription, plan *SubscriptionPlan, now int64, advanceResetTime bool) error {
 	if tx == nil || sub == nil || plan == nil {
 		return errors.New("invalid reset args")
+	}
+	if err := advanceSubscriptionResetVersion(sub); err != nil {
+		return err
 	}
 	sub.AmountUsed = 0
 	if advanceResetTime {
@@ -1231,9 +1253,12 @@ type SubscriptionPreConsumeRecord struct {
 	UserId             int    `json:"user_id" gorm:"index"`
 	UserSubscriptionId int    `json:"user_subscription_id" gorm:"index"`
 	PreConsumed        int64  `json:"pre_consumed" gorm:"type:bigint;not null;default:0"`
-	Status             string `json:"status" gorm:"type:varchar(32);index"` // consumed/refunded
-	CreatedAt          int64  `json:"created_at" gorm:"bigint"`
-	UpdatedAt          int64  `json:"updated_at" gorm:"bigint;index"`
+	// Nil identifies a pre-generation-schema or old-writer record. Refunds
+	// fail closed rather than treating an unknown historical generation as 0.
+	SubscriptionResetVersion *int64 `json:"subscription_reset_version" gorm:"type:bigint"`
+	Status                   string `json:"status" gorm:"type:varchar(32);index"` // consumed/refunded
+	CreatedAt                int64  `json:"created_at" gorm:"bigint"`
+	UpdatedAt                int64  `json:"updated_at" gorm:"bigint;index"`
 }
 
 func (r *SubscriptionPreConsumeRecord) BeforeCreate(tx *gorm.DB) error {
@@ -1248,15 +1273,21 @@ func (r *SubscriptionPreConsumeRecord) BeforeUpdate(tx *gorm.DB) error {
 	return nil
 }
 
-func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, plan *SubscriptionPlan, now int64) error {
-	if tx == nil || sub == nil || plan == nil {
-		return errors.New("invalid reset args")
+// projectUserSubscriptionReset applies the reset schedule to an in-memory
+// subscription copy. Callers can use it for mutation-free planning; the
+// transaction-bound wrapper below persists the projection when required.
+func projectUserSubscriptionReset(sub *UserSubscription, plan *SubscriptionPlan, now int64) (bool, error) {
+	if sub == nil || plan == nil {
+		return false, errors.New("invalid reset args")
+	}
+	if sub.QuotaResetVersion < 0 {
+		return false, errors.New("subscription reset version is negative")
 	}
 	if sub.NextResetTime > 0 && sub.NextResetTime > now {
-		return nil
+		return false, nil
 	}
 	if NormalizeResetPeriod(plan.QuotaResetPeriod) == SubscriptionResetNever {
-		return nil
+		return false, nil
 	}
 	baseUnix := sub.LastResetTime
 	if baseUnix <= 0 {
@@ -1274,13 +1305,30 @@ func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, pl
 		if sub.NextResetTime == 0 && next > 0 {
 			sub.NextResetTime = next
 			sub.LastResetTime = base.Unix()
-			return tx.Save(sub).Error
+			return true, nil
 		}
-		return nil
+		return false, nil
+	}
+	if err := advanceSubscriptionResetVersion(sub); err != nil {
+		return false, err
 	}
 	sub.AmountUsed = 0
 	sub.LastResetTime = base.Unix()
 	sub.NextResetTime = next
+	return true, nil
+}
+
+func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, plan *SubscriptionPlan, now int64) error {
+	if tx == nil {
+		return errors.New("invalid reset args")
+	}
+	changed, err := projectUserSubscriptionReset(sub, plan, now)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
 	return tx.Save(sub).Error
 }
 
@@ -1340,6 +1388,9 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 			if err := maybeResetUserSubscriptionWithPlanTx(tx, &sub, plan, now); err != nil {
 				return err
 			}
+			if sub.QuotaResetVersion < 0 {
+				return errors.New("subscription reset version is negative")
+			}
 			usedBefore := sub.AmountUsed
 			if sub.AmountTotal > 0 {
 				remain := sub.AmountTotal - usedBefore
@@ -1348,11 +1399,12 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 				}
 			}
 			record := &SubscriptionPreConsumeRecord{
-				RequestId:          requestId,
-				UserId:             userId,
-				UserSubscriptionId: sub.Id,
-				PreConsumed:        amount,
-				Status:             "consumed",
+				RequestId:                requestId,
+				UserId:                   userId,
+				UserSubscriptionId:       sub.Id,
+				PreConsumed:              amount,
+				SubscriptionResetVersion: common.GetPointer(sub.QuotaResetVersion),
+				Status:                   "consumed",
 			}
 			if err := tx.Create(record).Error; err != nil {
 				var dup SubscriptionPreConsumeRecord
@@ -1388,6 +1440,60 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 	return returnValue, nil
 }
 
+// PlanUserSubscriptionForTaskBilling selects the exact primary subscription
+// identity for a durable task without changing quota or idempotency records.
+// ApplyTaskFundingPreconsume locks and revalidates this exact row later.
+func PlanUserSubscriptionForTaskBilling(userID int, amount int64) (*UserSubscription, error) {
+	if userID <= 0 {
+		return nil, errors.New("invalid userId")
+	}
+	if amount < 0 {
+		return nil, errors.New("amount must not be negative")
+	}
+	now := GetDBTimestamp()
+	var subscriptions []UserSubscription
+	if err := DB.Where("user_id = ? AND status = ? AND end_time > ?", userID, "active", now).
+		Order("end_time asc, id asc").
+		Find(&subscriptions).Error; err != nil {
+		return nil, err
+	}
+	for i := range subscriptions {
+		subscription := &subscriptions[i]
+		if subscription.PlanId > 0 {
+			plan, err := getSubscriptionPlanForTaskBilling(nil, subscription.PlanId)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := projectUserSubscriptionReset(subscription, plan, now); err != nil {
+				return nil, err
+			}
+		}
+		if subscription.AmountTotal == 0 ||
+			subscription.AmountTotal-subscription.AmountUsed >= amount {
+			return subscription, nil
+		}
+	}
+	return nil, errors.New("no active subscription with sufficient quota")
+}
+
+// getSubscriptionPlanForTaskBilling reads reset configuration directly from
+// the primary database without filling the shared plan cache.
+func getSubscriptionPlanForTaskBilling(tx *gorm.DB, planID int) (*SubscriptionPlan, error) {
+	if planID <= 0 {
+		return nil, errors.New("invalid plan id")
+	}
+	query := DB
+	if tx != nil {
+		query = tx
+	}
+	var plan SubscriptionPlan
+	if err := query.Where("id = ?", planID).First(&plan).Error; err != nil {
+		return nil, err
+	}
+	plan.NormalizeDefaults()
+	return &plan, nil
+}
+
 // RefundSubscriptionPreConsume is idempotent and refunds pre-consumed subscription quota by requestId.
 func RefundSubscriptionPreConsume(requestId string) error {
 	if strings.TrimSpace(requestId) == "" {
@@ -1402,15 +1508,54 @@ func RefundSubscriptionPreConsume(requestId string) error {
 		if record.Status == "refunded" {
 			return nil
 		}
-		if record.PreConsumed <= 0 {
-			record.Status = "refunded"
-			return tx.Save(&record).Error
+		if record.Status != "consumed" || record.PreConsumed < 0 ||
+			record.SubscriptionResetVersion == nil ||
+			*record.SubscriptionResetVersion < 0 {
+			return errors.New("subscription pre-consume record identity drift")
 		}
-		if err := PostConsumeUserSubscriptionDelta(record.UserSubscriptionId, -record.PreConsumed); err != nil {
-			return err
+		now := common.GetTimestamp()
+		if record.PreConsumed > 0 {
+			var subscription UserSubscription
+			if err := lockForUpdate(tx).
+				Where("id = ? AND user_id = ?", record.UserSubscriptionId, record.UserId).
+				First(&subscription).Error; err != nil {
+				return err
+			}
+			if subscription.QuotaResetVersion < 0 ||
+				subscription.QuotaResetVersion < *record.SubscriptionResetVersion {
+				return errors.New("subscription pre-consume generation drift")
+			}
+			if subscription.QuotaResetVersion == *record.SubscriptionResetVersion {
+				if subscription.AmountUsed < record.PreConsumed {
+					return errors.New("subscription pre-consume balance drift")
+				}
+				update := tx.Model(&UserSubscription{}).
+					Where("id = ? AND user_id = ?", record.UserSubscriptionId, record.UserId).
+					Updates(map[string]any{
+						"amount_used": gorm.Expr("amount_used - ?", record.PreConsumed),
+						"updated_at":  now,
+					})
+				if update.Error != nil {
+					return update.Error
+				}
+				if update.RowsAffected != 1 {
+					return errors.New("subscription disappeared during refund")
+				}
+			}
 		}
-		record.Status = "refunded"
-		return tx.Save(&record).Error
+		update := tx.Model(&SubscriptionPreConsumeRecord{}).
+			Where("id = ? AND status = ?", record.Id, "consumed").
+			Updates(map[string]any{
+				"status":     "refunded",
+				"updated_at": now,
+			})
+		if update.Error != nil {
+			return update.Error
+		}
+		if update.RowsAffected != 1 {
+			return errors.New("subscription pre-consume record state conflict")
+		}
+		return nil
 	})
 }
 
@@ -1463,7 +1608,13 @@ func CleanupSubscriptionPreConsumeRecords(olderThanSeconds int64) (int64, error)
 		olderThanSeconds = 7 * 24 * 3600
 	}
 	cutoff := GetDBTimestamp() - olderThanSeconds
-	res := DB.Where("updated_at < ?", cutoff).Delete(&SubscriptionPreConsumeRecord{})
+	activeAttempt := DB.Table("task_billing_attempts AS active_attempt").
+		Select("1").
+		Where("active_attempt.request_id = subscription_pre_consume_records.request_id").
+		Where("active_attempt.succeeded_at = ? AND active_attempt.refund_completed_at = ?", 0, 0)
+	res := DB.Where("updated_at < ?", cutoff).
+		Where("NOT EXISTS (?)", activeAttempt).
+		Delete(&SubscriptionPreConsumeRecord{})
 	return res.RowsAffected, res.Error
 }
 

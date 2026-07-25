@@ -17,7 +17,7 @@ type TaskStatus string
 func (t TaskStatus) ToVideoStatus() string {
 	var status string
 	switch t {
-	case TaskStatusQueued, TaskStatusSubmitted:
+	case TaskStatusSubmitting, TaskStatusQueued, TaskStatusSubmitted:
 		status = dto.VideoStatusQueued
 	case TaskStatusInProgress:
 		status = dto.VideoStatusInProgress
@@ -33,6 +33,7 @@ func (t TaskStatus) ToVideoStatus() string {
 
 const (
 	TaskStatusNotStart   TaskStatus = "NOT_START"
+	TaskStatusSubmitting TaskStatus = "SUBMITTING"
 	TaskStatusSubmitted             = "SUBMITTED"
 	TaskStatusQueued                = "QUEUED"
 	TaskStatusInProgress            = "IN_PROGRESS"
@@ -297,7 +298,7 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
 	err := DB.Where("progress != ?", "100%").
-		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
+		Where("status NOT IN ?", []TaskStatus{TaskStatusFailure, TaskStatusSuccess}).
 		Where("submit_time < ?", cutoffUnix).
 		Order("submit_time").
 		Limit(limit).
@@ -334,7 +335,11 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
 	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
+	err = DB.Where("progress != ?", "100%").
+		Where("status NOT IN ?", []TaskStatus{TaskStatusSubmitting, TaskStatusFailure, TaskStatusSuccess}).
+		Limit(limit).
+		Order("id").
+		Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -364,8 +369,21 @@ func HasTaskPollingWork() bool {
 		return true
 	}
 
+	now := time.Now().Unix()
+	submittingBefore := int64(0)
+	if constant.TaskTimeoutMinutes > 0 {
+		submittingBefore = now - int64(constant.TaskTimeoutMinutes)*60
+	}
+	hasAttemptWork, err := HasRecoverableTaskBillingAttempts(
+		now-TaskBillingRequestRecoveryGraceSeconds,
+		submittingBefore,
+	)
+	if err == nil && hasAttemptWork {
+		return true
+	}
+
 	var id int64
-	err := DB.Model(&Task{}).
+	err = DB.Model(&Task{}).
 		Where("status = ?", TaskStatusFailure).
 		Where("quota != ?", 0).
 		Where("(submit_time <= ? OR submit_time >= ?)", 0, TaskRefundLegacyCutoff).

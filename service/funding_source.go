@@ -1,9 +1,11 @@
 package service
 
 import (
+	"errors"
 	"time"
 
 	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 )
 
 // ---------------------------------------------------------------------------
@@ -20,6 +22,32 @@ type FundingSource interface {
 	Settle(delta int) error
 	// Refund 退还所有预扣费
 	Refund() error
+}
+
+func newDurablePlannedFunding(
+	relayInfo *relaycommon.RelayInfo,
+	plan DurableTaskBillingPlan,
+) (FundingSource, error) {
+	if relayInfo == nil {
+		return nil, errors.New("relayInfo is nil")
+	}
+	switch plan.FundingSource {
+	case BillingSourceWallet:
+		return &WalletFunding{userId: relayInfo.UserId}, nil
+	case BillingSourceSubscription:
+		if plan.SubscriptionID <= 0 {
+			return nil, errors.New("durable subscription identity is missing")
+		}
+		return &SubscriptionFunding{
+			requestId:      relayInfo.RequestId,
+			userId:         relayInfo.UserId,
+			modelName:      relayInfo.OriginModelName,
+			amount:         int64(plan.FundingAmount),
+			subscriptionId: plan.SubscriptionID,
+		}, nil
+	default:
+		return nil, errors.New("unsupported durable funding source")
+	}
 }
 
 // ---------------------------------------------------------------------------
