@@ -1,6 +1,8 @@
 package relay
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +18,8 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -84,6 +88,7 @@ type durableSubmissionAdaptor struct {
 	publicResponse    *channel.TaskSubmitHTTPResponse
 	publicResponseErr error
 	postCount         int
+	onPost            func(int, *common.RelayInfo)
 }
 
 func (a *durableSubmissionAdaptor) Init(info *common.RelayInfo) { a.info = info }
@@ -129,6 +134,9 @@ func (a *durableSubmissionAdaptor) DoRequest(_ *gin.Context, info *common.RelayI
 	}
 	a.events = append(a.events, "post_generate")
 	a.postCount++
+	if a.onPost != nil {
+		a.onPost(a.postCount, info)
+	}
 	return a.response, a.requestErr
 }
 func (a *durableSubmissionAdaptor) DoResponse(*gin.Context, *http.Response, *common.RelayInfo) (string, []byte, *dto.TaskError) {
@@ -168,9 +176,197 @@ var _ channel.DurableTaskSubmitter = (*durableSubmissionAdaptor)(nil)
 var _ channel.DeferredTaskSubmitResponder = (*durableSubmissionAdaptor)(nil)
 var _ channel.TaskSubmitFailureClassifier = (*durableSubmissionAdaptor)(nil)
 
+type durableGateBaseAdaptor struct{}
+
+func (*durableGateBaseAdaptor) Init(*common.RelayInfo) {}
+func (*durableGateBaseAdaptor) ValidateRequestAndSetAction(
+	*gin.Context,
+	*common.RelayInfo,
+) *dto.TaskError {
+	return nil
+}
+func (*durableGateBaseAdaptor) BuildRequestURL(*common.RelayInfo) (string, error) {
+	return "", nil
+}
+func (*durableGateBaseAdaptor) BuildRequestHeader(
+	*gin.Context,
+	*http.Request,
+	*common.RelayInfo,
+) error {
+	return nil
+}
+func (*durableGateBaseAdaptor) BuildRequestBody(
+	*gin.Context,
+	*common.RelayInfo,
+) (io.Reader, error) {
+	return strings.NewReader(`{}`), nil
+}
+func (*durableGateBaseAdaptor) DoRequest(
+	*gin.Context,
+	*common.RelayInfo,
+	io.Reader,
+) (*http.Response, error) {
+	return nil, nil
+}
+func (*durableGateBaseAdaptor) DoResponse(
+	*gin.Context,
+	*http.Response,
+	*common.RelayInfo,
+) (string, []byte, *dto.TaskError) {
+	return "", nil, nil
+}
+func (*durableGateBaseAdaptor) GetModelList() []string { return nil }
+func (*durableGateBaseAdaptor) GetChannelName() string { return "durable-gate-test" }
+func (*durableGateBaseAdaptor) FetchTask(
+	string,
+	string,
+	map[string]any,
+	string,
+) (*http.Response, error) {
+	return nil, nil
+}
+func (*durableGateBaseAdaptor) ParseTaskResult([]byte) (*common.TaskInfo, error) {
+	return nil, nil
+}
+func (*durableGateBaseAdaptor) EstimateBilling(
+	*gin.Context,
+	*common.RelayInfo,
+) map[string]float64 {
+	return nil
+}
+func (*durableGateBaseAdaptor) AdjustBillingOnSubmit(
+	*common.RelayInfo,
+	[]byte,
+) map[string]float64 {
+	return nil
+}
+func (*durableGateBaseAdaptor) AdjustBillingOnComplete(
+	*model.Task,
+	*common.TaskInfo,
+) int {
+	return 0
+}
+
+type durableGateMissingFullPrepaid struct{ durableGateBaseAdaptor }
+
+func (*durableGateMissingFullPrepaid) RequiresDurableTaskBeforeSubmit() bool { return true }
+func (*durableGateMissingFullPrepaid) BuildTaskSubmitResponse(
+	*common.RelayInfo,
+	[]byte,
+) (*channel.TaskSubmitHTTPResponse, error) {
+	return &channel.TaskSubmitHTTPResponse{}, nil
+}
+
+type durableGateMissingDurable struct{ durableGateBaseAdaptor }
+
+func (*durableGateMissingDurable) RequiresFullPrepaidBilling() bool { return true }
+func (*durableGateMissingDurable) BuildTaskSubmitResponse(
+	*common.RelayInfo,
+	[]byte,
+) (*channel.TaskSubmitHTTPResponse, error) {
+	return &channel.TaskSubmitHTTPResponse{}, nil
+}
+
+type durableGateMissingResponder struct{ durableGateBaseAdaptor }
+
+func (*durableGateMissingResponder) RequiresFullPrepaidBilling() bool { return true }
+func (*durableGateMissingResponder) RequiresDurableTaskBeforeSubmit() bool {
+	return true
+}
+
+type responderlessCompatibilityAdaptor struct {
+	durableGateBaseAdaptor
+	postCount       int
+	doResponseCount int
+}
+
+func (*responderlessCompatibilityAdaptor) RequiresFullPrepaidBilling() bool { return true }
+func (*responderlessCompatibilityAdaptor) RequiresDurableTaskBeforeSubmit() bool {
+	return true
+}
+func (*responderlessCompatibilityAdaptor) BuildRequestBody(
+	*gin.Context,
+	*common.RelayInfo,
+) (io.Reader, error) {
+	return strings.NewReader(`{"legacy":true}`), nil
+}
+func (a *responderlessCompatibilityAdaptor) DoRequest(
+	*gin.Context,
+	*common.RelayInfo,
+	io.Reader,
+) (*http.Response, error) {
+	a.postCount++
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"id":"LEGACY_UPSTREAM"}`)),
+	}, nil
+}
+func (a *responderlessCompatibilityAdaptor) DoResponse(
+	*gin.Context,
+	*http.Response,
+	*common.RelayInfo,
+) (string, []byte, *dto.TaskError) {
+	a.doResponseCount++
+	return "LEGACY_UPSTREAM", []byte(`{"id":"LEGACY_UPSTREAM"}`), nil
+}
+
 func TestDurableOptionalInterfacesGateSubmission(t *testing.T) {
 	assert.True(t, isDurableFullPrepaidTaskAdaptor(&durableSubmissionAdaptor{}))
+	assert.False(t, isDurableFullPrepaidTaskAdaptor(&durableGateMissingFullPrepaid{}))
+	assert.False(t, isDurableFullPrepaidTaskAdaptor(&durableGateMissingDurable{}))
+	assert.False(t, isDurableFullPrepaidTaskAdaptor(&durableGateMissingResponder{}))
 	assert.False(t, isDurableFullPrepaidTaskAdaptor(nil))
+}
+
+func TestResponderlessAdaptorUsesLegacySubmissionWithoutDurableRows(t *testing.T) {
+	setupRelayTaskSubmissionDB(t)
+	oldModelPrices := ratio_setting.ModelPrice2JSONString()
+	oldGroupRatios := ratio_setting.GroupRatio2JSONString()
+	oldFreeModelPreconsume := operation_setting.GetQuotaSetting().EnableFreeModelPreConsume
+	operation_setting.GetQuotaSetting().EnableFreeModelPreConsume = false
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"legacy-compat-model":0}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		operation_setting.GetQuotaSetting().EnableFreeModelPreConsume = oldFreeModelPreconsume
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldModelPrices))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(oldGroupRatios))
+	})
+
+	adaptor := &responderlessCompatibilityAdaptor{}
+	oldFactory := getTaskSubmitAdaptor
+	getTaskSubmitAdaptor = func(constant.TaskPlatform) channel.TaskAdaptor {
+		return adaptor
+	}
+	t.Cleanup(func() { getTaskSubmitAdaptor = oldFactory })
+
+	c := relayTaskTestContext()
+	c.Set("platform", "59")
+	c.Set(string(constant.ContextKeyChannelType), constant.ChannelTypeSeedDance)
+	c.Set(string(constant.ContextKeyChannelId), 59)
+	c.Set(string(constant.ContextKeyOriginalModel), "legacy-compat-model")
+	info := &common.RelayInfo{
+		RequestId:       "responderless-compatibility",
+		OriginModelName: "legacy-compat-model",
+		UsingGroup:      "default",
+		TaskRelayInfo:   &common.TaskRelayInfo{},
+	}
+
+	result, taskErr := RelayTaskSubmit(c, info)
+	require.Nil(t, taskErr)
+	require.NotNil(t, result)
+	assert.Equal(t, "LEGACY_UPSTREAM", result.UpstreamTaskID)
+	assert.Equal(t, 1, adaptor.postCount)
+	assert.Equal(t, 1, adaptor.doResponseCount)
+	assert.Nil(t, info.Billing)
+	assert.Empty(t, info.BillingAttemptRequestID)
+	assert.Zero(t, info.PersistentTaskID)
+
+	var attemptCount int64
+	require.NoError(t, model.DB.Model(&model.TaskBillingAttempt{}).Count(&attemptCount).Error)
+	assert.Zero(t, attemptCount)
+	var taskCount int64
+	require.NoError(t, model.DB.Model(&model.Task{}).Count(&taskCount).Error)
+	assert.Zero(t, taskCount)
 }
 
 func seedRelayTaskBillingSubjects(t *testing.T, userID, tokenID, quota int) {
@@ -469,7 +665,7 @@ func TestGenerateVerifiesPrimaryDBConsumedMarkersBeforePost(t *testing.T) {
 		billingContext,
 	)
 	require.Nil(t, taskErr)
-	verified, taskErr := applyDurableTaskPreconsume(info, attempt)
+	verified, taskErr := applyDurableTaskPreconsume(nil, info, attempt)
 	require.Nil(t, taskErr)
 	require.NotNil(t, verified)
 	assert.NotZero(t, verified.FundingConsumedAt)
@@ -499,7 +695,7 @@ func TestGenerateUsesMainDBWithBatchUpdateEnabled(t *testing.T) {
 		billingContext,
 	)
 	require.Nil(t, taskErr)
-	verified, taskErr := applyDurableTaskPreconsume(info, attempt)
+	verified, taskErr := applyDurableTaskPreconsume(nil, info, attempt)
 	require.Nil(t, taskErr)
 	require.NotNil(t, verified)
 
@@ -529,7 +725,7 @@ func TestOwnerTransferAndTaskInsertAreAtomic(t *testing.T) {
 		billingContext,
 	)
 	require.Nil(t, taskErr)
-	_, taskErr = applyDurableTaskPreconsume(info, attempt)
+	_, taskErr = applyDurableTaskPreconsume(nil, info, attempt)
 	require.Nil(t, taskErr)
 
 	candidate := newDurableProvisionalTask(
@@ -553,6 +749,151 @@ func TestOwnerTransferAndTaskInsertAreAtomic(t *testing.T) {
 	assert.Equal(t, "SECRET_ROUTE_KEY", prepared.PrivateData.Key)
 }
 
+func TestPrepareRollbackBlocksProviderPostAndRequestOwnerRefundConverges(t *testing.T) {
+	setupRelayTaskSubmissionDB(t)
+	seedRelayTaskBillingSubjects(t, 7001, 8001, 100)
+	require.NoError(t, model.DB.Exec(`
+		CREATE TRIGGER fail_provisional_task_insert
+		BEFORE INSERT ON tasks
+		BEGIN
+			SELECT RAISE(FAIL, 'forced provisional task insert failure');
+		END
+	`).Error)
+	info := paidDurableRelayInfo("prepare-rollback-recovery", 1_750_000_050)
+	info.ChannelId = 59
+	info.ChannelType = constant.ChannelTypeSeedDance
+	info.ApiKey = "SECRET_ROUTE_KEY"
+	info.Action = "text2video"
+	info.UpstreamModelName = "seedance-uncensored"
+	adaptor := &durableSubmissionAdaptor{}
+
+	result, taskErr := submitDurableTask(
+		relayTaskTestContext(),
+		info,
+		adaptor,
+		constant.TaskPlatform("59"),
+		25,
+		taskSubmissionBillingContext(info),
+	)
+	assert.Nil(t, result)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "persist_task_submission_attempt_failed", taskErr.Code)
+	assert.Equal(t, 0, adaptor.postCount)
+
+	attempt, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingOwnerRequest, attempt.Owner)
+	assert.Nil(t, attempt.TaskID)
+	assert.NotZero(t, attempt.FundingConsumedAt)
+	assert.NotZero(t, attempt.TokenConsumedAt)
+	assert.Zero(t, attempt.RefundStartedAt)
+	var taskCount int64
+	require.NoError(t, model.DB.Model(&model.Task{}).Count(&taskCount).Error)
+	assert.Zero(t, taskCount)
+
+	require.NoError(t, service.FailAndRefundTaskSubmission(
+		context.Background(),
+		0,
+		info.BillingAttemptRequestID,
+		"",
+		nil,
+		taskErr.Code,
+		"task submission failed",
+	))
+	refunded, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingOwnerRequest, refunded.Owner)
+	assert.NotZero(t, refunded.FundingRefundedAt)
+	assert.NotZero(t, refunded.TokenRefundedAt)
+	assert.NotZero(t, refunded.RefundCompletedAt)
+	var user model.User
+	require.NoError(t, model.DB.First(&user, 7001).Error)
+	assert.Equal(t, 100, user.Quota)
+	var token model.Token
+	require.NoError(t, model.DB.First(&token, 8001).Error)
+	assert.Equal(t, 100, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+}
+
+func TestAmbiguousPrepareAPIErrorReadsTaskOwnerAndRefundsLinkedTask(t *testing.T) {
+	setupRelayTaskSubmissionDB(t)
+	seedRelayTaskBillingSubjects(t, 7001, 8001, 100)
+	info := paidDurableRelayInfo("prepare-committed-api-error", 1_750_000_060)
+	info.ChannelId = 59
+	info.ChannelType = constant.ChannelTypeSeedDance
+	info.ApiKey = "SECRET_ROUTE_KEY"
+	info.Action = "text2video"
+	info.UpstreamModelName = "seedance-uncensored"
+	adaptor := &durableSubmissionAdaptor{}
+	oldPrepare := prepareTaskSubmissionAttempt
+	prepareTaskSubmissionAttempt = func(
+		candidate *model.Task,
+		persistentTaskID int64,
+		requestID string,
+	) (*model.Task, *model.TaskBillingAttempt, error) {
+		_, _, err := model.PrepareTaskSubmissionAttempt(
+			candidate,
+			persistentTaskID,
+			requestID,
+		)
+		require.NoError(t, err)
+		return nil, nil, errors.New("ambiguous prepare API error after commit")
+	}
+	t.Cleanup(func() { prepareTaskSubmissionAttempt = oldPrepare })
+
+	result, taskErr := submitDurableTask(
+		relayTaskTestContext(),
+		info,
+		adaptor,
+		constant.TaskPlatform("59"),
+		25,
+		taskSubmissionBillingContext(info),
+	)
+	assert.Nil(t, result)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "persist_task_submission_attempt_failed", taskErr.Code)
+	assert.Equal(t, 0, adaptor.postCount)
+	assert.Zero(t, info.PersistentTaskID)
+
+	attempt, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingOwnerTask, attempt.Owner)
+	require.NotNil(t, attempt.TaskID)
+	var tasks []model.Task
+	require.NoError(t, model.DB.Find(&tasks).Error)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, *attempt.TaskID, tasks[0].ID)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitting), tasks[0].Status)
+
+	require.NoError(t, service.FailAndRefundTaskSubmission(
+		context.Background(),
+		0,
+		info.BillingAttemptRequestID,
+		"",
+		nil,
+		taskErr.Code,
+		"task submission failed",
+	))
+	refunded, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingOwnerTask, refunded.Owner)
+	assert.NotZero(t, refunded.FundingRefundedAt)
+	assert.NotZero(t, refunded.TokenRefundedAt)
+	assert.NotZero(t, refunded.RefundCompletedAt)
+	failed, err := model.GetTaskByPrimaryID(*attempt.TaskID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), failed.Status)
+	assert.Equal(t, "100%", failed.Progress)
+	assert.Zero(t, failed.Quota)
+	var user model.User
+	require.NoError(t, model.DB.First(&user, 7001).Error)
+	assert.Equal(t, 100, user.Quota)
+	var token model.Token
+	require.NoError(t, model.DB.First(&token, 8001).Error)
+	assert.Equal(t, 100, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+}
+
 func TestSafe429RetryPreservesFirstSubmitTimeAcrossTwoSeconds(t *testing.T) {
 	setupRelayTaskSubmissionDB(t)
 	seedRelayTaskBillingSubjects(t, 7001, 8001, 100)
@@ -573,7 +914,7 @@ func TestSafe429RetryPreservesFirstSubmitTimeAcrossTwoSeconds(t *testing.T) {
 	require.NotNil(t, plan)
 	firstTime := info.DurableSubmitTime
 	assert.Equal(t, now, firstTime)
-	_, taskErr = applyDurableTaskPreconsume(info, attempt)
+	_, taskErr = applyDurableTaskPreconsume(nil, info, attempt)
 	require.Nil(t, taskErr)
 	candidate := newDurableProvisionalTask(info, constant.TaskPlatform("59"), 25, billingContext)
 	prepared, _, err := model.PrepareTaskSubmissionAttempt(candidate, 0, info.BillingAttemptRequestID)
@@ -593,7 +934,7 @@ func TestSafe429RetryPreservesFirstSubmitTimeAcrossTwoSeconds(t *testing.T) {
 	assert.Equal(t, firstTime, info.DurableSubmitTime)
 	assert.Equal(t, firstTime, retryAttempt.SubmitTime)
 	assert.Equal(t, prepared.ID, info.PersistentTaskID)
-	reverified, taskErr := applyDurableTaskPreconsume(info, retryAttempt)
+	reverified, taskErr := applyDurableTaskPreconsume(nil, info, retryAttempt)
 	require.Nil(t, taskErr)
 	require.NotNil(t, reverified)
 	assert.Equal(t, model.TaskBillingOwnerTask, reverified.Owner)
@@ -608,6 +949,75 @@ func TestSafe429RetryPreservesFirstSubmitTimeAcrossTwoSeconds(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, firstTime, retried.SubmitTime)
 	assert.Equal(t, prepared.TaskID, retried.TaskID)
+}
+
+func TestSafe429RetryReprovesPrimarySubjectsBeforeSecondPost(t *testing.T) {
+	setupRelayTaskSubmissionDB(t)
+	seedRelayTaskBillingSubjects(t, 7001, 8001, 100)
+	retryable := true
+	adaptor := &durableSubmissionAdaptor{
+		response: &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       io.NopCloser(strings.NewReader(`{"code":"rate_limit"}`)),
+		},
+		classification: &channel.TaskSubmitFailureClassification{
+			TaskError: &dto.TaskError{
+				Code:       "upstream_rate_limit_error",
+				Message:    "rate limited",
+				StatusCode: http.StatusTooManyRequests,
+				Retryable:  &retryable,
+				Error:      errors.New("rate limited"),
+			},
+		},
+	}
+	adaptor.onPost = func(count int, _ *common.RelayInfo) {
+		if count == 1 {
+			require.NoError(t, model.DB.Unscoped().Delete(&model.Token{}, 8001).Error)
+		}
+	}
+	info := paidDurableRelayInfo("safe-retry-primary-subject", 1_750_000_200)
+	info.ChannelId = 59
+	info.ChannelType = constant.ChannelTypeSeedDance
+	info.ApiKey = "SECRET_ROUTE_KEY"
+	info.Action = "text2video"
+	info.UpstreamModelName = "seedance-uncensored"
+
+	firstResult, firstErr := submitDurableTask(
+		relayTaskTestContext(),
+		info,
+		adaptor,
+		constant.TaskPlatform("59"),
+		25,
+		taskSubmissionBillingContext(info),
+	)
+	assert.Nil(t, firstResult)
+	require.NotNil(t, firstErr)
+	require.NotNil(t, firstErr.Retryable)
+	assert.True(t, *firstErr.Retryable)
+	assert.Equal(t, 1, adaptor.postCount)
+
+	secondResult, secondErr := submitDurableTask(
+		relayTaskTestContext(),
+		info,
+		adaptor,
+		constant.TaskPlatform("59"),
+		25,
+		taskSubmissionBillingContext(info),
+	)
+	assert.Nil(t, secondResult)
+	require.NotNil(t, secondErr)
+	assert.Equal(t, "seedance_billing_primary_verify_failed", secondErr.Code)
+	assert.Equal(t, 1, adaptor.postCount, "deleted Token must stop the second provider POST")
+
+	attempt, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingOwnerTask, attempt.Owner)
+	assert.NotZero(t, attempt.FundingConsumedAt)
+	assert.NotZero(t, attempt.TokenConsumedAt)
+	assert.Zero(t, attempt.RefundStartedAt)
+	var user model.User
+	require.NoError(t, model.DB.First(&user, 7001).Error)
+	assert.Equal(t, 75, user.Quota, "relay proof failure must not perform a bare refund")
 }
 
 func runDurableSubmissionTest(
@@ -667,6 +1077,7 @@ func TestDurableSubmissionOrderThroughPost(t *testing.T) {
 
 func TestReliablePartialFromClassifierSurvivesTaskError(t *testing.T) {
 	retryable := false
+	const providerSentinel = "UPSTREAM_SECRET_ID PROMPT_SENTINEL MEDIA_SENTINEL"
 	adaptor := &durableSubmissionAdaptor{
 		response: &http.Response{
 			StatusCode: http.StatusBadGateway,
@@ -675,44 +1086,57 @@ func TestReliablePartialFromClassifierSurvivesTaskError(t *testing.T) {
 		classification: &channel.TaskSubmitFailureClassification{
 			TaskError: &dto.TaskError{
 				Code:       "classified_failure",
-				Message:    "classified failure",
+				Message:    "classified failure " + providerSentinel,
 				StatusCode: http.StatusBadGateway,
 				Retryable:  &retryable,
-				Error:      fmt.Errorf("classified failure"),
+				Error:      fmt.Errorf("classified failure %s", providerSentinel),
+				Data:       map[string]any{"provider": providerSentinel},
 			},
-			UpstreamTaskID: "UPSTREAM_CLASSIFIED",
+			UpstreamTaskID: "UPSTREAM_SECRET_ID",
 			TaskData:       []byte(`{"safe":"classified"}`),
 		},
 	}
 	result, taskErr, _ := runDurableSubmissionTest(t, "reliable-classifier", adaptor)
 	require.NotNil(t, taskErr)
 	require.NotNil(t, result)
-	assert.Equal(t, "UPSTREAM_CLASSIFIED", result.UpstreamTaskID)
+	assert.Equal(t, "UPSTREAM_SECRET_ID", result.UpstreamTaskID)
 	assert.Equal(t, []byte(`{"safe":"classified"}`), result.TaskData)
 	assert.Nil(t, taskErr.Data)
+	assert.Equal(t, "upstream task submission failed after task creation", taskErr.Message)
+	require.Error(t, taskErr.Error)
+	assert.Equal(t, "upstream task submission failed after task creation", taskErr.Error.Error())
+	assert.NotContains(t, taskErr.Message, providerSentinel)
+	assert.NotContains(t, taskErr.Error.Error(), providerSentinel)
 	assert.Equal(t, 1, adaptor.postCount)
 }
 
 func TestReliablePartialFromDoResponseSurvivesTaskError(t *testing.T) {
 	retryable := false
+	const providerSentinel = "UPSTREAM_SECRET_ID PROMPT_SENTINEL MEDIA_SENTINEL"
 	adaptor := &durableSubmissionAdaptor{
 		response:     &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`))},
-		responseID:   "UPSTREAM_RESPONSE_ERROR",
+		responseID:   "UPSTREAM_SECRET_ID",
 		responseData: []byte(`{"safe":"response-error"}`),
 		responseErr: &dto.TaskError{
 			Code:       "response_failure",
-			Message:    "response failure",
+			Message:    "response failure " + providerSentinel,
 			StatusCode: http.StatusBadGateway,
 			Retryable:  &retryable,
-			Error:      fmt.Errorf("response failure"),
+			Error:      fmt.Errorf("response failure %s", providerSentinel),
+			Data:       map[string]any{"provider": providerSentinel},
 		},
 	}
 	result, taskErr, _ := runDurableSubmissionTest(t, "reliable-response", adaptor)
 	require.NotNil(t, taskErr)
 	require.NotNil(t, result)
-	assert.Equal(t, "UPSTREAM_RESPONSE_ERROR", result.UpstreamTaskID)
+	assert.Equal(t, "UPSTREAM_SECRET_ID", result.UpstreamTaskID)
 	assert.Equal(t, []byte(`{"safe":"response-error"}`), result.TaskData)
 	assert.Nil(t, taskErr.Data)
+	assert.Equal(t, "upstream task submission failed after task creation", taskErr.Message)
+	require.Error(t, taskErr.Error)
+	assert.Equal(t, "upstream task submission failed after task creation", taskErr.Error.Error())
+	assert.NotContains(t, taskErr.Message, providerSentinel)
+	assert.NotContains(t, taskErr.Error.Error(), providerSentinel)
 	assert.Equal(t, 1, adaptor.postCount)
 }
 

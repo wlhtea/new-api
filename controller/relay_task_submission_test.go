@@ -1,12 +1,15 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -35,6 +39,7 @@ type controllerSubmissionBilling struct {
 	preConsumed int
 	settleErr   error
 	settleCalls int
+	refundCalls int
 }
 
 func (b *controllerSubmissionBilling) Settle(actual int) error {
@@ -44,7 +49,9 @@ func (b *controllerSubmissionBilling) Settle(actual int) error {
 	}
 	return b.settleErr
 }
-func (b *controllerSubmissionBilling) Refund(*gin.Context)      {}
+func (b *controllerSubmissionBilling) Refund(*gin.Context) {
+	b.refundCalls++
+}
 func (b *controllerSubmissionBilling) NeedsRefund() bool        { return false }
 func (b *controllerSubmissionBilling) GetPreConsumedQuota() int { return b.preConsumed }
 func (b *controllerSubmissionBilling) Reserve(int) error        { return nil }
@@ -88,6 +95,82 @@ func setupControllerTaskSubmissionDB(t *testing.T) {
 		common.RedisEnabled = previousRedis
 		_ = sqlDB.Close()
 	})
+}
+
+func configureControllerTaskSubmissionPrice(t *testing.T) {
+	t.Helper()
+	oldModelPrices := ratio_setting.ModelPrice2JSONString()
+	oldGroupRatios := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(fmt.Sprintf(
+		`{"seedance-uncensored":%g}`,
+		25.0/common.QuotaPerUnit,
+	)))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldModelPrices))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(oldGroupRatios))
+	})
+}
+
+func seedControllerTaskBillingSubjects(t *testing.T, userID, tokenID int) {
+	t.Helper()
+	require.NoError(t, model.DB.Create(&model.User{
+		Id:       userID,
+		Username: fmt.Sprintf("controller-user-%d", userID),
+		Quota:    1_000_000,
+	}).Error)
+	require.NoError(t, model.DB.Create(&model.Token{
+		Id:          tokenID,
+		UserId:      userID,
+		Key:         fmt.Sprintf("controller-token-%d", tokenID),
+		Status:      common.TokenStatusEnabled,
+		ExpiredTime: -1,
+		RemainQuota: 1_000_000,
+	}).Error)
+}
+
+func newSeedDanceControllerRelayContext(
+	recorder http.ResponseWriter,
+	baseURL string,
+	requestBody string,
+) *gin.Context {
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/videos",
+		strings.NewReader(requestBody),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("platform", "59")
+	c.Set(string(constant.ContextKeyChannelType), constant.ChannelTypeSeedDance)
+	c.Set(string(constant.ContextKeyChannelId), 59)
+	c.Set(string(constant.ContextKeyChannelKey), "SECRET_ROUTE_KEY")
+	c.Set(string(constant.ContextKeyChannelBaseUrl), baseURL)
+	c.Set(string(constant.ContextKeyOriginalModel), "seedance-uncensored")
+	c.Set("id", 8301)
+	c.Set("token_id", 9301)
+	c.Set("token_key", "controller-token-9301")
+	c.Set("token_name", "controller-token")
+	c.Set("group", "default")
+	c.Set("user_group", "default")
+	c.Set("user_quota", 1_000_000)
+	c.Set("user_setting", dto.UserSetting{BillingPreference: "wallet_only"})
+	c.Set("channel_name", "seedance-fixture")
+	return c
+}
+
+func newSeedDanceControllerRelayInfo(requestID string) *relaycommon.RelayInfo {
+	return &relaycommon.RelayInfo{
+		UserId:          8301,
+		TokenId:         9301,
+		RequestId:       requestID,
+		OriginModelName: "seedance-uncensored",
+		UsingGroup:      "default",
+		UserSetting: dto.UserSetting{
+			BillingPreference: "wallet_only",
+		},
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{},
+	}
 }
 
 func createSubmittedControllerTask(
@@ -372,6 +455,311 @@ func TestTaskErrorNeverSerializesReliablePartial(t *testing.T) {
 	assert.JSONEq(t, `{"code":"local_failure","message":"local failure","data":null}`, string(encoded))
 }
 
+func TestReliablePartialProviderSentinelsNeverReachHTTPOrLogs(t *testing.T) {
+	setupControllerTaskSubmissionDB(t)
+	configureControllerTaskSubmissionPrice(t)
+	seedControllerTaskBillingSubjects(t, 8301, 9301)
+	const providerMessage = "UPSTREAM_SECRET_ID PROMPT_SENTINEL MEDIA_SENTINEL"
+	upstream := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		assert.Equal(t, "/generate", request.URL.Path)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{
+			"task_id":"UPSTREAM_SECRET_ID",
+			"success":false,
+			"status":"failed",
+			"errCode":"PROVIDER_FAILURE",
+			"errMessage":"UPSTREAM_SECRET_ID PROMPT_SENTINEL MEDIA_SENTINEL",
+			"prompt":"PROMPT_SENTINEL",
+			"image_base64":"MEDIA_SENTINEL"
+		}`))
+	}))
+	defer upstream.Close()
+
+	var logBuffer bytes.Buffer
+	common.LogWriterMu.Lock()
+	oldErrorWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logBuffer
+	common.LogWriterMu.Unlock()
+	oldErrorLogEnabled := constant.ErrorLogEnabled
+	constant.ErrorLogEnabled = true
+	t.Cleanup(func() {
+		constant.ErrorLogEnabled = oldErrorLogEnabled
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = oldErrorWriter
+		common.LogWriterMu.Unlock()
+	})
+
+	recorder := httptest.NewRecorder()
+	c := newSeedDanceControllerRelayContext(
+		recorder,
+		upstream.URL,
+		`{
+			"model":"seedance-uncensored",
+			"prompt":"PROMPT_SENTINEL",
+			"duration":10,
+			"size":"1920x1080"
+		}`,
+	)
+	c.Set(common.RequestIdKey, "controller-sanitized-boundary")
+	info := newSeedDanceControllerRelayInfo("controller-sanitized-boundary")
+	result, taskErr := relay.RelayTaskSubmit(c, info)
+	require.NotNil(t, result, "taskErr=%+v", taskErr)
+	assert.Equal(t, "UPSTREAM_SECRET_ID", result.UpstreamTaskID)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "upstream task submission failed after task creation", taskErr.Message)
+	require.Error(t, taskErr.Error)
+	assert.Equal(t, taskErr.Message, taskErr.Error.Error())
+	assert.Nil(t, taskErr.Data)
+
+	processChannelError(
+		c,
+		*types.NewChannelError(
+			59,
+			constant.ChannelTypeSeedDance,
+			"seedance-fixture",
+			false,
+			"SECRET_ROUTE_KEY",
+			false,
+		),
+		types.NewOpenAIError(
+			taskErr.Error,
+			types.ErrorCodeBadResponseStatusCode,
+			taskErr.StatusCode,
+		),
+	)
+	respondTaskError(c, taskErr)
+
+	var errorLogs []model.Log
+	require.NoError(t, model.DB.
+		Where("type = ?", model.LogTypeError).
+		Find(&errorLogs).Error)
+	require.Len(t, errorLogs, 1)
+	sinks := recorder.Body.String() + "\n" + logBuffer.String()
+	for _, entry := range errorLogs {
+		sinks += "\n" + entry.Content + "\n" + entry.Other
+	}
+	for _, sentinel := range strings.Fields(providerMessage) {
+		assert.NotContains(t, sinks, sentinel)
+	}
+	assert.NotContains(t, sinks, "SECRET_ROUTE_KEY")
+	assert.JSONEq(t, `{
+		"code":"upstream_error",
+		"message":"upstream task submission failed after task creation",
+		"data":null
+	}`, recorder.Body.String())
+}
+
+func TestDurableSubmissionExactEndToEndEventOrder(t *testing.T) {
+	setupControllerTaskSubmissionDB(t)
+	common.BatchUpdateEnabled = true
+	configureControllerTaskSubmissionPrice(t)
+	seedControllerTaskBillingSubjects(t, 8301, 9301)
+	upstream := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		assert.Equal(t, http.MethodPost, request.Method)
+		assert.Equal(t, "/generate", request.URL.Path)
+		attempt, err := model.GetTaskBillingAttemptByRequestID("controller-exact-order")
+		assert.NoError(t, err)
+		if err == nil {
+			assert.Equal(t, model.TaskBillingOwnerTask, attempt.Owner)
+			assert.NotZero(t, attempt.FundingConsumedAt)
+			assert.NotZero(t, attempt.TokenConsumedAt)
+			assert.NotZero(t, attempt.PreconsumeCompletedAt)
+			assert.NotNil(t, attempt.TaskID)
+		}
+		var user model.User
+		assert.NoError(t, model.DB.First(&user, 8301).Error)
+		assert.Less(t, user.Quota, 1_000_000)
+		var token model.Token
+		assert.NoError(t, model.DB.First(&token, 9301).Error)
+		assert.Less(t, token.RemainQuota, 1_000_000)
+		assert.Greater(t, token.UsedQuota, 0)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{
+			"task_id":"UPSTREAM_ORDER",
+			"success":true,
+			"status":"submitted"
+		}`))
+	}))
+	defer upstream.Close()
+
+	recorder := httptest.NewRecorder()
+	c := newSeedDanceControllerRelayContext(
+		recorder,
+		upstream.URL,
+		`{
+			"model":"seedance-uncensored",
+			"prompt":"flower",
+			"duration":10,
+			"size":"1920x1080"
+		}`,
+	)
+	c.Set(common.RequestIdKey, "controller-exact-order")
+	var events []string
+	relay.SetTaskSubmissionEventObserver(c, func(event string) {
+		events = append(events, event)
+	})
+	info := newSeedDanceControllerRelayInfo("controller-exact-order")
+
+	result, taskErr := relay.RelayTaskSubmit(c, info)
+	require.Nil(t, taskErr)
+	require.NotNil(t, result)
+	require.NotNil(t, result.HTTPResponse)
+	taskErr = finalizeDurableTaskSubmission(c, info, result)
+	require.Nil(t, taskErr)
+
+	assert.Equal(t, []string{
+		"validate_full_prepaid_shape",
+		"begin_billing_attempt_owner_request",
+		"sync_funding_preconsume_and_marker",
+		"sync_token_preconsume_and_marker",
+		"primary_db_verify_preconsume",
+		"validate_full_prepaid_before_build",
+		"build_body",
+		"insert_provisional_link_attempt_transfer_owner",
+		"post_generate",
+		"attach_upstream_id",
+		"build_public_response",
+		"mark_submitted",
+		"validate_full_prepaid_again",
+		"settle_zero_delta",
+		"mark_billing_attempt_submission_settled",
+		"consume_log",
+		"write_http_200",
+	}, events)
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.NotContains(t, recorder.Body.String(), "UPSTREAM_ORDER")
+
+	attempt, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingOwnerTask, attempt.Owner)
+	assert.NotZero(t, attempt.SubmissionSettledAt)
+	assert.Zero(t, attempt.SucceededAt)
+	assert.Zero(t, attempt.RefundCompletedAt)
+	var task model.Task
+	require.NoError(t, model.DB.First(&task, info.PersistentTaskID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), task.Status)
+	assert.Equal(t, "10%", task.Progress)
+	assert.Equal(t, "UPSTREAM_ORDER", task.PrivateData.UpstreamTaskID)
+	var consumeLogCount int64
+	require.NoError(t, model.DB.Model(&model.Log{}).
+		Where("request_id = ? AND type = ?", info.BillingAttemptRequestID, model.LogTypeConsume).
+		Count(&consumeLogCount).Error)
+	assert.Equal(t, int64(1), consumeLogCount)
+}
+
+func TestControllerSafe429RetryReusesDurableIdentityAndStopsAfterReliableID(t *testing.T) {
+	setupControllerTaskSubmissionDB(t)
+	configureControllerTaskSubmissionPrice(t)
+	seedControllerTaskBillingSubjects(t, 8301, 9301)
+	var postCount atomic.Int32
+	var fakeNow atomic.Int64
+	const firstSubmitTime = int64(1_750_020_000)
+	fakeNow.Store(firstSubmitTime)
+	upstream := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		currentPost := postCount.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		if currentPost == 1 {
+			fakeNow.Add(3)
+			writer.WriteHeader(http.StatusTooManyRequests)
+			_, _ = writer.Write([]byte(`{
+				"success":false,
+				"errCode":"rate_limit",
+				"errMessage":"try later",
+				"data":{}
+			}`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{
+			"task_id":"UPSTREAM_RETRY_SUCCESS",
+			"success":true,
+			"status":"submitted"
+		}`))
+	}))
+	defer upstream.Close()
+
+	recorder := httptest.NewRecorder()
+	c := newSeedDanceControllerRelayContext(
+		recorder,
+		upstream.URL,
+		`{
+			"model":"seedance-uncensored",
+			"prompt":"flower",
+			"duration":10,
+			"size":"1920x1080"
+		}`,
+	)
+	c.Set(common.RequestIdKey, "controller-safe-429-retry")
+	relay.SetTaskSubmissionNow(c, func() time.Time {
+		return time.Unix(fakeNow.Load(), 0)
+	})
+
+	baseURL := upstream.URL
+	autoBan := 0
+	fixtureChannel := &model.Channel{
+		Id:       59,
+		Type:     constant.ChannelTypeSeedDance,
+		Key:      "SECRET_ROUTE_KEY",
+		Name:     "seedance-fixture",
+		BaseURL:  &baseURL,
+		AutoBan:  &autoBan,
+		Status:   common.ChannelStatusEnabled,
+		Models:   "seedance-uncensored",
+		Group:    "default",
+		Priority: common.GetPointer(int64(0)),
+	}
+	oldGetTaskRelayChannel := getTaskRelayChannel
+	getTaskRelayChannel = func(
+		context *gin.Context,
+		_ *relaycommon.RelayInfo,
+		_ *service.RetryParam,
+	) (*model.Channel, *types.NewAPIError) {
+		context.Set(string(constant.ContextKeyChannelId), fixtureChannel.Id)
+		context.Set(string(constant.ContextKeyChannelName), fixtureChannel.Name)
+		context.Set(string(constant.ContextKeyChannelType), fixtureChannel.Type)
+		context.Set(string(constant.ContextKeyChannelKey), fixtureChannel.Key)
+		context.Set(string(constant.ContextKeyChannelBaseUrl), *fixtureChannel.BaseURL)
+		context.Set(string(constant.ContextKeyChannelAutoBan), false)
+		return fixtureChannel, nil
+	}
+	t.Cleanup(func() { getTaskRelayChannel = oldGetTaskRelayChannel })
+	oldRetryTimes := common.RetryTimes
+	common.RetryTimes = 3
+	t.Cleanup(func() { common.RetryTimes = oldRetryTimes })
+
+	RelayTask(c)
+
+	assert.Equal(t, int32(2), postCount.Load())
+	assert.Equal(t, firstSubmitTime+3, fakeNow.Load())
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.NotContains(t, recorder.Body.String(), "UPSTREAM_RETRY_SUCCESS")
+	var attempts []model.TaskBillingAttempt
+	require.NoError(t, model.DB.Find(&attempts).Error)
+	require.Len(t, attempts, 1)
+	assert.Equal(t, "controller-safe-429-retry", attempts[0].RequestID)
+	assert.Equal(t, firstSubmitTime, attempts[0].SubmitTime)
+	assert.Equal(t, model.TaskBillingOwnerTask, attempts[0].Owner)
+	require.NotNil(t, attempts[0].TaskID)
+	assert.NotZero(t, attempts[0].SubmissionSettledAt)
+	assert.Zero(t, attempts[0].SucceededAt)
+	var tasks []model.Task
+	require.NoError(t, model.DB.Find(&tasks).Error)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, *attempts[0].TaskID, tasks[0].ID)
+	assert.Equal(t, attempts[0].PublicTaskID, tasks[0].TaskID)
+	assert.Equal(t, firstSubmitTime, tasks[0].SubmitTime)
+	assert.Equal(t, "UPSTREAM_RETRY_SUCCESS", tasks[0].PrivateData.UpstreamTaskID)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), tasks[0].Status)
+}
+
 func TestDeferredSuccessMarksSubmissionSettledBeforeLogAndHTTP(t *testing.T) {
 	setupControllerTaskSubmissionDB(t)
 	billing := &controllerSubmissionBilling{preConsumed: 25}
@@ -475,6 +863,111 @@ func TestSettleFailureTransitionsAndRefundsTaskAttempt(t *testing.T) {
 		Where("request_id = ? AND type = ?", info.BillingAttemptRequestID, model.LogTypeConsume).
 		Count(&logCount).Error)
 	assert.Zero(t, logCount)
+}
+
+func TestSubmissionMarkerFailurePreservesReliableIDAndBlocksLogAndHTTP(t *testing.T) {
+	setupControllerTaskSubmissionDB(t)
+	billing := &controllerSubmissionBilling{preConsumed: 25}
+	info, result, task := createSubmittedControllerTask(t, "submission-marker-failure", billing)
+	require.NoError(t, model.DB.Exec(`
+		CREATE TRIGGER fail_submission_settled_marker
+		BEFORE UPDATE OF submission_settled_at ON task_billing_attempts
+		WHEN NEW.submission_settled_at != OLD.submission_settled_at
+		BEGIN
+			SELECT RAISE(FAIL, 'forced submission marker failure');
+		END
+	`).Error)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	c.Set(common.RequestIdKey, info.BillingAttemptRequestID)
+
+	taskErr := finalizeDurableTaskSubmission(c, info, result)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "seedance_billing_settlement_failed", taskErr.Code)
+	assert.Equal(t, 1, billing.settleCalls)
+	assert.False(t, c.Writer.Written())
+	assert.Zero(t, recorder.Body.Len())
+
+	failed, err := model.GetTaskByPrimaryID(task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), failed.Status)
+	assert.Equal(t, "100%", failed.Progress)
+	assert.Equal(t, "UPSTREAM_DEFERRED", failed.PrivateData.UpstreamTaskID)
+	assert.Zero(t, failed.Quota)
+	attempt, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingOwnerTask, attempt.Owner)
+	assert.Zero(t, attempt.SubmissionSettledAt)
+	assert.Zero(t, attempt.SucceededAt)
+	assert.NotZero(t, attempt.FundingRefundedAt)
+	assert.NotZero(t, attempt.TokenRefundedAt)
+	assert.NotZero(t, attempt.RefundCompletedAt)
+	var consumeLogCount int64
+	require.NoError(t, model.DB.Model(&model.Log{}).
+		Where("request_id = ? AND type = ?", info.BillingAttemptRequestID, model.LogTypeConsume).
+		Count(&consumeLogCount).Error)
+	assert.Zero(t, consumeLogCount)
+}
+
+func TestControllerUnreadableDurableOwnerSkipsBareRefundAndRecoversLater(t *testing.T) {
+	setupControllerTaskSubmissionDB(t)
+	billing := &controllerSubmissionBilling{preConsumed: 25}
+	info, result, task := createSubmittedControllerTask(t, "controller-owner-unreadable", billing)
+	var userBefore model.User
+	require.NoError(t, model.DB.First(&userBefore, info.UserId).Error)
+	var tokenBefore model.Token
+	require.NoError(t, model.DB.First(&tokenBefore, info.TokenId).Error)
+	c := taskSubmissionControllerContext()
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	taskErr := &dto.TaskError{
+		Code:       "forced_controller_failure",
+		Message:    "forced controller failure",
+		StatusCode: http.StatusInternalServerError,
+		Error:      errors.New("forced controller failure"),
+	}
+
+	primaryDB := model.DB
+	closedDB, err := gorm.Open(
+		sqlite.Open("file:controller-owner-unreadable-closed?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	require.NoError(t, err)
+	sqlDB, err := closedDB.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Close())
+	model.DB = closedDB
+	recoveryErr := recoverDurableTaskSubmission(c, info, result, taskErr)
+	refundLegacyTaskBillingOnFailure(c, info, taskErr)
+	model.DB = primaryDB
+
+	require.Error(t, recoveryErr)
+	assert.Equal(t, 0, billing.refundCalls)
+	var userAfterFailure model.User
+	require.NoError(t, model.DB.First(&userAfterFailure, info.UserId).Error)
+	var tokenAfterFailure model.Token
+	require.NoError(t, model.DB.First(&tokenAfterFailure, info.TokenId).Error)
+	assert.Equal(t, userBefore.Quota, userAfterFailure.Quota)
+	assert.Equal(t, tokenBefore.RemainQuota, tokenAfterFailure.RemainQuota)
+	attempt, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingOwnerTask, attempt.Owner)
+	assert.Zero(t, attempt.RefundStartedAt)
+	assert.Zero(t, attempt.RefundCompletedAt)
+
+	require.NoError(t, recoverDurableTaskSubmission(c, info, result, taskErr))
+	refunded, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.NotZero(t, refunded.FundingRefundedAt)
+	assert.NotZero(t, refunded.TokenRefundedAt)
+	assert.NotZero(t, refunded.RefundCompletedAt)
+	failed, err := model.GetTaskByPrimaryID(task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), failed.Status)
+	assert.Equal(t, "100%", failed.Progress)
+	assert.Equal(t, "UPSTREAM_DEFERRED", failed.PrivateData.UpstreamTaskID)
+	assert.Zero(t, failed.Quota)
+	assert.Equal(t, 0, billing.refundCalls)
 }
 
 func createSeedDanceReconciliationFixture(

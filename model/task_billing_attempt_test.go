@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -854,6 +855,154 @@ func TestVerifyTaskBillingAttemptPreconsumedRejectsPrimaryIdentityDrift(t *testi
 
 	_, err = VerifyTaskBillingAttemptPreconsumed(snapshot.RequestID)
 	assert.ErrorIs(t, err, ErrTaskBillingIdentityDrift)
+}
+
+func linkBillingAttemptForSubmitProof(
+	t *testing.T,
+	snapshot TaskBillingAttemptSnapshot,
+) *Task {
+	t.Helper()
+	_, err := BeginTaskBillingAttempt(snapshot)
+	require.NoError(t, err)
+	_, err = ApplyTaskFundingPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	_, err = ApplyTaskTokenPreconsume(snapshot.RequestID)
+	require.NoError(t, err)
+	task, _, err := PrepareTaskSubmissionAttempt(
+		&Task{
+			TaskID:     snapshot.PublicTaskID,
+			Platform:   constant.TaskPlatform("59"),
+			UserId:     snapshot.UserID,
+			Group:      "default",
+			ChannelId:  59,
+			Quota:      snapshot.FundingAmount,
+			Status:     TaskStatusSubmitting,
+			SubmitTime: snapshot.SubmitTime,
+			Progress:   "0%",
+			PrivateData: TaskPrivateData{
+				BillingSource:  snapshot.FundingSource,
+				SubscriptionId: snapshot.SubscriptionID,
+				TokenId:        snapshot.TokenID,
+				BillingContext: snapshot.BillingContext,
+			},
+		},
+		0,
+		snapshot.RequestID,
+	)
+	require.NoError(t, err)
+	return task
+}
+
+func TestVerifyTaskBillingAttemptPreconsumedForSubmitLinkedOwner(t *testing.T) {
+	t.Run("linked owner success", func(t *testing.T) {
+		truncateTables(t)
+		snapshot := billingSnapshot("verify-linked-submit", 100)
+		seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+		task := linkBillingAttemptForSubmitProof(t, snapshot)
+
+		attempt, err := VerifyTaskBillingAttemptPreconsumedForSubmit(snapshot.RequestID)
+		require.NoError(t, err)
+		require.NotNil(t, attempt.TaskID)
+		assert.Equal(t, task.ID, *attempt.TaskID)
+		assert.Equal(t, TaskBillingOwnerTask, attempt.Owner)
+	})
+
+	t.Run("deleted token fails closed", func(t *testing.T) {
+		truncateTables(t)
+		snapshot := billingSnapshot("verify-linked-token-deleted", 100)
+		seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+		linkBillingAttemptForSubmitProof(t, snapshot)
+		require.NoError(t, DB.Unscoped().Delete(&Token{}, snapshot.TokenID).Error)
+
+		_, err := VerifyTaskBillingAttemptPreconsumedForSubmit(snapshot.RequestID)
+		require.Error(t, err)
+	})
+
+	t.Run("token owner drift fails closed", func(t *testing.T) {
+		truncateTables(t)
+		snapshot := billingSnapshot("verify-linked-token-owner", 100)
+		seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+		linkBillingAttemptForSubmitProof(t, snapshot)
+		require.NoError(t, DB.Model(&Token{}).
+			Where("id = ?", snapshot.TokenID).
+			Update("user_id", snapshot.UserID+1).Error)
+
+		_, err := VerifyTaskBillingAttemptPreconsumedForSubmit(snapshot.RequestID)
+		assert.ErrorIs(t, err, ErrTaskBillingIdentityDrift)
+	})
+
+	t.Run("missing wallet subject fails closed", func(t *testing.T) {
+		truncateTables(t)
+		snapshot := billingSnapshot("verify-linked-wallet-missing", 100)
+		seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+		linkBillingAttemptForSubmitProof(t, snapshot)
+		require.NoError(t, DB.Unscoped().Delete(&User{}, snapshot.UserID).Error)
+
+		_, err := VerifyTaskBillingAttemptPreconsumedForSubmit(snapshot.RequestID)
+		require.Error(t, err)
+	})
+
+	t.Run("linked task identity drift fails closed", func(t *testing.T) {
+		truncateTables(t)
+		snapshot := billingSnapshot("verify-linked-task-drift", 100)
+		seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+		task := linkBillingAttemptForSubmitProof(t, snapshot)
+		require.NoError(t, DB.Model(&Task{}).
+			Where("id = ?", task.ID).
+			Update("quota", snapshot.FundingAmount+1).Error)
+
+		_, err := VerifyTaskBillingAttemptPreconsumedForSubmit(snapshot.RequestID)
+		assert.ErrorIs(t, err, ErrTaskBillingIdentityDrift)
+	})
+
+	t.Run("subscription record drift fails closed", func(t *testing.T) {
+		truncateTables(t)
+		now := time.Now().Unix()
+		snapshot := billingSnapshot("verify-linked-subscription-record", 100)
+		snapshot.FundingSource = taskBillingFundingSubscription
+		snapshot.SubscriptionID = 701
+		seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+		require.NoError(t, DB.Create(&UserSubscription{
+			Id:          snapshot.SubscriptionID,
+			UserId:      snapshot.UserID,
+			AmountTotal: 1_000,
+			Status:      "active",
+			StartTime:   now - 10,
+			EndTime:     now + 3_600,
+		}).Error)
+		linkBillingAttemptForSubmitProof(t, snapshot)
+		_, err := VerifyTaskBillingAttemptPreconsumedForSubmit(snapshot.RequestID)
+		require.NoError(t, err)
+
+		require.NoError(t, DB.Model(&SubscriptionPreConsumeRecord{}).
+			Where("request_id = ?", snapshot.RequestID).
+			Update("status", "refunded").Error)
+		_, err = VerifyTaskBillingAttemptPreconsumedForSubmit(snapshot.RequestID)
+		assert.ErrorIs(t, err, ErrTaskBillingIdentityDrift)
+	})
+
+	t.Run("missing subscription subject fails closed", func(t *testing.T) {
+		truncateTables(t)
+		now := time.Now().Unix()
+		snapshot := billingSnapshot("verify-linked-subscription-missing", 100)
+		snapshot.FundingSource = taskBillingFundingSubscription
+		snapshot.SubscriptionID = 702
+		seedBillingBalances(t, snapshot.UserID, snapshot.TokenID, 1_000, 1_000)
+		require.NoError(t, DB.Create(&UserSubscription{
+			Id:          snapshot.SubscriptionID,
+			UserId:      snapshot.UserID,
+			AmountTotal: 1_000,
+			Status:      "active",
+			StartTime:   now - 10,
+			EndTime:     now + 3_600,
+		}).Error)
+		linkBillingAttemptForSubmitProof(t, snapshot)
+		require.NoError(t, DB.Unscoped().
+			Delete(&UserSubscription{}, snapshot.SubscriptionID).Error)
+
+		_, err := VerifyTaskBillingAttemptPreconsumedForSubmit(snapshot.RequestID)
+		require.Error(t, err)
+	})
 }
 
 func TestFundingRefundMutationAndMarkerAreAtomic(t *testing.T) {

@@ -885,63 +885,155 @@ func ApplyTaskTokenPreconsume(requestID string) (TaskBillingApplyResult, error) 
 	return taskBillingApplyResult(attempt, applied, attempt.PreconsumeCompletedAt != 0), nil
 }
 
-func VerifyTaskBillingAttemptPreconsumed(requestID string) (*TaskBillingAttempt, error) {
-	attempt, err := GetTaskBillingAttemptByRequestID(requestID)
-	if err != nil {
-		return nil, err
-	}
+func validateTaskBillingAttemptPreconsumed(attempt *TaskBillingAttempt) error {
 	if err := validateTaskBillingAttempt(attempt); err != nil {
-		return nil, err
+		return err
 	}
 	if attempt.FundingConsumedAt == 0 || attempt.TokenConsumedAt == 0 ||
 		attempt.PreconsumeCompletedAt == 0 {
-		return nil, ErrTaskBillingAttemptState
+		return ErrTaskBillingAttemptState
 	}
-	if attempt.Owner != TaskBillingOwnerRequest || attempt.TaskID != nil {
-		return nil, ErrTaskBillingAttemptState
+	if attempt.RefundStartedAt != 0 || attempt.RefundCompletedAt != 0 ||
+		attempt.SucceededAt != 0 || attempt.SubmissionSettledAt != 0 {
+		return ErrTaskBillingAttemptState
 	}
-	if attempt.RefundStartedAt != 0 || attempt.RefundCompletedAt != 0 || attempt.SucceededAt != 0 {
-		return nil, ErrTaskBillingAttemptState
+	return nil
+}
+
+func verifyTaskBillingAttemptPrimarySubjects(
+	db *gorm.DB,
+	attempt *TaskBillingAttempt,
+) error {
+	if db == nil || attempt == nil {
+		return ErrTaskBillingIdentityDrift
 	}
 	if !attempt.IsFree {
 		switch attempt.FundingSource {
 		case taskBillingFundingWallet:
 			var user User
-			if err := DB.Where("id = ?", attempt.UserID).First(&user).Error; err != nil {
-				return nil, err
+			if err := lockForUpdate(db).
+				Where("id = ?", attempt.UserID).
+				First(&user).Error; err != nil {
+				return err
 			}
 		case taskBillingFundingSubscription:
 			var record SubscriptionPreConsumeRecord
-			if err := DB.Where("request_id = ?", attempt.RequestID).First(&record).Error; err != nil {
-				return nil, err
+			if err := lockForUpdate(db).
+				Where("request_id = ?", attempt.RequestID).
+				First(&record).Error; err != nil {
+				return err
 			}
 			if record.UserId != attempt.UserID ||
 				record.UserSubscriptionId != attempt.SubscriptionID ||
 				record.PreConsumed != int64(attempt.FundingAmount) ||
 				record.Status != "consumed" {
-				return nil, ErrTaskBillingIdentityDrift
+				return ErrTaskBillingIdentityDrift
 			}
 			var subscription UserSubscription
-			if err := DB.Where("id = ? AND user_id = ?", attempt.SubscriptionID, attempt.UserID).
+			if err := lockForUpdate(db).
+				Where("id = ? AND user_id = ?", attempt.SubscriptionID, attempt.UserID).
 				First(&subscription).Error; err != nil {
-				return nil, err
+				return err
 			}
 		default:
-			return nil, ErrTaskBillingIdentityDrift
+			return ErrTaskBillingIdentityDrift
 		}
 	}
 	if attempt.TokenID > 0 {
 		var token Token
-		if err := DB.Where("id = ?", attempt.TokenID).First(&token).Error; err != nil {
-			return nil, err
+		if err := lockForUpdate(db).
+			Where("id = ?", attempt.TokenID).
+			First(&token).Error; err != nil {
+			return err
 		}
 		if token.UserId != attempt.UserID {
-			return nil, ErrTaskBillingIdentityDrift
+			return ErrTaskBillingIdentityDrift
 		}
 	} else if attempt.TokenAmount != 0 {
-		return nil, ErrTaskBillingIdentityDrift
+		return ErrTaskBillingIdentityDrift
+	}
+	return nil
+}
+
+func VerifyTaskBillingAttemptPreconsumed(requestID string) (*TaskBillingAttempt, error) {
+	attempt, err := GetTaskBillingAttemptByRequestID(requestID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateTaskBillingAttemptPreconsumed(attempt); err != nil {
+		return nil, err
+	}
+	if attempt.Owner != TaskBillingOwnerRequest || attempt.TaskID != nil {
+		return nil, ErrTaskBillingAttemptState
+	}
+	if err := verifyTaskBillingAttemptPrimarySubjects(DB, attempt); err != nil {
+		return nil, err
 	}
 	return attempt, nil
+}
+
+// VerifyTaskBillingAttemptPreconsumedForSubmit performs a fresh, uncached
+// primary-database proof immediately before a provider POST. It accepts the
+// initial request owner and a linked Task owner, but a linked Task must still be
+// the exact immutable SUBMITTING/0% provisional record with no upstream ID.
+func VerifyTaskBillingAttemptPreconsumedForSubmit(
+	requestID string,
+) (*TaskBillingAttempt, error) {
+	if requestID == "" {
+		return nil, ErrTaskBillingIdentityDrift
+	}
+	var verified TaskBillingAttempt
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).
+			Where("request_id = ?", requestID).
+			First(&verified).Error; err != nil {
+			return err
+		}
+		if err := validateTaskBillingAttemptPreconsumed(&verified); err != nil {
+			return err
+		}
+		switch verified.Owner {
+		case TaskBillingOwnerRequest:
+			if verified.TaskID != nil {
+				return ErrTaskBillingIdentityDrift
+			}
+		case TaskBillingOwnerTask:
+			if verified.TaskID == nil || *verified.TaskID <= 0 {
+				return ErrTaskBillingIdentityDrift
+			}
+			var task Task
+			if err := lockForUpdate(tx).
+				Where("id = ? AND task_id = ?", *verified.TaskID, verified.PublicTaskID).
+				First(&task).Error; err != nil {
+				return err
+			}
+			if task.Status != TaskStatusSubmitting ||
+				task.Progress != "0%" ||
+				task.PrivateData.UpstreamTaskID != "" ||
+				task.UserId != verified.UserID ||
+				task.SubmitTime != verified.SubmitTime ||
+				task.Quota != verified.FundingAmount ||
+				task.PrivateData.BillingSource != verified.FundingSource ||
+				task.PrivateData.SubscriptionId != verified.SubscriptionID ||
+				task.PrivateData.TokenId != verified.TokenID {
+				return ErrTaskBillingIdentityDrift
+			}
+			digest, err := DigestTaskBillingContext(task.PrivateData.BillingContext)
+			if err != nil {
+				return err
+			}
+			if digest != verified.BillingContextDigest {
+				return ErrTaskBillingIdentityDrift
+			}
+		default:
+			return ErrTaskBillingIdentityDrift
+		}
+		return verifyTaskBillingAttemptPrimarySubjects(tx, &verified)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &verified, nil
 }
 
 func validateTaskBillingRefundOwner(
