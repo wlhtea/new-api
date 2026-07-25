@@ -16,7 +16,7 @@
 
 Task 5 拆为两个可独立审查的提交，严格按以下顺序实施：
 
-1. **Task 5A：Durable model primitives 与 component refund ledger**
+1. **Task 5A：Durable billing attempt、model primitives 与 component ledger**
 2. **Task 5B：Relay/controller orchestration 与 administrator reconciliation**
 
 Task 5B 依赖 Task 5A，不得用旧的 `ClaimQuotaForRefund`/
@@ -38,13 +38,18 @@ Dance durable submit。
 
 本文保持以下总不变量：
 
-- `/generate` 前完成全额预扣和 `SUBMITTING/0%` provisional Task；
-- Task 持久化前由 request `BillingSession` 持有退款责任，Task 与 refund
-  ledger 同事务提交后由 Task 唯一持有；
+- 以 `RequestID` 唯一标识的 durable billing-attempt ledger 必须先于全额预扣
+  创建；`/generate` 前必须完成同步主库预扣、ledger owner transfer 和
+  `SUBMITTING/0%` provisional Task；
+- request-owned 与 task-owned 退款共用同一 billing-attempt ledger 和同一组
+  component markers；Task insert、ledger link 和 owner transfer 同事务；
+- 主库暂时不可读时 fail closed，不执行 ledger 外的 `BillingSession.Refund`
+  或任何裸余额增量，由 stale-attempt/failed-Task sweep 恢复；
 - 正常 Attach 和 Commit 严格，reconciliation-only attach 只能在完整的已持久
   身份匹配后补写，且绝不复活状态；
-- wallet/subscription funding 与 Token 是两个独立 component；每个
-  component 的主数据库余额 mutation 和完成 marker 在同一事务；
+- wallet/subscription funding 与 Token 是两个独立 component；每个同步
+  preconsume/refund 主数据库 mutation 和对应 marker 在同一事务，且
+  `BatchUpdateEnabled=true` 也不得经过 batch queue；
 - `Task.Quota` 只在两个 component 都完成时清零；
 - 成功消费日志和 HTTP 200 只能发生在 Task commit 与 zero-delta settle 之后；
 - 不改变未实现 durable marker 的旧 adaptor 的响应、插入和错误处理语义。
@@ -69,60 +74,79 @@ Attach 更新 `private_data` 时必须在事务内锁行、读取最新 JSON、�
 回写。退款 marker 使用独立的标量表，避免与 Attach、轮询结果或 stored Key
 互相覆盖。
 
-### 3.2 新增 `TaskRefundState`
+### 3.2 新增 `TaskBillingAttempt`
 
-新增 `model/task_refund.go`：
+新增 `model/task_billing_attempt.go`。ledger 在 Task 之前存在，以
+`RequestID` 唯一定位一次计费尝试，而不是以尚不存在的 Task 为主键：
 
 ```go
-type TaskRefundState struct {
-    TaskID int64 `json:"-" gorm:"primaryKey;autoIncrement:false"`
+type TaskBillingAttempt struct {
+    ID        int64  `json:"-"`
+    RequestID string `json:"-" gorm:"type:varchar(64);uniqueIndex"`
+    TaskID    *int64 `json:"-" gorm:"uniqueIndex"`
+    Owner     string `json:"-" gorm:"type:varchar(16);index"` // request/task
 
-    RequestID      string `json:"-" gorm:"type:varchar(64);index"`
-    FundingSource  string `json:"-" gorm:"type:varchar(32)"`
+    PublicTaskID   string `json:"-" gorm:"type:varchar(64);index"`
+    SubmitTime     int64  `json:"-"`
+    IsFree         bool   `json:"-"`
     UserID         int    `json:"-" gorm:"index"`
+    FundingSource  string `json:"-" gorm:"type:varchar(32)"`
     SubscriptionID int    `json:"-" gorm:"index"`
     FundingAmount  int    `json:"-"`
     TokenID        int    `json:"-" gorm:"index"`
     TokenAmount    int    `json:"-"`
 
-    FundingAppliedAt int64 `json:"-" gorm:"index"`
-    TokenAppliedAt   int64 `json:"-" gorm:"index"`
-    CompletedAt      int64 `json:"-" gorm:"index"`
-    CreatedAt        int64 `json:"-"`
-    UpdatedAt        int64 `json:"-"`
+    FundingConsumedAt    int64 `json:"-" gorm:"index"`
+    TokenConsumedAt      int64 `json:"-" gorm:"index"`
+    PreconsumeCompletedAt int64 `json:"-" gorm:"index"`
+    FundingRefundedAt    int64 `json:"-" gorm:"index"`
+    TokenRefundedAt      int64 `json:"-" gorm:"index"`
+    RefundStartedAt      int64 `json:"-" gorm:"index"`
+    RefundCompletedAt    int64 `json:"-" gorm:"index"`
+    OwnerTransferredAt   int64 `json:"-"`
+    SucceededAt          int64 `json:"-" gorm:"index"`
+    CreatedAt            int64 `json:"-"`
+    UpdatedAt            int64 `json:"-" gorm:"index"`
 }
 ```
 
 约束：
 
-- `TaskID` 对应 `tasks.id`，每个 durable Task 恰好一行；
-- `RequestID`、source、user/subscription/Token identity 和两个 amount 在创建
-  后不可修改；
-- `FundingAmount == Task.Quota == Billing.GetPreConsumedQuota()`；
+- `RequestID` 非空且全局唯一；同一 request 的 retry 只能复用该行；
+- 初始 `Owner="request"`、`TaskID=nil`；只有 Task link 事务可原子写入唯一
+  `TaskID`、`Owner="task"` 和 `OwnerTransferredAt`；
+- immutable identity 包含 public Task ID、首次 `SubmitTime`、free/paid
+  分类、user/source/subscription/Token identity 和两个 amount；
+- paid attempt 的 `UserID` 非零、`FundingSource` 为 wallet/subscription；
+  wallet 要求 `SubscriptionID=0`，subscription 要求
+  `SubscriptionID>0` 和非空 `RequestID`；
+- `FundingSource==""` 只对已由 full-prepaid validator 确认的 free attempt
+  合法；此时 `IsFree=true`、两个 amount 和 `SubscriptionID` 都为零；
+- free attempt 仍保留真实 `TokenID`，并在 Task link 时要求它与
+  `Task.PrivateData.TokenId` 相等；不得把 free 当成“无 Token identity”；
+- paid-zero attempt 保持 `IsFree=false` 和原 wallet/subscription source；
+  其零额 component 必须通过同步 Apply 事务写 marker，不能伪装成 free；
 - 非 playground Token 请求的 `TokenAmount` 等于实际 Token 预扣额；
-- playground 或未扣 Token 时 `TokenAmount=0`；
-- Token unlimited 不能仅因 unlimited 标志而把 `TokenAmount` 置零，因为现有
-  预扣逻辑仍会扣 Token quota；
-- free Task 的 `Quota=0`、`Billing=nil`，仍在同一事务创建零额 ledger，并把
-  两个 component marker 与 `CompletedAt` 初始化为已完成；
-- `CompletedAt != 0` 当且仅当 `FundingAppliedAt != 0 &&
-  TokenAppliedAt != 0`；除 free Task 的创建事务外，任何无需余额 mutation
-  的 component 也必须由对应 Apply 事务先持久化 marker，之后才可完成；
+  playground/未扣 Token 可为零；unlimited 不能仅因 unlimited 标志置零；
+- `PreconsumeCompletedAt != 0` 当且仅当两个 `*ConsumedAt` 均非零；
+  `RefundCompletedAt != 0` 当且仅当两个 `*RefundedAt` 均非零；
+- `SucceededAt` 与 `RefundStartedAt/RefundCompletedAt` 互斥；
 - 表内不得保存 Key、TokenKey、prompt、图片、Base64、请求体或供应商响应。
 
-把 `TaskRefundState` 加到普通和 fast 两条 AutoMigrate 路径以及 model 测试
-数据库。不要依赖隐式外键 cascade；Task 与 ledger 的创建和读取由明确事务
-控制。`model/task_cas_test.go` 与 `service/task_billing_test.go` 的测试
-setup/cleanup 必须显式 migrate 并 truncate `TaskRefundState` 与
-`SubscriptionPreConsumeRecord`，且先清 ledger/record 再清其关联主体。
+把 `TaskBillingAttempt` 加到普通、fast 和 model/service 测试 AutoMigrate。
+测试 cleanup 先清 attempt/record 再清其关联主体。
 
-### 3.3 Task 与 ledger 同事务
+### 3.3 Attempt 必须先于同步全额预扣
 
 新增：
 
 ```go
-type TaskRefundSnapshot struct {
+type TaskBillingAttemptSnapshot struct {
     RequestID      string
+    PublicTaskID   string
+    SubmitTime     int64
+    IsFree         bool
+    UserID         int
     FundingSource  string
     SubscriptionID int
     FundingAmount  int
@@ -130,53 +154,99 @@ type TaskRefundSnapshot struct {
     TokenAmount    int
 }
 
+func BeginTaskBillingAttempt(
+    snapshot TaskBillingAttemptSnapshot,
+) (*TaskBillingAttempt, error)
+
+func ApplyTaskFundingPreconsume(
+    requestID string,
+) (TaskBillingApplyResult, error)
+
+func ApplyTaskTokenPreconsume(
+    requestID string,
+) (TaskBillingApplyResult, error)
+
+func VerifyTaskBillingAttemptPreconsumed(
+    requestID string,
+) (*TaskBillingAttempt, error)
+```
+
+顺序固定为：
+
+```text
+validate snapshot shape
+INSERT/GET UNIQUE TaskBillingAttempt owner=request
+ApplyTaskFundingPreconsume
+ApplyTaskTokenPreconsume
+primary DB VerifyTaskBillingAttemptPreconsumed
+```
+
+free attempt 没有余额动作，`BeginTaskBillingAttempt` 在创建事务内同时初始化
+两个 `*ConsumedAt` 与 `PreconsumeCompletedAt`；后续 Apply 观察 marker 幂等
+返回。paid-zero 不走该捷径，仍由对应 Apply 事务写 no-op marker。
+
+wallet 与 Token preconsume 都锁 attempt 和相应主库余额行，执行同步主库扣减，
+并在同一事务写对应 `*ConsumedAt`；`BatchUpdateEnabled=true` 时也必须绕过
+batch queue。subscription preconsume 在同一 transaction 内创建/锁定
+`SubscriptionPreConsumeRecord`、更新 `UserSubscription` 并写
+`FundingConsumedAt`。零额 component 不改余额，但必须持久化 marker。
+
+任一 component API 重试时先在锁内检查 marker；已提交 mutation 不重放。
+commit 返回错误时只以 primary DB marker read-back 判定；数据库不可读时
+fail closed，不调用 cache 增量或旧 `BillingSession.Refund`。commit 后只
+invalidate cache，或从主库读取权威绝对余额写 cache。
+
+### 3.4 Task link 与 owner transfer 同事务
+
+新增：
+
+```go
 func PrepareTaskSubmissionAttempt(
     candidate *Task,
     persistentID int64,
-    refund TaskRefundSnapshot,
-) (*Task, error)
+    requestID string,
+) (*Task, *TaskBillingAttempt, error)
 ```
 
-首次 prepare：
+首次 link：
 
 ```text
 BEGIN
+LOCK TaskBillingAttempt BY RequestID
+require owner=request, TaskID=nil, both ConsumedAt + PreconsumeCompletedAt non-zero
+validate candidate financial identity and SubmitTime against immutable attempt
 INSERT tasks (..., status=SUBMITTING, progress=0%)
-INSERT task_refund_states (task_id=tasks.id, immutable snapshot)
+UPDATE attempt
+  SET TaskID=tasks.id, Owner='task', OwnerTransferredAt=now
 COMMIT
 ```
 
-任一 INSERT 失败则整体回滚。只有事务成功，或者 commit 返回错误但主库
-read-after-error 同时确认 Task 和 ledger 完整匹配，调用方才可设置：
+Task insert、attempt link 和 owner transfer 缺一不可。commit/API 返回错误时，
+调用方必须按 `RequestID` 从主库重读 owner：`request` 由 request recovery
+退款，`task` 由 linked Task failure path 退款。若 read-back 暂时不可用，
+不得猜 owner、不得立即执行 ledger 外退款、不得调用 `/generate`；保留 attempt
+给 stale request-owned sweep 或 linked Task timeout sweep 收敛。
+
+request failure refund 与 Task failure refund 都按同一 `RequestID` 锁定同一
+attempt，使用同一组 consumed/refunded marker。`BillingSession` 只携带计划
+数据和 zero-delta settle 状态；durable 路径禁止再调用 ledger 外的非幂等
+`BillingSession.Refund`。
+
+link 前必须 fail closed 验证：
 
 ```text
-PersistentTaskID  = Task.ID
-RefundOwnedByTask = true
+attempt.PublicTaskID == Task.TaskID
+attempt.UserID == Task.UserId
+attempt.FundingAmount == Task.Quota
+attempt.FundingSource == Task.PrivateData.BillingSource
+attempt.SubscriptionID == Task.PrivateData.SubscriptionId
+attempt.TokenID == Task.PrivateData.TokenId
+attempt.SubmitTime == Task.SubmitTime
+amounts non-negative and free/paid shape remains valid
 ```
 
-在此之前 request `BillingSession` 仍是退款 owner。Task 已提交但 ledger
-缺失不算 ownership transfer 成功。
-
-`TaskRefundState.UserID` 由锁定的 `candidate.UserId` 填充，不接受独立的调用方
-覆盖值；retry 时必须与 Task.UserId 相等。
-
-首次 prepare 在任何 INSERT 前也必须 fail closed 校验 Task 与 refund snapshot：
-
-```text
-FundingAmount == Task.Quota
-FundingSource == Task.PrivateData.BillingSource
-SubscriptionID == Task.PrivateData.SubscriptionId
-TokenID == Task.PrivateData.TokenId
-UserID 只能由 Task.UserId 派生，且 paid Task 的 UserId 必须非零
-FundingAmount、TokenAmount 不得为负数
-```
-
-`FundingSource` 只允许当前受支持的 wallet/subscription 值。wallet 必须满足
-`SubscriptionID == 0`；subscription 必须满足非空 `RequestID`、
-`SubscriptionID > 0`，并在同一事务锁定 `SubscriptionPreConsumeRecord`，
-确认其 user、subscription、amount 和 `consumed` 状态全部匹配。任一不匹配
-都不得创建 Task 或 ledger。free Task 使用明确的零额 snapshot，不得伪造
-subscription identity。
+任一不匹配不创建 Task、不改变 owner。Task retry 时也以 attempt 内首次
+`SubmitTime` 为真值，不得使用当前 wall clock 重建。
 
 ## 4. Task 5A：Model lifecycle 与退款原子性
 
@@ -192,12 +262,43 @@ const TaskStatusSubmitting TaskStatus = "SUBMITTING"
 
 - `GetAllUnFinishSyncTasks` 排除 `SUBMITTING`，不得用公开 TaskID 轮询供应商；
 - `HasTaskPollingWork` 和 timeout 查询仍包含 `SUBMITTING`；
-- timeout sweep 可把它 CAS 为 `FAILURE/100%`；
+- timeout sweep 只能通过下述锁行、窄列 transition 把它变为
+  `FAILURE/100%`；
 - timeout winner 和提交 controller 都调用同一个幂等 Task refund orchestrator。
 
-### 4.2 Prepare retry 的财务快照不可漂移
+新增：
 
-`persistentID != 0` 时锁定现有 Task 和 ledger，并验证：
+```go
+func TransitionTaskSubmissionToFailure(
+    id int64,
+    publicTaskID string,
+    upstreamTaskID string,
+    code string,
+    message string,
+) (*Task, error)
+```
+
+该 primitive 在 transaction 内锁定最新 Task 行，只允许
+`SUBMITTING/SUBMITTED -> FAILURE/100%`，并使用窄列 update：
+
+```text
+status, progress, finish_time, fail_reason, updated_at
+```
+
+只有 supplied upstream ID 非空且 locked row 尚无 ID 时，才从锁内最新
+`PrivateData` 副本补写 ID 后更新 `private_data`；相同 ID 幂等，不同 ID
+冲突。不得对 `SUBMITTING` 调用旧 `UpdateWithStatus`、
+`Select("*")`、`Save(staleTask)` 或任何 stale 全行回写。timeout sweep、
+`FailAndRefundTaskSubmission` 和 reconciliation handler 必须共用该 primitive。
+
+并发测试必须固定以下 interleaving：sweep discovery 先读到空 ID，正常 Attach
+随后 commit，sweep 再进入 transition 锁并重读；最终必须是
+`FAILURE/100%`，且最新 upstream ID、Key、billing identity 和其他
+`PrivateData` 均保留。
+
+### 4.2 Prepare retry 的财务快照与时间不可漂移
+
+`persistentID != 0` 时按 `RequestID` 锁定现有 Task 和 attempt，并验证：
 
 ```text
 Task.ID、TaskID、UserId、Platform、Action、SubmitTime 不变
@@ -206,7 +307,8 @@ Progress == 0%
 UpstreamTaskID 为空
 Group、Quota、BillingSource、SubscriptionId、TokenId 不变
 BillingContext 深度相等
-TaskRefundState immutable snapshot 逐项相等
+TaskBillingAttempt immutable snapshot 逐项相等
+Task.SubmitTime == TaskBillingAttempt.SubmitTime
 ```
 
 只允许刷新当前尝试的路由字段：
@@ -219,8 +321,11 @@ Properties.UpstreamModelName
 ```
 
 不得在 retry 中更新 `Quota`、billing source、subscription/Token identity、
-request ID、`BillingContext` 或 refund ledger。若新尝试重新计算的 quota 与
-首次预扣不相等，应在 prepare 前由 full-prepaid validator 拒绝。
+request ID、首次 `SubmitTime`、`BillingContext` 或 attempt ledger。5B 将
+首次时间写入 `TaskRelayInfo.DurableSubmitTime`；若内存值丢失，必须从 linked
+Task/attempt 回填。即使两次 retry 间 wall clock 推进两秒以上，也复用首次
+时间。若新尝试重新计算的 quota 与首次预扣不相等，应在 prepare 前由
+full-prepaid validator 拒绝。
 
 ### 4.3 正常 Attach
 
@@ -317,125 +422,125 @@ stored ID 为空，其他状态
 新增：
 
 ```go
-type TaskRefundApplyResult struct {
+type TaskBillingApplyResult struct {
     Applied   bool
     Completed bool
+    Owner     string
+    TaskID    int64
     UserID    int
     TokenID   int
 }
 
 func ApplyTaskFundingRefund(
-    taskID int64,
-) (TaskRefundApplyResult, error)
+    requestID string,
+) (TaskBillingApplyResult, error)
 
 func ApplyTaskTokenRefund(
-    taskID int64,
-) (TaskRefundApplyResult, error)
-
-func GetTaskRefundState(
-    taskID int64,
-) (*TaskRefundState, error)
-```
-
-两种 Apply 都锁定 Task 和 ledger，并要求 Task 已是 `FAILURE`。每个
-component 的主数据库余额 mutation 与对应 `AppliedAt` marker 必须在同一
-事务；禁止在事务中调用会使用全局 `DB`、batch queue 或先更新 Redis 的旧
-增量 helper。
-
-每次 Apply 都必须在任何余额 mutation、marker 写入或“已完成”返回前重验：
-
-```text
-TaskRefundState.TaskID == Task.ID
-TaskRefundState.UserID == Task.UserId
-FundingSource == Task.PrivateData.BillingSource
-SubscriptionID == Task.PrivateData.SubscriptionId
-TokenID == Task.PrivateData.TokenId
-CompletedAt == 0 时 FundingAmount == Task.Quota
-CompletedAt != 0 时 Task.Quota == 0 且两个 AppliedAt 均非零
-wallet/subscription 的 RequestID/source/ID 组合合法
-subscription record 的 request/user/subscription/amount identity 完整匹配
-```
-
-任何 identity、amount、source 或 completion invariant 漂移都必须整体回滚，
-余额 mutation 和 marker mutation 均为零；不得依赖调用方传入 identity 修复
-已损坏数据。
-
-#### Wallet funding
-
-```text
-BEGIN
-LOCK Task + TaskRefundState
-重验 Task/ledger 财务 identity 与 amount
-FundingAppliedAt != 0 -> 幂等成功
-FundingAmount == 0 -> 不做余额 mutation
-否则 UPDATE users SET quota = quota + FundingAmount WHERE id = UserID
-非零 mutation 要求 RowsAffected == 1
-SET FundingAppliedAt
-仅若 TokenAppliedAt != 0，SET CompletedAt 并清 Task.Quota
-COMMIT
-```
-
-#### Subscription funding
-
-拆出仅在传入 transaction 上运行的内部 helper：
-
-```go
-func postConsumeUserSubscriptionDeltaTx(
-    tx *gorm.DB,
-    subscriptionID int,
-    delta int64,
-) error
-
-func refundSubscriptionPreConsumeTx(
-    tx *gorm.DB,
     requestID string,
-    expectedUserID int,
-    expectedSubscriptionID int,
-    expectedAmount int64,
-) error
+) (TaskBillingApplyResult, error)
+
+func GetTaskBillingAttemptByRequestID(
+    requestID string,
+) (*TaskBillingAttempt, error)
+
+func GetTaskBillingAttemptByTaskID(
+    taskID int64,
+) (*TaskBillingAttempt, error)
 ```
 
-同一事务锁定 Task、ledger、`SubscriptionPreConsumeRecord` 和
-`UserSubscription`，验证 request/user/subscription/amount 全部相等。
+request failure 与 Task failure 都用 `RequestID` 调用这两个 Apply。每次 Apply
+锁定 attempt；若 owner 为 task，再锁定 linked Task 并要求它是 `FAILURE`。
+主数据库余额 mutation 与对应 `*RefundedAt` marker 必须在同一事务，禁止调用
+全局 `DB`、batch queue、先改 Redis 或 ledger 外的旧增量 helper。
+任一首次 refund Apply 都在锁内先写/确认 `RefundStartedAt`，并要求
+`SucceededAt==0`；从此所有 preconsume API 均拒绝该 attempt。
 
-- record 为 `consumed`：subscription delta、record=`refunded` 和
-  `FundingAppliedAt` 同事务；
-- record 已 `refunded`：不再修改 subscription，只收敛 Task ledger marker；
-- identity/status 不一致：不执行任何 mutation。
+任何首次 mutation 前重验：
 
-旧公开 subscription API 继续包装 tx helper，保持其他调用方兼容。
+```text
+RequestID、owner、TaskID link 合法
+task-owned 时 attempt.UserID/source/subscription/token == locked Task identity
+task-owned 且 RefundCompletedAt==0 时 FundingAmount == Task.Quota
+request-owned 时 TaskID 必须 nil
+free/paid/source/amount shape 未漂移
+subscription positive amount 时 record identity 完整匹配
+```
 
-#### Token
+若对应 `*RefundedAt` 已非零，立即以 marker 幂等成功；这一分支不得依赖可能已
+按保留策略清理的 `SubscriptionPreConsumeRecord`。首次 subscription refund
+且 amount 非零时才锁 record，并要求 request/user/subscription/amount 和
+`consumed/refunded` 状态合法。任何 identity 漂移整体回滚，余额和 marker
+mutation 均为零。
+
+#### Funding refund
 
 ```text
 BEGIN
-LOCK Task + TaskRefundState
-重验 Task/ledger 财务 identity 与 amount
-TokenAppliedAt != 0 -> 幂等成功
-TokenAmount == 0 -> 只写 marker
-Token 存在 -> 在 tx 上原子更新 remain_quota/used_quota
-Token 已删除 -> component 记为无可恢复对象，不重建 Token
-SET TokenAppliedAt
-仅若 FundingAppliedAt != 0，SET CompletedAt 并清 Task.Quota
+LOCK TaskBillingAttempt BY RequestID
+if owner=task: LOCK linked Task and require FAILURE
+FundingRefundedAt != 0 -> idempotent success without loading old record
+FundingConsumedAt == 0 or FundingAmount == 0 -> no balance mutation
+wallet -> UPDATE users SET quota = quota + FundingAmount
+subscription -> lock matching record + subscription, restore amount and mark refunded
+SET FundingRefundedAt
+if TokenRefundedAt != 0:
+  SET RefundCompletedAt
+  if owner=task: clear locked Task.Quota
 COMMIT
 ```
 
-paid Task 的 `TokenAmount == 0` 不是隐式“已完成”；上述 no-op Apply 仍必须
-写入 `TokenAppliedAt`。同理，任何合法的零额 funding component 都必须由
-funding Apply 写入 `FundingAppliedAt`。wallet Apply 不得仅凭“Token 无需
-余额动作”提前写 `CompletedAt` 或清 `Task.Quota`。
+#### Token refund
 
-TokenKey 只可在 model 内部用于 commit 后 cache invalidation，不能持久化到
-Task、ledger、SystemTask、日志或错误。
+```text
+BEGIN
+LOCK TaskBillingAttempt BY RequestID
+if owner=task: LOCK linked Task and require FAILURE
+TokenRefundedAt != 0 -> idempotent success
+TokenConsumedAt == 0 or TokenAmount == 0 -> no balance mutation
+Token exists -> atomically restore remain_quota/used_quota
+Token deleted -> do not recreate; mark component not applicable
+SET TokenRefundedAt
+if FundingRefundedAt != 0:
+  SET RefundCompletedAt
+  if owner=task: clear locked Task.Quota
+COMMIT
+```
 
-### 4.7 Exactly-once 的精确定义
+未完成 preconsume 的 component 也必须由 refund Apply 写 no-op marker，避免
+stale request-owned attempt 永久悬挂。paid-zero 保留 paid source，并通过
+上述 Apply 写 marker；free 也通过同一 marker 路径收敛。TokenKey 只可在
+model 内部用于 commit 后 cache invalidation，不能持久化到 Task、attempt、
+SystemTask、日志或错误。
+
+### 4.7 Subscription record retention 与 ledger lifecycle
+
+`CleanupSubscriptionPreConsumeRecords` 不得仅按 `updated_at < now-7d` 删除。
+对每个候选 record，必须排除仍由相同 `RequestID` 的 active
+`TaskBillingAttempt` 引用的行：
+
+```text
+active := SucceededAt == 0 && RefundCompletedAt == 0
+active attempt exists -> retain record regardless of age
+terminal attempt + record older than retention -> eligible for cleanup
+```
+
+测试必须把 record 和 active request-owned/task-owned attempt 的时间推进超过
+七天，再证明 funding refund 仍能完成。refund component marker 已完成后，
+重复 Apply 先读 marker 幂等返回，不依赖 record 是否已经清理。
+
+本 Task 不物理删除 billing-attempt ledger。成功 zero-delta settle 原子写
+`SucceededAt`；完整退款写 `RefundCompletedAt`。未来归档只能选择这两类
+terminal attempt，必须保留唯一 `RequestID`、owner/link、immutable identity
+和全部 component markers，且 lookup/recovery 仍可判定已完成。
+
+### 4.8 Exactly-once 的精确定义
 
 本文的 exactly-once 声明限定为：
 
-> 对每个 Task refund component，主数据库中的 wallet/subscription/Token
-> 余额 mutation 与该 component 的 durable marker 在同一事务提交；任意
-> 进程崩溃、事务回滚、commit 结果不确定或 sweep 重试后，已提交 component
-> 不重放，未提交 component 可继续执行。
+> 对每个 billing-attempt preconsume/refund component，主数据库中的
+> wallet/subscription/Token 余额 mutation 与对应 durable marker 在同一事务
+> 提交；任意进程崩溃、事务回滚、commit 结果不确定或 sweep 重试后，已提交
+> component 不重放，未提交 component 可继续执行。
 
 Redis/cache、消费/退款日志和统计是派生状态，不包含在主库事务承诺中：
 
@@ -446,7 +551,7 @@ Redis/cache、消费/退款日志和统计是派生状态，不包含在主库�
 - 若以后要求日志 exactly-once，应另设唯一 operation key，不得复用余额
   marker 暗示跨库原子性。
 
-### 4.8 Sweep
+### 4.9 Sweep
 
 `sweepUnrefundedFailedTasks` 不再：
 
@@ -456,20 +561,29 @@ ClaimQuotaForRefund
 RestoreQuotaAfterFailedRefund
 ```
 
-它直接对每个 `FAILURE + quota != 0` Task 调用幂等 component orchestrator：
+新 sweep 以 incomplete attempt marker 为选择条件，绝不只看
+`Task.Quota != 0`：
 
 ```text
-ApplyTaskFundingRefund
-ApplyTaskTokenRefund
+request-owned + stale + SucceededAt=0 + RefundCompletedAt=0
+  -> lock attempt, set RefundStartedAt, refund consumed components
+task-owned + linked Task FAILURE + RefundCompletedAt=0
+  -> refund incomplete components
+task-owned + linked Task SUBMITTING timeout
+  -> TransitionTaskSubmissionToFailure, then refund incomplete components
 ```
 
-若 funding 已完成而 Token 未完成，下一次 sweep 只执行 Token。第二个
-component 完成时，在同一事务写 `CompletedAt` 并清 `Task.Quota`。
+stale request-owned sweep 覆盖进程在 preconsume 任意 component 后、Task
+insert/link 前崩溃；它与 preconsume API 都锁 attempt，`RefundStartedAt`
+一旦写入，任何新的 preconsume 都 fail closed。paid-zero 即使
+`Task.Quota==0` 也能按缺失 refund marker 被选择。第二个 refund component
+完成时同事务写 `RefundCompletedAt`；task-owned attempt 同时清 Task quota。
 
 为保持旧 adaptor/历史 Task 兼容：
 
-- 所有新 durable Task 都必须有 `TaskRefundState` 并走新路径；
-- 没有 ledger 的历史/旧 adaptor Task 保持已有 legacy refund 兼容路径；
+- 所有新 durable Task 都必须有 linked `TaskBillingAttempt` 并走新路径；
+- lookup 只有明确返回 `gorm.ErrRecordNotFound` 才允许进入历史/旧 adaptor
+  legacy refund；timeout、连接错误或其他 DB error 一律 fail closed；
 - 不得从缺少 request ID 的历史 subscription Task 猜造新 ledger；
 - exactly-once 测试和声明只覆盖有 ledger 的 Task。
 
@@ -508,8 +622,10 @@ LocalError=true
 Retryable=false
 ```
 
-`RelayTaskSubmit` 在 `BuildRequestBody` 前调用；controller 在 deferred
-settle 前调用。controller 不复制 validator。
+controller `/generate` handler 在 Begin attempt 前调用该导出函数完成
+free/paid shape 分类，但不做余额 mutation；`RelayTaskSubmit` 在 primary DB
+preconsume verification 后、`BuildRequestBody` 前再次调用；controller 在
+deferred settle 前第三次调用。controller 不复制 validator。
 
 ### 5.2 Provisional billing snapshot
 
@@ -523,8 +639,9 @@ PerCallBilling:
     ) || info.PriceData.UsePrice
 ```
 
-Prepare 在 `BuildRequestBody` 成功后、`DoRequest` 前执行。这样 body 构造
-失败仍由 request owner 退款，Task/ledger 插入失败时供应商调用次数为零。
+durable 路径的顺序是：先 Begin attempt，再执行同步主库 preconsume，随后
+`BuildRequestBody`，最后在 `DoRequest` 前执行 Task link/owner transfer。
+body 构造或 link 失败都按同一 attempt markers 退款，供应商调用次数为零。
 
 ### 5.3 Ownership transfer
 
@@ -533,27 +650,45 @@ Prepare 在 `BuildRequestBody` 成功后、`DoRequest` 前执行。这样 body �
 ```go
 type TaskRelayInfo struct {
     // existing fields...
-    PersistentTaskID  int64
-    RefundOwnedByTask bool
+    PersistentTaskID       int64
+    BillingAttemptRequestID string
+    DurableSubmitTime      int64
 }
 ```
 
-request defer：
+删除以内存 bool 决定退款 owner 的模式。request/controller failure recovery
+始终以 `BillingAttemptRequestID` 查询 durable owner：
 
-```go
-if taskErr != nil && relayInfo.Billing != nil &&
-    !relayInfo.RefundOwnedByTask {
-    relayInfo.Billing.Refund(c)
-}
+```text
+owner=request, TaskID=nil
+  -> 用 attempt consumed/refunded markers 执行 request-owned refund
+owner=task, TaskID!=nil
+  -> Transition linked Task to FAILURE, 再用同一 markers refund
+DB unavailable / owner unreadable
+  -> fail closed，不执行裸退款；交给 stale/timeout sweep
 ```
 
-Prepare transaction/read-back 确认前保持 `false`；确认 Task+ledger 后设置
-`true`。设置后所有错误都通过 Task component ledger 退款，请求 defer 不再
-调用 `Billing.Refund`。
+`BillingSession.Refund` 不得参与 durable 路径。即使 link transaction 实际
+commit、API 返回错误且 read-back 失败，后续也不根据内存
+`PersistentTaskID`/bool 猜测；ledger owner 是唯一真值。
 
-付费任务从已创建的 Billing session 构造 ledger snapshot；经 validator
-确认的免费任务使用 source/amount 为零的 snapshot，并由 Prepare 在同一事务
-创建已完成的零额 ledger。
+付费任务从计划中的 Billing session 构造 attempt snapshot，然后由 5A 的同步
+主库 primitive 扣减；经 validator 确认的免费任务使用 `IsFree=true`、
+`FundingSource=""`、零 amount/SubscriptionID 的 snapshot，并保留真实
+TokenID。paid-zero 则必须保留 paid source 和 `IsFree=false`。
+
+每次 preconsume 后，5B 在 `/generate` handler 内直接调用 primary-DB
+`VerifyTaskBillingAttemptPreconsumed`，证明 wallet/subscription 与 Token
+marker 已随主库扣减提交，再允许 link/POST。该验证不得读 Redis/batch
+shadow：它从主库加载 attempt 以及对应 user/subscription/Token identity；
+marker 是同事务扣减的 durable 证明。测试从已知初始余额直接查询主库并断言
+wallet/Token 精确 delta。测试必须打开
+`BatchUpdateEnabled=true`、模拟 batch queue 丢失，仍观察到主库 wallet/Token
+已扣且 POST 只在验证后发生。
+
+Safe 429 retry 复用同一 RequestID、attempt、Task 和首次
+`DurableSubmitTime`。内存时间为空时从 attempt/Task 回填；禁止用 retry 时的
+当前时间覆盖。
 
 ### 5.4 Reliable partial result
 
@@ -614,6 +749,7 @@ partial；controller 仍把同一 ID 交给 `FailAndRefundTaskSubmission` 再尝
 func FailAndRefundTaskSubmission(
     ctx context.Context,
     taskID int64,
+    requestID string,
     upstreamTaskID string,
     taskData []byte,
     code string,
@@ -623,21 +759,24 @@ func FailAndRefundTaskSubmission(
 
 内部：
 
-1. 主库加载 Task；
+1. 以 request ID 从主库加载 attempt/owner，并核对 linked Task；
 2. supplied upstream ID 为空时不伪造；
-3. 非空时使用正常严格 attach；若 Task 已由其他路径进入 FAILURE，允许通过
-   reconciliation-only attach 的严格条件补 ID；
-4. 仅允许 `SUBMITTING` 或 `SUBMITTED` 转 `FAILURE/100%`；
+3. 非空时先使用正常严格 attach；若状态竞争，则交给
+   `TransitionTaskSubmissionToFailure` 在同一锁内按严格 ID 规则补写；
+4. 只通过 `TransitionTaskSubmissionToFailure` 允许
+   `SUBMITTING/SUBMITTED -> FAILURE/100%`；
 5. 已是 `FAILURE` 为幂等；不覆盖 `QUEUED/IN_PROGRESS/SUCCESS`；
-6. 写脱敏、截断的 FailReason 和 FinishTime；
-7. primary read 确认为 FAILURE 后调用 Task component refund。
+6. transition 只写窄列和锁内最新 `PrivateData`，不得 stale 全行回写；
+7. primary read 确认为 FAILURE 后按 attempt RequestID 调用 component refund。
 
 退款调用不限定为 status CAS winner。ledger marker 才是每个 component 的
 唯一执行权；CAS winner 崩溃后，CAS loser 或 sweep 可以安全补偿。
 
-controller 退出 retry loop 后，只要 `taskErr != nil &&
-RefundOwnedByTask`，就必须调用该函数，并把保留的 partial
-`UpstreamTaskID/TaskData` 一并传入；不得让 request defer 接管。
+controller 退出 retry loop 后，只要 `taskErr != nil` 且存在 durable attempt，
+就必须按 RequestID 解析 owner：task-owned 调用该函数并传入保留的 partial
+`UpstreamTaskID/TaskData`；request-owned 调用同一 ledger 的 request recovery。
+owner 查询失败时 fail closed，禁止 request defer 执行
+`BillingSession.Refund`。
 
 ### 5.7 Zero-delta settle 与成功输出
 
@@ -648,20 +787,23 @@ Task 已 attach
 Task 已 Commit 为 SUBMITTED/10%
 ValidateFullPrepaidTaskBilling
 SettleBilling(result.Quota)
+MarkTaskBillingAttemptSucceeded(requestID)
 LogTaskConsumption
 c.JSON(HTTPResponse.StatusCode, HTTPResponse.Body)
 ```
 
 validator 保证 paid Task 的 actual quota 等于 pre-consumed quota。真实
 `BillingSession.Settle` 的 delta=0 分支只标记 settled，不调用 wallet、
-subscription 或 Token adjustment。
+subscription 或 Token adjustment。`MarkTaskBillingAttemptSucceeded` 从主库
+锁定 task-owned attempt 与 linked `SUBMITTED` Task，要求两个 consumed marker
+完整、refund 尚未开始，再写 `SucceededAt`；不得依赖 cache。
 
 若 validator 或 settle 返回错误：
 
 - 不写 HTTP 200；
 - 不写成功消费日志；
 - 保留 upstream ID；
-- `SUBMITTED/10% -> FAILURE/100%`；
+- 通过窄列 transition 执行 `SUBMITTED/10% -> FAILURE/100%`；
 - 仅执行 Task component refund；
 - 返回非 retryable 本地 billing settlement error。
 
@@ -703,15 +845,15 @@ handler 是 non-scheduled `SystemTaskHandler`：
 decode 白名单 payload
 主库加载 Task
 核对 primary ID、public ID、channel ID
-验证 Task.UserId 非零且 TaskRefundState.UserID 与 Task.UserId 一致
+按 TaskID 加载 TaskBillingAttempt，验证 owner=task、RequestID/link/UserID
 验证 Task.Platform 与 channel type 为 Seed Dance
 reconciliation-only attach
-若仍 SUBMITTING，转 FAILURE/100%
+若仍 SUBMITTING，通过 TransitionTaskSubmissionToFailure 转 FAILURE/100%
 若已 FAILURE，保持状态
-执行/补齐 component refund
-从 primary DB 重载 Task + TaskRefundState
+按 attempt RequestID 执行/补齐 component refund
+从 primary DB 重载 Task + TaskBillingAttempt
 只有 FAILURE/100%、stored ID == payload ID、Task.Quota == 0、
-两个 AppliedAt 与 CompletedAt 均非零时才标记 SystemTask succeeded
+两个 RefundedAt 与 RefundCompletedAt 均非零时才标记 SystemTask succeeded
 冲突、不完整身份或退款未完整提交均标记 SystemTask failed，保留管理员记录
 永不 Commit，永不复活 Task
 ```
@@ -724,7 +866,7 @@ reconciliation-only attach
 - 继续使用既有通用 HTTP error code/status；
 - 继续由既有 `DoResponse` 决定响应；
 - 不提前插入 provisional Task；
-- 不要求 `TaskRefundState`；
+- 不要求 `TaskBillingAttempt`；
 - 保持现有 Task 插入和 legacy refund 行为；
 - `Retryable=nil` 继续使用原状态码重试规则。
 
@@ -741,8 +883,8 @@ Seed Dance 路径不得：
 
 **Create**
 
-- `model/task_refund.go`
-- `model/task_refund_test.go`
+- `model/task_billing_attempt.go`
+- `model/task_billing_attempt_test.go`
 - `model/task_submission.go`
 - `model/task_submission_test.go`
 
@@ -752,12 +894,19 @@ Seed Dance 路径不得：
 - `model/task_cas_test.go`
 - `model/main.go`
 - `model/subscription.go`
+- `model/user.go`
+- `model/token.go`
+- `service/billing_session.go`
+- `service/funding_source.go`
+- `service/quota.go`
 - `service/task_billing.go`
 - `service/task_billing_test.go`
 - `service/task_polling.go`
 - `service/task_polling_test.go`
 
-5A 不修改 `relay`、`controller` 或 Seed Dance adaptor。
+5A 的新 atomic model 文件持有 wallet/Token 主库 transaction primitive；
+service 层只编排，不能经 batch queue。5A 不修改 `relay`、`controller` 或
+Seed Dance adaptor。
 
 ### 7.2 Task 5B
 
@@ -785,25 +934,41 @@ Seed Dance 路径不得：
 
 先写失败测试，证明：
 
-- Task 与 ledger 同事务；ledger insert fail 不留下 Task；
-- 首次 Prepare 的 Task/private financial identity 与 snapshot 任一不匹配时
-  fail closed，且不留下 Task/ledger；
-- Prepare retry 只刷新 route 字段，任一财务快照漂移均拒绝；
+- attempt 在任何余额预扣前按 RequestID 唯一创建，重复 begin 不漂移；
+- wallet/Token/subscription 的主库 preconsume 与各自 `ConsumedAt` 同事务；
+- `BatchUpdateEnabled=true` 且 batch queue 丢失时，wallet/Token 主库扣减和
+  markers 仍准确；
+- preconsume 任一 commit ambiguous 时，primary marker read-back 不重放；
+- Task insert、attempt link 与 request→task owner transfer 同事务；
+- link commit 实际成功但 API/read-back 失败时不执行 request 裸退款；
+- DB 临时不可读时 owner resolution fail closed，后续 sweep 能按 durable owner
+  恢复；
+- stale request-owned attempt sweep 覆盖 funding-only、token-only 和两个
+  preconsume 后但尚未 link 的进程崩溃；
+- 首次 Prepare 的 Task/private financial identity 与 attempt 任一不匹配时
+  fail closed，且不留下 Task/owner 漂移；
+- Prepare retry 只刷新 route 字段，财务快照与首次 SubmitTime 均不漂移；
 - normal Attach/Commit 状态机与 read-after-error；
+- `TransitionTaskSubmissionToFailure` 只写窄列，不调用 stale 全行
+  `UpdateWithStatus`；
+- sweep 先读空 ID、Attach commit、transition 后最终 FAILURE/100% 且 ID、
+  Key 和最新 PrivateData 保留；
 - reconciliation-only attach 可给完全匹配的 `FAILURE/100%` 补 ID，但状态、
   reason、finish time 和 quota 不变；
-- wallet balance update 与 marker 同事务；
-- subscription balance、pre-consume record 与 marker 同事务；
-- Token balance update 与 marker 同事务；
-- `CompletedAt != 0` 当且仅当两个 AppliedAt 均非零；
-- `TokenAmount=0` 在 `TokenAppliedAt` 持久化前不得清 quota；任何零额
-  component 也必须以幂等事务持久化 marker；
-- 每次 Apply 重验 Task/ledger/private-data/subscription identity；任一漂移
+- request-owned 与 task-owned refund 复用同一 attempt/component markers；
+- wallet/subscription/Token 主库 refund 与 `RefundedAt` 同事务；
+- `RefundCompletedAt != 0` 当且仅当两个 RefundedAt 均非零；
+- paid-zero/free 的 no-op component 均以幂等事务持久化 marker；
+- 每次 Apply 重验 Task/attempt/private-data/subscription identity；任一漂移
   不产生余额或 marker mutation；
 - funding 已完成而 Token 失败时，重试不再 funding；
 - commit 已成功但 API 返回错误时，read-back 不重放 mutation；
 - 两个并发 sweep 对每个 component 只产生一次主库 mutation；
-- `BatchUpdateEnabled=true` 时 Task refund 仍绕过 batch queue；
+- incomplete-ledger sweep 不依赖 `Task.Quota != 0`，可恢复 paid-zero；
+- attempt lookup 仅 `gorm.ErrRecordNotFound` 进入 legacy；其他 error 不产生
+  legacy mutation；
+- active subscription record 超过七天仍保留并可退款；terminal record cleanup
+  后重复 Apply 只靠 marker 幂等成功；
 - 第二 component 完成与 `Task.Quota=0` 同事务；
 - cache/log failpoint 不触发主库 mutation 重放；
 - legacy Task 无 ledger 时保持旧行为。
@@ -814,9 +979,14 @@ Seed Dance 路径不得：
 
 - exported validator 的七种 free/paid 状态；
 - `TASK_PRICE_PATCH` 且 `UsePrice=false` 时 `PerCallBilling=true`；
-- provisional Task+ledger 在 `/generate` 前可从 DB 观察；
-- provisional transaction 失败时 POST=0、request refund=1、task refund=0；
-- Safe 429 retry 复用同一 Task，且财务快照不漂移；
+- attempt 在 preconsume 前、provisional Task/link 在 `/generate` 前可从 DB
+  观察；
+- `/generate` handler 从 primary DB 验证两项 consumed markers；batch queue
+  丢失也不影响主库扣减；
+- provisional link transaction 失败时 POST=0，并按 durable owner/markers
+  refund；DB 不可读时先不退款、由 sweep 后续收敛；
+- Safe 429 retry 复用同一 attempt/Task/首次 SubmitTime，测试时钟推进至少
+  两秒仍成功；
 - classifier/DoResponse 给可靠 ID 后，错误返回仍带 partial result；
 - attach/commit 持久失败：POST=1、无 200、无成功日志、ID 未丢；
 - reconciliation payload 恰好等于白名单，active key 等于
@@ -836,16 +1006,21 @@ Seed Dance 路径不得：
 成功事件必须严格为：
 
 ```text
-preconsume
-validate_full_prepaid
+validate_full_prepaid_shape
+begin_billing_attempt_owner_request
+sync_funding_preconsume_and_marker
+sync_token_preconsume_and_marker
+primary_db_verify_preconsume
+validate_full_prepaid_before_build
 build_body
-insert_provisional_and_refund_ledger
+insert_provisional_link_attempt_transfer_owner
 post_generate
 attach_upstream_id
 build_public_response
 mark_submitted
 validate_full_prepaid_again
 settle_zero_delta
+mark_billing_attempt_succeeded
 consume_log
 write_http_200
 ```
@@ -862,6 +1037,10 @@ Task 5 只有在以下条件同时满足时才完成：
 - `go test ./...` 通过，或仅存在有记录、与本变更无关的基线失败；
 - `git diff --check` 通过；
 - reconciliation payload/active key 的 whitelist 测试通过；
+- request/task owner、sync preconsume/refund marker、stale-attempt sweep 和窄列
+  failure transition 的 failpoint/concurrency 矩阵通过；
+- `BatchUpdateEnabled=true` 的主库事实测试与七天 subscription retention
+  测试通过；
 - secret scan 未发现 Key、TokenKey、prompt、图片、Base64 或完整响应；
 - 没有 Seed Dance 专用大小阈值；
 - 旧 adaptor 兼容测试通过。

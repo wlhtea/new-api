@@ -390,7 +390,9 @@ GetChannelName
 > **Task 5 correction governs：** 本节的 durable submission、退款 ownership、
 > Attach/Commit、reconciliation 与 zero-delta settle 细节受
 > [`2026-07-25-seed-dance-task5-corrective-design.md`](./2026-07-25-seed-dance-task5-corrective-design.md)
-> 约束；冲突处以该修订为准，并按 Task 5A → 5B 实施。
+> 约束；冲突处以该修订为准，并按 Task 5A → 5B 实施。下文旧的
+> `RefundOwnedByTask` 内存 owner、TaskID-keyed ledger 与 request
+> `BillingSession.Refund` 顺序仅保留为历史背景，不得实施。
 
 增加向后兼容的可选接口：
 
@@ -723,10 +725,11 @@ HTTP 200 业务失败也使用该结构，无法识别的普通 error 固定回�
 
 ## 7. 数据存储
 
-> **Task 5 correction governs：** 下述“不新增表”不适用于 durable refund
-> component marker。Task 5A 按修订设计新增 `TaskRefundState`，并要求
-> provisional Task 与 ledger 同事务创建；Key、prompt、图片、Base64 和完整
-> 响应仍不得进入该表。
+> **Task 5 correction governs：** 下述“不新增表”不适用于 durable billing
+> attempt/component marker。Task 5A 按修订设计新增以 `RequestID` 唯一标识的
+> `TaskBillingAttempt`，要求它先于同步主库预扣创建，并要求 provisional Task
+> insert、attempt link 与 request→task owner transfer 同事务；Key、prompt、
+> 图片、Base64 和完整响应仍不得进入该表。
 
 不新增表和字段，复用现有 `Task`：
 

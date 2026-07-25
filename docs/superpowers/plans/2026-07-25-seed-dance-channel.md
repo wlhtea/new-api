@@ -1532,6 +1532,8 @@ git commit -m "feat: add Seed Dance task adaptor"
 > must not be executed directly. The amendment and generated Task 5A/5B briefs are
 > the sole execution instructions; they incorporate every surviving non-conflicting
 > requirement and require **Task 5A → Task 5B** as two independent commits.
+> In particular, the amendment's RequestID-keyed billing-attempt-before-preconsume
+> sequence replaces every request-refund and TaskID-keyed ledger sequence below.
 
 **Files:**
 - Modify: `model/task.go`
