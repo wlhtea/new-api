@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"io"
 	"net/http"
 
@@ -76,6 +77,85 @@ type TaskAdaptor interface {
 
 	FetchTask(baseUrl, key string, body map[string]any, proxy string) (*http.Response, error)
 	ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error)
+}
+
+type TaskSubmitHTTPResponse struct {
+	StatusCode      int
+	Body            any
+	InitialStatus   model.TaskStatus
+	InitialProgress string
+}
+
+type DeferredTaskSubmitResponder interface {
+	BuildTaskSubmitResponse(
+		info *relaycommon.RelayInfo,
+		taskData []byte,
+	) (*TaskSubmitHTTPResponse, error)
+}
+
+type FullPrepaidTaskSubmitter interface {
+	RequiresFullPrepaidBilling() bool
+}
+
+type DurableTaskSubmitter interface {
+	RequiresDurableTaskBeforeSubmit() bool
+}
+
+type TaskSubmitFailureClassification struct {
+	TaskError      *dto.TaskError
+	UpstreamTaskID string
+	TaskData       []byte
+}
+
+type TaskSubmitFailureClassifier interface {
+	ClassifyTaskSubmitFailure(
+		resp *http.Response,
+		requestErr error,
+	) *TaskSubmitFailureClassification
+}
+
+type VideoContent struct {
+	ContentType   string
+	ContentLength int64
+	Body          io.ReadCloser
+}
+
+type VideoContentFetcher interface {
+	FetchVideoContent(
+		ctx context.Context,
+		baseURL string,
+		key string,
+		upstreamTaskID string,
+		proxy string,
+	) (*VideoContent, error)
+}
+
+type VideoContentError struct {
+	StatusCode int
+	Type       string
+	Code       string
+	Message    string
+	Cause      error
+}
+
+func (e *VideoContentError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Cause != nil {
+		return e.Cause.Error()
+	}
+	return e.Code
+}
+
+func (e *VideoContentError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 type OpenAIVideoConverter interface {

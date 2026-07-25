@@ -9,6 +9,7 @@ type TaskError struct {
 	Message    string `json:"message"`
 	Data       any    `json:"data"`
 	StatusCode int    `json:"-"`
+	Retryable  *bool  `json:"-"`
 	LocalError bool   `json:"-"`
 	Error      error  `json:"-"`
 }
