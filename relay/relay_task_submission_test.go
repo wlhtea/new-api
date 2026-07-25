@@ -815,6 +815,121 @@ func TestPrepareRollbackBlocksProviderPostAndRequestOwnerRefundConverges(t *test
 	assert.Zero(t, token.UsedQuota)
 }
 
+func TestStaleRequestAttemptIsLeftForRecoverySweep(t *testing.T) {
+	setupRelayTaskSubmissionDB(t)
+	seedRelayTaskBillingSubjects(t, 7001, 8001, 100)
+	previousFactory := service.GetTaskAdaptorFunc
+	service.GetTaskAdaptorFunc = nil
+	t.Cleanup(func() { service.GetTaskAdaptorFunc = previousFactory })
+	require.NoError(t, model.DB.Exec(`
+		CREATE TRIGGER fail_stale_request_provisional_task_insert
+		BEFORE INSERT ON tasks
+		BEGIN
+			SELECT RAISE(FAIL, 'forced provisional task insert failure');
+		END
+	`).Error)
+	info := paidDurableRelayInfo("stale-request-attempt-sweep", 1_750_000_055)
+	info.ChannelId = 59
+	info.ChannelType = constant.ChannelTypeSeedDance
+	info.ApiKey = "SECRET_ROUTE_KEY"
+	info.Action = "text2video"
+	info.UpstreamModelName = "seedance-uncensored"
+	adaptor := &durableSubmissionAdaptor{}
+
+	result, taskErr := submitDurableTask(
+		relayTaskTestContext(),
+		info,
+		adaptor,
+		constant.TaskPlatform("59"),
+		25,
+		taskSubmissionBillingContext(info),
+	)
+	assert.Nil(t, result)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "persist_task_submission_attempt_failed", taskErr.Code)
+	assert.Equal(t, 0, adaptor.postCount)
+	assert.Zero(t, info.PersistentTaskID)
+
+	attempt, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingOwnerRequest, attempt.Owner)
+	assert.Nil(t, attempt.TaskID)
+	assert.Zero(t, attempt.PrepareVersion)
+	assert.Zero(t, attempt.OwnerTransferredAt)
+	assert.NotZero(t, attempt.FundingConsumedAt)
+	assert.NotZero(t, attempt.TokenConsumedAt)
+	assert.NotZero(t, attempt.PreconsumeCompletedAt)
+	assert.Zero(t, attempt.RefundStartedAt)
+	assert.Zero(t, attempt.FundingRefundedAt)
+	assert.Zero(t, attempt.TokenRefundedAt)
+	assert.Zero(t, attempt.RefundCompletedAt)
+	assert.Zero(t, attempt.SubmissionSettledAt)
+	assert.Zero(t, attempt.SucceededAt)
+	assert.False(t, model.HasTaskPollingWork())
+
+	var taskCount int64
+	require.NoError(t, model.DB.Model(&model.Task{}).Count(&taskCount).Error)
+	assert.Zero(t, taskCount)
+	var userBeforeSweep model.User
+	require.NoError(t, model.DB.First(&userBeforeSweep, 7001).Error)
+	assert.Equal(t, 75, userBeforeSweep.Quota)
+	var tokenBeforeSweep model.Token
+	require.NoError(t, model.DB.First(&tokenBeforeSweep, 8001).Error)
+	assert.Equal(t, 75, tokenBeforeSweep.RemainQuota)
+	assert.Equal(t, 25, tokenBeforeSweep.UsedQuota)
+
+	require.NoError(t, model.DB.Model(&model.TaskBillingAttempt{}).
+		Where("id = ?", attempt.ID).
+		UpdateColumn("updated_at", time.Now().Add(-time.Minute).Unix()).Error)
+	assert.True(t, model.HasTaskPollingWork())
+
+	service.RunTaskPollingOnce(context.Background(), nil)
+
+	recovered, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingOwnerRequest, recovered.Owner)
+	assert.Nil(t, recovered.TaskID)
+	assert.NotZero(t, recovered.RefundStartedAt)
+	assert.NotZero(t, recovered.FundingRefundedAt)
+	assert.NotZero(t, recovered.TokenRefundedAt)
+	assert.NotZero(t, recovered.RefundCompletedAt)
+	assert.Zero(t, recovered.SucceededAt)
+	assert.False(t, model.HasTaskPollingWork())
+	require.NoError(t, model.DB.Model(&model.Task{}).Count(&taskCount).Error)
+	assert.Zero(t, taskCount)
+	var userAfterSweep model.User
+	require.NoError(t, model.DB.First(&userAfterSweep, 7001).Error)
+	assert.Equal(t, 100, userAfterSweep.Quota)
+	var tokenAfterSweep model.Token
+	require.NoError(t, model.DB.First(&tokenAfterSweep, 8001).Error)
+	assert.Equal(t, 100, tokenAfterSweep.RemainQuota)
+	assert.Zero(t, tokenAfterSweep.UsedQuota)
+	assert.Equal(t, 0, adaptor.postCount)
+
+	firstRefundMarkers := [4]int64{
+		recovered.RefundStartedAt,
+		recovered.FundingRefundedAt,
+		recovered.TokenRefundedAt,
+		recovered.RefundCompletedAt,
+	}
+	service.RunTaskPollingOnce(context.Background(), nil)
+
+	recoveredAgain, err := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	require.NoError(t, err)
+	assert.Equal(t, firstRefundMarkers, [4]int64{
+		recoveredAgain.RefundStartedAt,
+		recoveredAgain.FundingRefundedAt,
+		recoveredAgain.TokenRefundedAt,
+		recoveredAgain.RefundCompletedAt,
+	})
+	require.NoError(t, model.DB.First(&userAfterSweep, 7001).Error)
+	assert.Equal(t, 100, userAfterSweep.Quota)
+	require.NoError(t, model.DB.First(&tokenAfterSweep, 8001).Error)
+	assert.Equal(t, 100, tokenAfterSweep.RemainQuota)
+	assert.Zero(t, tokenAfterSweep.UsedQuota)
+	assert.Equal(t, 0, adaptor.postCount)
+}
+
 func TestAmbiguousPrepareAPIErrorReadsTaskOwnerAndRefundsLinkedTask(t *testing.T) {
 	setupRelayTaskSubmissionDB(t)
 	seedRelayTaskBillingSubjects(t, 7001, 8001, 100)
