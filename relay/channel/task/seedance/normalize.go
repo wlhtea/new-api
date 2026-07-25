@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -215,4 +219,222 @@ func normalizeScalars(input *requestInput) (*NormalizedRequest, *dto.TaskError) 
 		StrictDuration:     strictDuration,
 		NegativePrompt:     negativePrompt,
 	}, nil
+}
+
+func quotedRawMessage(value string) json.RawMessage {
+	encoded, _ := json.Marshal(value)
+	return encoded
+}
+
+func singleMultipartValue(form *multipart.Form, name string) (string, bool, error) {
+	values := form.Value[name]
+	if len(values) == 0 {
+		return "", false, nil
+	}
+	if len(values) != 1 {
+		return "", true, fmt.Errorf("multipart field %s must occur once", name)
+	}
+	return values[0], true, nil
+}
+
+func normalizeMultipartBoolean(raw *json.RawMessage, name string) error {
+	trimmed := bytes.TrimSpace(*raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var text string
+	if err := common.Unmarshal(trimmed, &text); err != nil {
+		return fmt.Errorf("multipart metadata field %s must be text true or false", name)
+	}
+	switch text {
+	case "true":
+		*raw = json.RawMessage("true")
+	case "false":
+		*raw = json.RawMessage("false")
+	default:
+		return fmt.Errorf("multipart metadata field %s must be text true or false", name)
+	}
+	return nil
+}
+
+func parseMultipartRequest(
+	form *multipart.Form,
+) (*requestInput, []byte, *dto.TaskError) {
+	input := &requestInput{}
+	stringFields := []struct {
+		name string
+		raw  *json.RawMessage
+	}{
+		{"model", &input.Raw.Model},
+		{"prompt", &input.Raw.Prompt},
+		{"duration", &input.Raw.Duration},
+		{"seconds", &input.Raw.Seconds},
+		{"size", &input.Raw.Size},
+		{"image", &input.Raw.Image},
+		{"input_reference", &input.Raw.InputReference},
+	}
+	for _, field := range stringFields {
+		value, present, err := singleMultipartValue(form, field.name)
+		if err != nil {
+			return nil, nil, service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+		}
+		if present {
+			*field.raw = quotedRawMessage(value)
+		}
+	}
+
+	if values := form.Value["images"]; len(values) != 0 {
+		if len(values) == 1 && strings.HasPrefix(strings.TrimSpace(values[0]), "[") {
+			input.Raw.Images = json.RawMessage(values[0])
+		} else {
+			encoded, err := json.Marshal(values)
+			if err != nil {
+				return nil, nil, service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+			}
+			input.Raw.Images = encoded
+		}
+	}
+
+	metadata, present, err := singleMultipartValue(form, "metadata")
+	if err != nil {
+		return nil, nil, service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if present && strings.TrimSpace(metadata) != "" {
+		if err := common.Unmarshal([]byte(metadata), &input.Metadata); err != nil {
+			return nil, nil, service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+		}
+		for _, boolean := range []struct {
+			name string
+			raw  *json.RawMessage
+		}{
+			{"prompt_optimization", &input.Metadata.PromptOptimization},
+			{"multi_shot", &input.Metadata.MultiShot},
+			{"strict_duration", &input.Metadata.StrictDuration},
+		} {
+			if err := normalizeMultipartBoolean(boolean.raw, boolean.name); err != nil {
+				return nil, nil, service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+			}
+		}
+	}
+
+	for name, files := range form.File {
+		if name != "input_reference" && len(files) != 0 {
+			return nil, nil, service.TaskErrorWrapperLocal(
+				fmt.Errorf("unsupported multipart file field %s", name),
+				"invalid_image",
+				http.StatusBadRequest,
+			)
+		}
+	}
+	files := form.File["input_reference"]
+	if len(files) > 1 {
+		return nil, nil, service.TaskErrorWrapperLocal(
+			errors.New("multipart input_reference must contain one file"),
+			"invalid_image",
+			http.StatusBadRequest,
+		)
+	}
+	if len(files) == 0 {
+		return input, nil, nil
+	}
+
+	file, err := files[0].Open()
+	if err != nil {
+		return nil, nil, service.TaskErrorWrapperLocal(err, "invalid_image", http.StatusBadRequest)
+	}
+	uploaded, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, nil, service.TaskErrorWrapperLocal(readErr, "invalid_image", http.StatusBadRequest)
+	}
+	if closeErr != nil {
+		return nil, nil, service.TaskErrorWrapperLocal(closeErr, "invalid_image", http.StatusBadRequest)
+	}
+	return input, uploaded, nil
+}
+
+func cachedNormalizedRequest(c *gin.Context) (*NormalizedRequest, bool, *dto.TaskError) {
+	cached, ok := c.Get(normalizedRequestContextKey)
+	if !ok {
+		return nil, false, nil
+	}
+	normalized, valid := cached.(*NormalizedRequest)
+	if !valid || normalized == nil {
+		return nil, true, service.TaskErrorWrapperLocal(
+			errors.New("invalid normalized request cache"),
+			"invalid_request",
+			http.StatusBadRequest,
+		)
+	}
+	return normalized, true, nil
+}
+
+func normalizeRequest(c *gin.Context) (*NormalizedRequest, *dto.TaskError) {
+	if cached, found, taskErr := cachedNormalizedRequest(c); found {
+		return cached, taskErr
+	}
+	return normalizeRequestWithLoader(c, service.GetImageFromUrl)
+}
+
+func normalizeRequestWithLoader(
+	c *gin.Context,
+	loadRemote remoteImageLoader,
+) (*NormalizedRequest, *dto.TaskError) {
+	if cached, found, taskErr := cachedNormalizedRequest(c); found {
+		return cached, taskErr
+	}
+
+	var (
+		input    *requestInput
+		uploaded []byte
+		taskErr  *dto.TaskError
+	)
+	contentType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil {
+		return nil, service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if contentType == "multipart/form-data" {
+		form, err := common.ParseMultipartFormReusable(c)
+		if err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+		}
+		defer form.RemoveAll()
+		input, uploaded, taskErr = parseMultipartRequest(form)
+	} else {
+		input, taskErr = parseJSONRequest(c)
+	}
+	if taskErr != nil {
+		return nil, taskErr
+	}
+
+	normalized, taskErr := normalizeScalars(input)
+	if taskErr != nil {
+		return nil, taskErr
+	}
+	normalized.ImageBase64, taskErr = normalizeImages(input, uploaded, loadRemote)
+	if taskErr != nil {
+		return nil, taskErr
+	}
+	if normalized.ImageBase64 == "" && normalized.Resolution == "480P" {
+		return nil, service.TaskErrorWrapperLocal(
+			errors.New("480P resolution requires an input image"),
+			"invalid_resolution",
+			http.StatusBadRequest,
+		)
+	}
+
+	c.Set(normalizedRequestContextKey, normalized)
+	return normalized, nil
+}
+
+func getNormalizedRequest(c *gin.Context) (*NormalizedRequest, error) {
+	cached, ok := c.Get(normalizedRequestContextKey)
+	if !ok {
+		return nil, errors.New("Seed Dance request was not normalized")
+	}
+	normalized, ok := cached.(*NormalizedRequest)
+	if !ok || normalized == nil {
+		return nil, errors.New("invalid Seed Dance normalized request")
+	}
+	return normalized, nil
 }
