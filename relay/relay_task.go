@@ -2,12 +2,14 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -20,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type TaskSubmitResult struct {
@@ -27,7 +30,632 @@ type TaskSubmitResult struct {
 	TaskData       []byte
 	Platform       constant.TaskPlatform
 	Quota          int
+	HTTPResponse   *channel.TaskSubmitHTTPResponse
 	//PerCallPrice   types.PriceData
+}
+
+var taskSubmissionNow = time.Now
+
+func fullPrepaidTaskBillingError() *dto.TaskError {
+	retryable := false
+	err := errors.New("full-prepaid task billing invariant failed")
+	return &dto.TaskError{
+		Code:       "seedance_billing_invariant_failed",
+		Message:    err.Error(),
+		StatusCode: http.StatusInternalServerError,
+		Retryable:  &retryable,
+		LocalError: true,
+		Error:      err,
+	}
+}
+
+// ValidateFullPrepaidTaskBilling proves that a full-prepaid task is either an
+// exact free shape or a paid session whose immutable preconsume amount equals
+// the quota about to cross a durable boundary.
+func ValidateFullPrepaidTaskBilling(
+	info *relaycommon.RelayInfo,
+	quota int,
+) *dto.TaskError {
+	if info == nil {
+		return fullPrepaidTaskBillingError()
+	}
+	if info.PriceData.FreeModel {
+		if quota != 0 || info.Billing != nil {
+			return fullPrepaidTaskBillingError()
+		}
+		return nil
+	}
+	if !info.ForcePreConsume || info.Billing == nil ||
+		quota != info.Billing.GetPreConsumedQuota() {
+		return fullPrepaidTaskBillingError()
+	}
+	return nil
+}
+
+func taskSubmissionBillingContext(info *relaycommon.RelayInfo) *model.TaskBillingContext {
+	if info == nil {
+		return nil
+	}
+	otherRatios := info.PriceData.OtherRatios()
+	if otherRatios == nil {
+		otherRatios = map[string]float64{}
+	}
+	return &model.TaskBillingContext{
+		ModelPrice:      info.PriceData.ModelPrice,
+		GroupRatio:      info.PriceData.GroupRatioInfo.GroupRatio,
+		ModelRatio:      info.PriceData.ModelRatio,
+		OtherRatios:     otherRatios,
+		OriginModelName: info.OriginModelName,
+		PerCallBilling: common.StringsContains(
+			constant.TaskPricePatches,
+			info.OriginModelName,
+		) || info.PriceData.UsePrice,
+	}
+}
+
+func taskBillingAttemptSnapshot(
+	info *relaycommon.RelayInfo,
+	plan *service.DurableTaskBillingPlan,
+	billingContext *model.TaskBillingContext,
+) model.TaskBillingAttemptSnapshot {
+	if info == nil || plan == nil {
+		return model.TaskBillingAttemptSnapshot{}
+	}
+	requestID := info.RequestId
+	publicTaskID := ""
+	submitTime := int64(0)
+	if info.TaskRelayInfo != nil {
+		if info.TaskRelayInfo.BillingAttemptRequestID != "" {
+			requestID = info.TaskRelayInfo.BillingAttemptRequestID
+		}
+		publicTaskID = info.TaskRelayInfo.PublicTaskID
+		submitTime = info.TaskRelayInfo.DurableSubmitTime
+	}
+	return model.TaskBillingAttemptSnapshot{
+		RequestID:      requestID,
+		PublicTaskID:   publicTaskID,
+		SubmitTime:     submitTime,
+		IsFree:         plan.IsFree,
+		UserID:         info.UserId,
+		FundingSource:  plan.FundingSource,
+		SubscriptionID: plan.SubscriptionID,
+		FundingAmount:  plan.FundingAmount,
+		TokenID:        plan.TokenID,
+		TokenAmount:    plan.TokenAmount,
+		BillingContext: billingContext,
+	}
+}
+
+func durableTaskLocalError(code string, err error) *dto.TaskError {
+	retryable := false
+	if err == nil {
+		err = errors.New("durable task submission failed")
+	}
+	return &dto.TaskError{
+		Code:       code,
+		Message:    err.Error(),
+		StatusCode: http.StatusInternalServerError,
+		Retryable:  &retryable,
+		LocalError: true,
+		Error:      err,
+	}
+}
+
+func beginDurableTaskBilling(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	quota int,
+	billingContext *model.TaskBillingContext,
+) (*service.DurableTaskBillingPlan, *model.TaskBillingAttempt, *dto.TaskError) {
+	if info == nil || info.TaskRelayInfo == nil || info.RequestId == "" ||
+		info.PublicTaskID == "" {
+		return nil, nil, durableTaskLocalError(
+			"seedance_billing_attempt_begin_failed",
+			model.ErrTaskBillingIdentityDrift,
+		)
+	}
+	if info.BillingAttemptRequestID == "" {
+		info.BillingAttemptRequestID = info.RequestId
+	}
+	if info.BillingAttemptRequestID != info.RequestId {
+		return nil, nil, durableTaskLocalError(
+			"seedance_billing_attempt_begin_failed",
+			model.ErrTaskBillingIdentityDrift,
+		)
+	}
+
+	var plan *service.DurableTaskBillingPlan
+	existing, lookupErr := model.GetTaskBillingAttemptByRequestID(info.BillingAttemptRequestID)
+	switch {
+	case lookupErr == nil:
+		if existing.PublicTaskID != info.PublicTaskID {
+			return nil, nil, durableTaskLocalError(
+				"seedance_billing_attempt_begin_failed",
+				model.ErrTaskBillingIdentityDrift,
+			)
+		}
+		if info.DurableSubmitTime == 0 {
+			info.DurableSubmitTime = existing.SubmitTime
+		}
+		if info.DurableSubmitTime != existing.SubmitTime {
+			return nil, nil, durableTaskLocalError(
+				"seedance_billing_attempt_begin_failed",
+				model.ErrTaskBillingIdentityDrift,
+			)
+		}
+		if existing.TaskID != nil {
+			info.PersistentTaskID = *existing.TaskID
+		}
+		plan = &service.DurableTaskBillingPlan{
+			IsFree:         existing.IsFree,
+			FundingSource:  existing.FundingSource,
+			SubscriptionID: existing.SubscriptionID,
+			FundingAmount:  existing.FundingAmount,
+			TokenID:        existing.TokenID,
+			TokenAmount:    existing.TokenAmount,
+		}
+		info.BillingSource = plan.FundingSource
+		info.SubscriptionId = plan.SubscriptionID
+		if !plan.IsFree {
+			info.ForcePreConsume = true
+		}
+	case errors.Is(lookupErr, gorm.ErrRecordNotFound):
+		if info.DurableSubmitTime == 0 {
+			info.DurableSubmitTime = taskSubmissionNow().Unix()
+		}
+		session, planned, apiErr := service.NewDurableTaskBillingSession(c, info, quota)
+		if apiErr != nil {
+			return nil, nil, service.TaskErrorFromAPIError(apiErr)
+		}
+		plan = planned
+		if plan == nil {
+			return nil, nil, durableTaskLocalError(
+				"seedance_billing_attempt_begin_failed",
+				model.ErrTaskBillingIdentityDrift,
+			)
+		}
+		if !plan.IsFree {
+			info.ForcePreConsume = true
+			info.Billing = session
+		}
+		info.BillingSource = plan.FundingSource
+		info.SubscriptionId = plan.SubscriptionID
+	default:
+		return nil, nil, durableTaskLocalError(
+			"seedance_billing_attempt_owner_unreadable",
+			lookupErr,
+		)
+	}
+
+	if taskErr := ValidateFullPrepaidTaskBilling(info, quota); taskErr != nil {
+		return nil, nil, taskErr
+	}
+	snapshot := taskBillingAttemptSnapshot(info, plan, billingContext)
+	attempt, err := model.BeginTaskBillingAttempt(snapshot)
+	if err != nil {
+		return nil, nil, durableTaskLocalError(
+			"seedance_billing_attempt_begin_failed",
+			err,
+		)
+	}
+	return plan, attempt, nil
+}
+
+func applyDurableTaskPreconsume(
+	info *relaycommon.RelayInfo,
+	attempt *model.TaskBillingAttempt,
+) (*model.TaskBillingAttempt, *dto.TaskError) {
+	if info == nil || attempt == nil || info.BillingAttemptRequestID == "" ||
+		attempt.RequestID != info.BillingAttemptRequestID {
+		return nil, durableTaskLocalError(
+			"seedance_billing_preconsume_failed",
+			model.ErrTaskBillingIdentityDrift,
+		)
+	}
+	if _, err := model.ApplyTaskFundingPreconsume(attempt.RequestID); err != nil {
+		return nil, durableTaskLocalError("seedance_billing_preconsume_failed", err)
+	}
+	if _, err := model.ApplyTaskTokenPreconsume(attempt.RequestID); err != nil {
+		return nil, durableTaskLocalError("seedance_billing_preconsume_failed", err)
+	}
+	verified, err := model.VerifyTaskBillingAttemptPreconsumed(attempt.RequestID)
+	if err != nil {
+		primary, readErr := model.GetTaskBillingAttemptByRequestID(attempt.RequestID)
+		if readErr == nil && primary.Owner == model.TaskBillingOwnerTask {
+			verified, err = verifyLinkedDurableTaskPreconsume(primary)
+		}
+	}
+	if err != nil {
+		return nil, durableTaskLocalError("seedance_billing_primary_verify_failed", err)
+	}
+	if !verified.IsFree {
+		verifier, ok := info.Billing.(interface {
+			VerifyDurableTaskBillingAttempt(string) error
+		})
+		if !ok {
+			return nil, durableTaskLocalError(
+				"seedance_billing_primary_verify_failed",
+				model.ErrTaskBillingIdentityDrift,
+			)
+		}
+		if err := verifier.VerifyDurableTaskBillingAttempt(attempt.RequestID); err != nil {
+			return nil, durableTaskLocalError("seedance_billing_primary_verify_failed", err)
+		}
+	}
+	return verified, nil
+}
+
+func verifyLinkedDurableTaskPreconsume(
+	attempt *model.TaskBillingAttempt,
+) (*model.TaskBillingAttempt, error) {
+	if attempt == nil || attempt.Owner != model.TaskBillingOwnerTask ||
+		attempt.TaskID == nil || *attempt.TaskID <= 0 ||
+		attempt.FundingConsumedAt == 0 || attempt.TokenConsumedAt == 0 ||
+		attempt.PreconsumeCompletedAt == 0 ||
+		attempt.RefundStartedAt != 0 || attempt.RefundCompletedAt != 0 ||
+		attempt.SucceededAt != 0 {
+		return nil, model.ErrTaskBillingAttemptState
+	}
+	task, err := model.GetTaskByPrimaryID(*attempt.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	if task.TaskID != attempt.PublicTaskID ||
+		task.UserId != attempt.UserID ||
+		task.Quota != attempt.FundingAmount ||
+		task.PrivateData.BillingSource != attempt.FundingSource ||
+		task.PrivateData.SubscriptionId != attempt.SubscriptionID ||
+		task.PrivateData.TokenId != attempt.TokenID ||
+		task.SubmitTime != attempt.SubmitTime ||
+		task.Status != model.TaskStatusSubmitting ||
+		task.Progress != "0%" ||
+		task.PrivateData.UpstreamTaskID != "" {
+		return nil, model.ErrTaskBillingIdentityDrift
+	}
+	return attempt, nil
+}
+
+func newDurableProvisionalTask(
+	info *relaycommon.RelayInfo,
+	platform constant.TaskPlatform,
+	quota int,
+	billingContext *model.TaskBillingContext,
+) *model.Task {
+	if info == nil {
+		return nil
+	}
+	task := model.InitTask(platform, info)
+	task.Platform = platform
+	task.SubmitTime = info.DurableSubmitTime
+	task.Status = model.TaskStatusSubmitting
+	task.Progress = "0%"
+	task.Quota = quota
+	task.Action = info.Action
+	task.PrivateData.Key = info.ApiKey
+	task.PrivateData.BillingSource = info.BillingSource
+	task.PrivateData.SubscriptionId = info.SubscriptionId
+	task.PrivateData.TokenId = info.TokenId
+	task.PrivateData.NodeName = common.NodeName
+	task.PrivateData.BillingContext = billingContext
+	task.Properties.OriginModelName = info.OriginModelName
+	task.Properties.UpstreamModelName = info.UpstreamModelName
+	return task
+}
+
+func taskSubmissionContext(c *gin.Context) context.Context {
+	if c != nil && c.Request != nil {
+		return c.Request.Context()
+	}
+	return context.Background()
+}
+
+func waitTaskSubmissionRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func attachTaskUpstreamResultWithRetry(
+	ctx context.Context,
+	info *relaycommon.RelayInfo,
+	upstreamTaskID string,
+	taskData []byte,
+) (*model.Task, error) {
+	if info == nil || info.PersistentTaskID <= 0 || info.PublicTaskID == "" ||
+		upstreamTaskID == "" {
+		return nil, model.ErrTaskSubmissionStateConflict
+	}
+	delays := []time.Duration{0, 25 * time.Millisecond, 100 * time.Millisecond}
+	var lastErr error
+	for _, delay := range delays {
+		if err := waitTaskSubmissionRetry(ctx, delay); err != nil {
+			return nil, err
+		}
+		attached, err := model.AttachTaskUpstreamResult(
+			info.PersistentTaskID,
+			info.PublicTaskID,
+			upstreamTaskID,
+			taskData,
+		)
+		if err == nil {
+			return attached, nil
+		}
+		lastErr = err
+		persisted, readErr := model.GetTaskByPrimaryID(info.PersistentTaskID)
+		if readErr == nil {
+			if persisted.TaskID != info.PublicTaskID {
+				return nil, model.ErrTaskSubmissionStateConflict
+			}
+			if persisted.PrivateData.UpstreamTaskID == upstreamTaskID {
+				return persisted, nil
+			}
+			if persisted.PrivateData.UpstreamTaskID != "" {
+				return nil, model.ErrTaskUpstreamIDConflict
+			}
+		}
+		if errors.Is(err, model.ErrTaskUpstreamIDConflict) ||
+			errors.Is(err, model.ErrTaskSubmissionStateConflict) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func commitTaskSubmissionWithRetry(
+	ctx context.Context,
+	info *relaycommon.RelayInfo,
+) (*model.Task, error) {
+	if info == nil || info.PersistentTaskID <= 0 || info.PublicTaskID == "" {
+		return nil, model.ErrTaskSubmissionStateConflict
+	}
+	delays := []time.Duration{0, 25 * time.Millisecond, 100 * time.Millisecond}
+	var lastErr error
+	for _, delay := range delays {
+		if err := waitTaskSubmissionRetry(ctx, delay); err != nil {
+			return nil, err
+		}
+		committed, err := model.CommitTaskSubmission(
+			info.PersistentTaskID,
+			info.PublicTaskID,
+		)
+		if err == nil {
+			return committed, nil
+		}
+		lastErr = err
+		persisted, readErr := model.GetTaskByPrimaryID(info.PersistentTaskID)
+		if readErr == nil {
+			if persisted.TaskID != info.PublicTaskID {
+				return nil, model.ErrTaskSubmissionStateConflict
+			}
+			if persisted.Status == model.TaskStatusSubmitted &&
+				persisted.Progress == "10%" &&
+				persisted.PrivateData.UpstreamTaskID != "" {
+				return persisted, nil
+			}
+			if persisted.Status == model.TaskStatusFailure ||
+				persisted.Status == model.TaskStatusSuccess {
+				return nil, errors.Join(lastErr, model.ErrTaskSubmissionStateConflict)
+			}
+		}
+		if errors.Is(err, model.ErrTaskSubmissionStateConflict) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func nonRetryableTaskPersistenceError(err error) *dto.TaskError {
+	retryable := false
+	return &dto.TaskError{
+		Code:       "persist_task_submit_result_failed",
+		Message:    "failed to persist upstream task result",
+		StatusCode: http.StatusInternalServerError,
+		Retryable:  &retryable,
+		LocalError: true,
+		Error:      err,
+	}
+}
+
+func recordSeedDanceSubmitReconciliation(
+	info *relaycommon.RelayInfo,
+	upstreamTaskID string,
+	errorCode string,
+) error {
+	if info == nil || info.TaskRelayInfo == nil {
+		return model.ErrTaskBillingIdentityDrift
+	}
+	_, err := service.CreateSeedDanceSubmitReconciliation(
+		service.SeedDanceSubmitReconciliationPayload{
+			PublicTaskID:     info.PublicTaskID,
+			UpstreamTaskID:   upstreamTaskID,
+			PersistentTaskID: info.PersistentTaskID,
+			ChannelID:        info.ChannelId,
+			NodeName:         common.NodeName,
+			ErrorCode:        errorCode,
+		},
+	)
+	return err
+}
+
+func submitDurableTask(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	adaptor channel.TaskAdaptor,
+	platform constant.TaskPlatform,
+	quota int,
+	billingContext *model.TaskBillingContext,
+) (*TaskSubmitResult, *dto.TaskError) {
+	if info == nil || adaptor == nil {
+		return nil, durableTaskLocalError(
+			"seedance_durable_submit_failed",
+			model.ErrTaskSubmissionStateConflict,
+		)
+	}
+	_, attempt, taskErr := beginDurableTaskBilling(c, info, quota, billingContext)
+	if taskErr != nil {
+		return nil, taskErr
+	}
+	if _, taskErr = applyDurableTaskPreconsume(info, attempt); taskErr != nil {
+		return nil, taskErr
+	}
+	if taskErr = ValidateFullPrepaidTaskBilling(info, quota); taskErr != nil {
+		return nil, taskErr
+	}
+
+	requestBody, err := adaptor.BuildRequestBody(c, info)
+	if err != nil {
+		return nil, service.TaskErrorWrapper(
+			err,
+			"build_request_failed",
+			http.StatusInternalServerError,
+		)
+	}
+	candidate := newDurableProvisionalTask(info, platform, quota, billingContext)
+	prepared, _, err := model.PrepareTaskSubmissionAttempt(
+		candidate,
+		info.PersistentTaskID,
+		info.BillingAttemptRequestID,
+	)
+	if err != nil {
+		return nil, durableTaskLocalError("persist_task_submission_attempt_failed", err)
+	}
+	info.PersistentTaskID = prepared.ID
+	info.DurableSubmitTime = prepared.SubmitTime
+
+	resp, requestErr := adaptor.DoRequest(c, info, requestBody)
+	if requestErr == nil && resp == nil {
+		requestErr = errors.New("upstream returned a nil response")
+	}
+
+	var upstreamTaskID string
+	var taskData []byte
+	needsClassification := requestErr != nil ||
+		(resp != nil && resp.StatusCode != http.StatusOK)
+	if needsClassification {
+		if classifier, ok := adaptor.(channel.TaskSubmitFailureClassifier); ok {
+			classified := classifier.ClassifyTaskSubmitFailure(resp, requestErr)
+			if classified != nil && classified.TaskError != nil {
+				upstreamTaskID = classified.UpstreamTaskID
+				taskData = append([]byte(nil), classified.TaskData...)
+				taskErr = classified.TaskError
+			}
+		}
+		if taskErr == nil {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if requestErr != nil {
+				return nil, service.TaskErrorWrapper(
+					requestErr,
+					"do_request_failed",
+					http.StatusInternalServerError,
+				)
+			}
+			status := http.StatusBadGateway
+			if resp != nil {
+				status = resp.StatusCode
+			}
+			return nil, service.TaskErrorWrapper(
+				errors.New("upstream task submission failed"),
+				"fail_to_fetch_task",
+				status,
+			)
+		}
+	} else {
+		upstreamTaskID, taskData, taskErr = adaptor.DoResponse(c, resp, info)
+	}
+
+	var partial *TaskSubmitResult
+	if upstreamTaskID != "" {
+		partial = &TaskSubmitResult{
+			UpstreamTaskID: upstreamTaskID,
+			TaskData:       append([]byte(nil), taskData...),
+			Platform:       platform,
+			Quota:          quota,
+		}
+		if _, err := attachTaskUpstreamResultWithRetry(
+			taskSubmissionContext(c),
+			info,
+			upstreamTaskID,
+			taskData,
+		); err != nil {
+			if recordErr := recordSeedDanceSubmitReconciliation(
+				info,
+				upstreamTaskID,
+				"persist_task_submit_result_failed",
+			); recordErr != nil {
+				common.SysError("create Seed Dance submit reconciliation record")
+			}
+			return partial, nonRetryableTaskPersistenceError(err)
+		}
+	}
+	if taskErr != nil {
+		return partial, taskErr
+	}
+	if partial == nil {
+		return nil, durableTaskLocalError(
+			"seedance_submit_outcome_unknown",
+			errors.New("upstream response has no task identity"),
+		)
+	}
+
+	finalQuota := quota
+	if adjustedRatios := adaptor.AdjustBillingOnSubmit(info, taskData); len(adjustedRatios) > 0 {
+		if adjustedQuota, ok := recalcQuotaFromRatios(info, adjustedRatios); ok {
+			finalQuota = adjustedQuota
+			info.PriceData.ReplaceOtherRatios(adjustedRatios)
+			info.PriceData.Quota = finalQuota
+		}
+	}
+	partial.Quota = finalQuota
+	if taskErr = ValidateFullPrepaidTaskBilling(info, finalQuota); taskErr != nil {
+		return partial, taskErr
+	}
+	responder, ok := adaptor.(channel.DeferredTaskSubmitResponder)
+	if !ok {
+		return partial, durableTaskLocalError(
+			"build_task_submit_response_failed",
+			errors.New("durable task adaptor has no deferred responder"),
+		)
+	}
+	httpResponse, err := responder.BuildTaskSubmitResponse(info, taskData)
+	if err != nil || httpResponse == nil {
+		if err == nil {
+			err = errors.New("durable task response is nil")
+		}
+		return partial, durableTaskLocalError("build_task_submit_response_failed", err)
+	}
+	partial.HTTPResponse = httpResponse
+	if _, err := commitTaskSubmissionWithRetry(taskSubmissionContext(c), info); err != nil {
+		if recordErr := recordSeedDanceSubmitReconciliation(
+			info,
+			upstreamTaskID,
+			"commit_task_submission_failed",
+		); recordErr != nil {
+			common.SysError("create Seed Dance submit reconciliation record")
+		}
+		return partial, nonRetryableTaskPersistenceError(err)
+	}
+	return partial, nil
+}
+
+func isDurableFullPrepaidTaskAdaptor(adaptor channel.TaskAdaptor) bool {
+	if adaptor == nil {
+		return false
+	}
+	fullPrepaid, fullPrepaidOK := adaptor.(channel.FullPrepaidTaskSubmitter)
+	durable, durableOK := adaptor.(channel.DurableTaskSubmitter)
+	return fullPrepaidOK && durableOK &&
+		fullPrepaid.RequiresFullPrepaidBilling() &&
+		durable.RequiresDurableTaskBeforeSubmit()
 }
 
 // ResolveOriginTask 处理基于已有任务的提交（remix / continuation）：
@@ -200,6 +828,17 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		quota, clamp := common.QuotaFromFloatChecked(quotaWithRatios)
 		info.PriceData.Quota = quota
 		noteTaskQuotaClamp(info, clamp)
+	}
+
+	if isDurableFullPrepaidTaskAdaptor(adaptor) {
+		return submitDurableTask(
+			c,
+			info,
+			adaptor,
+			platform,
+			info.PriceData.Quota,
+			taskSubmissionBillingContext(info),
+		)
 	}
 
 	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
