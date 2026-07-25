@@ -329,7 +329,10 @@ func (a *TaskAdaptor) BuildTaskSubmitResponse(
 
 func dataIsEmpty(raw []byte) bool {
 	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+	if len(trimmed) == 0 {
+		return false
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
 		return true
 	}
 	var value any
