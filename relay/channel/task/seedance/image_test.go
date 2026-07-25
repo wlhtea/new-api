@@ -51,6 +51,21 @@ func testPNG(t *testing.T, width, height int) []byte {
 	return testImage(t, width, height, "png")
 }
 
+func testNoisyPNG(t *testing.T, dimension int, seed int64) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, dimension, dimension))
+	random := rand.New(rand.NewSource(seed))
+	_, err := random.Read(img.Pix)
+	require.NoError(t, err)
+	for index := 3; index < len(img.Pix); index += 4 {
+		img.Pix[index] = 255
+	}
+
+	var data bytes.Buffer
+	require.NoError(t, png.Encode(&data, img))
+	return data.Bytes()
+}
+
 func TestNormalizeImagesDeduplicatesDecodedBytes(t *testing.T) {
 	pngBytes := testPNG(t, 240, 240)
 	encoded := base64.StdEncoding.EncodeToString(pngBytes)
@@ -173,19 +188,9 @@ func TestNormalizeRemoteImageRejectsMIMEContentMismatch(t *testing.T) {
 }
 
 func TestImageOverSupplierRecommendation(t *testing.T) {
-	const dimension = 3000
-	img := image.NewNRGBA(image.Rect(0, 0, dimension, dimension))
-	random := rand.New(rand.NewSource(1))
-	_, err := random.Read(img.Pix)
-	require.NoError(t, err)
-	for index := 3; index < len(img.Pix); index += 4 {
-		img.Pix[index] = 255
-	}
-
-	var data bytes.Buffer
-	require.NoError(t, png.Encode(&data, img))
-	require.Greater(t, data.Len(), 5*1024*1024)
-	encoded := base64.StdEncoding.EncodeToString(data.Bytes())
+	data := testNoisyPNG(t, 3000, 1)
+	require.Greater(t, len(data), 5*1024*1024)
+	encoded := base64.StdEncoding.EncodeToString(data)
 	body := fmt.Sprintf(`{"prompt":"p","image":%q}`, encoded)
 
 	got, taskErr := normalizeRequest(jsonContext(t, body))
