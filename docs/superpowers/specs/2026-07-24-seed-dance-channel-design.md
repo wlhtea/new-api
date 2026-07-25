@@ -387,6 +387,11 @@ GetChannelName
 
 ### 6.3 提交前计费门禁、持久化 provisional Task 与延迟成功响应
 
+> **Task 5 correction governs：** 本节的 durable submission、退款 ownership、
+> Attach/Commit、reconciliation 与 zero-delta settle 细节受
+> [`2026-07-25-seed-dance-task5-corrective-design.md`](./2026-07-25-seed-dance-task5-corrective-design.md)
+> 约束；冲突处以该修订为准，并按 Task 5A → 5B 实施。
+
 增加向后兼容的可选接口：
 
 ```go
@@ -717,6 +722,11 @@ HTTP 200 业务失败也使用该结构，无法识别的普通 error 固定回�
 内容请求的 Base URL 先取 `constant.ChannelBaseURLs[channel.Type]`，再由渠道自定义 Base URL 覆盖；Seed Dance 不使用当前 Controller 中面向 OpenAI 的默认回退地址。渠道代理设置同步传给 `FetchVideoContent`。
 
 ## 7. 数据存储
+
+> **Task 5 correction governs：** 下述“不新增表”不适用于 durable refund
+> component marker。Task 5A 按修订设计新增 `TaskRefundState`，并要求
+> provisional Task 与 ledger 同事务创建；Key、prompt、图片、Base64 和完整
+> 响应仍不得进入该表。
 
 不新增表和字段，复用现有 `Task`：
 

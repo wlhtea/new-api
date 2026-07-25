@@ -1524,6 +1524,15 @@ git commit -m "feat: add Seed Dance task adaptor"
 
 ### Task 5: Durable Submission Lifecycle, Pre-Submit Billing Gate, and Refund Ownership
 
+> **Supersession notice:** Do not execute this Task 5 section as a standalone
+> source of truth. The conflicting signatures, refund algorithm, transaction
+> boundaries, test matrix, and file scope below are superseded by
+> [`../specs/2026-07-25-seed-dance-task5-corrective-design.md`](../specs/2026-07-25-seed-dance-task5-corrective-design.md).
+> The original Task 5 Steps 1–12 below are retained only as historical context and
+> must not be executed directly. The amendment and generated Task 5A/5B briefs are
+> the sole execution instructions; they incorporate every surviving non-conflicting
+> requirement and require **Task 5A → Task 5B** as two independent commits.
+
 **Files:**
 - Modify: `model/task.go`
 - Create: `model/task_submission.go`
