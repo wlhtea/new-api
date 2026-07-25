@@ -323,6 +323,8 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 	return channel, nil
 }
 
+var getTaskRelayChannel = getChannel
+
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
 	if openaiErr == nil {
 		return false
@@ -590,17 +592,64 @@ func finalizeDurableTaskSubmission(
 	if taskErr := relay.ValidateFullPrepaidTaskBilling(info, result.Quota); taskErr != nil {
 		return failDurableTaskAfterSettlementError(c, info, result, taskErr.Error)
 	}
+	relay.RecordTaskSubmissionEvent(c, "validate_full_prepaid_again")
 	if err := service.SettleBilling(c, info, result.Quota); err != nil {
 		return failDurableTaskAfterSettlementError(c, info, result, err)
 	}
+	relay.RecordTaskSubmissionEvent(c, "settle_zero_delta")
 	if err := model.MarkTaskBillingAttemptSubmissionSettled(
 		info.BillingAttemptRequestID,
 	); err != nil {
 		return failDurableTaskAfterSettlementError(c, info, result, err)
 	}
+	relay.RecordTaskSubmissionEvent(c, "mark_billing_attempt_submission_settled")
 	service.LogTaskConsumption(c, info)
+	relay.RecordTaskSubmissionEvent(c, "consume_log")
 	c.JSON(result.HTTPResponse.StatusCode, result.HTTPResponse.Body)
+	relay.RecordTaskSubmissionEvent(c, "write_http_200")
 	return nil
+}
+
+func refundLegacyTaskBillingOnFailure(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	taskErr *dto.TaskError,
+) {
+	if info == nil || taskErr == nil || info.Billing == nil {
+		return
+	}
+	durableAttempt := info.TaskRelayInfo != nil &&
+		info.BillingAttemptRequestID != ""
+	if !durableAttempt {
+		info.Billing.Refund(c)
+	}
+}
+
+func recoverDurableTaskSubmission(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	result *relay.TaskSubmitResult,
+	taskErr *dto.TaskError,
+) error {
+	if info == nil || taskErr == nil || info.TaskRelayInfo == nil ||
+		info.BillingAttemptRequestID == "" {
+		return nil
+	}
+	upstreamTaskID := ""
+	var taskData []byte
+	if result != nil {
+		upstreamTaskID = result.UpstreamTaskID
+		taskData = result.TaskData
+	}
+	return service.FailAndRefundTaskSubmission(
+		durableTaskRequestContext(c),
+		info.PersistentTaskID,
+		info.BillingAttemptRequestID,
+		upstreamTaskID,
+		taskData,
+		taskErr.Code,
+		"task submission failed",
+	)
 }
 
 func RelayTask(c *gin.Context) {
@@ -622,11 +671,7 @@ func RelayTask(c *gin.Context) {
 	var result *relay.TaskSubmitResult
 	var taskErr *dto.TaskError
 	defer func() {
-		durableAttempt := relayInfo.TaskRelayInfo != nil &&
-			relayInfo.BillingAttemptRequestID != ""
-		if taskErr != nil && relayInfo.Billing != nil && !durableAttempt {
-			relayInfo.Billing.Refund(c)
-		}
+		refundLegacyTaskBillingOnFailure(c, relayInfo, taskErr)
 	}()
 
 	retryParam := &service.RetryParam{
@@ -650,7 +695,7 @@ func RelayTask(c *gin.Context) {
 			}
 		} else {
 			var channelErr *types.NewAPIError
-			channel, channelErr = getChannel(c, relayInfo, retryParam)
+			channel, channelErr = getTaskRelayChannel(c, relayInfo, retryParam)
 			if channelErr != nil {
 				logger.LogError(c, channelErr.Error())
 				taskErr = service.TaskErrorWrapperLocal(channelErr.Err, "get_channel_failed", http.StatusInternalServerError)
@@ -703,25 +748,13 @@ func RelayTask(c *gin.Context) {
 		logger.LogInfo(c, retryLogStr)
 	}
 
-	if taskErr != nil && relayInfo.TaskRelayInfo != nil &&
-		relayInfo.BillingAttemptRequestID != "" {
-		upstreamTaskID := ""
-		var taskData []byte
-		if result != nil {
-			upstreamTaskID = result.UpstreamTaskID
-			taskData = result.TaskData
-		}
-		if recoveryErr := service.FailAndRefundTaskSubmission(
-			durableTaskRequestContext(c),
-			relayInfo.PersistentTaskID,
-			relayInfo.BillingAttemptRequestID,
-			upstreamTaskID,
-			taskData,
-			taskErr.Code,
-			"task submission failed",
-		); recoveryErr != nil {
-			common.SysError("durable task submission recovery incomplete")
-		}
+	if recoveryErr := recoverDurableTaskSubmission(
+		c,
+		relayInfo,
+		result,
+		taskErr,
+	); recoveryErr != nil {
+		common.SysError("durable task submission recovery incomplete")
 	}
 
 	// ── 成功：durable 路径先结算/marker/日志/HTTP；旧 adaptor 保持原行为 ──

@@ -35,6 +35,57 @@ type TaskSubmitResult struct {
 }
 
 var taskSubmissionNow = time.Now
+var getTaskSubmitAdaptor = GetTaskAdaptor
+var prepareTaskSubmissionAttempt = model.PrepareTaskSubmissionAttempt
+
+const taskSubmissionEventObserverKey = "task_submission_event_observer"
+const taskSubmissionNowKey = "task_submission_now"
+
+// SetTaskSubmissionNow installs a request-local clock for deterministic
+// submission retries. Production requests fall back to taskSubmissionNow.
+func SetTaskSubmissionNow(c *gin.Context, now func() time.Time) {
+	if c == nil {
+		return
+	}
+	c.Set(taskSubmissionNowKey, now)
+}
+
+func currentTaskSubmissionTime(c *gin.Context) time.Time {
+	if c != nil {
+		if value, exists := c.Get(taskSubmissionNowKey); exists {
+			if now, ok := value.(func() time.Time); ok && now != nil {
+				return now()
+			}
+		}
+	}
+	return taskSubmissionNow()
+}
+
+// SetTaskSubmissionEventObserver installs a request-local event observer used
+// by orchestration tests. Normal requests have no observer and incur no output
+// or global state.
+func SetTaskSubmissionEventObserver(c *gin.Context, observer func(string)) {
+	if c == nil {
+		return
+	}
+	c.Set(taskSubmissionEventObserverKey, observer)
+}
+
+// RecordTaskSubmissionEvent records one successful durable-submission
+// boundary when a request-local observer is installed.
+func RecordTaskSubmissionEvent(c *gin.Context, event string) {
+	if c == nil || event == "" {
+		return
+	}
+	value, exists := c.Get(taskSubmissionEventObserverKey)
+	if !exists {
+		return
+	}
+	observer, ok := value.(func(string))
+	if ok && observer != nil {
+		observer(event)
+	}
+}
 
 func fullPrepaidTaskBillingError() *dto.TaskError {
 	retryable := false
@@ -201,7 +252,7 @@ func beginDurableTaskBilling(
 		}
 	case errors.Is(lookupErr, gorm.ErrRecordNotFound):
 		if info.DurableSubmitTime == 0 {
-			info.DurableSubmitTime = taskSubmissionNow().Unix()
+			info.DurableSubmitTime = currentTaskSubmissionTime(c).Unix()
 		}
 		session, planned, apiErr := service.NewDurableTaskBillingSession(c, info, quota)
 		if apiErr != nil {
@@ -230,6 +281,7 @@ func beginDurableTaskBilling(
 	if taskErr := ValidateFullPrepaidTaskBilling(info, quota); taskErr != nil {
 		return nil, nil, taskErr
 	}
+	RecordTaskSubmissionEvent(c, "validate_full_prepaid_shape")
 	snapshot := taskBillingAttemptSnapshot(info, plan, billingContext)
 	attempt, err := model.BeginTaskBillingAttempt(snapshot)
 	if err != nil {
@@ -238,10 +290,12 @@ func beginDurableTaskBilling(
 			err,
 		)
 	}
+	RecordTaskSubmissionEvent(c, "begin_billing_attempt_owner_request")
 	return plan, attempt, nil
 }
 
 func applyDurableTaskPreconsume(
+	c *gin.Context,
 	info *relaycommon.RelayInfo,
 	attempt *model.TaskBillingAttempt,
 ) (*model.TaskBillingAttempt, *dto.TaskError) {
@@ -255,19 +309,16 @@ func applyDurableTaskPreconsume(
 	if _, err := model.ApplyTaskFundingPreconsume(attempt.RequestID); err != nil {
 		return nil, durableTaskLocalError("seedance_billing_preconsume_failed", err)
 	}
+	RecordTaskSubmissionEvent(c, "sync_funding_preconsume_and_marker")
 	if _, err := model.ApplyTaskTokenPreconsume(attempt.RequestID); err != nil {
 		return nil, durableTaskLocalError("seedance_billing_preconsume_failed", err)
 	}
-	verified, err := model.VerifyTaskBillingAttemptPreconsumed(attempt.RequestID)
-	if err != nil {
-		primary, readErr := model.GetTaskBillingAttemptByRequestID(attempt.RequestID)
-		if readErr == nil && primary.Owner == model.TaskBillingOwnerTask {
-			verified, err = verifyLinkedDurableTaskPreconsume(primary)
-		}
-	}
+	RecordTaskSubmissionEvent(c, "sync_token_preconsume_and_marker")
+	verified, err := model.VerifyTaskBillingAttemptPreconsumedForSubmit(attempt.RequestID)
 	if err != nil {
 		return nil, durableTaskLocalError("seedance_billing_primary_verify_failed", err)
 	}
+	RecordTaskSubmissionEvent(c, "primary_db_verify_preconsume")
 	if !verified.IsFree {
 		verifier, ok := info.Billing.(interface {
 			VerifyDurableTaskBillingAttempt(string) error
@@ -283,36 +334,6 @@ func applyDurableTaskPreconsume(
 		}
 	}
 	return verified, nil
-}
-
-func verifyLinkedDurableTaskPreconsume(
-	attempt *model.TaskBillingAttempt,
-) (*model.TaskBillingAttempt, error) {
-	if attempt == nil || attempt.Owner != model.TaskBillingOwnerTask ||
-		attempt.TaskID == nil || *attempt.TaskID <= 0 ||
-		attempt.FundingConsumedAt == 0 || attempt.TokenConsumedAt == 0 ||
-		attempt.PreconsumeCompletedAt == 0 ||
-		attempt.RefundStartedAt != 0 || attempt.RefundCompletedAt != 0 ||
-		attempt.SucceededAt != 0 {
-		return nil, model.ErrTaskBillingAttemptState
-	}
-	task, err := model.GetTaskByPrimaryID(*attempt.TaskID)
-	if err != nil {
-		return nil, err
-	}
-	if task.TaskID != attempt.PublicTaskID ||
-		task.UserId != attempt.UserID ||
-		task.Quota != attempt.FundingAmount ||
-		task.PrivateData.BillingSource != attempt.FundingSource ||
-		task.PrivateData.SubscriptionId != attempt.SubscriptionID ||
-		task.PrivateData.TokenId != attempt.TokenID ||
-		task.SubmitTime != attempt.SubmitTime ||
-		task.Status != model.TaskStatusSubmitting ||
-		task.Progress != "0%" ||
-		task.PrivateData.UpstreamTaskID != "" {
-		return nil, model.ErrTaskBillingIdentityDrift
-	}
-	return attempt, nil
 }
 
 func newDurableProvisionalTask(
@@ -464,6 +485,32 @@ func nonRetryableTaskPersistenceError(err error) *dto.TaskError {
 	}
 }
 
+const reliableTaskSubmitErrorMessage = "upstream task submission failed after task creation"
+
+// sanitizeReliableTaskSubmitError retains only routing/retry metadata after a
+// reliable provider identity exists. Provider-controlled messages, wrapped
+// errors, and Data may contain the internal task ID or echoed request media and
+// therefore must not cross the relay boundary into logs or client JSON.
+func sanitizeReliableTaskSubmitError(taskErr *dto.TaskError) *dto.TaskError {
+	if taskErr == nil {
+		return nil
+	}
+	var retryable *bool
+	if taskErr.Retryable != nil {
+		value := *taskErr.Retryable
+		retryable = &value
+	}
+	return &dto.TaskError{
+		Code:       taskErr.Code,
+		Message:    reliableTaskSubmitErrorMessage,
+		StatusCode: taskErr.StatusCode,
+		Retryable:  retryable,
+		LocalError: taskErr.LocalError,
+		Error:      errors.New(reliableTaskSubmitErrorMessage),
+		Data:       nil,
+	}
+}
+
 func recordSeedDanceSubmitReconciliation(
 	info *relaycommon.RelayInfo,
 	upstreamTaskID string,
@@ -503,12 +550,13 @@ func submitDurableTask(
 	if taskErr != nil {
 		return nil, taskErr
 	}
-	if _, taskErr = applyDurableTaskPreconsume(info, attempt); taskErr != nil {
+	if _, taskErr = applyDurableTaskPreconsume(c, info, attempt); taskErr != nil {
 		return nil, taskErr
 	}
 	if taskErr = ValidateFullPrepaidTaskBilling(info, quota); taskErr != nil {
 		return nil, taskErr
 	}
+	RecordTaskSubmissionEvent(c, "validate_full_prepaid_before_build")
 
 	requestBody, err := adaptor.BuildRequestBody(c, info)
 	if err != nil {
@@ -518,8 +566,9 @@ func submitDurableTask(
 			http.StatusInternalServerError,
 		)
 	}
+	RecordTaskSubmissionEvent(c, "build_body")
 	candidate := newDurableProvisionalTask(info, platform, quota, billingContext)
-	prepared, _, err := model.PrepareTaskSubmissionAttempt(
+	prepared, _, err := prepareTaskSubmissionAttempt(
 		candidate,
 		info.PersistentTaskID,
 		info.BillingAttemptRequestID,
@@ -529,8 +578,15 @@ func submitDurableTask(
 	}
 	info.PersistentTaskID = prepared.ID
 	info.DurableSubmitTime = prepared.SubmitTime
+	RecordTaskSubmissionEvent(c, "insert_provisional_link_attempt_transfer_owner")
+	if _, err := model.VerifyTaskBillingAttemptPreconsumedForSubmit(
+		info.BillingAttemptRequestID,
+	); err != nil {
+		return nil, durableTaskLocalError("seedance_billing_primary_verify_failed", err)
+	}
 
 	resp, requestErr := adaptor.DoRequest(c, info, requestBody)
+	RecordTaskSubmissionEvent(c, "post_generate")
 	if requestErr == nil && resp == nil {
 		requestErr = errors.New("upstream returned a nil response")
 	}
@@ -581,6 +637,7 @@ func submitDurableTask(
 			Platform:       platform,
 			Quota:          quota,
 		}
+		taskErr = sanitizeReliableTaskSubmitError(taskErr)
 		if _, err := attachTaskUpstreamResultWithRetry(
 			taskSubmissionContext(c),
 			info,
@@ -596,6 +653,7 @@ func submitDurableTask(
 			}
 			return partial, nonRetryableTaskPersistenceError(err)
 		}
+		RecordTaskSubmissionEvent(c, "attach_upstream_id")
 	}
 	if taskErr != nil {
 		return partial, taskErr
@@ -634,6 +692,7 @@ func submitDurableTask(
 		return partial, durableTaskLocalError("build_task_submit_response_failed", err)
 	}
 	partial.HTTPResponse = httpResponse
+	RecordTaskSubmissionEvent(c, "build_public_response")
 	if _, err := commitTaskSubmissionWithRetry(taskSubmissionContext(c), info); err != nil {
 		if recordErr := recordSeedDanceSubmitReconciliation(
 			info,
@@ -644,6 +703,7 @@ func submitDurableTask(
 		}
 		return partial, nonRetryableTaskPersistenceError(err)
 	}
+	RecordTaskSubmissionEvent(c, "mark_submitted")
 	return partial, nil
 }
 
@@ -653,7 +713,8 @@ func isDurableFullPrepaidTaskAdaptor(adaptor channel.TaskAdaptor) bool {
 	}
 	fullPrepaid, fullPrepaidOK := adaptor.(channel.FullPrepaidTaskSubmitter)
 	durable, durableOK := adaptor.(channel.DurableTaskSubmitter)
-	return fullPrepaidOK && durableOK &&
+	_, responderOK := adaptor.(channel.DeferredTaskSubmitResponder)
+	return fullPrepaidOK && durableOK && responderOK &&
 		fullPrepaid.RequiresFullPrepaidBilling() &&
 		durable.RequiresDurableTaskBeforeSubmit()
 }
@@ -778,7 +839,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	if platform == "" {
 		platform = GetTaskPlatform(c)
 	}
-	adaptor := GetTaskAdaptor(platform)
+	adaptor := getTaskSubmitAdaptor(platform)
 	if adaptor == nil {
 		return nil, service.TaskErrorWrapperLocal(fmt.Errorf("invalid api platform: %s", platform), "invalid_api_platform", http.StatusBadRequest)
 	}
