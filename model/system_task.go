@@ -16,11 +16,12 @@ const (
 	SystemTaskStatusSucceeded SystemTaskStatus = "succeeded"
 	SystemTaskStatusFailed    SystemTaskStatus = "failed"
 
-	SystemTaskTypeLogCleanup     = "log_cleanup"
-	SystemTaskTypeChannelTest    = "channel_test"
-	SystemTaskTypeModelUpdate    = "model_update"
-	SystemTaskTypeMidjourneyPoll = "midjourney_poll"
-	SystemTaskTypeAsyncTaskPoll  = "async_task_poll"
+	SystemTaskTypeLogCleanup                    = "log_cleanup"
+	SystemTaskTypeChannelTest                   = "channel_test"
+	SystemTaskTypeModelUpdate                   = "model_update"
+	SystemTaskTypeMidjourneyPoll                = "midjourney_poll"
+	SystemTaskTypeAsyncTaskPoll                 = "async_task_poll"
+	SystemTaskTypeSeedDanceSubmitReconciliation = "seedance_submit_reconciliation"
 )
 
 var ErrSystemTaskLockLost = errors.New("system task lock lost")
@@ -90,6 +91,27 @@ func GenerateSystemTaskID() (string, error) {
 }
 
 func CreateSystemTask(taskType string, payload any, state any) (*SystemTask, error) {
+	return createSystemTaskWithActiveKey(taskType, taskType, payload, state)
+}
+
+func CreateSystemTaskWithActiveKey(
+	taskType string,
+	activeKey string,
+	payload any,
+	state any,
+) (*SystemTask, error) {
+	if taskType == "" || activeKey == "" {
+		return nil, errors.New("system task type and active key are required")
+	}
+	return createSystemTaskWithActiveKey(taskType, activeKey, payload, state)
+}
+
+func createSystemTaskWithActiveKey(
+	taskType string,
+	activeKey string,
+	payload any,
+	state any,
+) (*SystemTask, error) {
 	taskID, err := GenerateSystemTaskID()
 	if err != nil {
 		return nil, err
@@ -107,7 +129,7 @@ func CreateSystemTask(taskType string, payload any, state any) (*SystemTask, err
 		TaskID:    taskID,
 		Type:      taskType,
 		Status:    SystemTaskStatusPending,
-		ActiveKey: &taskType,
+		ActiveKey: &activeKey,
 		Payload:   payloadText,
 		State:     stateText,
 	}
@@ -132,6 +154,31 @@ func GetSystemTaskByTaskID(taskID string) (*SystemTask, error) {
 func GetActiveSystemTask(taskType string) (*SystemTask, error) {
 	var task SystemTask
 	err := DB.Where("type = ? AND status IN ?", taskType, activeSystemTaskStatuses()).
+		Order("id desc").
+		First(&task).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &task, nil
+}
+
+func GetActiveSystemTaskByActiveKey(
+	taskType string,
+	activeKey string,
+) (*SystemTask, error) {
+	if taskType == "" || activeKey == "" {
+		return nil, errors.New("system task type and active key are required")
+	}
+	var task SystemTask
+	err := DB.Where(
+		"type = ? AND active_key = ? AND status IN ?",
+		taskType,
+		activeKey,
+		activeSystemTaskStatuses(),
+	).
 		Order("id desc").
 		First(&task).Error
 	if err != nil {

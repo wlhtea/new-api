@@ -679,6 +679,14 @@ type TaskRelayInfo struct {
 	// 供 DoResponse 在返回给客户端时使用（避免暴露上游真实 ID）。
 	PublicTaskID string
 
+	// PersistentTaskID is the primary-key identity of a durable provisional
+	// Task. BillingAttemptRequestID is the RequestID-keyed ledger identity, and
+	// DurableSubmitTime is the immutable first submission timestamp reused by
+	// safe retries.
+	PersistentTaskID        int64
+	BillingAttemptRequestID string
+	DurableSubmitTime       int64
+
 	ConsumeQuota bool
 
 	// LockedChannel holds the full channel object when the request is bound to

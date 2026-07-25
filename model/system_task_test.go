@@ -89,6 +89,51 @@ func TestSystemTaskActiveKeyPreventsDuplicateActiveRun(t *testing.T) {
 	assert.Equal(t, task.TaskID, activeTask.TaskID)
 }
 
+func TestSystemTaskActiveKeyAwareCreationAndQuery(t *testing.T) {
+	truncateTables(t)
+
+	first, err := CreateSystemTaskWithActiveKey(
+		SystemTaskTypeSeedDanceSubmitReconciliation,
+		"sd-submit:first",
+		map[string]any{"public_task_id": "task_first"},
+		nil,
+	)
+	require.NoError(t, err)
+	second, err := CreateSystemTaskWithActiveKey(
+		SystemTaskTypeSeedDanceSubmitReconciliation,
+		"sd-submit:second",
+		map[string]any{"public_task_id": "task_second"},
+		nil,
+	)
+	require.NoError(t, err)
+	assert.NotEqual(t, first.TaskID, second.TaskID)
+
+	_, err = CreateSystemTaskWithActiveKey(
+		SystemTaskTypeSeedDanceSubmitReconciliation,
+		"sd-submit:first",
+		map[string]any{"public_task_id": "task_duplicate"},
+		nil,
+	)
+	require.Error(t, err)
+
+	active, err := GetActiveSystemTaskByActiveKey(
+		SystemTaskTypeSeedDanceSubmitReconciliation,
+		"sd-submit:first",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	assert.Equal(t, first.TaskID, active.TaskID)
+	require.NotNil(t, active.ActiveKey)
+	assert.Equal(t, "sd-submit:first", *active.ActiveKey)
+
+	missing, err := GetActiveSystemTaskByActiveKey(
+		SystemTaskTypeSeedDanceSubmitReconciliation,
+		"sd-submit:missing",
+	)
+	require.NoError(t, err)
+	assert.Nil(t, missing)
+}
+
 func TestSystemTaskLockPreventsConcurrentClaim(t *testing.T) {
 	truncateTables(t)
 

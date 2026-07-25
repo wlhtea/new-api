@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -483,6 +484,125 @@ func RelayTaskFetch(c *gin.Context) {
 	}
 }
 
+func mergeReliableTaskSubmitResult(
+	existing *relay.TaskSubmitResult,
+	incoming *relay.TaskSubmitResult,
+) (*relay.TaskSubmitResult, *dto.TaskError) {
+	if incoming == nil {
+		return existing, nil
+	}
+	if existing == nil {
+		return incoming, nil
+	}
+	if existing.UpstreamTaskID == "" {
+		existing.UpstreamTaskID = incoming.UpstreamTaskID
+	} else if incoming.UpstreamTaskID != "" &&
+		incoming.UpstreamTaskID != existing.UpstreamTaskID {
+		retryable := false
+		err := errors.New("conflicting reliable upstream task identities")
+		return existing, &dto.TaskError{
+			Code:       "reliable_task_identity_conflict",
+			Message:    "conflicting upstream task result",
+			StatusCode: http.StatusInternalServerError,
+			Retryable:  &retryable,
+			LocalError: true,
+			Error:      err,
+		}
+	}
+	if len(existing.TaskData) == 0 && len(incoming.TaskData) != 0 {
+		existing.TaskData = append([]byte(nil), incoming.TaskData...)
+	}
+	if existing.Platform == "" {
+		existing.Platform = incoming.Platform
+	}
+	if existing.Quota == 0 {
+		existing.Quota = incoming.Quota
+	}
+	if existing.HTTPResponse == nil {
+		existing.HTTPResponse = incoming.HTTPResponse
+	}
+	return existing, nil
+}
+
+func durableTaskSettlementError(err error) *dto.TaskError {
+	retryable := false
+	if err == nil {
+		err = errors.New("durable task billing settlement failed")
+	}
+	return &dto.TaskError{
+		Code:       "seedance_billing_settlement_failed",
+		Message:    "task billing settlement failed",
+		StatusCode: http.StatusInternalServerError,
+		Retryable:  &retryable,
+		LocalError: true,
+		Error:      err,
+	}
+}
+
+func failDurableTaskAfterSettlementError(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	result *relay.TaskSubmitResult,
+	settlementErr error,
+) *dto.TaskError {
+	if info == nil || info.TaskRelayInfo == nil {
+		return durableTaskSettlementError(settlementErr)
+	}
+	upstreamTaskID := ""
+	var taskData []byte
+	if result != nil {
+		upstreamTaskID = result.UpstreamTaskID
+		taskData = result.TaskData
+	}
+	recoveryErr := service.FailAndRefundTaskSubmission(
+		durableTaskRequestContext(c),
+		info.PersistentTaskID,
+		info.BillingAttemptRequestID,
+		upstreamTaskID,
+		taskData,
+		"seedance_billing_settlement_failed",
+		"task billing settlement failed",
+	)
+	return durableTaskSettlementError(errors.Join(settlementErr, recoveryErr))
+}
+
+func durableTaskRequestContext(c *gin.Context) context.Context {
+	if c != nil && c.Request != nil {
+		return c.Request.Context()
+	}
+	return context.Background()
+}
+
+func finalizeDurableTaskSubmission(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	result *relay.TaskSubmitResult,
+) *dto.TaskError {
+	if info == nil || info.TaskRelayInfo == nil || result == nil ||
+		result.HTTPResponse == nil || info.BillingAttemptRequestID == "" {
+		return failDurableTaskAfterSettlementError(
+			c,
+			info,
+			result,
+			errors.New("durable task success state is incomplete"),
+		)
+	}
+	if taskErr := relay.ValidateFullPrepaidTaskBilling(info, result.Quota); taskErr != nil {
+		return failDurableTaskAfterSettlementError(c, info, result, taskErr.Error)
+	}
+	if err := service.SettleBilling(c, info, result.Quota); err != nil {
+		return failDurableTaskAfterSettlementError(c, info, result, err)
+	}
+	if err := model.MarkTaskBillingAttemptSubmissionSettled(
+		info.BillingAttemptRequestID,
+	); err != nil {
+		return failDurableTaskAfterSettlementError(c, info, result, err)
+	}
+	service.LogTaskConsumption(c, info)
+	c.JSON(result.HTTPResponse.StatusCode, result.HTTPResponse.Body)
+	return nil
+}
+
 func RelayTask(c *gin.Context) {
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
@@ -502,7 +622,9 @@ func RelayTask(c *gin.Context) {
 	var result *relay.TaskSubmitResult
 	var taskErr *dto.TaskError
 	defer func() {
-		if taskErr != nil && relayInfo.Billing != nil {
+		durableAttempt := relayInfo.TaskRelayInfo != nil &&
+			relayInfo.BillingAttemptRequestID != ""
+		if taskErr != nil && relayInfo.Billing != nil && !durableAttempt {
 			relayInfo.Billing.Refund(c)
 		}
 	}()
@@ -548,7 +670,14 @@ func RelayTask(c *gin.Context) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
-		result, taskErr = relay.RelayTaskSubmit(c, relayInfo)
+		attemptResult, attemptErr := relay.RelayTaskSubmit(c, relayInfo)
+		var mergeErr *dto.TaskError
+		result, mergeErr = mergeReliableTaskSubmitResult(result, attemptResult)
+		if mergeErr != nil {
+			taskErr = mergeErr
+		} else {
+			taskErr = attemptErr
+		}
 		if taskErr == nil {
 			break
 		}
@@ -560,6 +689,9 @@ func RelayTask(c *gin.Context) {
 				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode))
 		}
 
+		if result != nil && result.UpstreamTaskID != "" {
+			break
+		}
 		if !shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry()) {
 			break
 		}
@@ -571,32 +703,62 @@ func RelayTask(c *gin.Context) {
 		logger.LogInfo(c, retryLogStr)
 	}
 
-	// ── 成功：结算 + 日志 + 插入任务 ──
-	if taskErr == nil {
-		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
-			common.SysError("settle task billing error: " + settleErr.Error())
+	if taskErr != nil && relayInfo.TaskRelayInfo != nil &&
+		relayInfo.BillingAttemptRequestID != "" {
+		upstreamTaskID := ""
+		var taskData []byte
+		if result != nil {
+			upstreamTaskID = result.UpstreamTaskID
+			taskData = result.TaskData
 		}
-		service.LogTaskConsumption(c, relayInfo)
+		if recoveryErr := service.FailAndRefundTaskSubmission(
+			durableTaskRequestContext(c),
+			relayInfo.PersistentTaskID,
+			relayInfo.BillingAttemptRequestID,
+			upstreamTaskID,
+			taskData,
+			taskErr.Code,
+			"task submission failed",
+		); recoveryErr != nil {
+			common.SysError("durable task submission recovery incomplete")
+		}
+	}
 
-		task := model.InitTask(result.Platform, relayInfo)
-		task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
-		task.PrivateData.BillingSource = relayInfo.BillingSource
-		task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
-		task.PrivateData.TokenId = relayInfo.TokenId
-		task.PrivateData.NodeName = common.NodeName
-		task.PrivateData.BillingContext = &model.TaskBillingContext{
-			ModelPrice:      relayInfo.PriceData.ModelPrice,
-			GroupRatio:      relayInfo.PriceData.GroupRatioInfo.GroupRatio,
-			ModelRatio:      relayInfo.PriceData.ModelRatio,
-			OtherRatios:     relayInfo.PriceData.OtherRatios(),
-			OriginModelName: relayInfo.OriginModelName,
-			PerCallBilling:  common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice,
-		}
-		task.Quota = result.Quota
-		task.Data = result.TaskData
-		task.Action = relayInfo.Action
-		if insertErr := task.Insert(); insertErr != nil {
-			common.SysError("insert task error: " + insertErr.Error())
+	// ── 成功：durable 路径先结算/marker/日志/HTTP；旧 adaptor 保持原行为 ──
+	if taskErr == nil {
+		durableAttempt := relayInfo.TaskRelayInfo != nil &&
+			relayInfo.BillingAttemptRequestID != ""
+		if durableAttempt {
+			taskErr = finalizeDurableTaskSubmission(c, relayInfo, result)
+		} else {
+			if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+				common.SysError("settle task billing error: " + settleErr.Error())
+			}
+			service.LogTaskConsumption(c, relayInfo)
+
+			task := model.InitTask(result.Platform, relayInfo)
+			task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
+			task.PrivateData.BillingSource = relayInfo.BillingSource
+			task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
+			task.PrivateData.TokenId = relayInfo.TokenId
+			task.PrivateData.NodeName = common.NodeName
+			task.PrivateData.BillingContext = &model.TaskBillingContext{
+				ModelPrice:      relayInfo.PriceData.ModelPrice,
+				GroupRatio:      relayInfo.PriceData.GroupRatioInfo.GroupRatio,
+				ModelRatio:      relayInfo.PriceData.ModelRatio,
+				OtherRatios:     relayInfo.PriceData.OtherRatios(),
+				OriginModelName: relayInfo.OriginModelName,
+				PerCallBilling: common.StringsContains(
+					constant.TaskPricePatches,
+					relayInfo.OriginModelName,
+				) || relayInfo.PriceData.UsePrice,
+			}
+			task.Quota = result.Quota
+			task.Data = result.TaskData
+			task.Action = relayInfo.Action
+			if insertErr := task.Insert(); insertErr != nil {
+				common.SysError("insert task error: " + insertErr.Error())
+			}
 		}
 	}
 
@@ -625,6 +787,9 @@ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError,
 	}
 	if _, ok := c.Get("specific_channel_id"); ok {
 		return false
+	}
+	if taskErr.Retryable != nil {
+		return *taskErr.Retryable
 	}
 	if taskErr.StatusCode == http.StatusTooManyRequests {
 		return true
