@@ -261,6 +261,142 @@ func TestUpdateWithStatus_ConcurrentWinner(t *testing.T) {
 	assert.Equal(t, 1, winCount, "exactly one goroutine should win the CAS")
 }
 
+func TestTransitionTaskToSuccessLocksAttemptAndUpdatesNarrowColumns(t *testing.T) {
+	truncateTables(t)
+	candidate, _ := preparedSubmissionFixture(t, "poll-final-success", 100)
+	prepared, _, err := PrepareTaskSubmissionAttempt(candidate, 0, "poll-final-success")
+	require.NoError(t, err)
+	_, err = AttachTaskUpstreamResult(
+		prepared.ID,
+		prepared.TaskID,
+		"UPSTREAM_FINAL_SUCCESS",
+		json.RawMessage(`{"status":"accepted"}`),
+	)
+	require.NoError(t, err)
+	prepared, err = CommitTaskSubmission(prepared.ID, prepared.TaskID)
+	require.NoError(t, err)
+	require.NoError(t, MarkTaskBillingAttemptSubmissionSettled("poll-final-success"))
+	require.NoError(t, DB.Model(&Task{}).Where("id = ?", prepared.ID).
+		Updates(map[string]any{
+			"status":   TaskStatusInProgress,
+			"progress": "30%",
+			"private_data": TaskPrivateData{
+				Key:            "LATEST_STORED_KEY",
+				UpstreamTaskID: "UPSTREAM_FINAL_SUCCESS",
+				BillingSource:  prepared.PrivateData.BillingSource,
+				SubscriptionId: prepared.PrivateData.SubscriptionId,
+				TokenId:        prepared.PrivateData.TokenId,
+				NodeName:       "latest-node",
+				BillingContext: prepared.PrivateData.BillingContext,
+			},
+		}).Error)
+
+	data := json.RawMessage(`{"status":"completed"}`)
+	transitioned, attempt, err := TransitionTaskToSuccess(
+		prepared.ID,
+		prepared.TaskID,
+		TaskSuccessTransition{
+			ExpectedStatus:   TaskStatusInProgress,
+			ExpectedProgress: "30%",
+			ResultURL:        "/v1/videos/" + prepared.TaskID + "/content",
+			Data:             &data,
+		},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, attempt)
+	assert.Equal(t, "poll-final-success", attempt.RequestID)
+	assert.Equal(t, TaskStatus(TaskStatusSuccess), transitioned.Status)
+	assert.Equal(t, "100%", transitioned.Progress)
+	assert.Equal(t, "LATEST_STORED_KEY", transitioned.PrivateData.Key)
+	assert.Equal(t, "latest-node", transitioned.PrivateData.NodeName)
+	assert.Equal(
+		t,
+		"/v1/videos/"+prepared.TaskID+"/content",
+		transitioned.PrivateData.ResultURL,
+	)
+	assert.JSONEq(t, string(data), string(transitioned.Data))
+
+	reloadedAttempt := loadBillingAttempt(t, "poll-final-success")
+	assert.NotZero(t, reloadedAttempt.SubmissionSettledAt)
+	assert.Zero(t, reloadedAttempt.SucceededAt)
+}
+
+func TestTransitionTaskToSuccessRejectsLostStateAndRefundConflict(t *testing.T) {
+	tests := []struct {
+		name         string
+		mutateTask   map[string]any
+		mutateLedger map[string]any
+	}{
+		{
+			name:       "lost expected state",
+			mutateTask: map[string]any{"progress": "40%"},
+		},
+		{
+			name: "refund started",
+			mutateLedger: map[string]any{
+				"refund_started_at": time.Now().Unix(),
+			},
+		},
+		{
+			name: "refund completed",
+			mutateLedger: map[string]any{
+				"refund_started_at":   time.Now().Unix(),
+				"refund_completed_at": time.Now().Unix(),
+			},
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			truncateTables(t)
+			requestID := "poll-success-conflict-" + string(rune('a'+index))
+			candidate, _ := preparedSubmissionFixture(t, requestID, 0)
+			prepared, attempt, err := PrepareTaskSubmissionAttempt(candidate, 0, requestID)
+			require.NoError(t, err)
+			_, err = AttachTaskUpstreamResult(
+				prepared.ID,
+				prepared.TaskID,
+				"UPSTREAM_CONFLICT",
+				nil,
+			)
+			require.NoError(t, err)
+			prepared, err = CommitTaskSubmission(prepared.ID, prepared.TaskID)
+			require.NoError(t, err)
+			require.NoError(t, MarkTaskBillingAttemptSubmissionSettled(requestID))
+			require.NoError(t, DB.Model(&Task{}).Where("id = ?", prepared.ID).
+				Updates(map[string]any{
+					"status":   TaskStatusInProgress,
+					"progress": "30%",
+				}).Error)
+			if len(test.mutateTask) > 0 {
+				require.NoError(t, DB.Model(&Task{}).Where("id = ?", prepared.ID).
+					Updates(test.mutateTask).Error)
+			}
+			if len(test.mutateLedger) > 0 {
+				require.NoError(t, DB.Model(&TaskBillingAttempt{}).
+					Where("id = ?", attempt.ID).
+					Updates(test.mutateLedger).Error)
+			}
+
+			_, _, err = TransitionTaskToSuccess(
+				prepared.ID,
+				prepared.TaskID,
+				TaskSuccessTransition{
+					ExpectedStatus:   TaskStatusInProgress,
+					ExpectedProgress: "30%",
+					ResultURL:        "/v1/videos/" + prepared.TaskID + "/content",
+				},
+			)
+			require.Error(t, err)
+
+			var reloaded Task
+			require.NoError(t, DB.First(&reloaded, prepared.ID).Error)
+			assert.NotEqual(t, TaskStatus(TaskStatusSuccess), reloaded.Status)
+			reloadedAttempt := loadBillingAttempt(t, requestID)
+			assert.Zero(t, reloadedAttempt.SucceededAt)
+		})
+	}
+}
+
 func TestClaimQuotaForRefund_OnlyOneClaimSucceeds(t *testing.T) {
 	truncateTables(t)
 

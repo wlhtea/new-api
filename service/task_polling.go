@@ -35,6 +35,16 @@ type TaskPollingAdaptor interface {
 	AdjustBillingOnComplete(task *model.Task, taskResult *relaycommon.TaskInfo) int
 }
 
+type TaskFetcherWithContext interface {
+	FetchTaskWithContext(
+		ctx context.Context,
+		baseURL string,
+		key string,
+		body map[string]any,
+		proxy string,
+	) (*http.Response, error)
+}
+
 // GetTaskAdaptorFunc 由 main 包注入，用于获取指定平台的任务适配器。
 // 打破 service -> relay -> relay/channel -> service 的循环依赖。
 var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
@@ -268,6 +278,9 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
 	for _, t := range allTasks {
+		if t == nil || t.Status == model.TaskStatusSubmitting {
+			continue
+		}
 		platformTask[t.Platform] = append(platformTask[t.Platform], t)
 	}
 
@@ -674,18 +687,30 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
 	}
-	key := ch.Key
-
-	privateData := task.PrivateData
-	if privateData.Key != "" {
-		key = privateData.Key
+	if task.Status == model.TaskStatusSubmitting {
+		return nil
 	}
-	resp, err := adaptor.FetchTask(baseURL, key, map[string]any{
-		"task_id": task.GetUpstreamTaskID(),
-		"action":  task.Action,
-	}, proxy)
+	key, err := ResolveStoredTaskKey(ch, task.PrivateData.Key)
 	if err != nil {
-		return fmt.Errorf("fetchTask failed for task %s: %w", taskId, err)
+		return fmt.Errorf("resolve stored task credential: %w", err)
+	}
+	request := map[string]any{
+		"task_id": task.GetUpstreamTaskID(),
+	}
+	var resp *http.Response
+	if withContext, ok := adaptor.(TaskFetcherWithContext); ok {
+		resp, err = withContext.FetchTaskWithContext(
+			ctx,
+			baseURL,
+			key,
+			request,
+			proxy,
+		)
+	} else {
+		resp, err = adaptor.FetchTask(baseURL, key, request, proxy)
+	}
+	if err != nil {
+		return fmt.Errorf("fetch task failed for task %s: %w", taskId, err)
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
@@ -759,7 +784,12 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		if task.FinishTime == 0 {
 			task.FinishTime = now
 		}
-		if strings.HasPrefix(taskResult.Url, "data:") {
+		if ch.Type == constant.ChannelTypeSeedDance {
+			task.PrivateData.ResultURL = fmt.Sprintf(
+				"/v1/videos/%s/content",
+				task.TaskID,
+			)
+		} else if strings.HasPrefix(taskResult.Url, "data:") {
 			// data: URI (e.g. Vertex base64 encoded video) — keep in Data, not in ResultURL
 			task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
 		} else if taskResult.Url != "" {
@@ -811,6 +841,65 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		}
 	}
 
+	if shouldSettle && ch.Type == constant.ChannelTypeSeedDance {
+		attempt, attemptErr := model.GetTaskBillingAttemptByTaskID(task.ID)
+		switch {
+		case attemptErr == nil:
+			transitioned, lockedAttempt, transitionErr := model.TransitionTaskToSuccess(
+				task.ID,
+				task.TaskID,
+				model.TaskSuccessTransition{
+					ExpectedStatus:   snap.Status,
+					ExpectedProgress: snap.Progress,
+					ResultURL:        task.PrivateData.ResultURL,
+					Data:             &task.Data,
+				},
+			)
+			if transitionErr != nil {
+				return fmt.Errorf(
+					"durable success transition failed for task %s: %w",
+					task.TaskID,
+					transitionErr,
+				)
+			}
+			if lockedAttempt.RequestID != attempt.RequestID {
+				return fmt.Errorf(
+					"durable success attempt changed for task %s",
+					task.TaskID,
+				)
+			}
+			if settleErr := settleTaskBillingOnCompleteForPolling(
+				ctx,
+				adaptor,
+				transitioned,
+				taskResult,
+			); settleErr != nil {
+				return fmt.Errorf(
+					"final settlement failed for task %s: %w",
+					task.TaskID,
+					settleErr,
+				)
+			}
+			if markerErr := model.MarkTaskBillingAttemptSucceeded(
+				lockedAttempt.RequestID,
+			); markerErr != nil {
+				return fmt.Errorf(
+					"mark durable task success failed for task %s: %w",
+					task.TaskID,
+					markerErr,
+				)
+			}
+			*task = *transitioned
+			return nil
+		case !errors.Is(attemptErr, gorm.ErrRecordNotFound):
+			return fmt.Errorf(
+				"load durable billing attempt for task %s: %w",
+				task.TaskID,
+				attemptErr,
+			)
+		}
+	}
+
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if isDone && snap.Status != task.Status {
 		won, err := task.UpdateWithStatus(snap.Status)
@@ -839,6 +928,28 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		RefundTaskQuota(ctx, task, task.FailReason)
 	}
 
+	return nil
+}
+
+var settleTaskBillingOnCompleteForPolling = func(
+	_ context.Context,
+	adaptor TaskPollingAdaptor,
+	task *model.Task,
+	taskResult *relaycommon.TaskInfo,
+) error {
+	if task == nil || task.PrivateData.BillingContext == nil || taskResult == nil {
+		return errors.New("durable task final billing context is unavailable")
+	}
+	if actualQuota := adaptor.AdjustBillingOnComplete(task, taskResult); actualQuota > 0 {
+		return fmt.Errorf(
+			"durable task final billing delta is not zero: actual=%d prepaid=%d",
+			actualQuota,
+			task.Quota,
+		)
+	}
+	if taskResult.TotalTokens > 0 {
+		return errors.New("durable task final token billing delta is not zero")
+	}
 	return nil
 }
 

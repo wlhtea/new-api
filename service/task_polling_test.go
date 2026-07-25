@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,8 +17,10 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -30,6 +33,143 @@ type taskPollingFetchAdaptor struct {
 	blockStarted chan struct{}
 	releaseBlock chan struct{}
 	blockOnce    sync.Once
+}
+
+type contextTaskPollingAdaptor struct {
+	contextCalled chan struct{}
+	legacyCalled  chan struct{}
+	seenKey       chan string
+}
+
+func (a *contextTaskPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a *contextTaskPollingAdaptor) FetchTask(
+	_ string,
+	_ string,
+	_ map[string]any,
+	_ string,
+) (*http.Response, error) {
+	select {
+	case a.legacyCalled <- struct{}{}:
+	default:
+	}
+	return nil, errors.New("legacy FetchTask must not be used")
+}
+
+func (a *contextTaskPollingAdaptor) FetchTaskWithContext(
+	ctx context.Context,
+	_ string,
+	key string,
+	_ map[string]any,
+	_ string,
+) (*http.Response, error) {
+	select {
+	case a.seenKey <- key:
+	default:
+	}
+	close(a.contextCalled)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (a *contextTaskPollingAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return nil, nil
+}
+
+func (a *contextTaskPollingAdaptor) AdjustBillingOnComplete(
+	_ *model.Task,
+	_ *relaycommon.TaskInfo,
+) int {
+	return 0
+}
+
+type legacyTaskPollingAdaptor struct {
+	mu      sync.Mutex
+	calls   int
+	seenKey string
+}
+
+func (a *legacyTaskPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a *legacyTaskPollingAdaptor) FetchTask(
+	_ string,
+	key string,
+	body map[string]any,
+	_ string,
+) (*http.Response, error) {
+	a.mu.Lock()
+	a.calls++
+	a.seenKey = key
+	a.mu.Unlock()
+	taskID, _ := body["task_id"].(string)
+	encoded, err := common.Marshal(dto.TaskResponse[model.Task]{
+		Code: dto.TaskSuccessCode,
+		Data: model.Task{
+			TaskID:   taskID,
+			Status:   model.TaskStatusInProgress,
+			Progress: "30%",
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(encoded)),
+	}, nil
+}
+
+func (a *legacyTaskPollingAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return nil, errors.New("unexpected parser fallback")
+}
+
+func (a *legacyTaskPollingAdaptor) AdjustBillingOnComplete(
+	_ *model.Task,
+	_ *relaycommon.TaskInfo,
+) int {
+	return 0
+}
+
+func (a *legacyTaskPollingAdaptor) snapshot() (int, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls, a.seenKey
+}
+
+type finalSuccessPollingAdaptor struct {
+	adjustReturn int
+}
+
+func (a *finalSuccessPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a *finalSuccessPollingAdaptor) FetchTask(
+	_ string,
+	_ string,
+	_ map[string]any,
+	_ string,
+) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			`{"requestId":"REQUEST_ID","status":"completed","success":true}`,
+		)),
+	}, nil
+}
+
+func (a *finalSuccessPollingAdaptor) ParseTaskResult(
+	_ []byte,
+) (*relaycommon.TaskInfo, error) {
+	return &relaycommon.TaskInfo{
+		Status:   model.TaskStatusSuccess,
+		Progress: taskcommon.ProgressComplete,
+	}, nil
+}
+
+func (a *finalSuccessPollingAdaptor) AdjustBillingOnComplete(
+	_ *model.Task,
+	_ *relaycommon.TaskInfo,
+) int {
+	return a.adjustReturn
 }
 
 type sunoFailurePollingAdaptor struct {
@@ -197,11 +337,395 @@ func seedPollingTask(t *testing.T, channelID int, publicID string, upstreamID st
 		CreatedAt: time.Now().Unix(),
 		UpdatedAt: time.Now().Unix(),
 		PrivateData: model.TaskPrivateData{
+			Key:            "sk-test",
 			UpstreamTaskID: upstreamID,
 		},
 	}
 	require.NoError(t, model.DB.Create(task).Error)
 	return task
+}
+
+func TestTaskPollingContextReachesContextAwareFetcherWithStoredKey(t *testing.T) {
+	truncate(t)
+
+	const channelID = 91
+	seedTaskPollingChannel(t, channelID, true)
+	task := seedPollingTask(t, channelID, "task_context", "upstream_context")
+	adaptor := &contextTaskPollingAdaptor{
+		contextCalled: make(chan struct{}),
+		legacyCalled:  make(chan struct{}, 1),
+		seenKey:       make(chan string, 1),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- updateVideoSingleTask(
+			ctx,
+			adaptor,
+			&model.Channel{
+				Id:   channelID,
+				Type: constant.ChannelTypeKling,
+				Key:  "sk-test",
+			},
+			task.GetUpstreamTaskID(),
+			map[string]*model.Task{task.GetUpstreamTaskID(): task},
+		)
+	}()
+
+	<-adaptor.contextCalled
+	cancel()
+	require.ErrorIs(t, <-errCh, context.Canceled)
+	assert.Equal(t, "sk-test", <-adaptor.seenKey)
+	select {
+	case <-adaptor.legacyCalled:
+		t.Fatal("context-aware adaptor fell back to legacy FetchTask")
+	default:
+	}
+}
+
+func TestTaskPollingContextLegacyAdaptorUsesFetchTaskWithStoredKey(t *testing.T) {
+	truncate(t)
+
+	task := &model.Task{
+		TaskID:    "task_legacy_fetch",
+		ChannelId: 92,
+		Action:    constant.TaskActionGenerate,
+		Status:    model.TaskStatusInProgress,
+		Progress:  "30%",
+		PrivateData: model.TaskPrivateData{
+			Key:            "STORED_KEY",
+			UpstreamTaskID: "upstream_legacy_fetch",
+		},
+	}
+	adaptor := &legacyTaskPollingAdaptor{}
+	err := updateVideoSingleTask(
+		context.Background(),
+		adaptor,
+		&model.Channel{
+			Id:   92,
+			Type: constant.ChannelTypeKling,
+			Key:  "STORED_KEY",
+		},
+		task.GetUpstreamTaskID(),
+		map[string]*model.Task{task.GetUpstreamTaskID(): task},
+	)
+	require.NoError(t, err)
+	calls, seenKey := adaptor.snapshot()
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, "STORED_KEY", seenKey)
+}
+
+func TestTaskPollingContextNeverFallsBackFromDisabledStoredKey(t *testing.T) {
+	task := &model.Task{
+		TaskID:    "task_disabled_stored_key",
+		ChannelId: 93,
+		Status:    model.TaskStatusInProgress,
+		Progress:  "30%",
+		PrivateData: model.TaskPrivateData{
+			Key:            "STORED_KEY",
+			UpstreamTaskID: "upstream_disabled_stored_key",
+		},
+	}
+	channel := &model.Channel{
+		Id:   93,
+		Type: constant.ChannelTypeKling,
+		Key:  "STORED_KEY\nCURRENT_RANDOM_KEY",
+		Keys: []string{"STORED_KEY", "CURRENT_RANDOM_KEY"},
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusManuallyDisabled,
+				1: common.ChannelStatusEnabled,
+			},
+		},
+	}
+	adaptor := &legacyTaskPollingAdaptor{}
+	err := updateVideoSingleTask(
+		context.Background(),
+		adaptor,
+		channel,
+		task.GetUpstreamTaskID(),
+		map[string]*model.Task{task.GetUpstreamTaskID(): task},
+	)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "STORED_KEY")
+	assert.NotContains(t, err.Error(), "CURRENT_RANDOM_KEY")
+	calls, _ := adaptor.snapshot()
+	assert.Zero(t, calls)
+}
+
+func TestTaskPollingContextStoredKeyErrorsAndLogsAreCredentialFree(t *testing.T) {
+	truncate(t)
+
+	channel := &model.Channel{
+		Id:     95,
+		Type:   constant.ChannelTypeKling,
+		Name:   "stored-key-log-channel",
+		Key:    "STORED_KEY\nCURRENT_RANDOM_KEY",
+		Status: common.ChannelStatusEnabled,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusManuallyDisabled,
+				1: common.ChannelStatusEnabled,
+			},
+		},
+	}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{DisableTaskPollingSleep: true})
+	require.NoError(t, model.DB.Create(channel).Error)
+	task := &model.Task{
+		TaskID:    "task_stored_key_log",
+		Platform:  constant.TaskPlatform("kling"),
+		ChannelId: channel.Id,
+		Status:    model.TaskStatusInProgress,
+		Progress:  "30%",
+		PrivateData: model.TaskPrivateData{
+			Key:            "STORED_KEY",
+			UpstreamTaskID: "upstream_stored_key_log",
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	adaptor := &legacyTaskPollingAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+		return adaptor
+	}
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	var logs bytes.Buffer
+	common.LogWriterMu.Lock()
+	previousErrorWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logs
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = previousErrorWriter
+		common.LogWriterMu.Unlock()
+	})
+
+	require.NoError(t, UpdateVideoTasks(
+		context.Background(),
+		task.Platform,
+		map[int][]string{channel.Id: {task.GetUpstreamTaskID()}},
+		map[string]*model.Task{task.GetUpstreamTaskID(): task},
+	))
+	assert.Contains(t, logs.String(), "stored task credential is disabled or removed")
+	assert.NotContains(t, logs.String(), "STORED_KEY")
+	assert.NotContains(t, logs.String(), "CURRENT_RANDOM_KEY")
+	calls, _ := adaptor.snapshot()
+	assert.Zero(t, calls)
+}
+
+func TestSubmittingTaskPollingSkipsFetch(t *testing.T) {
+	task := &model.Task{
+		TaskID:    "task_submitting",
+		ChannelId: 94,
+		Status:    model.TaskStatusSubmitting,
+		Progress:  "0%",
+		PrivateData: model.TaskPrivateData{
+			Key: "STORED_KEY",
+		},
+	}
+	adaptor := &legacyTaskPollingAdaptor{}
+	err := updateVideoSingleTask(
+		context.Background(),
+		adaptor,
+		&model.Channel{
+			Id:   94,
+			Type: constant.ChannelTypeKling,
+			Key:  "STORED_KEY",
+		},
+		task.TaskID,
+		map[string]*model.Task{task.TaskID: task},
+	)
+	require.NoError(t, err)
+	calls, _ := adaptor.snapshot()
+	assert.Zero(t, calls)
+}
+
+func TestSubmittingTaskPollingSkipsNullTaskFailurePath(t *testing.T) {
+	truncate(t)
+	task := &model.Task{
+		TaskID:     "task_submitting_without_upstream",
+		Platform:   constant.TaskPlatform("kling"),
+		ChannelId:  96,
+		Status:     model.TaskStatusSubmitting,
+		Progress:   "0%",
+		SubmitTime: time.Now().Unix(),
+		PrivateData: model.TaskPrivateData{
+			Key: "STORED_KEY",
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	adaptor := &legacyTaskPollingAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+		return adaptor
+	}
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	summary := RunTaskPollingOnce(context.Background(), nil)
+	assert.Zero(t, summary.NullTasksFailed)
+	calls, _ := adaptor.snapshot()
+	assert.Zero(t, calls)
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitting), reloaded.Status)
+	assert.Equal(t, "0%", reloaded.Progress)
+}
+
+func seedSettledDurablePollingTask(
+	t *testing.T,
+	requestID string,
+	userID int,
+	tokenID int,
+) *model.Task {
+	t.Helper()
+	attempt := seedDurableBillingAttempt(t, requestID, userID, tokenID, 100)
+	task := linkDurableBillingAttempt(t, attempt, requestID)
+	_, err := model.AttachTaskUpstreamResult(
+		task.ID,
+		task.TaskID,
+		"UPSTREAM_"+requestID,
+		json.RawMessage(`{"status":"accepted"}`),
+	)
+	require.NoError(t, err)
+	task, err = model.CommitTaskSubmission(task.ID, task.TaskID)
+	require.NoError(t, err)
+	require.NoError(t, model.MarkTaskBillingAttemptSubmissionSettled(requestID))
+	task.PrivateData.Key = "STORED_KEY"
+	require.NoError(t, model.DB.Model(&model.Task{}).
+		Where("id = ?", task.ID).
+		Update("private_data", task.PrivateData).Error)
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	return task
+}
+
+func TestTaskPollingSuccessTransitionSettlesBeforeSucceededMarker(t *testing.T) {
+	truncate(t)
+	task := seedSettledDurablePollingTask(
+		t,
+		"poll-success-order",
+		621,
+		721,
+	)
+	previousSettlement := settleTaskBillingOnCompleteForPolling
+	settlementCalled := false
+	settleTaskBillingOnCompleteForPolling = func(
+		_ context.Context,
+		_ TaskPollingAdaptor,
+		settledTask *model.Task,
+		_ *relaycommon.TaskInfo,
+	) error {
+		settlementCalled = true
+		var persisted model.Task
+		require.NoError(t, model.DB.First(&persisted, settledTask.ID).Error)
+		assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
+		assert.Equal(t, taskcommon.ProgressComplete, persisted.Progress)
+		attempt, err := model.GetTaskBillingAttemptByTaskID(settledTask.ID)
+		require.NoError(t, err)
+		assert.Zero(t, attempt.SucceededAt)
+		return nil
+	}
+	t.Cleanup(func() {
+		settleTaskBillingOnCompleteForPolling = previousSettlement
+	})
+
+	err := updateVideoSingleTask(
+		context.Background(),
+		&finalSuccessPollingAdaptor{},
+		&model.Channel{
+			Id:   task.ChannelId,
+			Type: constant.ChannelTypeSeedDance,
+			Key:  "STORED_KEY",
+		},
+		task.GetUpstreamTaskID(),
+		map[string]*model.Task{task.GetUpstreamTaskID(): task},
+	)
+	require.NoError(t, err)
+	assert.True(t, settlementCalled)
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), reloaded.Status)
+	assert.Equal(t, taskcommon.ProgressComplete, reloaded.Progress)
+	assert.Contains(t, reloaded.PrivateData.ResultURL, "/v1/videos/"+task.TaskID+"/content")
+	attempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.NotZero(t, attempt.SubmissionSettledAt)
+	assert.NotZero(t, attempt.SucceededAt)
+	assert.Zero(t, attempt.RefundStartedAt)
+	assert.Zero(t, attempt.RefundCompletedAt)
+}
+
+func TestTaskPollingFinalSettlementFailureLeavesSucceededMarkerUnset(t *testing.T) {
+	truncate(t)
+	task := seedSettledDurablePollingTask(
+		t,
+		"poll-settlement-failure",
+		622,
+		722,
+	)
+	err := updateVideoSingleTask(
+		context.Background(),
+		&finalSuccessPollingAdaptor{adjustReturn: 200},
+		&model.Channel{
+			Id:   task.ChannelId,
+			Type: constant.ChannelTypeSeedDance,
+			Key:  "STORED_KEY",
+		},
+		task.GetUpstreamTaskID(),
+		map[string]*model.Task{task.GetUpstreamTaskID(): task},
+	)
+	require.ErrorContains(t, err, "final settlement")
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), reloaded.Status)
+	assert.Equal(t, taskcommon.ProgressComplete, reloaded.Progress)
+	attempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.Zero(t, attempt.SucceededAt)
+	assert.Zero(t, attempt.RefundStartedAt)
+	assert.Zero(t, attempt.RefundCompletedAt)
+}
+
+func TestTaskPollingSettledSubmissionFailureRefundsBothComponents(t *testing.T) {
+	truncate(t)
+	task := seedSettledDurablePollingTask(
+		t,
+		"poll-settled-provider-failure",
+		623,
+		723,
+	)
+
+	err := updateVideoSingleTask(
+		context.Background(),
+		&videoFailurePollingAdaptor{reason: "safe provider failure"},
+		&model.Channel{
+			Id:   task.ChannelId,
+			Type: constant.ChannelTypeSeedDance,
+			Key:  "STORED_KEY",
+		},
+		task.GetUpstreamTaskID(),
+		map[string]*model.Task{task.GetUpstreamTaskID(): task},
+	)
+	require.NoError(t, err)
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), reloaded.Status)
+	assert.Equal(t, taskcommon.ProgressComplete, reloaded.Progress)
+	assert.Zero(t, reloaded.Quota)
+	attempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.NotZero(t, attempt.SubmissionSettledAt)
+	assert.Zero(t, attempt.SucceededAt)
+	assert.NotZero(t, attempt.FundingRefundedAt)
+	assert.NotZero(t, attempt.TokenRefundedAt)
+	assert.NotZero(t, attempt.RefundStartedAt)
+	assert.NotZero(t, attempt.RefundCompletedAt)
 }
 
 func TestUpdateVideoTasksDefaultSleepWaitsBetweenTasks(t *testing.T) {
@@ -610,6 +1134,15 @@ func TestDurableVideoFailurePreservesLatestInProgressTaskColumns(t *testing.T) {
 
 	var channel model.Channel
 	require.NoError(t, model.DB.First(&channel, channelID).Error)
+	channel.Key = "STALE_VIDEO_KEY\nLATEST_VIDEO_KEY"
+	channel.Keys = []string{"STALE_VIDEO_KEY", "LATEST_VIDEO_KEY"}
+	channel.ChannelInfo = model.ChannelInfo{
+		IsMultiKey: true,
+		MultiKeyStatusList: map[int]int{
+			0: common.ChannelStatusEnabled,
+			1: common.ChannelStatusEnabled,
+		},
+	}
 	err := updateVideoSingleTask(
 		context.Background(),
 		&videoFailurePollingAdaptor{reason: "durable video failed"},
