@@ -27,6 +27,8 @@ var resolutionAliases = map[string]string{
 	"1080P":     "1080P",
 }
 
+var errResolutionMustBeString = errors.New("resolution must be a JSON string")
+
 func parseJSONRequest(c *gin.Context) (*requestInput, *dto.TaskError) {
 	var raw rawJSONRequest
 	if err := common.UnmarshalBodyReusable(c, &raw); err != nil {
@@ -116,7 +118,10 @@ func parseStringValue(raw json.RawMessage) (string, bool, error) {
 
 func parseResolutionValue(raw json.RawMessage) (string, bool, error) {
 	value, present, err := parseStringValue(raw)
-	if err != nil || !present {
+	if err != nil {
+		return "", present, errResolutionMustBeString
+	}
+	if !present {
 		return "", present, err
 	}
 
@@ -125,6 +130,14 @@ func parseResolutionValue(raw json.RawMessage) (string, bool, error) {
 		return "", true, errors.New("unsupported resolution")
 	}
 	return resolution, true, nil
+}
+
+func resolutionTaskError(err error) *dto.TaskError {
+	code := "invalid_resolution"
+	if errors.Is(err, errResolutionMustBeString) {
+		code = "invalid_request"
+	}
+	return service.TaskErrorWrapperLocal(err, code, http.StatusBadRequest)
 }
 
 func parseOptionalBoolean(raw json.RawMessage) (*bool, error) {
@@ -158,11 +171,11 @@ func normalizeScalars(input *requestInput) (*NormalizedRequest, *dto.TaskError) 
 
 	size, sizePresent, err := parseResolutionValue(input.Raw.Size)
 	if err != nil {
-		return nil, service.TaskErrorWrapperLocal(err, "invalid_resolution", http.StatusBadRequest)
+		return nil, resolutionTaskError(err)
 	}
 	metadataResolution, metadataPresent, err := parseResolutionValue(input.Metadata.Resolution)
 	if err != nil {
-		return nil, service.TaskErrorWrapperLocal(err, "invalid_resolution", http.StatusBadRequest)
+		return nil, resolutionTaskError(err)
 	}
 	if sizePresent && metadataPresent && size != metadataResolution {
 		return nil, service.TaskErrorWrapperLocal(

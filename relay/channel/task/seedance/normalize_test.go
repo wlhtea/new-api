@@ -95,6 +95,26 @@ func TestNormalizeJSONRejectsResolutionConflict(t *testing.T) {
 	assert.Equal(t, "invalid_resolution", taskErr.Code)
 }
 
+func TestNormalizeJSONRejectsNonStringSize(t *testing.T) {
+	input, taskErr := parseJSONRequest(jsonContext(t, `{"prompt":"p","size":720}`))
+	require.Nil(t, taskErr)
+
+	_, taskErr = normalizeScalars(input)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "invalid_request", taskErr.Code)
+}
+
+func TestNormalizeJSONRejectsNonStringMetadataResolution(t *testing.T) {
+	input, taskErr := parseJSONRequest(jsonContext(t,
+		`{"prompt":"p","metadata":{"resolution":true}}`,
+	))
+	require.Nil(t, taskErr)
+
+	_, taskErr = normalizeScalars(input)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "invalid_request", taskErr.Code)
+}
+
 func TestNormalizeJSONRejectsStringBoolean(t *testing.T) {
 	input, taskErr := parseJSONRequest(jsonContext(t,
 		`{"prompt":"p","metadata":{"strict_duration":"false"}}`,
