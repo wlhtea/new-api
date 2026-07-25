@@ -1534,6 +1534,11 @@ git commit -m "feat: add Seed Dance task adaptor"
 > requirement and require **Task 5A → Task 5B** as two independent commits.
 > In particular, the amendment's RequestID-keyed billing-attempt-before-preconsume
 > sequence replaces every request-refund and TaskID-keyed ledger sequence below.
+> Marker semantics are also authoritative throughout the remaining steps:
+> Task 5B writes `SubmissionSettledAt` after Task Attach+Commit, full-prepaid
+> revalidation, and successful zero-delta settle, before consumption log/HTTP 200.
+> Task 5B never writes `SucceededAt`; Task 6 alone writes it after a locked narrow
+> `SUCCESS/100%` transition and final settlement.
 
 **Files:**
 - Modify: `model/task.go`
@@ -2169,24 +2174,34 @@ function. Set `taskErr` before the defer runs. Tests must count request-level an
 refund calls separately for wallet, subscription, and Token quota and assert that exactly
 one owner acts.
 
-- [ ] **Step 8: Finalize success only after DB commit, zero-delta settlement, and log**
+- [ ] **Step 8: Mark submission settlement after DB commit and zero-delta settle**
 
 For deferred responses:
 
 ```text
 RelayTaskSubmit already attached the upstream ID and committed SUBMITTED/10%
-Controller calls SettleBilling(result.Quota)
+Controller repeats ValidateFullPrepaidTaskBilling
+Controller calls SettleBilling(result.Quota) with delta=0
+Controller calls MarkTaskBillingAttemptSubmissionSettled(requestID)
 Controller calls LogTaskConsumption
 Controller writes c.JSON(result.HTTPResponse.StatusCode, result.HTTPResponse.Body)
 ```
 
-If `SettleBilling` returns an error:
+`SubmissionSettledAt` means only that the accepted submission was durably attached and
+committed, revalidated, and zero-delta settled. It is not final async success and does
+not terminate the attempt. Task 5B must not call `MarkTaskBillingAttemptSucceeded` or
+exercise the final-success transition; a Task 5B boundary test may only prove
+`SucceededAt` remains zero. Task 6 owns that final marker.
+
+If validator, `SettleBilling`, or
+`MarkTaskBillingAttemptSubmissionSettled` returns an error:
 
 ```text
 do not write 200
 do not write success consumption log
-mark the Task FAILURE/100%
-task-level refund only
+preserve every reliable upstream ID
+narrow-transition the Task to FAILURE/100%
+use durable task-owned refund/reconciliation only
 return seedance_billing_settlement_failed
 ```
 
@@ -2361,6 +2376,7 @@ attach_upstream_id
 build_public_response
 mark_submitted
 settle_zero_delta
+mark_submission_settled
 consume_log
 write_http_200
 ```
@@ -2380,6 +2396,9 @@ commit transient failure => bounded retry succeeds without another POST
 commit persistent failure => upstream ID remains, reconciliation record, no 200, task-owned refund
 timeout sweep wins before commit => FAILURE remains terminal and is not revived
 zero-delta settle failure => upstream ID remains, no success log, task-owned refund
+SubmissionSettledAt failure => upstream ID remains, no success log/200, narrow FAILURE,
+durable task-owned refund/reconciliation
+successful Task 5B => SubmissionSettledAt non-zero and SucceededAt remains zero
 timed-out SUBMITTING => no FetchTask call, FAILURE/100%, task-owned refund
 shouldRetry 502 with Retryable=false => false
 shouldRetry 429 with Retryable=false => false
@@ -2430,8 +2449,8 @@ git commit -m "feat: persist Seed Dance submissions before upstream calls"
 - Modify: `model/task_cas_test.go`
 
 **Interfaces:**
-- Consumes: `TaskAdaptor.FetchTask`; `TaskAdaptor.FetchTaskWithContext`; `Task.PrivateData.Key`; `Task.PrivateData.UpstreamTaskID`; `model.TaskStatusSubmitting`.
-- Produces: service-local `TaskFetcherWithContext`; `service.ResolveStoredTaskKey`; Seed Dance status mapping and sanitized polling data.
+- Consumes: `TaskAdaptor.FetchTask`; `TaskAdaptor.FetchTaskWithContext`; `Task.PrivateData.Key`; `Task.PrivateData.UpstreamTaskID`; `model.TaskStatusSubmitting`; `model.GetTaskBillingAttemptByTaskID`; `model.MarkTaskBillingAttemptSucceeded`.
+- Produces: service-local `TaskFetcherWithContext`; `service.ResolveStoredTaskKey`; Seed Dance status mapping, sanitized polling data, locked narrow final-SUCCESS transition, and final-success billing marker orchestration.
 
 - [ ] **Step 1: Write failing context, stored-Key, and state-machine tests**
 
@@ -2591,8 +2610,38 @@ completed => TaskStatusSuccess, Progress 100%, ResultURL /v1/videos/{publicID}/c
 accepted/queued/running/processing => no terminal billing
 ```
 
-The common polling CAS remains the only state writer. Failure refunds once; success keeps
-the pre-consumed quota. Polling never invokes `/video`.
+Durable failure uses the locked narrow FAILURE primitive and can refund a task-owned
+attempt whenever `SucceededAt==0` and the locked Task is `FAILURE/100%`, including when
+`SubmissionSettledAt!=0`. `SubmissionSettledAt` may therefore coexist with
+`RefundStartedAt/RefundCompletedAt`; `SucceededAt` must remain mutually exclusive with
+all refund markers.
+
+Durable success must not use the historical stale full-row CAS path. Task 6 polling
+owns this exact order:
+
+```text
+lock Task + linked TaskBillingAttempt
+narrow transition expected non-terminal state -> SUCCESS/100%
+complete final billing settlement successfully
+call MarkTaskBillingAttemptSucceeded(attempt.RequestID)
+```
+
+Only after the narrow transition and final settlement succeed may
+`MarkTaskBillingAttemptSucceeded` write `SucceededAt`. A lost transition, billing
+failure, marker conflict, or active refund writes no `SucceededAt` and remains
+reconcilable; Task 5B never performs or tests this sequence. Final success keeps the
+pre-consumed quota. Polling never invokes `/video`.
+
+Add tests that prove:
+
+```text
+Task 5B-created SubmissionSettledAt alone does not make the attempt terminal
+settled submission + provider FAILURE/100% can complete both refund components
+SUCCESS narrow transition precedes final settlement and SucceededAt
+final-settlement failure leaves SucceededAt=0
+SucceededAt cannot coexist with RefundStartedAt or RefundCompletedAt
+active retention is SucceededAt==0 && RefundCompletedAt==0
+```
 
 - [ ] **Step 6: Run focused and existing polling regression tests**
 

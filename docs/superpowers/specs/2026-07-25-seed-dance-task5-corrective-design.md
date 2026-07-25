@@ -51,7 +51,13 @@ Dance durable submit。
   preconsume/refund 主数据库 mutation 和对应 marker 在同一事务，且
   `BatchUpdateEnabled=true` 也不得经过 batch queue；
 - `Task.Quota` 只在两个 component 都完成时清零；
-- 成功消费日志和 HTTP 200 只能发生在 Task commit 与 zero-delta settle 之后；
+- 成功消费日志和 HTTP 200 只能发生在 Task commit、zero-delta settle 与
+  `SubmissionSettledAt` marker 成功写入之后；
+- `SubmissionSettledAt` 只表示上游 submission 已接受、Task 已 Attach+Commit、
+  full-prepaid validator 已重验且 zero-delta settle 成功；它不是异步任务终态；
+- `SucceededAt` 只表示异步视频 Task 最终进入 `SUCCESS/100%`，Task 5A/5B
+  不得写；只有 Task 6 polling 在锁内窄列 SUCCESS transition 与最终结算成功
+  后调用 `MarkTaskBillingAttemptSucceeded`；
 - 不改变未实现 durable marker 的旧 adaptor 的响应、插入和错误处理语义。
 
 ## 3. 数据模型
@@ -95,6 +101,8 @@ type TaskBillingAttempt struct {
     FundingAmount  int    `json:"-"`
     TokenID        int    `json:"-" gorm:"index"`
     TokenAmount    int    `json:"-"`
+    BillingContextDigest string `json:"-" gorm:"type:char(64)"`
+    PrepareVersion       int64  `json:"-"`
 
     FundingConsumedAt    int64 `json:"-" gorm:"index"`
     TokenConsumedAt      int64 `json:"-" gorm:"index"`
@@ -104,6 +112,7 @@ type TaskBillingAttempt struct {
     RefundStartedAt      int64 `json:"-" gorm:"index"`
     RefundCompletedAt    int64 `json:"-" gorm:"index"`
     OwnerTransferredAt   int64 `json:"-"`
+    SubmissionSettledAt  int64 `json:"-" gorm:"index"`
     SucceededAt          int64 `json:"-" gorm:"index"`
     CreatedAt            int64 `json:"-"`
     UpdatedAt            int64 `json:"-" gorm:"index"`
@@ -128,10 +137,23 @@ type TaskBillingAttempt struct {
   其零额 component 必须通过同步 Apply 事务写 marker，不能伪装成 free；
 - 非 playground Token 请求的 `TokenAmount` 等于实际 Token 预扣额；
   playground/未扣 Token 可为零；unlimited 不能仅因 unlimited 标志置零；
+- `BillingContextDigest` 是 Task 5A 已实现的 canonical SHA-256 财务身份；
+  输入只含 `TaskBillingContext` 的非秘密计费字段，Prepare/link/retry 必须重验，
+  ledger 不保存 Key、prompt、媒体或供应商 payload；
+- `PrepareVersion` 是 Task 5A 已实现的单调 Prepare generation；首次 link 为
+  1，合法 route refresh 递增，用于拒绝过期/歧义 writer 与 overflow；
 - `PreconsumeCompletedAt != 0` 当且仅当两个 `*ConsumedAt` 均非零；
   `RefundCompletedAt != 0` 当且仅当两个 `*RefundedAt` 均非零；
+- `SubmissionSettledAt` 可与之后的 `RefundStartedAt/RefundCompletedAt` 共存；
+  submission settlement 本身不终结 attempt；
 - `SucceededAt` 与 `RefundStartedAt/RefundCompletedAt` 互斥；
 - 表内不得保存 Key、TokenKey、prompt、图片、Base64、请求体或供应商响应。
+
+subscription funding 同时使用 Task 5A 已实现的 reset generation：
+`UserSubscription.QuotaResetVersion` 在每次 quota reset 时单调递增；
+`SubscriptionPreConsumeRecord.SubscriptionResetVersion` 为 nullable historical
+record discriminator。新 writer 必须写入当前 generation；`NULL` 表示迁移前
+或旧 writer 记录，退款 fail closed，不得把未知历史 generation 当作 0。
 
 把 `TaskBillingAttempt` 加到普通、fast 和 model/service 测试 AutoMigrate。
 测试 cleanup 先清 attempt/record 再清其关联主体。
@@ -453,7 +475,9 @@ request failure 与 Task failure 都用 `RequestID` 调用这两个 Apply。每�
 主数据库余额 mutation 与对应 `*RefundedAt` marker 必须在同一事务，禁止调用
 全局 `DB`、batch queue、先改 Redis 或 ledger 外的旧增量 helper。
 任一首次 refund Apply 都在锁内先写/确认 `RefundStartedAt`，并要求
-`SucceededAt==0`；从此所有 preconsume API 均拒绝该 attempt。
+`SucceededAt==0`；task-owned attempt 还必须锁定 linked Task 并要求
+`FAILURE/100%`。`SubmissionSettledAt!=0` 不阻止退款。从首次 refund 开始，
+所有 preconsume API 均拒绝该 attempt。
 
 任何首次 mutation 前重验：
 
@@ -528,10 +552,14 @@ terminal attempt + record older than retention -> eligible for cleanup
 七天，再证明 funding refund 仍能完成。refund component marker 已完成后，
 重复 Apply 先读 marker 幂等返回，不依赖 record 是否已经清理。
 
-本 Task 不物理删除 billing-attempt ledger。成功 zero-delta settle 原子写
-`SucceededAt`；完整退款写 `RefundCompletedAt`。未来归档只能选择这两类
-terminal attempt，必须保留唯一 `RequestID`、owner/link、immutable identity
-和全部 component markers，且 lookup/recovery 仍可判定已完成。
+本 Task 不物理删除 billing-attempt ledger。Task 5B 在 zero-delta settle
+成功后写 `SubmissionSettledAt`，但该 marker 不改变 active/terminal 判定；
+Task 6 在异步 Task 最终进入 `SUCCESS/100%`、最终结算成功后写
+`SucceededAt`；完整退款写 `RefundCompletedAt`。active attempt 定义仍为
+`SucceededAt==0 && RefundCompletedAt==0`。未来归档只能选择最终成功或完整
+退款这两类 terminal attempt，必须保留唯一 `RequestID`、owner/link、
+immutable identity 和全部 component markers，且 lookup/recovery 仍可判定
+已完成。
 
 ### 4.8 Exactly-once 的精确定义
 
@@ -567,7 +595,7 @@ RestoreQuotaAfterFailedRefund
 ```text
 request-owned + stale + SucceededAt=0 + RefundCompletedAt=0
   -> lock attempt, set RefundStartedAt, refund consumed components
-task-owned + linked Task FAILURE + RefundCompletedAt=0
+task-owned + SucceededAt=0 + linked Task FAILURE/100% + RefundCompletedAt=0
   -> refund incomplete components
 task-owned + linked Task SUBMITTING timeout
   -> TransitionTaskSubmissionToFailure, then refund incomplete components
@@ -787,18 +815,25 @@ Task 已 attach
 Task 已 Commit 为 SUBMITTED/10%
 ValidateFullPrepaidTaskBilling
 SettleBilling(result.Quota)
-MarkTaskBillingAttemptSucceeded(requestID)
+MarkTaskBillingAttemptSubmissionSettled(requestID)
 LogTaskConsumption
 c.JSON(HTTPResponse.StatusCode, HTTPResponse.Body)
 ```
 
 validator 保证 paid Task 的 actual quota 等于 pre-consumed quota。真实
 `BillingSession.Settle` 的 delta=0 分支只标记 settled，不调用 wallet、
-subscription 或 Token adjustment。`MarkTaskBillingAttemptSucceeded` 从主库
-锁定 task-owned attempt 与 linked `SUBMITTED` Task，要求两个 consumed marker
-完整、refund 尚未开始，再写 `SucceededAt`；不得依赖 cache。
+subscription 或 Token adjustment。`MarkTaskBillingAttemptSubmissionSettled`
+从主库锁定 task-owned attempt 与 linked Task，要求上游 ID 已 Attach、Task
+已 Commit、两个 consumed marker 完整、refund 尚未开始，再写
+`SubmissionSettledAt`；不得依赖 cache。写 marker 发生在消费日志和
+`POST /v1/videos` HTTP 200 之前。
 
-若 validator 或 settle 返回错误：
+Task 5B 不得调用 `MarkTaskBillingAttemptSucceeded`，也不得在其 tests 或
+implementation 中模拟提前写 `SucceededAt`。该 marker 由 Task 6 polling
+独占：只有锁内窄列 transition 已把 Task 最终化为 `SUCCESS/100%` 且最终
+结算成功，才调用 `MarkTaskBillingAttemptSucceeded`。
+
+若 validator、settle 或 submission-settled marker 返回错误：
 
 - 不写 HTTP 200；
 - 不写成功消费日志；
@@ -876,6 +911,28 @@ Seed Dance 路径不得：
 - 记录 prompt、图片、Base64、完整供应商响应或完整 request body；
 - 新增 Seed Dance 专用请求/响应大小阈值；
 - 在 reconciliation payload 中加入白名单外字段。
+
+### 6.1 Schema-first 部署硬门禁
+
+Task 5A 已引入 `TaskBillingAttempt`、`BillingContextDigest`、
+`PrepareVersion`、`SubmissionSettledAt`、subscription reset generation
+以及 nullable historical record discriminator。这些不是可由混合版本 writer
+边运行边猜测的兼容字段。生产 rollout 必须严格执行：
+
+```text
+备份并验证回滚点
+停止接受新的 durable submit
+停止并 drain 所有旧 subscription reset / subscription-refund writer
+先完成 schema migration 并验证列、索引、NULL 历史记录语义
+部署全部会写 reset generation、record discriminator 和 attempt marker 的新 writer
+确认集群不存在旧 writer 后，才重新启用 submit/reset/refund worker
+```
+
+`Schema-first` 与“停止/drain 旧 writer”是部署硬门禁，不是建议。任一旧 reset
+或 subscription-refund writer 仍可能运行时，禁止启用新 writer 或 Seed Dance
+durable 流量；否则旧 writer 会制造缺失 generation 的新记录，破坏退款身份
+验证。历史 `SubscriptionResetVersion=NULL` 只作为迁移前记录 discriminator，
+不得由新 writer 继续产生。
 
 ## 7. 文件范围
 
@@ -998,6 +1055,11 @@ Seed Dance adaptor。
   和三个 ledger completion marker 全部收敛才 succeeded；
 - zero-delta settle 不调用 wallet/subscription/Token adjustment；
 - settle fail：Task FAILURE、task-only refund、无成功日志/200；
+- submission marker fail：Task FAILURE、task-only durable refund/reconciliation、
+  无成功日志/200，且可靠 upstream ID 保留；
+- Task 5B 成功只写 `SubmissionSettledAt`，不写 `SucceededAt`；
+- settled submission 的 locked Task 后续进入 `FAILURE/100%` 时仍可完整退款；
+- Task 6 才覆盖最终 SUCCESS 窄列 transition、最终结算与 `SucceededAt`；
 - `Retryable=false/true/nil` 与现有全局 retry guard 的优先级；
 - 旧 adaptor 的 response/error/body-close/insert 顺序保持。
 
@@ -1020,7 +1082,7 @@ build_public_response
 mark_submitted
 validate_full_prepaid_again
 settle_zero_delta
-mark_billing_attempt_succeeded
+mark_billing_attempt_submission_settled
 consume_log
 write_http_200
 ```

@@ -511,9 +511,17 @@ Controller 对验证通过且非空的 `HTTPResponse` 采用：
 → 构造公开成功响应
 → CAS 把任务最终化为 SUBMITTED 和 10%
 → 以相同 quota 完成零 delta 的 SettleBilling
+→ 写 TaskBillingAttempt.SubmissionSettledAt
 → 写消费日志
 → 最后向客户端写 200
 ```
+
+这里的 submission marker 语义固定为：上游 submission 已接受、Task 已
+Attach+Commit、full-prepaid validator 已重验且 zero-delta settle 成功。
+Task 5B 调用 `MarkTaskBillingAttemptSubmissionSettled`，并且只有 marker
+提交后才能写消费日志与 HTTP 200。Task 5B 不调用
+`MarkTaskBillingAttemptSucceeded`；`SucceededAt` 只由 Task 6 polling 在
+锁内窄列最终化 `SUCCESS/100%` 且最终结算成功后写入。
 
 收到完整响应并解析出非空上游 ID 后，任何计费、防御性检查、响应构造或状态
 最终化之前，先调用：
@@ -548,8 +556,9 @@ func CommitTaskSubmission(
 `Status=SUBMITTED`、`Progress=10%`；重复调用且已经是
 `SUBMITTED / 10%` 时幂等成功；若 timeout sweep 已把任务转为
 `FAILURE`，不得复活。这样完成状态的 CAS 失败时，上游关联仍已独立保存。
-客户端只有在关联持久化、最终化 CAS、零 delta 结算和消费日志都成功后才收到
-公开 ID，因此收到 ID 时任务一定可查询。
+客户端只有在关联持久化、最终化 CAS、零 delta 结算、
+`SubmissionSettledAt` 和消费日志都成功后才收到公开 ID，因此收到 ID 时任务
+一定可查询。
 
 若附加上游关联或完成提交的 CAS 暂时失败，核心进行有限、带退避且服从请求
 context 的持久化重试；仍失败时：
@@ -576,7 +585,8 @@ context 的持久化重试；仍失败时：
 部分提交状态。供应商成功后的 quota 检查只是防御性断言；若它异常，不能再
 退回到请求级退款，也不能丢弃已经持久化的供应商关联。
 
-若零 delta 结算仍异常返回错误，说明实现不变量或计费会话契约已被破坏：
+若零 delta 结算或 `SubmissionSettledAt` marker 异常返回错误，说明实现
+不变量、计费会话或 durable ledger 契约已被破坏：
 
 - 不删除已经插入的审计 Task；
 - 通过状态 CAS 把该 Task 标记为 `FAILURE / 100%`，保留非零 `Task.Quota`
@@ -725,13 +735,51 @@ HTTP 200 业务失败也使用该结构，无法识别的普通 error 固定回�
 
 ## 7. 数据存储
 
-> **Task 5 correction governs：** 下述“不新增表”不适用于 durable billing
-> attempt/component marker。Task 5A 按修订设计新增以 `RequestID` 唯一标识的
+> **Task 5 correction governs：** Task 5A 新增以 `RequestID` 唯一标识的
 > `TaskBillingAttempt`，要求它先于同步主库预扣创建，并要求 provisional Task
 > insert、attempt link 与 request→task owner transfer 同事务；Key、prompt、
-> 图片、Base64 和完整响应仍不得进入该表。
+> 图片、Base64 和完整响应不得进入该表。
 
-不新增表和字段，复用现有 `Task`：
+Task 5A 的权威 ledger schema 至少包含：
+
+```text
+immutable identity:
+  RequestID, TaskID, Owner, PublicTaskID, SubmitTime, IsFree, UserID,
+  FundingSource, SubscriptionID, FundingAmount, TokenID, TokenAmount
+financial/link concurrency identity:
+  BillingContextDigest, PrepareVersion, OwnerTransferredAt
+preconsume/refund markers:
+  FundingConsumedAt, TokenConsumedAt, PreconsumeCompletedAt,
+  FundingRefundedAt, TokenRefundedAt, RefundStartedAt, RefundCompletedAt
+submission/final-success markers:
+  SubmissionSettledAt, SucceededAt
+```
+
+`BillingContextDigest` 是 canonical SHA-256 非秘密计费身份；
+`PrepareVersion` 是单调 Prepare generation。subscription reset 使用
+`UserSubscription.QuotaResetVersion`；对应
+`SubscriptionPreConsumeRecord.SubscriptionResetVersion` 为 nullable historical
+record discriminator，`NULL` 表示迁移前/旧 writer 的未知 generation，退款
+fail closed。
+
+marker 语义不得合并：
+
+```text
+SubmissionSettledAt:
+  accepted submit + Attach/Commit + full-prepaid revalidation + zero-delta settle
+SucceededAt:
+  Task 6 final asynchronous SUCCESS/100% + final settlement
+active attempt:
+  SucceededAt == 0 && RefundCompletedAt == 0
+```
+
+`SubmissionSettledAt` 可与后续 `RefundStartedAt/RefundCompletedAt` 共存。
+task-owned attempt 只要 `SucceededAt==0` 且锁定 Task 为 `FAILURE/100%` 就可
+退款，即使 submission 已 settled；`SucceededAt` 与任何 refund marker 互斥。
+submission settlement 本身不允许清理 active attempt 引用的 subscription
+record。
+
+任务业务数据继续复用现有 `Task`：
 
 ```text
 Task.TaskID
@@ -761,6 +809,7 @@ Seed Dance 使用第 6.3 节的延迟响应路径：
 → 优先幂等附加 upstream task ID 和清理后的 Data
 → 单独 CAS 最终化为 SUBMITTED 和 10%
 → 零 delta SettleBilling 成功
+→ MarkTaskBillingAttemptSubmissionSettled 成功
 → 消费日志成功
 → 最后向客户端返回 200
 ```
@@ -1647,12 +1696,16 @@ Redocly lint 两份文件，Go 契约测试负责 Redocly 无法证明的业务�
   成功；持续失败时不再次 POST；
 - 零 delta `SettleBilling` 不调用 funding 或 Token 调整 failpoint；
 - 注入异常 `SettleBilling` 时不返回成功 task ID、不删除审计 Task、不写消费
-  成功日志；请求级 defer 被禁用，只有任务级 `RefundTaskQuota` 退款，失败时
-  保留 quota 由 reconciliation sweep 重试；
+  成功日志；`SubmissionSettledAt` marker 写失败同样不得返回 200 或写成功
+  日志；两类失败都保留 reliable upstream ID，并通过窄列 FAILURE 与 durable
+  task-owned refund/reconciliation 收敛；
 - 插表前错误只走请求级退款，插表后结算错误只走任务级退款，两个 owner 在钱包、
   订阅和 Token 场景都互斥；
 - 异步失败退款；
 - 超时退款；
+- settled submission 后异步失败仍可退款；
+- Task 6 最终 SUCCESS 路径在锁内窄列写 `SUCCESS/100%`、最终结算成功后才写
+  `SucceededAt`，Task 5B 测试不提前覆盖该 marker；
 - 成功时保留请求期费用；
 - 后台价格变化不修改已有任务快照。
 
@@ -1830,6 +1883,24 @@ new-api-seedance:{commit_sha}
 Map（仅用于审计和灾难恢复）、`seedance-uncensored` 在两个 Map 中部署前的
 存在性与原值，以及上一个镜像标签。
 
+Task 5A 含数据库 schema 变更。启用新 writer 前必须满足不可跳过的
+schema-first 硬门禁：
+
+```text
+禁用新的 durable submit
+停止并 drain 全部旧 subscription reset / subscription-refund writer
+执行并验证 TaskBillingAttempt、marker、digest/version、reset-generation schema
+部署所有新 writer
+确认集群中不存在旧 writer
+重新启用 submit/reset/refund worker 与 Seed Dance 渠道
+```
+
+尤其要验证 `SubmissionSettledAt`、`BillingContextDigest`、`PrepareVersion`、
+`UserSubscription.QuotaResetVersion` 与 nullable
+`SubscriptionPreConsumeRecord.SubscriptionResetVersion` 的列、索引和 NULL
+历史语义。只做滚动发布、让旧 reset/subscription-refund writer 与新 writer
+重叠运行不满足门禁；新 writer 不得产生 `SubscriptionResetVersion=NULL`。
+
 ## 23. 真实验收
 
 供应商只能从目标服务器稳定访问。先核验第 2.2 节传输门禁；满足至少一项后，
@@ -1878,7 +1949,12 @@ Map（仅用于审计和灾难恢复）、`seedance-uncensored` 在两个 Map �
 
 ## 24. 回滚
 
-本次没有数据库 schema 迁移，但会写入旧版本不认识的 Type 59 渠道、ability、任务和运行时价格配置。旧版本 `ChannelBaseURLs` 没有索引 59，不能只切换旧镜像。
+本次包含 Task 5A billing-attempt 与 subscription reset-generation schema
+迁移，并会写入旧版本不认识的 Type 59 渠道、ability、任务和运行时价格配置。
+旧版本既不理解新 ledger/marker，也没有 `ChannelBaseURLs[59]`，不能只切换旧
+镜像。回滚必须先禁用流量并 drain 新 submit/reset/refund writer，保留 ledger
+与 nullable historical discriminator；不得降级到会忽略 generation 的旧退款
+writer。
 
 回滚前：
 
