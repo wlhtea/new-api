@@ -259,7 +259,7 @@ func normalizeMultipartBoolean(raw *json.RawMessage, name string) error {
 
 func parseMultipartRequest(
 	form *multipart.Form,
-) (*requestInput, []byte, *dto.TaskError) {
+) (*requestInput, *imageCandidate, *dto.TaskError) {
 	input := &requestInput{}
 	stringFields := []struct {
 		name string
@@ -350,7 +350,10 @@ func parseMultipartRequest(
 	if closeErr != nil {
 		return nil, nil, service.TaskErrorWrapperLocal(closeErr, "invalid_image", http.StatusBadRequest)
 	}
-	return input, uploaded, nil
+	return input, &imageCandidate{
+		source: "multipart input_reference",
+		bytes:  uploaded,
+	}, nil
 }
 
 func cachedNormalizedRequest(c *gin.Context) (*NormalizedRequest, bool, *dto.TaskError) {
@@ -386,7 +389,7 @@ func normalizeRequestWithLoader(
 
 	var (
 		input    *requestInput
-		uploaded []byte
+		uploaded *imageCandidate
 		taskErr  *dto.TaskError
 	)
 	contentType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))

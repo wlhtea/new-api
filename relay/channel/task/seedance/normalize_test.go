@@ -2,6 +2,8 @@ package seedance
 
 import (
 	"bytes"
+	"encoding/base64"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -163,19 +166,41 @@ func TestNormalizeJSONRejectsStringBoolean(t *testing.T) {
 func TestNormalizeMultipartRemovesTemporaryFilesAndCachesResult(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("TMPDIR", tempDir)
+	originalLimit := constant.MaxFileDownloadMB
+	constant.MaxFileDownloadMB = 1
+	t.Cleanup(func() {
+		constant.MaxFileDownloadMB = originalLimit
+	})
+
+	uploaded := testNoisyPNG(t, 700, 2)
+	require.Greater(t, len(uploaded), 1*1024*1024)
+	encoded := base64.StdEncoding.EncodeToString(uploaded)
 
 	body, contentType := multipartRequest(t, map[string]string{
 		"prompt":   "flower",
 		"duration": "10",
 		"metadata": `{"strict_duration":"false","multi_shot":"true"}`,
-	}, "input_reference", "input.png", testPNG(t, 240, 240))
+		"image":    "https://HOST/input.png",
+	}, "input_reference", "input.png", uploaded)
 	c := multipartContext(t, body, contentType)
 
-	first, taskErr := normalizeRequest(c)
+	observedTemporaryFile := false
+	loaderCalls := 0
+	loader := func(string) (string, string, error) {
+		loaderCalls++
+		entries, err := os.ReadDir(tempDir)
+		require.NoError(t, err)
+		observedTemporaryFile = len(entries) > 0
+		return "image/png", encoded, nil
+	}
+
+	first, taskErr := normalizeRequestWithLoader(c, loader)
 	require.Nil(t, taskErr)
-	second, taskErr := normalizeRequest(c)
+	second, taskErr := normalizeRequestWithLoader(c, loader)
 	require.Nil(t, taskErr)
 	assert.Same(t, first, second)
+	assert.True(t, observedTemporaryFile, "multipart parsing must spill the oversized file to TMPDIR")
+	assert.Equal(t, 1, loaderCalls)
 	assert.Equal(t, 10, first.Duration)
 	require.NotNil(t, first.StrictDuration)
 	assert.False(t, *first.StrictDuration)
@@ -185,6 +210,52 @@ func TestNormalizeMultipartRemovesTemporaryFilesAndCachesResult(t *testing.T) {
 	entries, err := os.ReadDir(tempDir)
 	require.NoError(t, err)
 	assert.Empty(t, entries)
+}
+
+func TestNormalizeMultipartRemovesTemporaryFilesAfterImageFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	originalLimit := constant.MaxFileDownloadMB
+	constant.MaxFileDownloadMB = 1
+	t.Cleanup(func() {
+		constant.MaxFileDownloadMB = originalLimit
+	})
+
+	uploaded := testNoisyPNG(t, 700, 3)
+	require.Greater(t, len(uploaded), 1*1024*1024)
+	body, contentType := multipartRequest(t, map[string]string{
+		"prompt": "flower",
+		"image":  "https://HOST/input.png",
+	}, "input_reference", "input.png", uploaded)
+
+	observedTemporaryFile := false
+	loader := func(string) (string, string, error) {
+		entries, err := os.ReadDir(tempDir)
+		require.NoError(t, err)
+		observedTemporaryFile = len(entries) > 0
+		return "", "", errors.New("download failed")
+	}
+	_, taskErr := normalizeRequestWithLoader(
+		multipartContext(t, body, contentType),
+		loader,
+	)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "invalid_image", taskErr.Code)
+	assert.True(t, observedTemporaryFile, "multipart parsing must spill the oversized file to TMPDIR")
+
+	entries, err := os.ReadDir(tempDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestNormalizeMultipartRejectsEmptyInputReferenceFile(t *testing.T) {
+	body, contentType := multipartRequest(t, map[string]string{
+		"prompt": "flower",
+	}, "input_reference", "empty.png", nil)
+
+	_, taskErr := normalizeRequest(multipartContext(t, body, contentType))
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "invalid_image", taskErr.Code)
 }
 
 func TestNormalizeMultipartRejectsMultipleInputReferenceFiles(t *testing.T) {

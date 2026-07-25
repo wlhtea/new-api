@@ -126,7 +126,7 @@ func imageStrings(input *requestInput) ([]string, error) {
 
 func normalizeImages(
 	input *requestInput,
-	uploaded []byte,
+	uploaded *imageCandidate,
 	loadRemote remoteImageLoader,
 ) (string, *dto.TaskError) {
 	sources, err := imageStrings(input)
@@ -144,11 +144,8 @@ func normalizeImages(
 			candidates = append(candidates, candidate)
 		}
 	}
-	if len(uploaded) != 0 {
-		candidate, err := validateImageCandidate(imageCandidate{
-			source: "multipart input_reference",
-			bytes:  uploaded,
-		})
+	if uploaded != nil {
+		candidate, err := validateImageCandidate(*uploaded)
 		if err != nil {
 			return "", service.TaskErrorWrapperLocal(err, "invalid_image", http.StatusBadRequest)
 		}
