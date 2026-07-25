@@ -8,11 +8,12 @@ import (
 )
 
 func TestSeedDanceOnlyAdvertisesOpenAIVideo(t *testing.T) {
-	assert.Equal(t,
-		[]constant.EndpointType{constant.EndpointTypeOpenAIVideo},
-		GetEndpointTypesByChannelType(
-			constant.ChannelTypeSeedDance,
-			"seedance-uncensored",
-		),
+	expected := []constant.EndpointType{constant.EndpointTypeOpenAIVideo}
+
+	assert.Equal(t, expected,
+		GetEndpointTypesByChannelType(constant.ChannelTypeSeedDance, "seedance-uncensored"),
+	)
+	assert.Equal(t, expected,
+		GetEndpointTypesByChannelType(constant.ChannelTypeSeedDance, "flux-1"),
 	)
 }
