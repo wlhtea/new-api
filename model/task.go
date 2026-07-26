@@ -312,18 +312,23 @@ func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 }
 
 // GetUnrefundedFailedTasks returns failed tasks whose non-zero quota marks a
-// pending refund. Legacy timeout tasks are excluded before LIMIT is applied so
-// they cannot starve refundable tasks from the reconciliation sweep.
+// pending refund. Legacy timeout records and Seed Dance tasks, whose refunds
+// require durable billing attempts, are excluded before LIMIT so they cannot
+// starve eligible legacy refunds from the reconciliation sweep.
 func GetUnrefundedFailedTasks(updatedBefore int64, limit int) []*Task {
 	if limit <= 0 {
 		return nil
 	}
 
+	seedDancePlatform := constant.TaskPlatform(
+		strconv.Itoa(constant.ChannelTypeSeedDance),
+	)
 	var tasks []*Task
 	err := DB.Where("status = ?", TaskStatusFailure).
 		Where("quota != ?", 0).
 		Where("updated_at <= ?", updatedBefore).
 		Where("(submit_time <= ? OR submit_time >= ?)", 0, TaskRefundLegacyCutoff).
+		Where("(platform IS NULL OR platform != ?)", seedDancePlatform).
 		Order("id").
 		Limit(limit).
 		Find(&tasks).Error
@@ -453,11 +458,15 @@ func HasTaskPollingWork() bool {
 		return true
 	}
 
+	seedDancePlatform := constant.TaskPlatform(
+		strconv.Itoa(constant.ChannelTypeSeedDance),
+	)
 	var id int64
 	err = DB.Model(&Task{}).
 		Where("status = ?", TaskStatusFailure).
 		Where("quota != ?", 0).
 		Where("(submit_time <= ? OR submit_time >= ?)", 0, TaskRefundLegacyCutoff).
+		Where("(platform IS NULL OR platform != ?)", seedDancePlatform).
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0

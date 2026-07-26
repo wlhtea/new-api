@@ -241,7 +241,27 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 		}
 		return true
 	case errors.Is(err, gorm.ErrRecordNotFound):
-		return refundLegacyTaskQuota(ctx, task, reason)
+		primaryTask, taskErr := model.GetTaskByPrimaryID(task.ID)
+		if taskErr != nil {
+			logger.LogError(ctx, fmt.Sprintf(
+				"legacy refund task lookup failed closed task %s: %v",
+				task.TaskID,
+				taskErr,
+			))
+			return false
+		}
+		if isSeedDancePlatform(primaryTask.Platform) {
+			logger.LogError(ctx, fmt.Sprintf(
+				"durable billing attempt unavailable for task %s",
+				primaryTask.TaskID,
+			))
+			return false
+		}
+		refunded := refundLegacyTaskQuota(ctx, primaryTask, reason)
+		if refunded {
+			task.Quota = primaryTask.Quota
+		}
+		return refunded
 	default:
 		logger.LogError(ctx, fmt.Sprintf(
 			"task billing attempt lookup failed closed task %s: %v",

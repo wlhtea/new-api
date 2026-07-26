@@ -3,6 +3,7 @@ package model
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -1089,6 +1090,7 @@ func TestGetUnrefundedFailedTasks_FiltersAndLimits(t *testing.T) {
 	tasks := []*Task{
 		{TaskID: "failed_refundable_1", Status: TaskStatusFailure, Quota: 100, SubmitTime: TaskRefundLegacyCutoff, Data: json.RawMessage(`{}`)},
 		{TaskID: "failed_refundable_2", Status: TaskStatusFailure, Quota: 200, SubmitTime: TaskRefundLegacyCutoff + 1, Data: json.RawMessage(`{}`)},
+		{TaskID: "seedance_failed_missing_ledger", Platform: constant.TaskPlatform("59"), Status: TaskStatusFailure, Progress: "100%", Quota: 300, SubmitTime: TaskRefundLegacyCutoff, Data: json.RawMessage(`{}`)},
 		{TaskID: "legacy_failed", Status: TaskStatusFailure, Quota: 400, SubmitTime: TaskRefundLegacyCutoff - 1, Data: json.RawMessage(`{}`)},
 		{TaskID: "failed_without_quota", Status: TaskStatusFailure, Quota: 0, Data: json.RawMessage(`{}`)},
 		{TaskID: "successful_with_quota", Status: TaskStatusSuccess, Quota: 300, Data: json.RawMessage(`{}`)},
@@ -1107,6 +1109,73 @@ func TestGetUnrefundedFailedTasks_FiltersAndLimits(t *testing.T) {
 	assert.Equal(t, []int64{tasks[0].ID, tasks[1].ID}, []int64{found[0].ID, found[1].ID})
 
 	assert.Empty(t, GetUnrefundedFailedTasks(updatedBefore, 0))
+}
+
+func TestHasTaskPollingWorkExcludesSeedDanceFailureWithoutLedger(t *testing.T) {
+	truncateTables(t)
+
+	seedDanceMissingLedger := &Task{
+		TaskID:     "seedance_failed_without_ledger_work",
+		Platform:   constant.TaskPlatform("59"),
+		Status:     TaskStatusFailure,
+		Progress:   "100%",
+		Quota:      500,
+		SubmitTime: TaskRefundLegacyCutoff,
+		Data:       json.RawMessage(`{}`),
+	}
+	insertTask(t, seedDanceMissingLedger)
+
+	assert.False(
+		t,
+		HasTaskPollingWork(),
+		"a Type 59 terminal task without its durable ledger must not keep the legacy refund scheduler active",
+	)
+
+	legacyMissingLedger := &Task{
+		TaskID:     "kling_failed_without_ledger_work",
+		Platform:   constant.TaskPlatform("kling"),
+		Status:     TaskStatusFailure,
+		Progress:   "100%",
+		Quota:      600,
+		SubmitTime: TaskRefundLegacyCutoff,
+		Data:       json.RawMessage(`{}`),
+	}
+	insertTask(t, legacyMissingLedger)
+	assert.True(
+		t,
+		HasTaskPollingWork(),
+		"non-Type 59 legacy refund work must remain scheduler-visible",
+	)
+}
+
+func TestGetUnrefundedFailedTasksFiltersSeedDanceBeforeLimit(t *testing.T) {
+	truncateTables(t)
+
+	for index := 0; index < 101; index++ {
+		insertTask(t, &Task{
+			TaskID:     fmt.Sprintf("seedance_orphan_%03d", index),
+			Platform:   constant.TaskPlatform("59"),
+			Status:     TaskStatusFailure,
+			Progress:   "100%",
+			Quota:      100 + index,
+			SubmitTime: TaskRefundLegacyCutoff,
+			Data:       json.RawMessage(`{}`),
+		})
+	}
+	legacy := &Task{
+		TaskID:     "kling_refundable_after_seedance_orphans",
+		Platform:   constant.TaskPlatform("kling"),
+		Status:     TaskStatusFailure,
+		Progress:   "100%",
+		Quota:      900,
+		SubmitTime: TaskRefundLegacyCutoff,
+		Data:       json.RawMessage(`{}`),
+	}
+	insertTask(t, legacy)
+
+	found := GetUnrefundedFailedTasks(time.Now().Unix()+1, 1)
+	require.Len(t, found, 1)
+	assert.Equal(t, legacy.ID, found[0].ID)
 }
 
 func TestRestoreQuotaAfterFailedRefund_OnlyRestoresClaimedMarker(t *testing.T) {

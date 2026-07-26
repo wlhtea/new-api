@@ -1928,6 +1928,229 @@ func TestMissingVideoChannelRefundsDurableAttemptThroughFailurePrimitive(t *test
 	assert.NotZero(t, reloadedAttempt.RefundCompletedAt)
 }
 
+func TestTaskPollingReconciliationSeedDanceMissingLedgerFailsClosed(t *testing.T) {
+	truncate(t)
+
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = nil
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	const (
+		walletUserID       = 871
+		walletTokenID      = 971
+		walletQuota        = 120
+		subscriptionUserID = 872
+		subscriptionToken  = 972
+		subscriptionID     = 1_072
+		subscriptionQuota  = 170
+	)
+	seedUser(t, walletUserID, 5_000)
+	seedToken(t, walletTokenID, walletUserID, "sk-seedance-missing-wallet", 4_000)
+	seedUser(t, subscriptionUserID, 6_000)
+	seedToken(
+		t,
+		subscriptionToken,
+		subscriptionUserID,
+		"sk-seedance-missing-subscription",
+		3_000,
+	)
+	seedSubscription(t, subscriptionID, subscriptionUserID, 10_000, 2_500)
+
+	oldUpdatedAt := time.Now().Add(-time.Minute).Unix()
+	walletTask := makeTask(
+		walletUserID,
+		0,
+		walletQuota,
+		walletTokenID,
+		BillingSourceWallet,
+		0,
+	)
+	walletTask.TaskID = "seedance_failed_missing_wallet_ledger"
+	walletTask.Platform = seedDanceTaskPlatform
+	walletTask.Status = model.TaskStatusFailure
+	walletTask.Progress = taskcommon.ProgressComplete
+	walletTask.SubmitTime = model.TaskRefundLegacyCutoff
+	walletTask.UpdatedAt = oldUpdatedAt
+	require.NoError(t, model.DB.Create(walletTask).Error)
+
+	subscriptionTask := makeTask(
+		subscriptionUserID,
+		0,
+		subscriptionQuota,
+		subscriptionToken,
+		BillingSourceSubscription,
+		subscriptionID,
+	)
+	subscriptionTask.TaskID = "seedance_failed_missing_subscription_ledger"
+	subscriptionTask.Platform = seedDanceTaskPlatform
+	subscriptionTask.Status = model.TaskStatusFailure
+	subscriptionTask.Progress = taskcommon.ProgressComplete
+	subscriptionTask.SubmitTime = model.TaskRefundLegacyCutoff
+	subscriptionTask.UpdatedAt = oldUpdatedAt
+	require.NoError(t, model.DB.Create(subscriptionTask).Error)
+
+	walletUserBefore := getUserQuota(t, walletUserID)
+	walletTokenBefore := getTokenRemainQuota(t, walletTokenID)
+	subscriptionUserBefore := getUserQuota(t, subscriptionUserID)
+	subscriptionTokenBefore := getTokenRemainQuota(t, subscriptionToken)
+	subscriptionUsedBefore := getSubscriptionUsed(t, subscriptionID)
+	logsBefore := countLogs(t)
+
+	assert.False(
+		t,
+		model.HasTaskPollingWork(),
+		"missing-ledger Type 59 failures must not keep the legacy refund scheduler active",
+	)
+	RunTaskPollingOnce(context.Background(), nil)
+	RunTaskPollingOnce(context.Background(), nil)
+
+	var reloadedWallet model.Task
+	var reloadedSubscription model.Task
+	require.NoError(t, model.DB.First(&reloadedWallet, walletTask.ID).Error)
+	require.NoError(t, model.DB.First(&reloadedSubscription, subscriptionTask.ID).Error)
+	assert.Equal(t, walletQuota, reloadedWallet.Quota)
+	assert.Equal(t, subscriptionQuota, reloadedSubscription.Quota)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), reloadedWallet.Status)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), reloadedSubscription.Status)
+	assert.Equal(t, taskcommon.ProgressComplete, reloadedWallet.Progress)
+	assert.Equal(t, taskcommon.ProgressComplete, reloadedSubscription.Progress)
+
+	assert.Equal(t, walletUserBefore, getUserQuota(t, walletUserID))
+	assert.Equal(t, walletTokenBefore, getTokenRemainQuota(t, walletTokenID))
+	assert.Equal(t, subscriptionUserBefore, getUserQuota(t, subscriptionUserID))
+	assert.Equal(t, subscriptionTokenBefore, getTokenRemainQuota(t, subscriptionToken))
+	assert.Equal(t, subscriptionUsedBefore, getSubscriptionUsed(t, subscriptionID))
+	assert.Equal(t, logsBefore, countLogs(t))
+
+	var attemptCount int64
+	require.NoError(t, model.DB.Model(&model.TaskBillingAttempt{}).
+		Where("task_id IN ?", []int64{walletTask.ID, subscriptionTask.ID}).
+		Count(&attemptCount).Error)
+	assert.Zero(t, attemptCount, "reconciliation must not fabricate component markers")
+	assert.False(t, model.HasTaskPollingWork())
+}
+
+func TestRefundTaskQuotaSeedDanceMissingLedgerCentralGate(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, quota = 873, 973, 190
+	seedUser(t, userID, 7_000)
+	seedToken(t, tokenID, userID, "sk-seedance-central-gate", 6_000)
+	task := makeTask(userID, 0, quota, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "seedance_missing_ledger_central_gate"
+	task.Platform = seedDanceTaskPlatform
+	task.Status = model.TaskStatusFailure
+	task.Progress = taskcommon.ProgressComplete
+	task.SubmitTime = model.TaskRefundLegacyCutoff
+	require.NoError(t, model.DB.Create(task).Error)
+
+	userBefore := getUserQuota(t, userID)
+	tokenBefore := getTokenRemainQuota(t, tokenID)
+	logsBefore := countLogs(t)
+	staleCaller := *task
+	staleCaller.Platform = constant.TaskPlatform("kling")
+	staleCaller.Quota = quota + 50
+	assert.False(t, RefundTaskQuota(
+		context.Background(),
+		&staleCaller,
+		"missing ledger through stale caller",
+	))
+	assert.False(t, RefundTaskQuota(
+		context.Background(),
+		&staleCaller,
+		"missing ledger retry through stale caller",
+	))
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, quota, reloaded.Quota)
+	assert.Equal(t, userBefore, getUserQuota(t, userID))
+	assert.Equal(t, tokenBefore, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, logsBefore, countLogs(t))
+
+	var attemptCount int64
+	require.NoError(t, model.DB.Model(&model.TaskBillingAttempt{}).
+		Where("task_id = ?", task.ID).
+		Count(&attemptCount).Error)
+	assert.Zero(t, attemptCount)
+}
+
+func TestTaskPollingReconciliationRefundsSeedDanceDurableAttempt(t *testing.T) {
+	truncate(t)
+
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = nil
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	const userID, tokenID, quota = 874, 974, 210
+	const requestID = "seedance-durable-failure-reconciliation"
+	attempt := seedDurableBillingAttempt(t, requestID, userID, tokenID, quota)
+	task := linkDurableBillingAttempt(t, attempt, requestID)
+	require.NoError(t, model.DB.Model(&model.Task{}).
+		Where("id = ?", task.ID).
+		Update("platform", seedDanceTaskPlatform).Error)
+	task, err := model.TransitionTaskSubmissionToFailure(
+		task.ID,
+		task.TaskID,
+		"",
+		"provider_failure",
+		"provider failed",
+	)
+	require.NoError(t, err)
+
+	assert.True(t, model.HasTaskPollingWork())
+	RunTaskPollingOnce(context.Background(), nil)
+	RunTaskPollingOnce(context.Background(), nil)
+
+	reloadedAttempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.NotZero(t, reloadedAttempt.FundingRefundedAt)
+	assert.NotZero(t, reloadedAttempt.TokenRefundedAt)
+	assert.NotZero(t, reloadedAttempt.RefundStartedAt)
+	assert.NotZero(t, reloadedAttempt.RefundCompletedAt)
+	assert.Zero(t, reloadedAttempt.SucceededAt)
+
+	var reloadedTask model.Task
+	require.NoError(t, model.DB.First(&reloadedTask, task.ID).Error)
+	assert.Zero(t, reloadedTask.Quota)
+	assert.Equal(t, 10_000, getUserQuota(t, userID))
+	assert.Equal(t, 10_000, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, int64(1), countLogs(t))
+	assert.False(t, model.HasTaskPollingWork())
+}
+
+func TestTaskPollingReconciliationPreservesNonSeedDanceLegacyRefund(t *testing.T) {
+	truncate(t)
+
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = nil
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	const userID, tokenID, quota = 875, 975, 230
+	seedUser(t, userID, 8_000)
+	seedToken(t, tokenID, userID, "sk-kling-legacy-refund", 7_000)
+	task := makeTask(userID, 0, quota, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "kling_failed_legacy_reconciliation"
+	task.Platform = constant.TaskPlatform("kling")
+	task.Status = model.TaskStatusFailure
+	task.Progress = taskcommon.ProgressComplete
+	task.SubmitTime = model.TaskRefundLegacyCutoff
+	task.UpdatedAt = time.Now().Add(-time.Minute).Unix()
+	require.NoError(t, model.DB.Create(task).Error)
+
+	assert.True(t, model.HasTaskPollingWork())
+	RunTaskPollingOnce(context.Background(), nil)
+	RunTaskPollingOnce(context.Background(), nil)
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Zero(t, reloaded.Quota)
+	assert.Equal(t, 8_000+quota, getUserQuota(t, userID))
+	assert.Equal(t, 7_000+quota, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, int64(1), countLogs(t))
+	assert.False(t, model.HasTaskPollingWork())
+}
+
 func TestSweepUnrefundedFailedTasksRefundsModernTaskAndSkipsLegacy(t *testing.T) {
 	truncate(t)
 
