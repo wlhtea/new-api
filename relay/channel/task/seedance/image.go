@@ -74,6 +74,9 @@ func loadImageCandidate(source string, loadRemote remoteImageLoader) (imageCandi
 		return imageCandidate{}, errors.New("unsupported image data URI")
 	}
 
+	if strings.ContainsAny(encoded, " \t\r\n\v\f") {
+		return imageCandidate{}, errors.New("image base64 must not contain whitespace")
+	}
 	decoded, err := base64.StdEncoding.Strict().DecodeString(encoded)
 	if err != nil {
 		return imageCandidate{}, fmt.Errorf("decode image: %w", err)
