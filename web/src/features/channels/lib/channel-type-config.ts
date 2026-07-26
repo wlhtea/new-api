@@ -22,6 +22,9 @@ import { CHANNEL_TYPES } from '../constants'
 // Channel Type Configuration
 // ============================================================================
 
+export const SEED_DANCE_DEFAULT_BASE_URL =
+  'http://alb-o13xqj8f2cpjsa67ym.ap-northeast-1.alb.aliyuncsslbintl.com/v1/public_api/m-predict/polar4ai-i2v'
+
 export interface ChannelTypeConfig {
   id: number
   name: string
@@ -144,6 +147,18 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
       models: 'Models exposed by this channel',
     },
   },
+  59: {
+    id: 59,
+    name: CHANNEL_TYPES[59],
+    icon: 'doubao',
+    defaultBaseUrl: SEED_DANCE_DEFAULT_BASE_URL,
+    supportedModels: ['seedance-uncensored'],
+    hints: {
+      baseUrl: 'Seed Dance upstream base URL',
+      key: 'Bearer API key',
+      models: 'seedance-uncensored',
+    },
+  },
 }
 
 /**
@@ -157,6 +172,17 @@ export function getChannelTypeConfig(type: number): ChannelTypeConfig {
       icon: 'openai',
     }
   )
+}
+
+export function getChannelTypeCreateDefaults(type: number): {
+  baseUrl: string
+  models: string
+} {
+  const config = getChannelTypeConfig(type)
+  return {
+    baseUrl: config.defaultBaseUrl || '',
+    models: (config.supportedModels || []).join(','),
+  }
 }
 
 /**
