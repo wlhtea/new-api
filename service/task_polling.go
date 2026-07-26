@@ -54,6 +54,49 @@ const (
 	refundReconciliationGracePeriod = 30 * time.Second
 )
 
+var seedDanceTaskPlatform = constant.TaskPlatform(
+	fmt.Sprintf("%d", constant.ChannelTypeSeedDance),
+)
+
+type safeTaskPollingError struct {
+	message string
+	cause   error
+}
+
+func (e *safeTaskPollingError) Error() string {
+	return e.message
+}
+
+func (e *safeTaskPollingError) Unwrap() error {
+	return e.cause
+}
+
+func newSafeTaskPollingError(message string, cause error) error {
+	return &safeTaskPollingError{message: message, cause: cause}
+}
+
+func isSeedDancePlatform(platform constant.TaskPlatform) bool {
+	return platform == seedDanceTaskPlatform
+}
+
+func seedDancePollingIdentity(
+	ch *model.Channel,
+	task *model.Task,
+) (bool, error) {
+	if task == nil {
+		return false, model.ErrTaskSubmissionStateConflict
+	}
+	taskIsSeedDance := isSeedDancePlatform(task.Platform)
+	channelIsSeedDance := ch != nil && ch.Type == constant.ChannelTypeSeedDance
+	if taskIsSeedDance != channelIsSeedDance {
+		return true, fmt.Errorf(
+			"Seed Dance polling identity mismatch for task %s",
+			task.TaskID,
+		)
+	}
+	return taskIsSeedDance, nil
+}
+
 func transitionDurablePollingFailure(
 	task *model.Task,
 	expectedStatus model.TaskStatus,
@@ -61,14 +104,16 @@ func transitionDurablePollingFailure(
 	code string,
 	message string,
 	data *json.RawMessage,
+	requireDurable bool,
 ) (*model.Task, bool, error) {
 	if task == nil {
 		return nil, false, model.ErrTaskSubmissionStateConflict
 	}
+	requireDurable = requireDurable || isSeedDancePlatform(task.Platform)
 	_, err := model.GetTaskBillingAttemptByTaskID(task.ID)
 	switch {
 	case err == nil:
-		failed, transitionErr := model.TransitionTaskToFailure(
+		failed, transitionErr := model.TransitionDurableTaskToFailure(
 			task.ID,
 			task.TaskID,
 			model.TaskFailureTransition{
@@ -81,6 +126,12 @@ func transitionDurablePollingFailure(
 		)
 		return failed, true, transitionErr
 	case errors.Is(err, gorm.ErrRecordNotFound):
+		if requireDurable {
+			return nil, true, fmt.Errorf(
+				"durable billing attempt unavailable for task %s",
+				task.TaskID,
+			)
+		}
 		return nil, false, nil
 	default:
 		return nil, true, err
@@ -106,26 +157,16 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
-		_, attemptErr := model.GetTaskBillingAttemptByTaskID(task.ID)
-		if attemptErr != nil && !errors.Is(attemptErr, gorm.ErrRecordNotFound) {
-			logger.LogError(ctx, fmt.Sprintf(
-				"sweepTimedOutTasks billing owner lookup failed closed for task %s: %v",
-				task.TaskID,
-				attemptErr,
-			))
-			continue
-		}
-		if attemptErr == nil {
-			failed, transitionErr := model.TransitionTaskToFailure(
-				task.ID,
-				task.TaskID,
-				model.TaskFailureTransition{
-					ExpectedStatus:   task.Status,
-					ExpectedProgress: task.Progress,
-					Code:             "task_timeout",
-					Message:          reason,
-				},
-			)
+		failed, durable, transitionErr := transitionDurablePollingFailure(
+			task,
+			task.Status,
+			task.Progress,
+			"task_timeout",
+			reason,
+			nil,
+			false,
+		)
+		if durable {
 			if transitionErr != nil {
 				logger.LogError(ctx, fmt.Sprintf(
 					"sweepTimedOutTasks durable transition error for task %s: %v",
@@ -249,6 +290,134 @@ func sweepUnrefundedFailedTasks(ctx context.Context) {
 	}
 }
 
+func finalizeDurableFinalSuccess(
+	ctx context.Context,
+	adaptor TaskPollingAdaptor,
+	task *model.Task,
+	taskResult *relaycommon.TaskInfo,
+	requestID string,
+) error {
+	if task == nil || taskResult == nil || adaptor == nil || requestID == "" {
+		return errors.New("durable final success state is unavailable")
+	}
+	if err := settleTaskBillingOnCompleteForPolling(
+		ctx,
+		adaptor,
+		task,
+		taskResult,
+	); err != nil {
+		return fmt.Errorf("final settlement failed for task %s: %w", task.TaskID, err)
+	}
+	if err := model.MarkTaskBillingAttemptSucceeded(requestID); err != nil {
+		return fmt.Errorf(
+			"mark durable task success failed for task %s: %w",
+			task.TaskID,
+			err,
+		)
+	}
+	return nil
+}
+
+// replayDurableFinalSuccessTasks repairs the crash window after the durable
+// SUCCESS/100% Task transition but before its zero-delta verification and
+// SucceededAt marker. It is deliberately local-only: no channel lookup,
+// credential resolution, or provider status request occurs here.
+func replayDurableFinalSuccessTasks(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if GetTaskAdaptorFunc == nil {
+		return nil
+	}
+	tasks, err := model.ListRecoverableFinalSuccessTasks(refundReconciliationLimit)
+	if err != nil {
+		return newSafeTaskPollingError(
+			"query recoverable final success tasks failed",
+			err,
+		)
+	}
+
+	var replayErrors []error
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			replayErrors = append(replayErrors, err)
+			break
+		}
+		if !isSeedDancePlatform(task.Platform) {
+			replayErrors = append(replayErrors, fmt.Errorf(
+				"recoverable final success platform mismatch for task %s",
+				task.TaskID,
+			))
+			continue
+		}
+		attempt, attemptErr := model.GetTaskBillingAttemptByTaskID(task.ID)
+		if attemptErr != nil {
+			replayErrors = append(replayErrors, newSafeTaskPollingError(
+				fmt.Sprintf(
+					"load recoverable billing attempt failed for task %s",
+					task.TaskID,
+				),
+				attemptErr,
+			))
+			continue
+		}
+		if attempt.TaskID == nil ||
+			*attempt.TaskID != task.ID ||
+			attempt.PublicTaskID != task.TaskID ||
+			attempt.Owner != model.TaskBillingOwnerTask ||
+			task.Status != model.TaskStatusSuccess ||
+			task.Progress != taskcommon.ProgressComplete {
+			replayErrors = append(replayErrors, fmt.Errorf(
+				"recoverable final success identity mismatch for task %s",
+				task.TaskID,
+			))
+			continue
+		}
+		if attempt.SucceededAt != 0 {
+			continue
+		}
+		if attempt.FundingRefundedAt != 0 ||
+			attempt.TokenRefundedAt != 0 ||
+			attempt.RefundStartedAt != 0 ||
+			attempt.RefundCompletedAt != 0 {
+			replayErrors = append(replayErrors, fmt.Errorf(
+				"recoverable final success refund conflict for task %s",
+				task.TaskID,
+			))
+			continue
+		}
+
+		adaptor := GetTaskAdaptorFunc(task.Platform)
+		if adaptor == nil {
+			replayErrors = append(replayErrors, fmt.Errorf(
+				"recoverable final success adaptor unavailable for task %s",
+				task.TaskID,
+			))
+			continue
+		}
+		adaptor.Init(&relaycommon.RelayInfo{
+			ChannelMeta: &relaycommon.ChannelMeta{},
+		})
+		taskResult := &relaycommon.TaskInfo{
+			Status:   string(model.TaskStatusSuccess),
+			Progress: taskcommon.ProgressComplete,
+		}
+		if finalizeErr := finalizeDurableFinalSuccess(
+			ctx,
+			adaptor,
+			task,
+			taskResult,
+			attempt.RequestID,
+		); finalizeErr != nil {
+			replayErrors = append(replayErrors, finalizeErr)
+		}
+	}
+	return errors.Join(replayErrors...)
+}
+
 // TaskPollSummary is the result recorded on an async_task_poll system task row,
 // summarizing one polling pass.
 type TaskPollSummary struct {
@@ -273,6 +442,12 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	sweepUnrefundedFailedTasks(ctx)
 	if GetTaskAdaptorFunc == nil {
 		return summary
+	}
+	if err := replayDurableFinalSuccessTasks(ctx); err != nil {
+		logger.LogError(ctx, fmt.Sprintf(
+			"replay durable final success tasks failed: %v",
+			err,
+		))
 	}
 	allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
 	summary.UnfinishedTasks = len(allTasks)
@@ -303,6 +478,16 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		nullTaskIds := make([]int64, 0)
 		for _, task := range tasks {
 			upstreamID := task.GetUpstreamTaskID()
+			if isSeedDancePlatform(task.Platform) {
+				upstreamID = task.PrivateData.UpstreamTaskID
+				if upstreamID == "" {
+					logger.LogError(ctx, fmt.Sprintf(
+						"durable upstream task id unavailable for task %s",
+						task.TaskID,
+					))
+					continue
+				}
+			}
 			if upstreamID == "" {
 				// 统计失败的未完成任务
 				nullTaskIds = append(nullTaskIds, task.ID)
@@ -393,6 +578,7 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 					"task_channel_unavailable",
 					reason,
 					nil,
+					false,
 				)
 				if durable {
 					if transitionErr != nil {
@@ -492,6 +678,7 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 				"provider_failure",
 				task.FailReason,
 				&task.Data,
+				false,
 			)
 			if durable {
 				if transitionErr != nil {
@@ -614,6 +801,7 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 					"task_channel_unavailable",
 					reason,
 					nil,
+					isSeedDancePlatform(platform),
 				)
 				if durable {
 					if transitionErr != nil {
@@ -656,7 +844,15 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 			return ctx.Err()
 		}
 		if err := updateVideoSingleTask(ctx, adaptor, cacheGetChannel, taskId, taskM); err != nil {
-			logger.LogError(ctx, fmt.Sprintf("Failed to update video task %s: %s", taskId, err.Error()))
+			publicTaskID := ""
+			if task := taskM[taskId]; task != nil {
+				publicTaskID = task.TaskID
+			}
+			logger.LogError(ctx, fmt.Sprintf(
+				"Failed to update video task %s: %s",
+				publicTaskID,
+				err.Error(),
+			))
 		}
 		if disablePollingSleep || i == len(taskIds)-1 {
 			continue
@@ -676,6 +872,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	if ch == nil {
+		return errors.New("video polling channel is unavailable")
+	}
 	baseURL := constant.ChannelBaseURLs[ch.Type]
 	if ch.GetBaseURL() != "" {
 		baseURL = ch.GetBaseURL()
@@ -684,18 +883,42 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	task := taskM[taskId]
 	if task == nil {
-		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
-		return fmt.Errorf("task %s not found", taskId)
+		logger.LogError(ctx, "video task not found in polling map")
+		return errors.New("video task not found in polling map")
 	}
 	if task.Status == model.TaskStatusSubmitting {
 		return nil
+	}
+	isSeedDance, identityErr := seedDancePollingIdentity(ch, task)
+	if identityErr != nil {
+		return identityErr
+	}
+	upstreamTaskID := task.GetUpstreamTaskID()
+	if isSeedDance {
+		upstreamTaskID = task.PrivateData.UpstreamTaskID
+		if upstreamTaskID == "" {
+			return fmt.Errorf(
+				"durable upstream task id unavailable for task %s",
+				task.TaskID,
+			)
+		}
+		if _, attemptErr := model.GetTaskBillingAttemptByTaskID(task.ID); attemptErr != nil {
+			return newSafeTaskPollingError(
+				fmt.Sprintf(
+					"durable billing attempt unavailable for task %s",
+					task.TaskID,
+				),
+				attemptErr,
+			)
+		}
 	}
 	key, err := ResolveStoredTaskKey(ch, task.PrivateData.Key)
 	if err != nil {
 		return fmt.Errorf("resolve stored task credential: %w", err)
 	}
 	request := map[string]any{
-		"task_id": task.GetUpstreamTaskID(),
+		"task_id": upstreamTaskID,
+		"action":  task.Action,
 	}
 	var resp *http.Response
 	if withContext, ok := adaptor.(TaskFetcherWithContext); ok {
@@ -710,15 +933,19 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		resp, err = adaptor.FetchTask(baseURL, key, request, proxy)
 	}
 	if err != nil {
-		return fmt.Errorf("fetch task failed for task %s: %w", taskId, err)
+		return newSafeTaskPollingError(
+			fmt.Sprintf("fetch task failed for task %s", task.TaskID),
+			err,
+		)
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("readAll failed for task %s: %w", taskId, err)
+		return newSafeTaskPollingError(
+			fmt.Sprintf("read polling response failed for task %s", task.TaskID),
+			err,
+		)
 	}
-
-	logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
 
 	snap := task.Snapshot()
 
@@ -726,7 +953,11 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	// try parse as New API response format
 	var responseItems dto.TaskResponse[model.Task]
 	if err = common.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
-		logger.LogDebug(ctx, "updateVideoSingleTask parsed as new api response format: %+v", responseItems)
+		logger.LogDebug(
+			ctx,
+			"updateVideoSingleTask parsed new api response for task %s",
+			task.TaskID,
+		)
 		t := responseItems.Data
 		taskResult.TaskID = t.TaskID
 		taskResult.Status = string(t.Status)
@@ -735,12 +966,13 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		taskResult.Reason = t.FailReason
 		task.Data = t.Data
 	} else if taskResult, err = adaptor.ParseTaskResult(responseBody); err != nil {
-		return fmt.Errorf("parseTaskResult failed for task %s: %w", taskId, err)
+		return newSafeTaskPollingError(
+			fmt.Sprintf("parse polling response failed for task %s", task.TaskID),
+			err,
+		)
 	}
 
 	task.Data = redactVideoResponseBody(responseBody)
-
-	logger.LogDebug(ctx, "updateVideoSingleTask taskResult: %+v", taskResult)
 
 	now := time.Now().Unix()
 	if taskResult.Status == "" {
@@ -759,7 +991,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 				taskResult = relaycommon.FailTaskInfo("upstream returned error")
 			} else {
 				// unknown error format, log original response
-				logger.LogError(ctx, fmt.Sprintf("Task %s returned empty status with unrecognized error format, response: %s", taskId, string(responseBody)))
+				logger.LogError(ctx, fmt.Sprintf(
+					"Task %s returned empty status with unrecognized error format",
+					task.TaskID,
+				))
 				taskResult = relaycommon.FailTaskInfo("upstream returned unrecognized message")
 			}
 		}
@@ -784,7 +1019,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		if task.FinishTime == 0 {
 			task.FinishTime = now
 		}
-		if ch.Type == constant.ChannelTypeSeedDance {
+		if isSeedDance {
 			task.PrivateData.ResultURL = fmt.Sprintf(
 				"/v1/videos/%s/content",
 				task.TaskID,
@@ -801,18 +1036,17 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		}
 		shouldSettle = true
 	case model.TaskStatusFailure:
-		logger.LogJson(ctx, fmt.Sprintf("Task %s failed", taskId), task)
 		task.Status = model.TaskStatusFailure
 		task.Progress = taskcommon.ProgressComplete
 		if task.FinishTime == 0 {
 			task.FinishTime = now
 		}
 		task.FailReason = taskResult.Reason
-		logger.LogInfo(ctx, fmt.Sprintf("Task %s failed: %s", task.TaskID, task.FailReason))
+		logger.LogInfo(ctx, fmt.Sprintf("Task %s failed", task.TaskID))
 		taskResult.Progress = taskcommon.ProgressComplete
 		shouldRefund = true
 	default:
-		return fmt.Errorf("unknown task status %s for task %s", taskResult.Status, task.TaskID)
+		return fmt.Errorf("unknown task status for task %s", task.TaskID)
 	}
 	if taskResult.Progress != "" {
 		task.Progress = taskResult.Progress
@@ -826,6 +1060,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			"provider_failure",
 			task.FailReason,
 			&task.Data,
+			isSeedDance,
 		)
 		if durable {
 			if transitionErr != nil {
@@ -841,63 +1076,58 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		}
 	}
 
-	if shouldSettle && ch.Type == constant.ChannelTypeSeedDance {
-		attempt, attemptErr := model.GetTaskBillingAttemptByTaskID(task.ID)
-		switch {
-		case attemptErr == nil:
-			transitioned, lockedAttempt, transitionErr := model.TransitionTaskToSuccess(
-				task.ID,
-				task.TaskID,
-				model.TaskSuccessTransition{
-					ExpectedStatus:   snap.Status,
-					ExpectedProgress: snap.Progress,
-					ResultURL:        task.PrivateData.ResultURL,
-					Data:             &task.Data,
-				},
-			)
-			if transitionErr != nil {
-				return fmt.Errorf(
-					"durable success transition failed for task %s: %w",
-					task.TaskID,
-					transitionErr,
-				)
-			}
-			if lockedAttempt.RequestID != attempt.RequestID {
-				return fmt.Errorf(
-					"durable success attempt changed for task %s",
-					task.TaskID,
-				)
-			}
-			if settleErr := settleTaskBillingOnCompleteForPolling(
-				ctx,
-				adaptor,
-				transitioned,
-				taskResult,
-			); settleErr != nil {
-				return fmt.Errorf(
-					"final settlement failed for task %s: %w",
-					task.TaskID,
-					settleErr,
-				)
-			}
-			if markerErr := model.MarkTaskBillingAttemptSucceeded(
-				lockedAttempt.RequestID,
-			); markerErr != nil {
-				return fmt.Errorf(
-					"mark durable task success failed for task %s: %w",
-					task.TaskID,
-					markerErr,
-				)
-			}
-			*task = *transitioned
-			return nil
-		case !errors.Is(attemptErr, gorm.ErrRecordNotFound):
+	if shouldSettle && isSeedDance {
+		transitioned, lockedAttempt, transitionErr := model.TransitionTaskToSuccess(
+			task.ID,
+			task.TaskID,
+			model.TaskSuccessTransition{
+				ExpectedStatus:   snap.Status,
+				ExpectedProgress: snap.Progress,
+				ResultURL:        task.PrivateData.ResultURL,
+				Data:             &task.Data,
+			},
+		)
+		if transitionErr != nil {
 			return fmt.Errorf(
-				"load durable billing attempt for task %s: %w",
+				"durable success transition failed for task %s: %w",
 				task.TaskID,
-				attemptErr,
+				transitionErr,
 			)
 		}
+		if finalizeErr := finalizeDurableFinalSuccess(
+			ctx,
+			adaptor,
+			transitioned,
+			taskResult,
+			lockedAttempt.RequestID,
+		); finalizeErr != nil {
+			return finalizeErr
+		}
+		*task = *transitioned
+		return nil
+	}
+
+	if isSeedDance {
+		transitioned, transitionErr := model.TransitionTaskPollingState(
+			task.ID,
+			task.TaskID,
+			model.TaskPollingTransition{
+				ExpectedStatus:   snap.Status,
+				ExpectedProgress: snap.Progress,
+				Status:           task.Status,
+				Progress:         task.Progress,
+				Data:             &task.Data,
+			},
+		)
+		if transitionErr != nil {
+			return fmt.Errorf(
+				"durable polling transition failed for task %s: %w",
+				task.TaskID,
+				transitionErr,
+			)
+		}
+		*task = *transitioned
+		return nil
 	}
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure

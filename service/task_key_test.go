@@ -1,6 +1,7 @@
 package service
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -142,4 +143,46 @@ func TestResolveStoredTaskKeyNeverFallsBack(t *testing.T) {
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "KEY_A")
 	assert.NotContains(t, err.Error(), "KEY_B")
+}
+
+func TestResolveStoredTaskKeyConcurrentStatusWriterUsesLockedSnapshot(t *testing.T) {
+	channel := multiKeyChannel(
+		[]string{"KEY_A", "KEY_B"},
+		map[int]int{0: common.ChannelStatusEnabled},
+	)
+	channel.Id = 6_001
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for index := 0; index < 10_000; index++ {
+			lock := model.GetChannelPollingLock(channel.Id)
+			lock.Lock()
+			if index%2 == 0 {
+				channel.ChannelInfo.MultiKeyStatusList[0] = common.ChannelStatusManuallyDisabled
+			} else {
+				delete(channel.ChannelInfo.MultiKeyStatusList, 0)
+			}
+			lock.Unlock()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for index := 0; index < 10_000; index++ {
+			resolved, err := ResolveStoredTaskKey(channel, "KEY_A")
+			if err == nil {
+				assert.Equal(t, "KEY_A", resolved)
+				continue
+			}
+			assert.Empty(t, resolved)
+			assert.NotContains(t, err.Error(), "KEY_A")
+			assert.NotContains(t, err.Error(), "KEY_B")
+		}
+	}()
+	close(start)
+	wg.Wait()
 }

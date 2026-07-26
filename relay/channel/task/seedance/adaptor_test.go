@@ -525,7 +525,10 @@ func TestFetchTaskWithContextUsesStatusDeadlineAndCancellation(t *testing.T) {
 	<-started
 	cancelParent()
 
-	require.ErrorIs(t, <-errCh, context.Canceled)
+	err := <-errCh
+	require.ErrorIs(t, err, context.Canceled)
+	assert.NotContains(t, err.Error(), "UPSTREAM_TASK_ID")
+	assert.NotContains(t, err.Error(), "TOKEN")
 	assert.Equal(t, 30*time.Second, statusTimeout)
 	select {
 	case <-disconnected:
@@ -683,6 +686,143 @@ func TestSeedDanceStatusFetchRejectsHTTPAndAmbiguousBusinessErrors(t *testing.T)
 	}
 }
 
+func TestSeedDanceStatusBusinessEnvelopeErrCodeMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantError  bool
+		wantStatus model.TaskStatus
+	}{
+		{
+			name:       "absent code",
+			body:       `{"success":true,"status":"processing"}`,
+			wantStatus: model.TaskStatusInProgress,
+		},
+		{
+			name:       "empty string code",
+			body:       `{"status":"processing","errCode":""}`,
+			wantStatus: model.TaskStatusInProgress,
+		},
+		{
+			name:       "string zero code",
+			body:       `{"success":true,"status":"completed","errCode":"0"}`,
+			wantStatus: model.TaskStatusSuccess,
+		},
+		{
+			name:       "numeric zero code",
+			body:       `{"status":"queued","errCode":0}`,
+			wantStatus: model.TaskStatusQueued,
+		},
+		{
+			name:      "nonzero string code",
+			body:      `{"success":true,"status":"completed","errCode":"AUTH_SECRET_CODE"}`,
+			wantError: true,
+		},
+		{
+			name:      "nonzero numeric code",
+			body:      `{"status":"processing","errCode":401}`,
+			wantError: true,
+		},
+		{
+			name:      "malformed object code",
+			body:      `{"status":"processing","errCode":{"nested":"SECRET_VALUE"}}`,
+			wantError: true,
+		},
+		{
+			name:      "malformed null code",
+			body:      `{"status":"processing","errCode":null}`,
+			wantError: true,
+		},
+		{
+			name:      "malformed boolean code",
+			body:      `{"status":"processing","errCode":true}`,
+			wantError: true,
+		},
+		{
+			name:       "failed status with nonzero code remains terminal",
+			body:       `{"success":false,"status":"failed","errCode":"PROVIDER_FAILED","errMessage":"safe reason"}`,
+			wantStatus: model.TaskStatusFailure,
+		},
+		{
+			name:      "failed status with malformed code fails closed",
+			body:      `{"success":false,"status":"failed","errCode":{"nested":"SECRET_VALUE"}}`,
+			wantError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(
+				writer http.ResponseWriter,
+				_ *http.Request,
+			) {
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(writer, test.body)
+			}))
+			defer upstream.Close()
+
+			resp, err := (&TaskAdaptor{}).FetchTaskWithContext(
+				context.Background(),
+				upstream.URL,
+				"TOKEN",
+				map[string]any{"task_id": "UPSTREAM_TASK_ID"},
+				"",
+			)
+			if test.wantError {
+				require.Error(t, err)
+				assert.Nil(t, resp)
+				assert.NotContains(t, err.Error(), "AUTH_SECRET_CODE")
+				assert.NotContains(t, err.Error(), "SECRET_VALUE")
+				assert.NotContains(t, err.Error(), "UPSTREAM_TASK_ID")
+				assert.NotContains(t, err.Error(), "TOKEN")
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			defer resp.Body.Close()
+			cleaned, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			result, err := (&TaskAdaptor{}).ParseTaskResult(cleaned)
+			require.NoError(t, err)
+			assert.Equal(t, string(test.wantStatus), result.Status)
+			if test.wantStatus == model.TaskStatusFailure {
+				assert.Equal(t, "safe reason", result.Reason)
+			}
+		})
+	}
+}
+
+func TestSeedDanceStatusTransportErrorIsSafeAndPreservesCause(t *testing.T) {
+	started := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(
+		_ http.ResponseWriter,
+		req *http.Request,
+	) {
+		close(started)
+		<-req.Context().Done()
+	}))
+	parent, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := (&TaskAdaptor{}).FetchTaskWithContext(
+			parent,
+			upstream.URL,
+			"TOKEN",
+			map[string]any{"task_id": "UPSTREAM_TASK_ID"},
+			"",
+		)
+		errCh <- err
+	}()
+	<-started
+	cancel()
+	err := <-errCh
+	upstream.Close()
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.NotContains(t, err.Error(), "UPSTREAM_TASK_ID")
+	assert.NotContains(t, err.Error(), "TOKEN")
+	assert.NotContains(t, err.Error(), "/status/")
+}
+
 func TestParseTaskResultMapsStatusesAndRejectsUnknown(t *testing.T) {
 	tests := []struct {
 		status   string
@@ -721,7 +861,8 @@ func TestParseTaskResultMapsStatusesAndRejectsUnknown(t *testing.T) {
 	}
 
 	result, err := (&TaskAdaptor{}).ParseTaskResult([]byte(`{"status":"FUTURE_STATUS"}`))
-	require.ErrorContains(t, err, `unknown Seed Dance status "FUTURE_STATUS"`)
+	require.EqualError(t, err, "unknown Seed Dance status")
+	assert.NotContains(t, err.Error(), "FUTURE_STATUS")
 	assert.Nil(t, result)
 }
 

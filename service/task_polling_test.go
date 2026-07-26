@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -84,9 +85,11 @@ func (a *contextTaskPollingAdaptor) AdjustBillingOnComplete(
 }
 
 type legacyTaskPollingAdaptor struct {
-	mu      sync.Mutex
-	calls   int
-	seenKey string
+	mu            sync.Mutex
+	calls         int
+	seenKey       string
+	seenAction    string
+	requireAction bool
 }
 
 func (a *legacyTaskPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
@@ -100,7 +103,12 @@ func (a *legacyTaskPollingAdaptor) FetchTask(
 	a.mu.Lock()
 	a.calls++
 	a.seenKey = key
+	a.seenAction, _ = body["action"].(string)
+	missingAction := a.requireAction && a.seenAction == ""
 	a.mu.Unlock()
+	if missingAction {
+		return nil, errors.New("invalid action")
+	}
 	taskID, _ := body["task_id"].(string)
 	encoded, err := common.Marshal(dto.TaskResponse[model.Task]{
 		Code: dto.TaskSuccessCode,
@@ -136,8 +144,16 @@ func (a *legacyTaskPollingAdaptor) snapshot() (int, string) {
 	return a.calls, a.seenKey
 }
 
+func (a *legacyTaskPollingAdaptor) actionSnapshot() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.seenAction
+}
+
 type finalSuccessPollingAdaptor struct {
 	adjustReturn int
+	adjustCalls  atomic.Int32
+	fetchCalls   atomic.Int32
 }
 
 func (a *finalSuccessPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
@@ -148,6 +164,7 @@ func (a *finalSuccessPollingAdaptor) FetchTask(
 	_ map[string]any,
 	_ string,
 ) (*http.Response, error) {
+	a.fetchCalls.Add(1)
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body: io.NopCloser(strings.NewReader(
@@ -169,7 +186,82 @@ func (a *finalSuccessPollingAdaptor) AdjustBillingOnComplete(
 	_ *model.Task,
 	_ *relaycommon.TaskInfo,
 ) int {
+	a.adjustCalls.Add(1)
 	return a.adjustReturn
+}
+
+type seedDanceStatePollingAdaptor struct {
+	status     model.TaskStatus
+	progress   string
+	reason     string
+	fetchCalls atomic.Int32
+}
+
+type barrierFinalSuccessAdaptor struct {
+	adjustCalls atomic.Int32
+	entered     chan struct{}
+	release     chan struct{}
+}
+
+func (a *barrierFinalSuccessAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a *barrierFinalSuccessAdaptor) FetchTask(
+	_ string,
+	_ string,
+	_ map[string]any,
+	_ string,
+) (*http.Response, error) {
+	return nil, errors.New("final-success recovery must not fetch provider status")
+}
+
+func (a *barrierFinalSuccessAdaptor) ParseTaskResult(
+	_ []byte,
+) (*relaycommon.TaskInfo, error) {
+	return nil, errors.New("final-success recovery must not parse provider status")
+}
+
+func (a *barrierFinalSuccessAdaptor) AdjustBillingOnComplete(
+	_ *model.Task,
+	_ *relaycommon.TaskInfo,
+) int {
+	a.adjustCalls.Add(1)
+	a.entered <- struct{}{}
+	<-a.release
+	return 0
+}
+
+func (a *seedDanceStatePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a *seedDanceStatePollingAdaptor) FetchTask(
+	_ string,
+	_ string,
+	_ map[string]any,
+	_ string,
+) (*http.Response, error) {
+	a.fetchCalls.Add(1)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			`{"requestId":"REQUEST_ID","status":"sanitized"}`,
+		)),
+	}, nil
+}
+
+func (a *seedDanceStatePollingAdaptor) ParseTaskResult(
+	_ []byte,
+) (*relaycommon.TaskInfo, error) {
+	return &relaycommon.TaskInfo{
+		Status:   string(a.status),
+		Progress: a.progress,
+		Reason:   a.reason,
+	}, nil
+}
+
+func (a *seedDanceStatePollingAdaptor) AdjustBillingOnComplete(
+	_ *model.Task,
+	_ *relaycommon.TaskInfo,
+) int {
+	return 0
 }
 
 type sunoFailurePollingAdaptor struct {
@@ -374,7 +466,10 @@ func TestTaskPollingContextReachesContextAwareFetcherWithStoredKey(t *testing.T)
 
 	<-adaptor.contextCalled
 	cancel()
-	require.ErrorIs(t, <-errCh, context.Canceled)
+	err := <-errCh
+	require.ErrorIs(t, err, context.Canceled)
+	assert.NotContains(t, err.Error(), "upstream_context")
+	assert.NotContains(t, err.Error(), "sk-test")
 	assert.Equal(t, "sk-test", <-adaptor.seenKey)
 	select {
 	case <-adaptor.legacyCalled:
@@ -413,6 +508,34 @@ func TestTaskPollingContextLegacyAdaptorUsesFetchTaskWithStoredKey(t *testing.T)
 	calls, seenKey := adaptor.snapshot()
 	assert.Equal(t, 1, calls)
 	assert.Equal(t, "STORED_KEY", seenKey)
+}
+
+func TestTaskPollingLegacyKlingRequestPreservesAction(t *testing.T) {
+	task := &model.Task{
+		TaskID:    "task_kling_action",
+		ChannelId: 97,
+		Action:    constant.TaskActionGenerate,
+		Status:    model.TaskStatusInProgress,
+		Progress:  "30%",
+		PrivateData: model.TaskPrivateData{
+			Key:            "STORED_KEY",
+			UpstreamTaskID: "upstream_kling_action",
+		},
+	}
+	adaptor := &legacyTaskPollingAdaptor{requireAction: true}
+	err := updateVideoSingleTask(
+		context.Background(),
+		adaptor,
+		&model.Channel{
+			Id:   97,
+			Type: constant.ChannelTypeKling,
+			Key:  "STORED_KEY",
+		},
+		task.GetUpstreamTaskID(),
+		map[string]*model.Task{task.GetUpstreamTaskID(): task},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, constant.TaskActionGenerate, adaptor.actionSnapshot())
 }
 
 func TestTaskPollingContextNeverFallsBackFromDisabledStoredKey(t *testing.T) {
@@ -512,6 +635,7 @@ func TestTaskPollingContextStoredKeyErrorsAndLogsAreCredentialFree(t *testing.T)
 	assert.Contains(t, logs.String(), "stored task credential is disabled or removed")
 	assert.NotContains(t, logs.String(), "STORED_KEY")
 	assert.NotContains(t, logs.String(), "CURRENT_RANDOM_KEY")
+	assert.NotContains(t, logs.String(), "upstream_stored_key_log")
 	calls, _ := adaptor.snapshot()
 	assert.Zero(t, calls)
 }
@@ -584,6 +708,10 @@ func seedSettledDurablePollingTask(
 	t.Helper()
 	attempt := seedDurableBillingAttempt(t, requestID, userID, tokenID, 100)
 	task := linkDurableBillingAttempt(t, attempt, requestID)
+	require.NoError(t, model.DB.Model(&model.Task{}).
+		Where("id = ?", task.ID).
+		Update("platform", seedDanceTaskPlatform).Error)
+	require.NoError(t, model.DB.First(task, task.ID).Error)
 	_, err := model.AttachTaskUpstreamResult(
 		task.ID,
 		task.TaskID,
@@ -691,6 +819,77 @@ func TestTaskPollingFinalSettlementFailureLeavesSucceededMarkerUnset(t *testing.
 	assert.Zero(t, attempt.RefundCompletedAt)
 }
 
+func TestTaskPollingMarkerFailureIsRecoveredWithoutProviderRefetch(t *testing.T) {
+	truncate(t)
+	task := seedSettledDurablePollingTask(
+		t,
+		"poll-marker-failure-recovery",
+		624,
+		724,
+	)
+	const triggerName = "test_fail_task_success_marker"
+	require.NoError(t, model.DB.Exec(
+		"CREATE TRIGGER "+triggerName+" "+
+			"BEFORE UPDATE OF succeeded_at ON task_billing_attempts "+
+			"WHEN NEW.succeeded_at <> 0 "+
+			"BEGIN SELECT RAISE(FAIL, 'marker unavailable'); END",
+	).Error)
+	t.Cleanup(func() {
+		_ = model.DB.Exec("DROP TRIGGER IF EXISTS " + triggerName).Error
+	})
+
+	initialAdaptor := &finalSuccessPollingAdaptor{}
+	err := updateVideoSingleTask(
+		context.Background(),
+		initialAdaptor,
+		&model.Channel{
+			Id:   task.ChannelId,
+			Type: constant.ChannelTypeSeedDance,
+			Key:  "STORED_KEY",
+		},
+		task.GetUpstreamTaskID(),
+		map[string]*model.Task{task.GetUpstreamTaskID(): task},
+	)
+	require.ErrorContains(t, err, "mark durable task success")
+	assert.Equal(t, int32(1), initialAdaptor.fetchCalls.Load())
+	assert.Equal(t, int32(1), initialAdaptor.adjustCalls.Load())
+
+	var afterFailure model.Task
+	require.NoError(t, model.DB.First(&afterFailure, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), afterFailure.Status)
+	assert.Equal(t, taskcommon.ProgressComplete, afterFailure.Progress)
+	assert.Equal(t, task.Quota, afterFailure.Quota)
+	attempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.Zero(t, attempt.SucceededAt)
+	assert.True(t, model.HasTaskPollingWork())
+
+	require.NoError(t, model.DB.Exec("DROP TRIGGER "+triggerName).Error)
+	recoveryAdaptor := &finalSuccessPollingAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(platform constant.TaskPlatform) TaskPollingAdaptor {
+		assert.Equal(t, seedDanceTaskPlatform, platform)
+		return recoveryAdaptor
+	}
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	RunTaskPollingOnce(context.Background(), nil)
+	attempt, err = model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	firstSucceededAt := attempt.SucceededAt
+	assert.NotZero(t, firstSucceededAt)
+	assert.Zero(t, recoveryAdaptor.fetchCalls.Load())
+	assert.Equal(t, int32(1), recoveryAdaptor.adjustCalls.Load())
+	assert.False(t, model.HasTaskPollingWork())
+
+	RunTaskPollingOnce(context.Background(), nil)
+	attempt, err = model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, firstSucceededAt, attempt.SucceededAt)
+	assert.Zero(t, recoveryAdaptor.fetchCalls.Load())
+	assert.Equal(t, int32(1), recoveryAdaptor.adjustCalls.Load())
+}
+
 func TestTaskPollingSettledSubmissionFailureRefundsBothComponents(t *testing.T) {
 	truncate(t)
 	task := seedSettledDurablePollingTask(
@@ -726,6 +925,501 @@ func TestTaskPollingSettledSubmissionFailureRefundsBothComponents(t *testing.T) 
 	assert.NotZero(t, attempt.TokenRefundedAt)
 	assert.NotZero(t, attempt.RefundStartedAt)
 	assert.NotZero(t, attempt.RefundCompletedAt)
+}
+
+func seedRecoverableFinalSuccessTask(
+	t *testing.T,
+	requestID string,
+	userID int,
+	tokenID int,
+	channelID int,
+) *model.Task {
+	t.Helper()
+	task := seedSettledDurablePollingTask(t, requestID, userID, tokenID)
+	channel := &model.Channel{
+		Id:     channelID,
+		Type:   constant.ChannelTypeSeedDance,
+		Name:   "seed-dance-recovery",
+		Key:    "STORED_KEY",
+		Status: common.ChannelStatusEnabled,
+	}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{DisableTaskPollingSleep: true})
+	require.NoError(t, model.DB.Create(channel).Error)
+	require.NoError(t, model.DB.Model(&model.Task{}).
+		Where("id = ?", task.ID).
+		Updates(map[string]any{
+			"channel_id": channelID,
+			"platform": constant.TaskPlatform(
+				fmt.Sprintf("%d", constant.ChannelTypeSeedDance),
+			),
+		}).Error)
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	data := json.RawMessage(`{"status":"completed"}`)
+	transitioned, _, err := model.TransitionTaskToSuccess(
+		task.ID,
+		task.TaskID,
+		model.TaskSuccessTransition{
+			ExpectedStatus:   model.TaskStatusSubmitted,
+			ExpectedProgress: taskcommon.ProgressSubmitted,
+			ResultURL:        "/v1/videos/" + task.TaskID + "/content",
+			Data:             &data,
+		},
+	)
+	require.NoError(t, err)
+	recoverable, err := model.ListRecoverableFinalSuccessTasks(10)
+	require.NoError(t, err)
+	if len(recoverable) != 1 {
+		attempt, attemptErr := model.GetTaskBillingAttemptByTaskID(task.ID)
+		t.Logf(
+			"recoverable fixture task=%+v attempt=%+v attemptErr=%v",
+			transitioned,
+			attempt,
+			attemptErr,
+		)
+	}
+	require.Len(t, recoverable, 1)
+	return transitioned
+}
+
+func TestTaskPollingFinalSuccessRecoveryReplaysCrashAfterTransition(t *testing.T) {
+	truncate(t)
+	task := seedRecoverableFinalSuccessTask(
+		t,
+		"poll-success-crash-recovery",
+		631,
+		731,
+		5_901,
+	)
+	assert.True(t, model.HasTaskPollingWork())
+	adaptor := &finalSuccessPollingAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(platform constant.TaskPlatform) TaskPollingAdaptor {
+		assert.Equal(
+			t,
+			constant.TaskPlatform(fmt.Sprintf("%d", constant.ChannelTypeSeedDance)),
+			platform,
+		)
+		return adaptor
+	}
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	RunTaskPollingOnce(context.Background(), nil)
+
+	attempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.NotZero(t, attempt.SucceededAt)
+	assert.Zero(t, attempt.RefundStartedAt)
+	assert.Zero(t, adaptor.fetchCalls.Load())
+	assert.Equal(t, int32(1), adaptor.adjustCalls.Load())
+	assert.False(t, model.HasTaskPollingWork())
+}
+
+func TestTaskPollingFinalSuccessRecoveryRetriesSettlementFailure(t *testing.T) {
+	truncate(t)
+	task := seedRecoverableFinalSuccessTask(
+		t,
+		"poll-success-settlement-retry",
+		632,
+		732,
+		5_902,
+	)
+	failingAdaptor := &finalSuccessPollingAdaptor{adjustReturn: 200}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+		return failingAdaptor
+	}
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	err := replayDurableFinalSuccessTasks(context.Background())
+	require.ErrorContains(t, err, "final settlement")
+	attempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.Zero(t, attempt.SucceededAt)
+	assert.True(t, model.HasTaskPollingWork())
+
+	successAdaptor := &finalSuccessPollingAdaptor{}
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+		return successAdaptor
+	}
+	require.NoError(t, replayDurableFinalSuccessTasks(context.Background()))
+	attempt, err = model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.NotZero(t, attempt.SucceededAt)
+	assert.Equal(t, int32(1), successAdaptor.adjustCalls.Load())
+	require.NoError(t, replayDurableFinalSuccessTasks(context.Background()))
+	assert.Equal(t, int32(1), successAdaptor.adjustCalls.Load())
+}
+
+func TestTaskPollingFinalSuccessRecoveryIsIdempotentAcrossTwoWorkers(t *testing.T) {
+	truncate(t)
+	task := seedRecoverableFinalSuccessTask(
+		t,
+		"poll-success-two-workers",
+		634,
+		734,
+		5_904,
+	)
+	adaptor := &barrierFinalSuccessAdaptor{
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+		return adaptor
+	}
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	errCh := make(chan error, 2)
+	for worker := 0; worker < 2; worker++ {
+		go func() {
+			errCh <- replayDurableFinalSuccessTasks(context.Background())
+		}()
+	}
+	for worker := 0; worker < 2; worker++ {
+		select {
+		case <-adaptor.entered:
+		case <-time.After(time.Second):
+			t.Fatal("both recovery workers did not reach zero-delta settlement")
+		}
+	}
+	close(adaptor.release)
+	require.NoError(t, <-errCh)
+	require.NoError(t, <-errCh)
+
+	attempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.NotZero(t, attempt.SucceededAt)
+	assert.Equal(t, int32(2), adaptor.adjustCalls.Load())
+	require.NoError(t, replayDurableFinalSuccessTasks(context.Background()))
+	assert.Equal(t, int32(2), adaptor.adjustCalls.Load())
+}
+
+func TestSeedDancePollingUsesNarrowNonterminalTransition(t *testing.T) {
+	truncate(t)
+	task := seedSettledDurablePollingTask(
+		t,
+		"poll-nonterminal-production",
+		633,
+		733,
+	)
+	channel := &model.Channel{
+		Id:     5_903,
+		Type:   constant.ChannelTypeSeedDance,
+		Name:   "seed-dance-nonterminal",
+		Key:    "STORED_KEY",
+		Status: common.ChannelStatusEnabled,
+	}
+	require.NoError(t, model.DB.Create(channel).Error)
+	require.NoError(t, model.DB.Model(&model.Task{}).
+		Where("id = ?", task.ID).
+		Updates(map[string]any{
+			"channel_id": channel.Id,
+			"platform": constant.TaskPlatform(
+				fmt.Sprintf("%d", constant.ChannelTypeSeedDance),
+			),
+		}).Error)
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	stale := *task
+	latestPrivate := task.PrivateData
+	latestPrivate.NodeName = "latest-concurrent-node"
+	latestProperties := model.Properties{
+		Input:             "latest-concurrent-input",
+		UpstreamModelName: "latest-concurrent-route",
+		OriginModelName:   task.Properties.OriginModelName,
+	}
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).
+		Updates(map[string]any{
+			"private_data": latestPrivate,
+			"properties":   latestProperties,
+		}).Error)
+	adaptor := &seedDanceStatePollingAdaptor{
+		status:   model.TaskStatusInProgress,
+		progress: taskcommon.ProgressInProgress,
+	}
+
+	require.NoError(t, updateVideoSingleTask(
+		context.Background(),
+		adaptor,
+		channel,
+		stale.GetUpstreamTaskID(),
+		map[string]*model.Task{stale.GetUpstreamTaskID(): &stale},
+	))
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusInProgress), reloaded.Status)
+	assert.Equal(t, taskcommon.ProgressInProgress, reloaded.Progress)
+	assert.Equal(t, "latest-concurrent-node", reloaded.PrivateData.NodeName)
+	assert.Equal(t, latestProperties, reloaded.Properties)
+	assert.Equal(t, task.Quota, reloaded.Quota)
+}
+
+func TestSeedDancePollingMissingLedgerFailsClosedBeforeFetch(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   model.TaskStatus
+		progress string
+	}{
+		{
+			name:     "nonterminal provider result",
+			status:   model.TaskStatusInProgress,
+			progress: taskcommon.ProgressInProgress,
+		},
+		{
+			name:     "success provider result",
+			status:   model.TaskStatusSuccess,
+			progress: taskcommon.ProgressComplete,
+		},
+		{
+			name:     "failure provider result",
+			status:   model.TaskStatusFailure,
+			progress: taskcommon.ProgressComplete,
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			truncate(t)
+			channelID := 5_910 + index
+			channel := &model.Channel{
+				Id:     channelID,
+				Type:   constant.ChannelTypeSeedDance,
+				Name:   "seed-dance-missing-ledger",
+				Key:    "STORED_KEY",
+				Status: common.ChannelStatusEnabled,
+			}
+			require.NoError(t, model.DB.Create(channel).Error)
+			task := &model.Task{
+				TaskID:    fmt.Sprintf("task_missing_ledger_%d", index),
+				Platform:  constant.TaskPlatform("59"),
+				UserId:    1,
+				ChannelId: channelID,
+				Quota:     100,
+				Action:    constant.TaskActionGenerate,
+				Status:    model.TaskStatusSubmitted,
+				Progress:  taskcommon.ProgressSubmitted,
+				PrivateData: model.TaskPrivateData{
+					Key:            "STORED_KEY",
+					UpstreamTaskID: fmt.Sprintf("UPSTREAM_MISSING_LEDGER_%d", index),
+				},
+			}
+			require.NoError(t, model.DB.Create(task).Error)
+			adaptor := &seedDanceStatePollingAdaptor{
+				status:   test.status,
+				progress: test.progress,
+				reason:   "safe failure",
+			}
+
+			err := updateVideoSingleTask(
+				context.Background(),
+				adaptor,
+				channel,
+				task.GetUpstreamTaskID(),
+				map[string]*model.Task{task.GetUpstreamTaskID(): task},
+			)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "durable billing attempt")
+			assert.NotContains(t, err.Error(), task.GetUpstreamTaskID())
+			assert.NotContains(t, err.Error(), "STORED_KEY")
+			assert.Zero(t, adaptor.fetchCalls.Load())
+
+			var reloaded model.Task
+			require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+			assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), reloaded.Status)
+			assert.Equal(t, taskcommon.ProgressSubmitted, reloaded.Progress)
+			assert.Equal(t, 100, reloaded.Quota)
+		})
+	}
+}
+
+func TestSeedDanceMissingDurableUpstreamIDFailsClosedBeforeFetch(t *testing.T) {
+	truncate(t)
+	previousQueryLimit := constant.TaskQueryLimit
+	constant.TaskQueryLimit = 100
+	t.Cleanup(func() { constant.TaskQueryLimit = previousQueryLimit })
+
+	task := seedSettledDurablePollingTask(
+		t,
+		"poll-missing-durable-upstream-id",
+		637,
+		737,
+	)
+	channel := &model.Channel{
+		Id:     5_930,
+		Type:   constant.ChannelTypeSeedDance,
+		Name:   "seed-dance-missing-upstream-id",
+		Key:    "STORED_KEY",
+		Status: common.ChannelStatusEnabled,
+	}
+	require.NoError(t, model.DB.Create(channel).Error)
+	require.NoError(t, model.DB.Model(&model.Task{}).
+		Where("id = ?", task.ID).
+		Updates(map[string]any{
+			"channel_id": channel.Id,
+			"platform":   seedDanceTaskPlatform,
+		}).Error)
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	task.PrivateData.UpstreamTaskID = ""
+	require.NoError(t, model.DB.Model(&model.Task{}).
+		Where("id = ?", task.ID).
+		Update("private_data", task.PrivateData).Error)
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+
+	beforeAttempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	var beforeUser model.User
+	require.NoError(t, model.DB.First(&beforeUser, beforeAttempt.UserID).Error)
+	var beforeToken model.Token
+	require.NoError(t, model.DB.First(&beforeToken, beforeAttempt.TokenID).Error)
+
+	adaptor := &seedDanceStatePollingAdaptor{
+		status:   model.TaskStatusFailure,
+		progress: taskcommon.ProgressComplete,
+		reason:   "provider did not recognize the public id",
+	}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(platform constant.TaskPlatform) TaskPollingAdaptor {
+		if platform == seedDanceTaskPlatform {
+			return adaptor
+		}
+		return nil
+	}
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	summary := RunTaskPollingOnce(context.Background(), nil)
+	assert.Zero(t, summary.NullTasksFailed)
+	assert.Zero(t, adaptor.fetchCalls.Load())
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), reloaded.Status)
+	assert.Equal(t, taskcommon.ProgressSubmitted, reloaded.Progress)
+	assert.Equal(t, 100, reloaded.Quota)
+	assert.Empty(t, reloaded.PrivateData.UpstreamTaskID)
+	assert.Zero(t, reloaded.FinishTime)
+	assert.Empty(t, reloaded.FailReason)
+
+	afterAttempt, err := model.GetTaskBillingAttemptByTaskID(task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, beforeAttempt.SucceededAt, afterAttempt.SucceededAt)
+	assert.Equal(t, beforeAttempt.FundingRefundedAt, afterAttempt.FundingRefundedAt)
+	assert.Equal(t, beforeAttempt.TokenRefundedAt, afterAttempt.TokenRefundedAt)
+	assert.Equal(t, beforeAttempt.RefundStartedAt, afterAttempt.RefundStartedAt)
+	assert.Equal(t, beforeAttempt.RefundCompletedAt, afterAttempt.RefundCompletedAt)
+
+	var afterUser model.User
+	require.NoError(t, model.DB.First(&afterUser, beforeAttempt.UserID).Error)
+	assert.Equal(t, beforeUser.Quota, afterUser.Quota)
+	var afterToken model.Token
+	require.NoError(t, model.DB.First(&afterToken, beforeAttempt.TokenID).Error)
+	assert.Equal(t, beforeToken.RemainQuota, afterToken.RemainQuota)
+}
+
+func TestSeedDanceMissingChannelWithoutLedgerFailsClosed(t *testing.T) {
+	truncate(t)
+	const missingChannelID = 5_920
+	task := &model.Task{
+		TaskID:     "task_seedance_missing_channel_ledger",
+		Platform:   seedDanceTaskPlatform,
+		UserId:     1,
+		ChannelId:  missingChannelID,
+		Quota:      100,
+		Action:     constant.TaskActionGenerate,
+		Status:     model.TaskStatusInProgress,
+		Progress:   taskcommon.ProgressInProgress,
+		SubmitTime: time.Now().Unix(),
+		PrivateData: model.TaskPrivateData{
+			Key:            "STORED_KEY",
+			UpstreamTaskID: "UPSTREAM_MISSING_CHANNEL_LEDGER",
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+
+	err := updateVideoTasks(
+		context.Background(),
+		seedDanceTaskPlatform,
+		missingChannelID,
+		[]string{task.GetUpstreamTaskID()},
+		map[string]*model.Task{task.GetUpstreamTaskID(): task},
+	)
+	require.Error(t, err)
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusInProgress), reloaded.Status)
+	assert.Equal(t, taskcommon.ProgressInProgress, reloaded.Progress)
+	assert.Equal(t, 100, reloaded.Quota)
+	assert.Zero(t, reloaded.FinishTime)
+	assert.Empty(t, reloaded.FailReason)
+}
+
+func TestSeedDanceTimeoutWithoutLedgerFailsClosed(t *testing.T) {
+	truncate(t)
+	previousTimeout := constant.TaskTimeoutMinutes
+	constant.TaskTimeoutMinutes = 1
+	t.Cleanup(func() {
+		constant.TaskTimeoutMinutes = previousTimeout
+	})
+
+	task := &model.Task{
+		TaskID:     "task_seedance_timeout_without_ledger",
+		Platform:   seedDanceTaskPlatform,
+		UserId:     1,
+		ChannelId:  5_921,
+		Quota:      100,
+		Action:     constant.TaskActionGenerate,
+		Status:     model.TaskStatusInProgress,
+		Progress:   taskcommon.ProgressInProgress,
+		SubmitTime: time.Now().Add(-2 * time.Minute).Unix(),
+		PrivateData: model.TaskPrivateData{
+			Key:            "STORED_KEY",
+			UpstreamTaskID: "UPSTREAM_TIMEOUT_WITHOUT_LEDGER",
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+
+	sweepTimedOutTasks(context.Background())
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusInProgress), reloaded.Status)
+	assert.Equal(t, taskcommon.ProgressInProgress, reloaded.Progress)
+	assert.Equal(t, 100, reloaded.Quota)
+	assert.Zero(t, reloaded.FinishTime)
+	assert.Empty(t, reloaded.FailReason)
+}
+
+func TestSeedDancePlatformChannelDriftFailsClosedBeforeFetch(t *testing.T) {
+	truncate(t)
+	task := seedSettledDurablePollingTask(
+		t,
+		"poll-seedance-channel-drift",
+		635,
+		735,
+	)
+	adaptor := &seedDanceStatePollingAdaptor{
+		status:   model.TaskStatusInProgress,
+		progress: taskcommon.ProgressInProgress,
+	}
+
+	err := updateVideoSingleTask(
+		context.Background(),
+		adaptor,
+		&model.Channel{
+			Id:   task.ChannelId,
+			Type: constant.ChannelTypeKling,
+			Key:  "STORED_KEY",
+		},
+		task.GetUpstreamTaskID(),
+		map[string]*model.Task{task.GetUpstreamTaskID(): task},
+	)
+	require.ErrorContains(t, err, "identity mismatch")
+	assert.NotContains(t, err.Error(), task.GetUpstreamTaskID())
+	assert.Zero(t, adaptor.fetchCalls.Load())
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), reloaded.Status)
+	assert.Equal(t, taskcommon.ProgressSubmitted, reloaded.Progress)
 }
 
 func TestUpdateVideoTasksDefaultSleepWaitsBetweenTasks(t *testing.T) {
@@ -1030,14 +1724,6 @@ func TestDurableSunoFailurePreservesLatestQueuedTaskColumns(t *testing.T) {
 	latestPrivate.UpstreamTaskID = "LATEST_SUNO_UPSTREAM"
 	latestPrivate.ResultURL = "LATEST_RESULT"
 	latestPrivate.NodeName = "LATEST_NODE"
-	latestPrivate.BillingContext = &model.TaskBillingContext{
-		ModelPrice:      9,
-		GroupRatio:      8,
-		ModelRatio:      7,
-		OtherRatios:     map[string]float64{"latest": 6},
-		OriginModelName: "LATEST_MODEL",
-		PerCallBilling:  true,
-	}
 	latestProperties := model.Properties{
 		Input:             "LATEST_INPUT",
 		UpstreamModelName: "LATEST_UPSTREAM_MODEL",
@@ -1074,7 +1760,11 @@ func TestDurableSunoFailurePreservesLatestQueuedTaskColumns(t *testing.T) {
 	assert.Equal(t, "LATEST_RESULT", reloaded.PrivateData.ResultURL)
 	assert.Equal(t, "LATEST_NODE", reloaded.PrivateData.NodeName)
 	require.NotNil(t, reloaded.PrivateData.BillingContext)
-	assert.Equal(t, "LATEST_MODEL", reloaded.PrivateData.BillingContext.OriginModelName)
+	assert.Equal(
+		t,
+		stale.PrivateData.BillingContext,
+		reloaded.PrivateData.BillingContext,
+	)
 	assert.Equal(t, latestProperties, reloaded.Properties)
 	assert.JSONEq(t, `{"sanitized":"suno"}`, string(reloaded.Data))
 }
@@ -1112,14 +1802,6 @@ func TestDurableVideoFailurePreservesLatestInProgressTaskColumns(t *testing.T) {
 	latestPrivate.UpstreamTaskID = "LATEST_VIDEO_UPSTREAM"
 	latestPrivate.ResultURL = "LATEST_VIDEO_RESULT"
 	latestPrivate.NodeName = "LATEST_VIDEO_NODE"
-	latestPrivate.BillingContext = &model.TaskBillingContext{
-		ModelPrice:      19,
-		GroupRatio:      18,
-		ModelRatio:      17,
-		OtherRatios:     map[string]float64{"latest": 16},
-		OriginModelName: "LATEST_VIDEO_MODEL",
-		PerCallBilling:  true,
-	}
 	latestProperties := model.Properties{
 		Input:             "LATEST_VIDEO_INPUT",
 		UpstreamModelName: "LATEST_VIDEO_UPSTREAM_MODEL",
@@ -1161,7 +1843,11 @@ func TestDurableVideoFailurePreservesLatestInProgressTaskColumns(t *testing.T) {
 	assert.Equal(t, "LATEST_VIDEO_RESULT", reloaded.PrivateData.ResultURL)
 	assert.Equal(t, "LATEST_VIDEO_NODE", reloaded.PrivateData.NodeName)
 	require.NotNil(t, reloaded.PrivateData.BillingContext)
-	assert.Equal(t, "LATEST_VIDEO_MODEL", reloaded.PrivateData.BillingContext.OriginModelName)
+	assert.Equal(
+		t,
+		stale.PrivateData.BillingContext,
+		reloaded.PrivateData.BillingContext,
+	)
 	assert.Equal(t, latestProperties, reloaded.Properties)
 	assert.Contains(t, string(reloaded.Data), `"code":"success"`)
 	assert.Contains(t, string(reloaded.Data), `"status":"FAILURE"`)

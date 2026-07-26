@@ -926,6 +926,7 @@ func TestMarkTaskBillingAttemptSucceededRequiresFinalTaskSuccess(t *testing.T) {
 	require.NoError(t, err)
 	_, err = CommitTaskSubmission(prepared.ID, prepared.TaskID)
 	require.NoError(t, err)
+	require.NoError(t, MarkTaskBillingAttemptSubmissionSettled("final-task-success"))
 
 	err = MarkTaskBillingAttemptSucceeded("final-task-success")
 	assert.ErrorIs(t, err, ErrTaskBillingAttemptState)
