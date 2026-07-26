@@ -1,0 +1,469 @@
+openapi: 3.0.3
+info:
+  title: New API Seed Dance Video API
+  version: 1.0.0
+  license:
+    name: GNU Affero General Public License v3.0
+    url: https://www.gnu.org/licenses/agpl-3.0.html
+  description: |
+    OpenAI-compatible video generation contract for the Seed Dance channel.
+    Task identifiers in this document are public New API identifiers; upstream
+    provider identifiers are never exposed.
+servers:
+  - url: "{{base_url}}"
+    variables:
+      "{base_url":
+        default: http://localhost:3000
+tags:
+  - name: Videos
+    description: Create, inspect, and download video-generation tasks.
+paths:
+  /v1/videos:
+    post:
+      tags: [Videos]
+      summary: Create a video task
+      operationId: createVideo
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VideoCreateJSON"
+            example:
+              model: seedance-uncensored
+              prompt: TEST_PROMPT
+              duration: 10
+              size: 1280x720
+              metadata:
+                prompt_optimization: false
+                multi_shot: false
+                strict_duration: false
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/VideoCreateMultipart"
+            example:
+              model: seedance-uncensored
+              prompt: TEST_PROMPT
+              duration: "10"
+              size: 1280x720
+              metadata: '{"strict_duration":false}'
+              input_reference: FILE_BYTES
+      responses:
+        "200":
+          description: Video task created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAIVideo"
+              example:
+                id: "{{task_id}}"
+                task_id: "{{task_id}}"
+                object: video
+                model: seedance-uncensored
+                status: queued
+                progress: 0
+                created_at: 1753372800
+                seconds: "10"
+                size: 720P
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+        "504":
+          $ref: "#/components/responses/UpstreamTimeout"
+  /v1/videos/{task_id}:
+    get:
+      tags: [Videos]
+      summary: Get video task status
+      operationId: getVideo
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Current public video task state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAIVideo"
+              example:
+                id: "{{task_id}}"
+                task_id: "{{task_id}}"
+                object: video
+                model: seedance-uncensored
+                status: in_progress
+                progress: 50
+                created_at: 1753372800
+                seconds: "10"
+                size: 720P
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+        "504":
+          $ref: "#/components/responses/UpstreamTimeout"
+  /v1/videos/{task_id}/content:
+    get:
+      tags: [Videos]
+      summary: Download completed video content
+      operationId: getVideoContent
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Validated MP4 content for a completed task.
+          headers:
+            Content-Length:
+              description: Decoded MP4 size in bytes.
+              schema:
+                type: integer
+                minimum: 0
+          content:
+            video/mp4:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+        "504":
+          $ref: "#/components/responses/UpstreamTimeout"
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API key
+  parameters:
+    TaskId:
+      name: task_id
+      in: path
+      required: true
+      description: Public New API task identifier.
+      schema:
+        type: string
+      example: "{{task_id}}"
+  responses:
+    BadRequest:
+      description: The request failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          example:
+            error:
+              message: duration must be between 1 and 15
+              type: invalid_request_error
+              code: invalid_duration
+    Unauthorized:
+      description: Authentication failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          example:
+            error:
+              message: Invalid API key
+              type: authentication_error
+              code: invalid_api_key
+    NotFound:
+      description: The public task does not exist or is not owned by the caller.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          example:
+            error:
+              message: Video task not found
+              type: invalid_request_error
+              code: task_not_found
+    RateLimited:
+      description: The request was rate limited.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          example:
+            error:
+              message: Too many requests
+              type: upstream_rate_limit_error
+              code: upstream_rate_limit_error
+    UpstreamError:
+      description: The upstream provider returned an invalid response or error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          example:
+            error:
+              message: Upstream video service error
+              type: upstream_error
+              code: invalid_upstream_response
+    UpstreamTimeout:
+      description: The upstream provider did not complete within the deadline.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          example:
+            error:
+              message: Upstream video service timed out
+              type: upstream_timeout_error
+              code: upstream_timeout_error
+  schemas:
+    VideoCreateJSON:
+      type: object
+      additionalProperties: false
+      required:
+        - model
+        - prompt
+      properties:
+        model:
+          type: string
+          description: Model routed to the Seed Dance channel.
+          example: seedance-uncensored
+        prompt:
+          type: string
+          description: Video-generation prompt.
+          example: TEST_PROMPT
+        duration:
+          type: integer
+          minimum: 1
+          maximum: 15
+          default: 15
+          description: Requested duration in seconds.
+          example: 10
+        seconds:
+          description: Alias for duration.
+          oneOf:
+            - type: integer
+              minimum: 1
+              maximum: 15
+            - type: string
+              pattern: "^[0-9]+$"
+          example: "10"
+        size:
+          type: string
+          enum:
+            - 854x480
+            - 480x854
+            - 1280x720
+            - 720x1280
+            - 1920x1080
+            - 1080x1920
+          description: Output dimensions.
+          example: 1280x720
+        image:
+          type: string
+          description: A pure Base64 image, supported image data URI, or remote image URL.
+          example: IMAGE_REFERENCE
+        images:
+          type: array
+          maxItems: 1
+          description: Single-item image-reference alias.
+          items:
+            type: string
+          example:
+            - IMAGE_REFERENCE
+        input_reference:
+          type: string
+          description: Image-reference alias for JSON requests.
+          example: IMAGE_REFERENCE
+        metadata:
+          $ref: "#/components/schemas/VideoMetadata"
+    VideoMetadata:
+      type: object
+      additionalProperties: false
+      properties:
+        duration:
+          description: Duration alias inside metadata.
+          oneOf:
+            - type: integer
+              minimum: 1
+              maximum: 15
+            - type: string
+              pattern: "^[0-9]+$"
+          example: 10
+        resolution:
+          type: string
+          enum:
+            - 480P
+            - 720P
+            - 1080P
+          example: 720P
+        image_base64:
+          type: string
+          description: Seed Dance image input; no channel-specific byte ceiling is imposed.
+          example: IMAGE_DATA_PLACEHOLDER
+        prompt_optimization:
+          type: boolean
+          default: false
+        multi_shot:
+          type: boolean
+          default: false
+        strict_duration:
+          type: boolean
+          default: false
+        negative_prompt:
+          type: string
+          example: TEST_NEGATIVE_PROMPT
+    VideoCreateMultipart:
+      type: object
+      additionalProperties: false
+      required:
+        - model
+        - prompt
+      properties:
+        model:
+          type: string
+          example: seedance-uncensored
+        prompt:
+          type: string
+          example: TEST_PROMPT
+        duration:
+          type: string
+          pattern: "^[0-9]+$"
+          example: "10"
+        seconds:
+          type: string
+          pattern: "^[0-9]+$"
+          example: "10"
+        size:
+          type: string
+          enum:
+            - 854x480
+            - 480x854
+            - 1280x720
+            - 720x1280
+            - 1920x1080
+            - 1080x1920
+          example: 1280x720
+        metadata:
+          type: string
+          description: JSON-encoded VideoMetadata object.
+          example: '{"strict_duration":false}'
+        input_reference:
+          type: string
+          format: binary
+          description: JPG or PNG reference image.
+    OpenAIVideo:
+      type: object
+      required:
+        - id
+        - task_id
+        - object
+        - model
+        - status
+        - progress
+        - created_at
+        - seconds
+        - size
+      properties:
+        id:
+          type: string
+          description: Public New API video task identifier.
+          example: "{{task_id}}"
+        task_id:
+          type: string
+          description: Public task identifier alias.
+          example: "{{task_id}}"
+        object:
+          type: string
+          enum: [video]
+          example: video
+        model:
+          type: string
+          example: seedance-uncensored
+        status:
+          type: string
+          enum:
+            - queued
+            - in_progress
+            - completed
+            - failed
+          example: queued
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+          example: 0
+        created_at:
+          type: integer
+          format: int64
+          example: 1753372800
+        completed_at:
+          type: integer
+          format: int64
+          nullable: true
+          example: 1753372810
+        expires_at:
+          type: integer
+          format: int64
+          nullable: true
+          example: 1753459200
+        seconds:
+          type: string
+          pattern: "^[0-9]+$"
+          example: "10"
+        size:
+          type: string
+          enum:
+            - 480P
+            - 720P
+            - 1080P
+          example: 720P
+        error:
+          allOf:
+            - $ref: "#/components/schemas/VideoTaskError"
+    VideoTaskError:
+      type: object
+      required:
+        - message
+        - code
+      properties:
+        message:
+          type: string
+        code:
+          type: string
+    OpenAIError:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - message
+            - type
+            - code
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+            code:
+              type: string
