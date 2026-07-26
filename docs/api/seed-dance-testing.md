@@ -119,7 +119,9 @@ API 不因图片超过该建议值而添加 Seed Dance 专用的 `5 MB` 或 `5 M
 ```
 
 JSON 请求中的布尔字段必须是真正的布尔值。multipart 的 `metadata` 是一个
-JSON 编码字符串。`strict_duration` 的供应商缺省值为 `false`。
+JSON 编码字符串，其中 `prompt_optimization`、`multi_shot` 和
+`strict_duration` 当前必须写成文本 `"true"` 或 `"false"`；适配器会在发送
+上游前将其规范化为布尔值。`strict_duration` 的供应商缺省值为 `false`。
 
 ## 4. 计费配置与公式
 
@@ -304,7 +306,7 @@ curl -fsS \
   -F 'prompt=TEST_PROMPT' \
   -F 'duration=1' \
   -F 'size=1280x720' \
-  -F 'metadata={"prompt_optimization":false,"multi_shot":false,"strict_duration":true,"negative_prompt":""}' \
+  -F 'metadata={"prompt_optimization":"false","multi_shot":"false","strict_duration":"true","negative_prompt":""}' \
   -F 'input_reference=@./reference.png;type=image/png' \
   "{{base_url}}/v1/videos" | jq .
 ```
@@ -566,11 +568,12 @@ Content-Type: application/json
 |---|---:|---|---|
 | 参数缺失、冲突或越界 | 400 | `invalid_request_error` | 对应稳定参数 code |
 | 模型价格未配置 | 400 | `invalid_request_error` | `model_price_error` |
-| 客户端 API Key 无效 | 401 | `authentication_error` | `invalid_api_key` |
+| 客户端 API Key 无效 | 401 | `new_api_error` | 空字符串 |
 | 任务不存在或越权 | 404 | `invalid_request_error` | `task_not_found` |
 | 任务未完成时下载 | 400 | `invalid_request_error` | `task_not_completed` |
 | 供应商认证失败 | 502 | `upstream_error` | `upstream_authentication_error` |
-| 供应商限流 | 429 | `upstream_rate_limit_error` | `upstream_rate_limit_error` |
+| 提交/任务接口收到供应商限流 | 429 | `rate_limit_error` | `upstream_rate_limit_error` |
+| 视频下载接口收到供应商限流 | 429 | `upstream_rate_limit_error` | `upstream_rate_limit_error` |
 | 供应商连接异常 | 502 | `upstream_error` | `upstream_connection_error` |
 | 供应商下载超时 | 504 | `upstream_timeout_error` | `upstream_timeout_error` |
 | 供应商 JSON、Base64 或 MP4 无效 | 502 | `invalid_upstream_response` | `invalid_upstream_response` |
