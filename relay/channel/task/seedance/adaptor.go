@@ -38,6 +38,23 @@ type cleanedStatusData struct {
 	Message    string `json:"message,omitempty"`
 }
 
+type safeStatusError struct {
+	message string
+	cause   error
+}
+
+func (e *safeStatusError) Error() string {
+	return e.message
+}
+
+func (e *safeStatusError) Unwrap() error {
+	return e.cause
+}
+
+func newSafeStatusError(message string, cause error) error {
+	return &safeStatusError{message: message, cause: cause}
+}
+
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 	a.apiKey = info.ApiKey
 	a.baseURL = strings.TrimRight(info.ChannelBaseUrl, "/")
@@ -213,6 +230,35 @@ func rawErrorCode(raw []byte) string {
 		return string(number)
 	}
 	return ""
+}
+
+func parseStatusErrorCode(raw []byte) (string, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return "", false, nil
+	}
+	if trimmed[0] == '"' {
+		var value string
+		if err := common.Unmarshal(trimmed, &value); err != nil {
+			return "", false, errors.New("malformed Seed Dance status errCode")
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return "", false, nil
+		}
+		if numeric, err := strconv.ParseFloat(value, 64); err == nil && numeric == 0 {
+			return "0", false, nil
+		}
+		return value, true, nil
+	}
+	numeric, err := strconv.ParseFloat(string(trimmed), 64)
+	if err != nil {
+		return "", false, errors.New("malformed Seed Dance status errCode")
+	}
+	if numeric == 0 {
+		return "0", false, nil
+	}
+	return string(trimmed), true, nil
 }
 
 type jsonNumber string
@@ -497,7 +543,10 @@ func (a *TaskAdaptor) FetchTaskWithContext(
 	)
 	if err != nil {
 		cancel()
-		return nil, err
+		return nil, newSafeStatusError(
+			"build Seed Dance status request failed",
+			err,
+		)
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	baseClient, err := service.GetHttpClientWithProxy(proxy)
@@ -513,7 +562,10 @@ func (a *TaskAdaptor) FetchTaskWithContext(
 	resp, err := client.Do(req)
 	if err != nil {
 		cancel()
-		return nil, err
+		return nil, newSafeStatusError(
+			"Seed Dance status request failed",
+			err,
+		)
 	}
 	if resp == nil || resp.Body == nil {
 		cancel()
@@ -529,21 +581,31 @@ func (a *TaskAdaptor) FetchTaskWithContext(
 	}
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read Seed Dance status response: %w", err)
+		return nil, newSafeStatusError(
+			"read Seed Dance status response failed",
+			err,
+		)
 	}
 	var provider providerEnvelope
 	if err := common.Unmarshal(responseBody, &provider); err != nil {
-		return nil, fmt.Errorf("decode Seed Dance status response: %w", err)
+		return nil, newSafeStatusError(
+			"decode Seed Dance status response failed",
+			err,
+		)
 	}
-	if provider.Success != nil &&
-		!*provider.Success &&
-		!strings.EqualFold(provider.Status, "failed") {
+	errCode, hasBusinessError, err := parseStatusErrorCode(provider.ErrCode)
+	if err != nil {
+		return nil, err
+	}
+	isFailedStatus := strings.EqualFold(provider.Status, "failed")
+	if !isFailedStatus &&
+		(provider.Success != nil && !*provider.Success || hasBusinessError) {
 		return nil, errors.New("Seed Dance status business request failed")
 	}
 	cleaned := cleanedStatusData{
 		RequestID:  provider.RequestID,
 		Success:    provider.Success,
-		ErrCode:    rawErrorCode(provider.ErrCode),
+		ErrCode:    errCode,
 		ErrMessage: provider.ErrMessage,
 		Status:     provider.Status,
 		Message:    provider.Message,
@@ -603,7 +665,7 @@ func (a *TaskAdaptor) ParseTaskResult(
 			info.Reason = provider.Message
 		}
 	default:
-		return nil, fmt.Errorf("unknown Seed Dance status %q", provider.Status)
+		return nil, errors.New("unknown Seed Dance status")
 	}
 	return info, nil
 }

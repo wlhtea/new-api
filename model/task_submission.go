@@ -707,11 +707,67 @@ func transitionTaskToFailureLocked(
 	return nil
 }
 
+func validateTaskBillingAttemptFinalSuccess(
+	task *Task,
+	attempt *TaskBillingAttempt,
+) error {
+	if task == nil || attempt == nil {
+		return ErrTaskBillingAttemptState
+	}
+	if err := validateTaskBillingAttempt(attempt); err != nil {
+		return err
+	}
+	if attempt.Owner != TaskBillingOwnerTask ||
+		attempt.TaskID == nil ||
+		attempt.FundingConsumedAt == 0 ||
+		attempt.TokenConsumedAt == 0 ||
+		attempt.PreconsumeCompletedAt == 0 ||
+		attempt.SubmissionSettledAt == 0 ||
+		attempt.FundingRefundedAt != 0 ||
+		attempt.TokenRefundedAt != 0 ||
+		attempt.RefundStartedAt != 0 ||
+		attempt.RefundCompletedAt != 0 {
+		return ErrTaskBillingAttemptState
+	}
+	if task.Status != TaskStatusSuccess || task.Progress != "100%" {
+		return ErrTaskBillingAttemptState
+	}
+	return validateLinkedTaskBillingIdentity(task, attempt)
+}
+
+func readTaskBillingAttemptFinalSuccess(requestID string) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var attempt TaskBillingAttempt
+		if err := lockForUpdate(tx).
+			Where("request_id = ?", requestID).
+			First(&attempt).Error; err != nil {
+			return err
+		}
+		if attempt.TaskID == nil {
+			return ErrTaskBillingAttemptState
+		}
+
+		var task Task
+		if err := lockForUpdate(tx).
+			Where("id = ? AND task_id = ?", *attempt.TaskID, attempt.PublicTaskID).
+			First(&task).Error; err != nil {
+			return err
+		}
+		if err := validateTaskBillingAttemptFinalSuccess(&task, &attempt); err != nil {
+			return err
+		}
+		if attempt.SucceededAt == 0 {
+			return ErrTaskBillingAttemptState
+		}
+		return nil
+	})
+}
+
 func markTaskBillingAttemptTerminal(requestID string, finalSuccess bool) error {
 	if requestID == "" {
 		return ErrTaskBillingAttemptState
 	}
-	return DB.Transaction(func(tx *gorm.DB) error {
+	err := DB.Transaction(func(tx *gorm.DB) error {
 		var attempt TaskBillingAttempt
 		if err := lockForUpdate(tx).Where("request_id = ?", requestID).First(&attempt).Error; err != nil {
 			return err
@@ -730,38 +786,133 @@ func markTaskBillingAttemptTerminal(requestID string, finalSuccess bool) error {
 			First(&task).Error; err != nil {
 			return err
 		}
-		now := taskBillingTimestamp()
-		column := "submission_settled_at"
 		if finalSuccess {
-			if task.Status != TaskStatusSuccess || task.Progress != "100%" {
-				return ErrTaskBillingAttemptState
+			if err := validateTaskBillingAttemptFinalSuccess(
+				&task,
+				&attempt,
+			); err != nil {
+				return err
 			}
+			// Idempotence is accepted only after the complete locked
+			// Task/attempt identity and every mutually exclusive refund marker
+			// were revalidated.
 			if attempt.SucceededAt != 0 {
 				return nil
 			}
-			column = "succeeded_at"
-			attempt.SucceededAt = now
-		} else {
-			validForwardState := false
-			switch task.Status {
-			case TaskStatusSubmitted:
-				validForwardState = task.Progress == "10%"
-			case TaskStatusQueued, TaskStatusInProgress:
-				validForwardState = true
-			case TaskStatusSuccess:
-				validForwardState = task.Progress == "100%"
+			if err := runTaskSubmissionFailpoint(
+				"mark_success",
+				"before_update",
+			); err != nil {
+				return err
 			}
-			if !validForwardState {
+
+			now := taskBillingTimestamp()
+			update := tx.Model(&TaskBillingAttempt{}).
+				Where(
+					"id = ? AND request_id = ? AND owner = ? AND task_id = ? AND "+
+						"public_task_id = ? AND submit_time = ? AND is_free = ? AND "+
+						"user_id = ? AND funding_source = ? AND subscription_id = ? AND "+
+						"funding_amount = ? AND token_id = ? AND token_amount = ? AND "+
+						"billing_context_digest = ? AND prepare_version = ? AND "+
+						"funding_consumed_at = ? AND token_consumed_at = ? AND "+
+						"preconsume_completed_at = ? AND owner_transferred_at = ? AND "+
+						"submission_settled_at = ? AND succeeded_at = ? AND "+
+						"funding_refunded_at = ? AND token_refunded_at = ? AND "+
+						"refund_started_at = ? AND refund_completed_at = ?",
+					attempt.ID,
+					attempt.RequestID,
+					TaskBillingOwnerTask,
+					*attempt.TaskID,
+					attempt.PublicTaskID,
+					attempt.SubmitTime,
+					attempt.IsFree,
+					attempt.UserID,
+					attempt.FundingSource,
+					attempt.SubscriptionID,
+					attempt.FundingAmount,
+					attempt.TokenID,
+					attempt.TokenAmount,
+					attempt.BillingContextDigest,
+					attempt.PrepareVersion,
+					attempt.FundingConsumedAt,
+					attempt.TokenConsumedAt,
+					attempt.PreconsumeCompletedAt,
+					attempt.OwnerTransferredAt,
+					attempt.SubmissionSettledAt,
+					0,
+					0,
+					0,
+					0,
+					0,
+				).
+				Updates(map[string]any{
+					"succeeded_at": now,
+					"updated_at":   now,
+				})
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected != 1 {
 				return ErrTaskBillingAttemptState
 			}
-			if attempt.SubmissionSettledAt != 0 {
-				return nil
+
+			attempt.SucceededAt = now
+			attempt.UpdatedAt = now
+			if err := validateTaskBillingAttemptFinalSuccess(
+				&task,
+				&attempt,
+			); err != nil {
+				return err
 			}
-			attempt.SubmissionSettledAt = now
+			return runTaskSubmissionFailpoint("mark_success", "before_commit")
 		}
+
+		now := taskBillingTimestamp()
+		validForwardState := false
+		switch task.Status {
+		case TaskStatusSubmitted:
+			validForwardState = task.Progress == "10%"
+		case TaskStatusQueued, TaskStatusInProgress:
+			validForwardState = true
+		case TaskStatusSuccess:
+			validForwardState = task.Progress == "100%"
+		}
+		if !validForwardState {
+			return ErrTaskBillingAttemptState
+		}
+		if attempt.SubmissionSettledAt != 0 {
+			return nil
+		}
+		attempt.SubmissionSettledAt = now
 		return tx.Model(&TaskBillingAttempt{}).Where("id = ?", attempt.ID).
-			Updates(map[string]any{column: now, "updated_at": now}).Error
+			Updates(map[string]any{
+				"submission_settled_at": now,
+				"updated_at":            now,
+			}).Error
 	})
+	if !finalSuccess {
+		return err
+	}
+	if err == nil {
+		err = runTaskSubmissionFailpoint("mark_success", "after_commit")
+	}
+	if err == nil {
+		return nil
+	}
+
+	// Any update, transaction, or COMMIT error may be ambiguous. Resolve only
+	// from the primary ledger row, re-locking attempt then Task and accepting
+	// success only if the complete terminal state is durable and still valid.
+	if readbackErr := runTaskSubmissionFailpoint(
+		"mark_success",
+		"before_readback",
+	); readbackErr != nil {
+		return err
+	}
+	if readbackErr := readTaskBillingAttemptFinalSuccess(requestID); readbackErr == nil {
+		return nil
+	}
+	return err
 }
 
 // MarkTaskBillingAttemptSubmissionSettled records the zero-delta submission

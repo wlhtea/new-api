@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql/driver"
 	"encoding/json"
+	"strconv"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -347,6 +348,71 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	return tasks
 }
 
+func recoverableFinalSuccessTasksQuery() *gorm.DB {
+	seedDancePlatform := constant.TaskPlatform(
+		strconv.Itoa(constant.ChannelTypeSeedDance),
+	)
+	return DB.Table("tasks").
+		Joins(
+			"JOIN task_billing_attempts ON task_billing_attempts.task_id = tasks.id",
+		).
+		Where("tasks.platform = ?", seedDancePlatform).
+		Where("tasks.status = ? AND tasks.progress = ?", TaskStatusSuccess, "100%").
+		Where(
+			"task_billing_attempts.owner = ? AND "+
+				"task_billing_attempts.task_id IS NOT NULL AND "+
+				"task_billing_attempts.public_task_id = tasks.task_id AND "+
+				"task_billing_attempts.funding_consumed_at != ? AND "+
+				"task_billing_attempts.token_consumed_at != ? AND "+
+				"task_billing_attempts.preconsume_completed_at != ? AND "+
+				"task_billing_attempts.submission_settled_at != ? AND "+
+				"task_billing_attempts.succeeded_at = ? AND "+
+				"task_billing_attempts.funding_refunded_at = ? AND "+
+				"task_billing_attempts.token_refunded_at = ? AND "+
+				"task_billing_attempts.refund_started_at = ? AND "+
+				"task_billing_attempts.refund_completed_at = ?",
+			TaskBillingOwnerTask,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+		)
+}
+
+// ListRecoverableFinalSuccessTasks returns Seed Dance Tasks whose narrow
+// SUCCESS transition committed but whose final billing marker is still
+// active. The service replays only zero-delta settlement and the idempotent
+// terminal marker; it never re-fetches provider status.
+func ListRecoverableFinalSuccessTasks(limit int) ([]*Task, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var tasks []*Task
+	err := recoverableFinalSuccessTasksQuery().
+		Select("tasks.*").
+		Order("tasks.id").
+		Limit(limit).
+		Find(&tasks).Error
+	return tasks, err
+}
+
+func HasRecoverableFinalSuccessTasks() (bool, error) {
+	var id int64
+	query := recoverableFinalSuccessTasksQuery().
+		Select("tasks.id").
+		Limit(1).
+		Scan(&id)
+	if query.Error != nil {
+		return false, query.Error
+	}
+	return id != 0, nil
+}
+
 // HasUnfinishedSyncTasks reports whether at least one async (Suno/video) task is
 // still in progress. It is a cheap existence check (LIMIT 1) used to decide
 // whether the async_task_poll system task needs to run; when no task is pending
@@ -367,6 +433,10 @@ func HasUnfinishedSyncTasks() bool {
 // task scheduler active when reconciliation is the only work left.
 func HasTaskPollingWork() bool {
 	if HasUnfinishedSyncTasks() {
+		return true
+	}
+	hasFinalSuccessWork, err := HasRecoverableFinalSuccessTasks()
+	if err == nil && hasFinalSuccessWork {
 		return true
 	}
 
@@ -494,6 +564,247 @@ type TaskSuccessTransition struct {
 	Data             *json.RawMessage
 }
 
+type TaskPollingTransition struct {
+	ExpectedStatus   TaskStatus
+	ExpectedProgress string
+	Status           TaskStatus
+	Progress         string
+	Data             *json.RawMessage
+}
+
+func validateLinkedTaskBillingIdentity(
+	task *Task,
+	attempt *TaskBillingAttempt,
+) error {
+	if task == nil || attempt == nil || attempt.TaskID == nil ||
+		task.ID != *attempt.TaskID ||
+		task.TaskID != attempt.PublicTaskID ||
+		task.UserId != attempt.UserID ||
+		task.SubmitTime != attempt.SubmitTime ||
+		task.Quota != attempt.FundingAmount ||
+		task.PrivateData.BillingSource != attempt.FundingSource ||
+		task.PrivateData.SubscriptionId != attempt.SubscriptionID ||
+		task.PrivateData.TokenId != attempt.TokenID {
+		return ErrTaskBillingIdentityDrift
+	}
+	digest, err := DigestTaskBillingContext(task.PrivateData.BillingContext)
+	if err != nil {
+		return err
+	}
+	if digest != attempt.BillingContextDigest {
+		return ErrTaskBillingIdentityDrift
+	}
+	return nil
+}
+
+func validatePollingAttemptActive(attempt *TaskBillingAttempt) error {
+	if attempt == nil {
+		return ErrTaskBillingAttemptState
+	}
+	if err := validateTaskBillingAttempt(attempt); err != nil {
+		return err
+	}
+	if attempt.Owner != TaskBillingOwnerTask ||
+		attempt.TaskID == nil ||
+		attempt.FundingConsumedAt == 0 ||
+		attempt.TokenConsumedAt == 0 ||
+		attempt.PreconsumeCompletedAt == 0 ||
+		attempt.SubmissionSettledAt == 0 ||
+		attempt.SucceededAt != 0 ||
+		attempt.FundingRefundedAt != 0 ||
+		attempt.TokenRefundedAt != 0 ||
+		attempt.RefundStartedAt != 0 ||
+		attempt.RefundCompletedAt != 0 {
+		return ErrTaskBillingAttemptState
+	}
+	return nil
+}
+
+func validatePollingAttemptForFailure(attempt *TaskBillingAttempt) error {
+	if attempt == nil {
+		return ErrTaskBillingAttemptState
+	}
+	if err := validateTaskBillingAttempt(attempt); err != nil {
+		return err
+	}
+	if attempt.Owner != TaskBillingOwnerTask ||
+		attempt.TaskID == nil ||
+		attempt.FundingConsumedAt == 0 ||
+		attempt.TokenConsumedAt == 0 ||
+		attempt.PreconsumeCompletedAt == 0 ||
+		attempt.SucceededAt != 0 ||
+		attempt.FundingRefundedAt != 0 ||
+		attempt.TokenRefundedAt != 0 ||
+		attempt.RefundStartedAt != 0 ||
+		attempt.RefundCompletedAt != 0 {
+		return ErrTaskBillingAttemptState
+	}
+	return nil
+}
+
+func validatePollingState(status TaskStatus, progress string) error {
+	if progress == "" {
+		return ErrTaskSubmissionStateConflict
+	}
+	switch status {
+	case TaskStatusSubmitted, TaskStatusQueued, TaskStatusInProgress:
+		return nil
+	default:
+		return ErrTaskSubmissionStateConflict
+	}
+}
+
+// TransitionTaskPollingState performs a locked, exact-state, narrow update for
+// a durable nonterminal polling result. It never writes quota, properties, or
+// PrivateData and therefore cannot overwrite a concurrent route/credential
+// refresh from a stale polling snapshot.
+func TransitionTaskPollingState(
+	id int64,
+	publicTaskID string,
+	transition TaskPollingTransition,
+) (*Task, error) {
+	if id <= 0 || publicTaskID == "" {
+		return nil, ErrTaskSubmissionStateConflict
+	}
+	if err := validatePollingState(
+		transition.ExpectedStatus,
+		transition.ExpectedProgress,
+	); err != nil {
+		return nil, err
+	}
+	if err := validatePollingState(transition.Status, transition.Progress); err != nil {
+		return nil, err
+	}
+
+	var task Task
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var attempt TaskBillingAttempt
+		if err := lockForUpdate(tx).
+			Where("task_id = ?", id).
+			First(&attempt).Error; err != nil {
+			return err
+		}
+		if err := validatePollingAttemptActive(&attempt); err != nil {
+			return err
+		}
+		if err := lockForUpdate(tx).
+			Where("id = ? AND task_id = ?", id, publicTaskID).
+			First(&task).Error; err != nil {
+			return err
+		}
+		if task.Status != transition.ExpectedStatus ||
+			task.Progress != transition.ExpectedProgress {
+			return ErrTaskSubmissionStateConflict
+		}
+		if err := validateLinkedTaskBillingIdentity(&task, &attempt); err != nil {
+			return err
+		}
+
+		statusChanged := task.Status != transition.Status
+		progressChanged := task.Progress != transition.Progress
+		dataChanged := transition.Data != nil &&
+			!bytes.Equal(task.Data, *transition.Data)
+		startChanged := transition.Status == TaskStatusInProgress &&
+			task.StartTime == 0
+		if !statusChanged && !progressChanged && !dataChanged && !startChanged {
+			return nil
+		}
+
+		now := taskBillingTimestamp()
+		updates := make(map[string]any, 5)
+		if statusChanged {
+			task.Status = transition.Status
+			updates["status"] = task.Status
+		}
+		if progressChanged {
+			task.Progress = transition.Progress
+			updates["progress"] = task.Progress
+		}
+		if startChanged {
+			task.StartTime = now
+			updates["start_time"] = task.StartTime
+		}
+		if dataChanged {
+			task.Data = append(json.RawMessage(nil), (*transition.Data)...)
+			updates["data"] = task.Data
+		}
+		task.UpdatedAt = now
+		updates["updated_at"] = task.UpdatedAt
+		update := tx.Model(&Task{}).
+			Where(
+				"id = ? AND task_id = ? AND status = ? AND progress = ?",
+				id,
+				publicTaskID,
+				transition.ExpectedStatus,
+				transition.ExpectedProgress,
+			).
+			Updates(updates)
+		if update.Error != nil {
+			return update.Error
+		}
+		if update.RowsAffected != 1 {
+			return ErrTaskSubmissionStateConflict
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+// TransitionDurableTaskToFailure keeps the polling failure transition inside
+// the same attempt -> Task lock order used by the other durable polling
+// primitives. It proves that the linked component ledger is still active
+// before allowing the narrow terminal Task update.
+func TransitionDurableTaskToFailure(
+	id int64,
+	publicTaskID string,
+	transition TaskFailureTransition,
+) (*Task, error) {
+	if id <= 0 || publicTaskID == "" {
+		return nil, ErrTaskSubmissionStateConflict
+	}
+	if err := validateTaskFailureExpectedState(transition); err != nil {
+		return nil, err
+	}
+
+	var task Task
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var attempt TaskBillingAttempt
+		if err := lockForUpdate(tx).
+			Where("task_id = ?", id).
+			First(&attempt).Error; err != nil {
+			return err
+		}
+		if err := validatePollingAttemptForFailure(&attempt); err != nil {
+			return err
+		}
+		if attempt.TaskID == nil ||
+			*attempt.TaskID != id ||
+			attempt.PublicTaskID != publicTaskID {
+			return ErrTaskBillingAttemptState
+		}
+		if err := lockForUpdate(tx).
+			Where("id = ? AND task_id = ?", id, publicTaskID).
+			First(&task).Error; err != nil {
+			return err
+		}
+		if task.Status != transition.ExpectedStatus ||
+			task.Progress != transition.ExpectedProgress {
+			return ErrTaskSubmissionStateConflict
+		}
+		if err := validateLinkedTaskBillingIdentity(&task, &attempt); err != nil {
+			return err
+		}
+		return transitionTaskToFailureLocked(tx, &task, transition)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
 // TransitionTaskToSuccess locks the durable billing attempt and its linked
 // Task, verifies that no refund has started, and writes only the terminal Task
 // columns. Final billing settlement and SucceededAt are deliberately owned by
@@ -522,20 +833,12 @@ func TransitionTaskToSuccess(
 			First(&attempt).Error; err != nil {
 			return err
 		}
-		if err := validateTaskBillingAttempt(&attempt); err != nil {
+		if err := validatePollingAttemptActive(&attempt); err != nil {
 			return err
 		}
-		if attempt.Owner != TaskBillingOwnerTask ||
-			attempt.TaskID == nil ||
+		if attempt.TaskID == nil ||
 			*attempt.TaskID != id ||
-			attempt.PublicTaskID != publicTaskID ||
-			attempt.FundingConsumedAt == 0 ||
-			attempt.TokenConsumedAt == 0 ||
-			attempt.PreconsumeCompletedAt == 0 ||
-			attempt.SubmissionSettledAt == 0 ||
-			attempt.SucceededAt != 0 ||
-			attempt.RefundStartedAt != 0 ||
-			attempt.RefundCompletedAt != 0 {
+			attempt.PublicTaskID != publicTaskID {
 			return ErrTaskBillingAttemptState
 		}
 		if err := lockForUpdate(tx).
@@ -547,20 +850,8 @@ func TransitionTaskToSuccess(
 			task.Progress != transition.ExpectedProgress {
 			return ErrTaskSubmissionStateConflict
 		}
-		if task.UserId != attempt.UserID ||
-			task.SubmitTime != attempt.SubmitTime ||
-			task.Quota != attempt.FundingAmount ||
-			task.PrivateData.BillingSource != attempt.FundingSource ||
-			task.PrivateData.SubscriptionId != attempt.SubscriptionID ||
-			task.PrivateData.TokenId != attempt.TokenID {
-			return ErrTaskBillingIdentityDrift
-		}
-		digest, err := DigestTaskBillingContext(task.PrivateData.BillingContext)
-		if err != nil {
+		if err := validateLinkedTaskBillingIdentity(&task, &attempt); err != nil {
 			return err
-		}
-		if digest != attempt.BillingContextDigest {
-			return ErrTaskBillingIdentityDrift
 		}
 
 		task.Status = TaskStatusSuccess

@@ -13,19 +13,29 @@ func ResolveStoredTaskKey(channel *model.Channel, storedKey string) (string, err
 	if channel == nil || storedKey == "" {
 		return "", errors.New("stored task credential is unavailable")
 	}
-	if !channel.ChannelInfo.IsMultiKey {
-		if channel.Key != storedKey {
+	lock := model.GetChannelPollingLock(channel.Id)
+	lock.Lock()
+	isMultiKey := channel.ChannelInfo.IsMultiKey
+	configuredKey := channel.Key
+	keys := append([]string(nil), channel.GetKeys()...)
+	statuses := make(map[int]int, len(channel.ChannelInfo.MultiKeyStatusList))
+	for index, status := range channel.ChannelInfo.MultiKeyStatusList {
+		statuses[index] = status
+	}
+	lock.Unlock()
+
+	if !isMultiKey {
+		if configuredKey != storedKey {
 			return "", errors.New("stored task credential is no longer configured")
 		}
 		return storedKey, nil
 	}
-	keys := channel.GetKeys()
 	for index, key := range keys {
 		if key != storedKey {
 			continue
 		}
 		status := common.ChannelStatusEnabled
-		if configured, ok := channel.ChannelInfo.MultiKeyStatusList[index]; ok {
+		if configured, ok := statuses[index]; ok {
 			status = configured
 		}
 		if status == common.ChannelStatusEnabled {
