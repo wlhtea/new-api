@@ -1,0 +1,144 @@
+# 每周自动同步上游 QuantumNous/new-api 的更新到本 fork。
+#
+# 工作方式：
+#   1. 把 fork 的 main 分支强制镜像为上游 main（fork 的 main 永远等于上游，请勿在 main 上提交）。
+#   2. 尝试把上游 main 合并进定制分支 custom-main：
+#      - 无冲突 → 直接合并并推送，全自动完成；
+#      - 有冲突 → 打开一个 main -> custom-main 的 PR，并在描述里列出冲突文件，等待手动解决。
+#
+# 注意：
+#   - schedule 只会在【默认分支】上生效，请确保仓库默认分支已设置为 custom-main。
+#   - 也可以随时在 Actions 页面通过 "Run workflow" 手动触发。
+name: Sync Upstream
+
+on:
+  schedule:
+    # UTC 周日 22:00 = 北京时间每周一早上 06:00
+    - cron: "0 22 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_URL: https://github.com/QuantumNous/new-api.git
+  UPSTREAM_BRANCH: main
+  MIRROR_BRANCH: main
+  CUSTOM_BRANCH: custom-main
+
+jobs:
+  sync:
+    # 防止其他人 fork 本仓库后意外运行
+    if: github.repository == 'wlhtea/new-api'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout custom branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CUSTOM_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream "$UPSTREAM_BRANCH" --no-tags
+
+      - name: Mirror upstream main to fork main
+        run: |
+          git push origin "refs/remotes/upstream/${UPSTREAM_BRANCH}:refs/heads/${MIRROR_BRANCH}" --force
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          NEW_COUNT=$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")
+          echo "new_count=${NEW_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "上游有 ${NEW_COUNT} 个新提交尚未合入 ${CUSTOM_BRANCH}"
+
+      - name: Try merge upstream into custom branch
+        id: merge
+        if: steps.check.outputs.new_count != '0'
+        run: |
+          set +e
+          git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+          MERGE_EXIT=$?
+          set -e
+          if [ "$MERGE_EXIT" -eq 0 ]; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+            echo "合并无冲突"
+          else
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            echo "存在冲突的文件："
+            cat /tmp/conflicts.txt
+          fi
+
+      - name: Push merged custom branch
+        if: steps.merge.outputs.result == 'clean'
+        run: |
+          git push origin "$CUSTOM_BRANCH"
+
+      - name: Open conflict PR
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXISTING=$(gh pr list --base "$CUSTOM_BRANCH" --head "$MIRROR_BRANCH" --state open --json number --jq 'length')
+          if [ "$EXISTING" != "0" ]; then
+            echo "已存在打开状态的同步 PR，跳过创建（PR 会自动包含本次镜像的最新提交）。"
+            exit 0
+          fi
+          {
+            echo "上游 [QuantumNous/new-api](https://github.com/QuantumNous/new-api) 的最新更新与 \`${CUSTOM_BRANCH}\` 存在冲突，无法自动合并，需要手动处理。"
+            echo ""
+            echo "### 冲突文件"
+            echo ""
+            echo '```'
+            cat /tmp/conflicts.txt
+            echo '```'
+            echo ""
+            echo "### 本地解决步骤"
+            echo ""
+            echo '```bash'
+            echo "git fetch origin"
+            echo "git switch ${CUSTOM_BRANCH}"
+            echo "git pull origin ${CUSTOM_BRANCH}"
+            echo "git merge origin/${MIRROR_BRANCH}"
+            echo "# 逐个解决冲突后："
+            echo "git add -A && git commit"
+            echo "git push origin ${CUSTOM_BRANCH}"
+            echo '```'
+            echo ""
+            echo "推送完成后，本 PR 会自动标记为已合并。"
+          } > /tmp/pr_body.md
+          gh pr create \
+            --base "$CUSTOM_BRANCH" \
+            --head "$MIRROR_BRANCH" \
+            --title "🔄 上游同步冲突，需手动合并（$(date +%F)）" \
+            --body-file /tmp/pr_body.md
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo ""
+            echo "- 上游新提交数：${{ steps.check.outputs.new_count || '0' }}"
+            if [ "${{ steps.check.outputs.new_count }}" = "0" ]; then
+              echo "- 结果：已是最新，无需操作 ✅"
+            elif [ "${{ steps.merge.outputs.result }}" = "clean" ]; then
+              echo "- 结果：无冲突，已自动合并并推送 ✅"
+            elif [ "${{ steps.merge.outputs.result }}" = "conflict" ]; then
+              echo "- 结果：存在冲突，已创建/更新 PR，请手动处理 ⚠️"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
