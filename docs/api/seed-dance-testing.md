@@ -634,22 +634,67 @@ Content-Type: application/json
 
 ## 16. Apifox 导入
 
+仓库提供两种可导入制品，适用于不同用途：
+
+| 文件 | Apifox 导入类型 | 用途 |
+|---|---|---|
+| `docs/api/seed-dance-openapi.yaml` | OpenAPI/Swagger | 导入接口定义、请求/响应 schema、示例和错误模型 |
+| `docs/api/seed-dance-apifox.postman_collection.json` | Postman | 导入人工验收请求、测试脚本和自动保存 `task_id` 的逻辑 |
+
+### 16.1 导入接口定义
+
 1. 在 Apifox 中选择「导入数据」→「OpenAPI/Swagger」；
 2. 导入 `docs/api/seed-dance-openapi.yaml`；
-3. 创建环境，并配置下列三个变量；
-4. 对三个接口选择导入的 Bearer Auth，Token 使用 `{{api_key}}`；
-5. 先执行 `POST /v1/videos`，把响应的 `id` 保存到 `task_id`；
-6. 执行状态查询，直到 `completed`；
-7. 执行内容下载，并确认响应为 `video/mp4` 二进制文件。
+3. 创建环境并配置 `base_url`、`api_key` 和 `task_id`；
+4. 对三个接口使用 Bearer Auth，Token 填写 `{{api_key}}`；
+5. 如果只需要浏览接口和 schema，到此即可。
+
+### 16.2 导入人工验收集合
+
+1. 在 Apifox 中选择「导入数据」→「Postman」；
+2. 导入 `docs/api/seed-dance-apifox.postman_collection.json`；
+3. 在当前 Apifox 环境中创建同名的 `base_url` 和 `api_key` 变量；把真实
+   Token 只填写到 `api_key` 的本地值，不要写入团队共享远程值，也不要把
+   修改后的真实 Token 重新导出或提交；
+4. 如需 JSON Base64 I2V，把 `image_base64` 替换为有效 JPG/PNG 的纯
+   Base64；
+5. 如需 multipart I2V，打开对应请求并重新选择本机 JPG/PNG 文件，不要
+   手动添加 multipart `Content-Type`；
+6. 先执行「服务状态」，确认服务可访问；
+7. 从三个创建请求中只选择一个手工执行。成功脚本会校验创建响应，并把
+   `id`、计费时长和计费分辨率快照同时保存到 Collection 和当前
+   Environment；
+8. 每约 10 秒手工重复执行「查询任务状态」，直到状态为 `completed` 或
+   `failed`；脚本会确认 `seconds` 和 `size` 在长任务轮询期间没有漂移；
+9. 只有状态为 `completed` 时执行「下载完成视频」，确认响应是非空
+   `video/mp4`，并检查下载文件名、缓存策略和 `nosniff` 响应头。
+
+「01 - 创建视频任务（会产生费用）」中的三个请求都会创建真实供应商任务。
+不要对整个集合或该目录使用 Runner；一次人工验收只执行需要的一个创建请求。
+
+「03 - 无费用参数拒绝用例」应在本地参数验证阶段返回 `400`，不存在任务查询
+应返回 `404`。请逐个手工执行；如果任何拒绝用例返回 `2xx`，立即停止后续
+POST 验证并检查渠道路由与参数验证配置。
 
 | Apifox 变量名 | 模板值 | 用途 |
 |---|---|---|
-| `base_url` | `{{base_url}}` | New API 基础地址 |
-| `api_key` | `{{api_key}}` | New API 客户端 API Key |
-| `task_id` | `{{task_id}}` | New API 公开任务 ID |
+| `base_url` | `http://TARGET_HOST` | New API 基础地址，不包含尾部 `/` |
+| `api_key` | `NEW_API_TOKEN` | New API 客户端 API Key，不是供应商渠道 Key |
+| `task_id` | `TASK_ID` | 创建成功后自动保存的 New API 公开任务 ID |
+| `model` | `seedance-uncensored` | 渠道模型名 |
+| `prompt` | 合成测试提示词 | T2V/I2V 测试提示词 |
+| `negative_prompt` | 合成负面提示词 | `metadata.negative_prompt` |
+| `duration` | `1` | 测试时长，允许范围为 1–15 秒 |
+| `size` | `1280x720` | T2V 测试分辨率 |
+| `image_base64` | `IMAGE_BASE64` | JSON I2V 使用的 JPG/PNG 纯 Base64 |
+| `input_image_path` | `/ABSOLUTE/PATH/TO/INPUT.png` | multipart I2V 本机图片路径；导入后重新选文件 |
+| `expected_seconds` | 自动保存 | 创建响应中的计费时长快照 |
+| `expected_size` | 自动保存 | 创建响应中的计费分辨率快照 |
+| `task_status` | 自动保存 | 最近一次有效状态查询返回的状态 |
 
-导入成功只验证发布制品可被 Apifox 使用，不能替代 Redocly lint 和 Go OpenAPI
-契约测试。
+Collection 中的脚本会验证创建、状态和下载响应合同，但不会自动递归轮询，也
+不会自动执行任何创建请求。导入成功只验证发布制品可被 Apifox 使用，不能
+替代 Redocly lint、Postman Collection schema 验证和 Go 合同测试。
 
 ## 17. 合成 fixtures
 

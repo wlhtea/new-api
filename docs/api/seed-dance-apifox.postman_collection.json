@@ -1,0 +1,945 @@
+{
+  "info": {
+    "_postman_id": "2b2510f8-51ca-4a41-aec6-d83acc1d8c4b",
+    "name": "New API - 无审核 Seed Dance",
+    "description": "可直接导入 Apifox 的 Postman Collection 2.1 测试集合。先在当前环境的本地值中配置 base_url 和 api_key。创建任务请求会产生真实视频任务与费用，只按需手动执行；创建成功后集合会把公开任务 ID、计费时长和计费分辨率快照同时写入 collection/environment。无费用参数拒绝用例必须返回 4xx，不会进入上游生成步骤。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{api_key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://TARGET_HOST",
+      "type": "string",
+      "description": "New API 基础地址，不要以 / 结尾。"
+    },
+    {
+      "key": "api_key",
+      "value": "NEW_API_TOKEN",
+      "type": "string",
+      "description": "New API 客户端令牌，不是供应商渠道 Key。真实值只填写到 Apifox 当前环境的本地值，不要修改或共享此模板占位符。"
+    },
+    {
+      "key": "task_id",
+      "value": "TASK_ID",
+      "type": "string",
+      "description": "创建任务成功后由测试脚本自动保存的 New API 公开任务 ID。"
+    },
+    {
+      "key": "model",
+      "value": "seedance-uncensored",
+      "type": "string"
+    },
+    {
+      "key": "prompt",
+      "value": "A cinematic close-up of a cute cat walking through warm sunlight",
+      "type": "string"
+    },
+    {
+      "key": "negative_prompt",
+      "value": "low quality, blurry, distorted",
+      "type": "string"
+    },
+    {
+      "key": "duration",
+      "value": "1",
+      "type": "string",
+      "description": "有效范围 1-15。"
+    },
+    {
+      "key": "size",
+      "value": "1280x720",
+      "type": "string",
+      "description": "T2V 默认使用 720P；480P 只用于 I2V。"
+    },
+    {
+      "key": "image_base64",
+      "value": "IMAGE_BASE64",
+      "type": "string",
+      "description": "仅填写 JPG/PNG 的纯 Base64，不要包含引号。"
+    },
+    {
+      "key": "input_image_path",
+      "value": "/ABSOLUTE/PATH/TO/INPUT.png",
+      "type": "string",
+      "description": "导入后请在 multipart 请求中重新选择本机 JPG/PNG 文件。"
+    },
+    {
+      "key": "expected_seconds",
+      "value": "1",
+      "type": "string",
+      "description": "创建成功后自动保存，用于验证长任务轮询期间计费时长快照不漂移。"
+    },
+    {
+      "key": "expected_size",
+      "value": "720P",
+      "type": "string",
+      "description": "创建成功后自动保存，用于验证长任务轮询期间计费分辨率快照不漂移。"
+    },
+    {
+      "key": "task_status",
+      "value": "unknown",
+      "type": "string",
+      "description": "最近一次有效状态查询返回的任务状态。"
+    }
+  ],
+  "item": [
+    {
+      "name": "00 - 服务检查",
+      "description": "不创建视频任务，可先执行。",
+      "item": [
+        {
+          "name": "服务状态",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test(\"响应是 JSON\", function () {",
+                  "  pm.response.to.be.json;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/status",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "status"
+              ]
+            },
+            "description": "验证 New API 和反向代理是否可访问。"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "01 - 创建视频任务（会产生费用）",
+      "description": "以下请求会创建真实视频任务并产生费用。不要使用 Runner 批量执行；人工选择其中一个请求即可。每个成功响应都会把 id/task_id 保存为 task_id。",
+      "item": [
+        {
+          "name": "创建 T2V - 全参数 JSON",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "const allowedStatuses = [\"queued\", \"in_progress\", \"completed\", \"failed\"];",
+                  "pm.test(\"创建响应合同\", function () {",
+                  "  pm.expect(body.id).to.be.a(\"string\").and.not.empty;",
+                  "  pm.expect(body.task_id).to.eql(body.id);",
+                  "  pm.expect(body.object).to.eql(\"video\");",
+                  "  pm.expect(body.model).to.eql(\"seedance-uncensored\");",
+                  "  pm.expect(allowedStatuses).to.include(body.status);",
+                  "  pm.expect(Number.isInteger(body.progress)).to.eql(true);",
+                  "  pm.expect(body.progress).to.be.within(0, 100);",
+                  "  pm.expect(Number.isInteger(body.created_at)).to.eql(true);",
+                  "  pm.expect(body.created_at).to.be.above(0);",
+                  "  pm.expect(body.seconds).to.eql(String(pm.variables.get(\"duration\")));",
+                  "  pm.expect(body.size).to.eql(\"720P\");",
+                  "});",
+                  "const valid = (",
+                  "  pm.response.code === 200 &&",
+                  "  typeof body.id === \"string\" &&",
+                  "  body.id.length > 0 &&",
+                  "  body.task_id === body.id &&",
+                  "  body.object === \"video\" &&",
+                  "  body.model === \"seedance-uncensored\" &&",
+                  "  allowedStatuses.includes(body.status) &&",
+                  "  Number.isInteger(body.progress) &&",
+                  "  body.progress >= 0 &&",
+                  "  body.progress <= 100 &&",
+                  "  Number.isInteger(body.created_at) &&",
+                  "  body.created_at > 0 &&",
+                  "  body.seconds === String(pm.variables.get(\"duration\")) &&",
+                  "  body.size === \"720P\"",
+                  ");",
+                  "if (valid) {",
+                  "  pm.collectionVariables.set(\"task_id\", body.id);",
+                  "  pm.collectionVariables.set(\"expected_seconds\", body.seconds);",
+                  "  pm.collectionVariables.set(\"expected_size\", body.size);",
+                  "  pm.environment.set(\"task_id\", body.id);",
+                  "  pm.environment.set(\"expected_seconds\", body.seconds);",
+                  "  pm.environment.set(\"expected_size\", body.size);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"{{prompt}}\",\n  \"duration\": {{duration}},\n  \"seconds\": \"{{duration}}\",\n  \"size\": \"{{size}}\",\n  \"metadata\": {\n    \"duration\": \"{{duration}}\",\n    \"resolution\": \"720P\",\n    \"prompt_optimization\": false,\n    \"multi_shot\": false,\n    \"strict_duration\": true,\n    \"negative_prompt\": \"{{negative_prompt}}\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/videos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos"
+              ]
+            },
+            "description": "文本生成视频。duration、seconds、metadata.duration 必须解析为相同值；size 与 metadata.resolution 必须规范化为相同分辨率。"
+          },
+          "response": []
+        },
+        {
+          "name": "创建 I2V - JSON Base64",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "const allowedStatuses = [\"queued\", \"in_progress\", \"completed\", \"failed\"];",
+                  "pm.test(\"创建响应合同\", function () {",
+                  "  pm.expect(body.id).to.be.a(\"string\").and.not.empty;",
+                  "  pm.expect(body.task_id).to.eql(body.id);",
+                  "  pm.expect(body.object).to.eql(\"video\");",
+                  "  pm.expect(body.model).to.eql(\"seedance-uncensored\");",
+                  "  pm.expect(allowedStatuses).to.include(body.status);",
+                  "  pm.expect(Number.isInteger(body.progress)).to.eql(true);",
+                  "  pm.expect(body.progress).to.be.within(0, 100);",
+                  "  pm.expect(Number.isInteger(body.created_at)).to.eql(true);",
+                  "  pm.expect(body.created_at).to.be.above(0);",
+                  "  pm.expect(body.seconds).to.eql(String(pm.variables.get(\"duration\")));",
+                  "  pm.expect(body.size).to.eql(\"480P\");",
+                  "});",
+                  "const valid = (",
+                  "  pm.response.code === 200 &&",
+                  "  typeof body.id === \"string\" &&",
+                  "  body.id.length > 0 &&",
+                  "  body.task_id === body.id &&",
+                  "  body.object === \"video\" &&",
+                  "  body.model === \"seedance-uncensored\" &&",
+                  "  allowedStatuses.includes(body.status) &&",
+                  "  Number.isInteger(body.progress) &&",
+                  "  body.progress >= 0 &&",
+                  "  body.progress <= 100 &&",
+                  "  Number.isInteger(body.created_at) &&",
+                  "  body.created_at > 0 &&",
+                  "  body.seconds === String(pm.variables.get(\"duration\")) &&",
+                  "  body.size === \"480P\"",
+                  ");",
+                  "if (valid) {",
+                  "  pm.collectionVariables.set(\"task_id\", body.id);",
+                  "  pm.collectionVariables.set(\"expected_seconds\", body.seconds);",
+                  "  pm.collectionVariables.set(\"expected_size\", body.size);",
+                  "  pm.environment.set(\"task_id\", body.id);",
+                  "  pm.environment.set(\"expected_seconds\", body.seconds);",
+                  "  pm.environment.set(\"expected_size\", body.size);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"{{prompt}}\",\n  \"duration\": {{duration}},\n  \"size\": \"854x480\",\n  \"input_reference\": \"{{image_base64}}\",\n  \"metadata\": {\n    \"resolution\": \"480P\",\n    \"prompt_optimization\": false,\n    \"multi_shot\": false,\n    \"strict_duration\": true,\n    \"negative_prompt\": \"{{negative_prompt}}\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/videos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos"
+              ]
+            },
+            "description": "图片生成视频。执行前把 image_base64 替换为 240-8000 像素范围内的 JPG/PNG 纯 Base64。"
+          },
+          "response": []
+        },
+        {
+          "name": "创建 I2V - multipart 文件",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "const allowedStatuses = [\"queued\", \"in_progress\", \"completed\", \"failed\"];",
+                  "pm.test(\"创建响应合同\", function () {",
+                  "  pm.expect(body.id).to.be.a(\"string\").and.not.empty;",
+                  "  pm.expect(body.task_id).to.eql(body.id);",
+                  "  pm.expect(body.object).to.eql(\"video\");",
+                  "  pm.expect(body.model).to.eql(\"seedance-uncensored\");",
+                  "  pm.expect(allowedStatuses).to.include(body.status);",
+                  "  pm.expect(Number.isInteger(body.progress)).to.eql(true);",
+                  "  pm.expect(body.progress).to.be.within(0, 100);",
+                  "  pm.expect(Number.isInteger(body.created_at)).to.eql(true);",
+                  "  pm.expect(body.created_at).to.be.above(0);",
+                  "  pm.expect(body.seconds).to.eql(String(pm.variables.get(\"duration\")));",
+                  "  pm.expect(body.size).to.eql(\"480P\");",
+                  "});",
+                  "const valid = (",
+                  "  pm.response.code === 200 &&",
+                  "  typeof body.id === \"string\" &&",
+                  "  body.id.length > 0 &&",
+                  "  body.task_id === body.id &&",
+                  "  body.object === \"video\" &&",
+                  "  body.model === \"seedance-uncensored\" &&",
+                  "  allowedStatuses.includes(body.status) &&",
+                  "  Number.isInteger(body.progress) &&",
+                  "  body.progress >= 0 &&",
+                  "  body.progress <= 100 &&",
+                  "  Number.isInteger(body.created_at) &&",
+                  "  body.created_at > 0 &&",
+                  "  body.seconds === String(pm.variables.get(\"duration\")) &&",
+                  "  body.size === \"480P\"",
+                  ");",
+                  "if (valid) {",
+                  "  pm.collectionVariables.set(\"task_id\", body.id);",
+                  "  pm.collectionVariables.set(\"expected_seconds\", body.seconds);",
+                  "  pm.collectionVariables.set(\"expected_size\", body.size);",
+                  "  pm.environment.set(\"task_id\", body.id);",
+                  "  pm.environment.set(\"expected_seconds\", body.seconds);",
+                  "  pm.environment.set(\"expected_size\", body.size);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "model",
+                  "value": "{{model}}",
+                  "type": "text"
+                },
+                {
+                  "key": "prompt",
+                  "value": "{{prompt}}",
+                  "type": "text"
+                },
+                {
+                  "key": "duration",
+                  "value": "{{duration}}",
+                  "type": "text"
+                },
+                {
+                  "key": "size",
+                  "value": "854x480",
+                  "type": "text"
+                },
+                {
+                  "key": "metadata",
+                  "value": "{\"resolution\":\"480P\",\"prompt_optimization\":\"false\",\"multi_shot\":\"false\",\"strict_duration\":\"true\",\"negative_prompt\":\"{{negative_prompt}}\"}",
+                  "type": "text"
+                },
+                {
+                  "key": "input_reference",
+                  "type": "file",
+                  "src": "{{input_image_path}}",
+                  "description": "导入后在 Apifox 中重新选择本机 JPG/PNG 文件。"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/videos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos"
+              ]
+            },
+            "description": "不要手动添加 Content-Type；Apifox 会自动生成 multipart boundary。metadata 中的三个布尔字段按渠道合同使用字符串 true/false。"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "02 - 查询与下载",
+      "description": "使用创建请求自动保存的 task_id。生成时间较长时可以重复执行状态查询；只有 completed 后再下载内容。",
+      "item": [
+        {
+          "name": "查询任务状态",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "const expectedTaskId = pm.variables.get(\"task_id\");",
+                  "const allowedStatuses = [\"queued\", \"in_progress\", \"completed\", \"failed\"];",
+                  "pm.test(\"任务状态合同\", function () {",
+                  "  pm.expect(body.id).to.eql(expectedTaskId);",
+                  "  pm.expect(body.task_id).to.eql(expectedTaskId);",
+                  "  pm.expect(body.object).to.eql(\"video\");",
+                  "  pm.expect(body.model).to.eql(\"seedance-uncensored\");",
+                  "  pm.expect(allowedStatuses).to.include(body.status);",
+                  "  pm.expect(Number.isInteger(body.progress)).to.eql(true);",
+                  "  pm.expect(body.progress).to.be.within(0, 100);",
+                  "  pm.expect(Number.isInteger(body.created_at)).to.eql(true);",
+                  "  pm.expect(body.created_at).to.be.above(0);",
+                  "  pm.expect(body.seconds).to.match(/^[0-9]+$/);",
+                  "  pm.expect([\"480P\", \"720P\", \"1080P\"]).to.include(body.size);",
+                  "  pm.expect(body.seconds).to.eql(pm.variables.get(\"expected_seconds\"));",
+                  "  pm.expect(body.size).to.eql(pm.variables.get(\"expected_size\"));",
+                  "  if ([\"completed\", \"failed\"].includes(body.status)) {",
+                  "    pm.expect(Number.isInteger(body.completed_at)).to.eql(true);",
+                  "    pm.expect(body.completed_at).to.be.above(0);",
+                  "  } else {",
+                  "    pm.expect(body).not.to.have.property(\"completed_at\");",
+                  "  }",
+                  "  if (body.status === \"completed\") {",
+                  "    pm.expect(body.progress).to.eql(100);",
+                  "  }",
+                  "  if (body.status === \"failed\") {",
+                  "    pm.expect(body.error.message).to.be.a(\"string\");",
+                  "    pm.expect(body.error.code).to.be.a(\"string\");",
+                  "  }",
+                  "});",
+                  "if (pm.response.code === 200 && allowedStatuses.includes(body.status)) {",
+                  "  pm.collectionVariables.set(\"task_status\", body.status);",
+                  "  pm.environment.set(\"task_status\", body.status);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/videos/{{task_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos",
+                "{{task_id}}"
+              ]
+            },
+            "description": "重复执行直到 status 为 completed 或 failed。服务端通过供应商状态轮询和 durable task 快照返回当前状态。"
+          },
+          "response": []
+        },
+        {
+          "name": "下载完成视频",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "const taskId = pm.variables.get(\"task_id\");",
+                  "const contentType = pm.response.headers.get(\"Content-Type\") || \"\";",
+                  "const contentLength = Number(pm.response.headers.get(\"Content-Length\"));",
+                  "const disposition = pm.response.headers.get(\"Content-Disposition\") || \"\";",
+                  "const cacheControl = pm.response.headers.get(\"Cache-Control\") || \"\";",
+                  "const nosniff = pm.response.headers.get(\"X-Content-Type-Options\") || \"\";",
+                  "pm.test(\"返回完整 MP4 下载合同\", function () {",
+                  "  pm.expect(contentType.toLowerCase()).to.include(\"video/mp4\");",
+                  "  pm.expect(contentLength).to.be.above(0);",
+                  "  pm.expect(disposition).to.include(taskId);",
+                  "  pm.expect(disposition).to.include(\".mp4\");",
+                  "  pm.expect(cacheControl.toLowerCase()).to.include(\"private\");",
+                  "  pm.expect(nosniff.toLowerCase()).to.eql(\"nosniff\");",
+                  "  if (typeof pm.response.responseSize === \"number\") {",
+                  "    pm.expect(pm.response.responseSize).to.be.above(0);",
+                  "  }",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "video/mp4",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/videos/{{task_id}}/content",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos",
+                "{{task_id}}",
+                "content"
+              ]
+            },
+            "description": "仅在任务 completed 后执行。响应为二进制 video/mp4，可在 Apifox 中保存响应到文件。"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "03 - 无费用参数拒绝用例",
+      "description": "这些请求应在 New API 本地参数验证阶段返回 400/404，不应创建供应商任务。若任何 POST 返回 2xx，立即停止，不要继续批量执行。",
+      "item": [
+        {
+          "name": "拒绝 duration=0",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", function () {",
+                  "  pm.response.to.have.status(400);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test(\"错误码 invalid_duration\", function () {",
+                  "  pm.expect(body).to.have.nested.property(\"error.code\", \"invalid_duration\");",
+                  "  pm.expect(body).to.have.nested.property(\"error.type\", \"invalid_request_error\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"parameter validation\",\n  \"duration\": 0,\n  \"size\": \"1280x720\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/videos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "拒绝冲突的 duration 与 seconds",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", function () {",
+                  "  pm.response.to.have.status(400);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test(\"错误码 invalid_duration\", function () {",
+                  "  pm.expect(body).to.have.nested.property(\"error.code\", \"invalid_duration\");",
+                  "  pm.expect(body).to.have.nested.property(\"error.type\", \"invalid_request_error\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"parameter validation\",\n  \"duration\": 1,\n  \"seconds\": 2,\n  \"size\": \"1280x720\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/videos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "拒绝无效分辨率",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", function () {",
+                  "  pm.response.to.have.status(400);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test(\"错误码 invalid_resolution\", function () {",
+                  "  pm.expect(body).to.have.nested.property(\"error.code\", \"invalid_resolution\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"parameter validation\",\n  \"duration\": 1,\n  \"size\": \"640x360\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/videos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "拒绝 T2V 480P",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", function () {",
+                  "  pm.response.to.have.status(400);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test(\"错误码 invalid_resolution\", function () {",
+                  "  pm.expect(body).to.have.nested.property(\"error.code\", \"invalid_resolution\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"parameter validation\",\n  \"duration\": 1,\n  \"size\": \"854x480\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/videos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "拒绝字符串布尔值",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", function () {",
+                  "  pm.response.to.have.status(400);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test(\"错误码 invalid_request\", function () {",
+                  "  pm.expect(body).to.have.nested.property(\"error.code\", \"invalid_request\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"parameter validation\",\n  \"duration\": 1,\n  \"size\": \"1280x720\",\n  \"metadata\": {\n    \"strict_duration\": \"true\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/videos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "拒绝无效 Base64 图片",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", function () {",
+                  "  pm.response.to.have.status(400);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test(\"错误码 invalid_image\", function () {",
+                  "  pm.expect(body).to.have.nested.property(\"error.code\", \"invalid_image\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"parameter validation\",\n  \"duration\": 1,\n  \"size\": \"854x480\",\n  \"input_reference\": \"data:image/png;base64,NOT_VALID_BASE64***\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/videos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "查询不存在的任务",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", function () {",
+                  "  pm.response.to.have.status(404);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test(\"错误码 task_not_found\", function () {",
+                  "  pm.expect(body).to.have.nested.property(\"error.code\", \"task_not_found\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/videos/TASK_DOES_NOT_EXIST",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "videos",
+                "TASK_DOES_NOT_EXIST"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}
