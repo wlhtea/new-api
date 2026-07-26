@@ -474,7 +474,7 @@ func RelayNotFound(c *gin.Context) {
 func RelayTaskFetch(c *gin.Context) {
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, &dto.TaskError{
+		respondTaskErrorForRequest(c, &dto.TaskError{
 			Code:       "gen_relay_info_failed",
 			Message:    err.Error(),
 			StatusCode: http.StatusInternalServerError,
@@ -482,7 +482,7 @@ func RelayTaskFetch(c *gin.Context) {
 		return
 	}
 	if taskErr := relay.RelayTaskFetch(c, relayInfo.RelayMode); taskErr != nil {
-		respondTaskError(c, taskErr)
+		respondTaskErrorForRequest(c, taskErr)
 	}
 }
 
@@ -655,7 +655,7 @@ func recoverDurableTaskSubmission(
 func RelayTask(c *gin.Context) {
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, &dto.TaskError{
+		respondTaskErrorForRequest(c, &dto.TaskError{
 			Code:       "gen_relay_info_failed",
 			Message:    err.Error(),
 			StatusCode: http.StatusInternalServerError,
@@ -664,7 +664,7 @@ func RelayTask(c *gin.Context) {
 	}
 
 	if taskErr := relay.ResolveOriginTask(c, relayInfo); taskErr != nil {
-		respondTaskError(c, taskErr)
+		respondTaskErrorForRequest(c, taskErr)
 		return
 	}
 
@@ -796,8 +796,78 @@ func RelayTask(c *gin.Context) {
 	}
 
 	if taskErr != nil {
-		respondTaskError(c, taskErr)
+		respondTaskErrorForRequest(c, taskErr)
 	}
+}
+
+// writeOpenAIVideoError writes the OpenAI video API's nested error schema.
+// It is deliberately selected only by isOpenAIVideoPath so old task routes
+// preserve their established flat TaskError response contract.
+func writeOpenAIVideoError(
+	c *gin.Context,
+	status int,
+	errorType string,
+	code string,
+	message string,
+) {
+	c.AbortWithStatusJSON(status, gin.H{
+		"error": gin.H{
+			"message": message,
+			"type":    errorType,
+			"code":    code,
+		},
+	})
+}
+
+func isOpenAIVideoPath(c *gin.Context) bool {
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return false
+	}
+	path := c.Request.URL.Path
+	if path == "/v1/videos" {
+		return true
+	}
+	if !strings.HasPrefix(path, "/v1/videos/") {
+		return false
+	}
+	segments := strings.Split(strings.TrimPrefix(path, "/v1/videos/"), "/")
+	if len(segments) == 1 {
+		return segments[0] != ""
+	}
+	return len(segments) == 2 && segments[0] != "" && segments[1] == "content"
+}
+
+func openAIVideoTaskErrorType(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case status >= http.StatusInternalServerError:
+		return "server_error"
+	default:
+		return "invalid_request_error"
+	}
+}
+
+func openAIVideoTaskError(taskErr *dto.TaskError) (int, string, string, string) {
+	if taskErr == nil {
+		return http.StatusInternalServerError, "server_error", "server_error", "internal server error"
+	}
+	if taskErr.Code == "task_not_exist" {
+		return http.StatusNotFound, "invalid_request_error", "task_not_found", "video task was not found"
+	}
+	return taskErr.StatusCode,
+		openAIVideoTaskErrorType(taskErr.StatusCode),
+		taskErr.Code,
+		taskErr.Message
+}
+
+func respondTaskErrorForRequest(c *gin.Context, taskErr *dto.TaskError) {
+	if isOpenAIVideoPath(c) {
+		status, errorType, code, message := openAIVideoTaskError(taskErr)
+		writeOpenAIVideoError(c, status, errorType, code, message)
+		return
+	}
+	respondTaskError(c, taskErr)
 }
 
 // respondTaskError 统一输出 Task 错误响应（含 429 限流提示改写）
