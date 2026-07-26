@@ -11,9 +11,6 @@ info:
     provider identifiers are never exposed.
 servers:
   - url: "{{base_url}}"
-    variables:
-      "{base_url":
-        default: http://localhost:3000
 tags:
   - name: Videos
     description: Create, inspect, and download video-generation tasks.
@@ -63,7 +60,7 @@ paths:
                 object: video
                 model: seedance-uncensored
                 status: queued
-                progress: 0
+                progress: 10
                 created_at: 1753372800
                 seconds: "10"
                 size: 720P
@@ -101,7 +98,7 @@ paths:
                 object: video
                 model: seedance-uncensored
                 status: in_progress
-                progress: 50
+                progress: 30
                 created_at: 1753372800
                 seconds: "10"
                 size: 720P

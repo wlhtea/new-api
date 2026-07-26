@@ -22,14 +22,51 @@ func TestSeedDanceStandaloneOpenAPIContract(t *testing.T) {
 	require.Equal(t, "3.0.3", stringAt(t, doc, "openapi"))
 	servers := sliceAt(t, doc, "servers")
 	require.NotEmpty(t, servers)
-	assert.Equal(t, "{{base_url}}", stringAt(t, objectValue(t, servers[0]), "url"))
+	server := objectValue(t, servers[0])
+	assert.Equal(t, "{{base_url}}", stringAt(t, server, "url"))
+	assert.NotContains(t, server, "variables")
 	bearerAuth := objectAt(t, doc, "components", "securitySchemes", "BearerAuth")
 	assert.Equal(t, "http", stringAt(t, bearerAuth, "type"))
 	assert.Equal(t, "bearer", stringAt(t, bearerAuth, "scheme"))
 	assert.Equal(t, "API key", stringAt(t, bearerAuth, "bearerFormat"))
 	assertVideoOperations(t, doc)
+	assertSeedDanceResponseExamples(t, doc)
 	assertLocalRefsResolve(t, doc)
 	assertExamplesMatchBasicSchema(t, doc)
+}
+
+func assertSeedDanceResponseExamples(t *testing.T, document map[string]any) {
+	t.Helper()
+
+	createExample := objectAt(
+		t,
+		document,
+		"paths",
+		"/v1/videos",
+		"post",
+		"responses",
+		"200",
+		"content",
+		"application/json",
+		"example",
+	)
+	assert.Equal(t, "queued", stringAt(t, createExample, "status"))
+	assert.Equal(t, float64(10), numberAt(t, createExample, "progress"))
+
+	statusExample := objectAt(
+		t,
+		document,
+		"paths",
+		"/v1/videos/{task_id}",
+		"get",
+		"responses",
+		"200",
+		"content",
+		"application/json",
+		"example",
+	)
+	assert.Equal(t, "in_progress", stringAt(t, statusExample, "status"))
+	assert.Equal(t, float64(30), numberAt(t, statusExample, "progress"))
 }
 
 func TestSeedDanceFixturesAreSanitizedContracts(t *testing.T) {
