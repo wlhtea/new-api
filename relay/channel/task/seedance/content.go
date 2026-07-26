@@ -16,7 +16,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/service"
 )
@@ -36,7 +35,6 @@ var (
 	errInvalidVideoBase64      = errors.New("invalid video base64")
 	errInvalidMP4              = errors.New("invalid MP4")
 
-	contentTempDir      = os.TempDir()
 	contentTempSequence uint64
 )
 
@@ -235,8 +233,20 @@ type contentTempFile struct {
 	path string
 }
 
+type contentFetchDependencies struct {
+	doRequest    func(*http.Request) (*http.Response, error)
+	newTempFile  func(string) (*contentTempFile, error)
+	copyResponse func(io.Writer, io.Reader) (int64, error)
+}
+
 func newContentTempFile(label string) (*contentTempFile, error) {
-	directory := contentTempDir
+	return newContentTempFileIn("", label)
+}
+
+func newContentTempFileIn(
+	directory string,
+	label string,
+) (*contentTempFile, error) {
 	if directory == "" {
 		directory = os.TempDir()
 	}
@@ -325,6 +335,24 @@ func (a *TaskAdaptor) FetchVideoContent(
 	upstreamTaskID string,
 	proxy string,
 ) (*channel.VideoContent, error) {
+	return a.fetchVideoContentWithDependencies(
+		parent,
+		baseURL,
+		key,
+		upstreamTaskID,
+		proxy,
+		contentFetchDependencies{},
+	)
+}
+
+func (a *TaskAdaptor) fetchVideoContentWithDependencies(
+	parent context.Context,
+	baseURL string,
+	key string,
+	upstreamTaskID string,
+	proxy string,
+	deps contentFetchDependencies,
+) (*channel.VideoContent, error) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -342,17 +370,22 @@ func (a *TaskAdaptor) FetchVideoContent(
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 
-	baseClient, err := service.GetHttpClientWithProxy(proxy)
-	if err != nil {
-		cancel()
-		return nil, contentRequestError(ctx, err)
+	var resp *http.Response
+	if deps.doRequest != nil {
+		resp, err = deps.doRequest(req)
+	} else {
+		baseClient, clientErr := service.GetHttpClientWithProxy(proxy)
+		if clientErr != nil {
+			cancel()
+			return nil, contentRequestError(ctx, clientErr)
+		}
+		client, clientErr := newStageClient(baseClient, proxy, connectTimeout)
+		if clientErr != nil {
+			cancel()
+			return nil, contentRequestError(ctx, clientErr)
+		}
+		resp, err = client.Do(req)
 	}
-	client, err := newStageClient(baseClient, proxy, connectTimeout)
-	if err != nil {
-		cancel()
-		return nil, contentRequestError(ctx, err)
-	}
-	resp, err := client.Do(req)
 	if err != nil {
 		cancel()
 		return nil, contentRequestError(ctx, err)
@@ -402,12 +435,21 @@ func (a *TaskAdaptor) FetchVideoContent(
 		}
 	}()
 
-	rawResponse, err = newContentTempFile("raw")
+	newTempFile := deps.newTempFile
+	if newTempFile == nil {
+		newTempFile = newContentTempFile
+	}
+	copyResponse := deps.copyResponse
+	if copyResponse == nil {
+		copyResponse = io.Copy
+	}
+
+	rawResponse, err = newTempFile("raw")
 	if err != nil {
 		_ = resp.Body.Close()
 		return nil, invalidContentResponse(err)
 	}
-	if _, copyErr := io.Copy(rawResponse.file, resp.Body); copyErr != nil {
+	if _, copyErr := copyResponse(rawResponse.file, resp.Body); copyErr != nil {
 		_ = resp.Body.Close()
 		return nil, contentRequestError(ctx, copyErr)
 	}
@@ -418,42 +460,30 @@ func (a *TaskAdaptor) FetchVideoContent(
 		return nil, invalidContentResponse(err)
 	}
 
-	redactedJSON, err = newContentTempFile("redacted")
+	redactedJSON, err = newTempFile("redacted")
 	if err != nil {
 		return nil, invalidContentResponse(err)
 	}
-	encodedBase64, err = newContentTempFile("base64")
+	encodedBase64, err = newTempFile("base64")
 	if err != nil {
 		return nil, invalidContentResponse(err)
 	}
-	if err := extractVideoBase64JSON(
+	business, err := extractVideoBase64JSONWithBusiness(
 		rawResponse.file,
 		redactedJSON.file,
 		encodedBase64.file,
-	); err != nil {
+	)
+	if err != nil {
 		return nil, invalidContentResponse(err)
 	}
-
-	if _, err := redactedJSON.file.Seek(0, io.SeekStart); err != nil {
+	if err := validateContentBusinessState(business); err != nil {
 		return nil, invalidContentResponse(err)
-	}
-	var provider providerEnvelope
-	if err := common.DecodeJson(redactedJSON.file, &provider); err != nil {
-		return nil, invalidContentResponse(err)
-	}
-	if provider.Success == nil {
-		return nil, invalidContentResponse(
-			errors.New("upstream content response has no success state"),
-		)
-	}
-	if explicitBusinessFailure(&provider) {
-		return nil, invalidContentResponse(errors.New(providerErrorMessage(&provider)))
 	}
 
 	if _, err := encodedBase64.file.Seek(0, io.SeekStart); err != nil {
 		return nil, invalidContentResponse(err)
 	}
-	mp4, err = newContentTempFile("mp4")
+	mp4, err = newTempFile("mp4")
 	if err != nil {
 		return nil, invalidContentResponse(err)
 	}
