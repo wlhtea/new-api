@@ -276,6 +276,114 @@ func contentTestDependencies(directory string) contentFetchDependencies {
 	}
 }
 
+type recordedContentTemp struct {
+	label  string
+	path   string
+	owner  *contentTempFile
+	handle *os.File
+}
+
+type contentTempRecorder struct {
+	directory              string
+	failLabel              string
+	failErr                error
+	closeBeforeReturnLabel string
+	temps                  []*recordedContentTemp
+}
+
+func newContentTempRecorder(directory string) *contentTempRecorder {
+	return &contentTempRecorder{directory: directory}
+}
+
+func (r *contentTempRecorder) allocator(
+	t *testing.T,
+) func(string) (*contentTempFile, error) {
+	t.Helper()
+	return func(label string) (*contentTempFile, error) {
+		for _, existing := range r.temps {
+			requireContentHandleOpen(t, existing.handle)
+			_, err := os.Stat(existing.path)
+			require.NoErrorf(t, err, "%s path must still exist", existing.label)
+		}
+		if label == r.failLabel {
+			require.Error(t, r.failErr)
+			return nil, r.failErr
+		}
+
+		temp, err := newContentTempFileIn(r.directory, label)
+		require.NoError(t, err)
+		info, err := temp.file.Stat()
+		require.NoError(t, err)
+		require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+		recorded := &recordedContentTemp{
+			label:  label,
+			path:   temp.path,
+			owner:  temp,
+			handle: temp.file,
+		}
+		r.temps = append(r.temps, recorded)
+		if label == r.closeBeforeReturnLabel {
+			require.NoError(t, recorded.handle.Close())
+		}
+		return temp, nil
+	}
+}
+
+func (r *contentTempRecorder) requireTemp(
+	t *testing.T,
+	label string,
+) *recordedContentTemp {
+	t.Helper()
+	for _, temp := range r.temps {
+		if temp.label == label {
+			return temp
+		}
+	}
+	t.Fatalf("temporary file %q was not recorded", label)
+	return nil
+}
+
+func (r *contentTempRecorder) requireAllCleaned(t *testing.T) {
+	t.Helper()
+	for _, temp := range r.temps {
+		requireRecordedContentTempCleaned(t, temp)
+	}
+}
+
+func requireContentHandleOpen(t *testing.T, handle *os.File) {
+	t.Helper()
+	require.NotNil(t, handle)
+	_, err := handle.Stat()
+	require.NoError(t, err)
+}
+
+func requireContentHandleClosed(t *testing.T, handle *os.File) {
+	t.Helper()
+	require.NotNil(t, handle)
+	_, err := handle.Stat()
+	require.Error(t, err)
+	require.ErrorIs(t, err, os.ErrClosed)
+	var pathErr *os.PathError
+	require.ErrorAs(t, err, &pathErr)
+	assert.Equal(t, "stat", pathErr.Op)
+}
+
+func requireRecordedContentTempCleaned(
+	t *testing.T,
+	temp *recordedContentTemp,
+) {
+	t.Helper()
+	requireContentHandleClosed(t, temp.handle)
+	assert.Nil(t, temp.owner.file)
+	assert.Empty(t, temp.owner.path)
+	_, err := os.Stat(temp.path)
+	require.Error(t, err)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	var pathErr *os.PathError
+	require.ErrorAs(t, err, &pathErr)
+	assert.Equal(t, "stat", pathErr.Op)
+}
+
 type contentTestFetcher struct {
 	adaptor *TaskAdaptor
 	deps    contentFetchDependencies
@@ -1191,29 +1299,8 @@ func TestFetchVideoContentTempFileStages(t *testing.T) {
 	t.Run("all four files coexist as mode 0600 before ownership transfer", func(t *testing.T) {
 		directory := useContentTempDir(t)
 		fetcher := newContentTestFetcher(directory)
-		type observedTemp struct {
-			label string
-			path  string
-			temp  *contentTempFile
-		}
-		var observed []observedTemp
-		fetcher.deps.newTempFile = func(label string) (*contentTempFile, error) {
-			temp, err := newContentTempFileIn(directory, label)
-			require.NoError(t, err)
-			info, err := os.Stat(temp.path)
-			require.NoError(t, err)
-			require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
-			for _, existing := range observed {
-				_, err := os.Stat(existing.path)
-				require.NoErrorf(t, err, "%s must still exist", existing.label)
-			}
-			observed = append(observed, observedTemp{
-				label: label,
-				path:  temp.path,
-				temp:  temp,
-			})
-			return temp, nil
-		}
+		recorder := newContentTempRecorder(directory)
+		fetcher.deps.newTempFile = recorder.allocator(t)
 		body := &contentTestReadCloser{
 			reader: strings.NewReader(videoSuccessJSON(validEncoded)),
 		}
@@ -1234,27 +1321,37 @@ func TestFetchVideoContentTempFileStages(t *testing.T) {
 		)
 
 		require.NoError(t, err)
-		require.Len(t, observed, 4)
+		require.Len(t, recorder.temps, 4)
 		assert.Equal(t, []string{"raw", "redacted", "base64", "mp4"}, []string{
-			observed[0].label,
-			observed[1].label,
-			observed[2].label,
-			observed[3].label,
+			recorder.temps[0].label,
+			recorder.temps[1].label,
+			recorder.temps[2].label,
+			recorder.temps[3].label,
 		})
-		for _, item := range observed {
-			assert.Nil(t, item.temp.file)
-			assert.Empty(t, item.temp.path)
+		for _, temp := range recorder.temps[:3] {
+			requireRecordedContentTempCleaned(t, temp)
 		}
-		for _, item := range observed[:3] {
-			_, statErr := os.Stat(item.path)
-			require.ErrorIs(t, statErr, os.ErrNotExist)
-		}
-		info, err := os.Stat(observed[3].path)
+
+		mp4 := recorder.requireTemp(t, "mp4")
+		requireContentHandleOpen(t, mp4.handle)
+		assert.Nil(t, mp4.owner.file)
+		assert.Empty(t, mp4.owner.path)
+		info, err := os.Stat(mp4.path)
 		require.NoError(t, err)
 		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+		var brand [4]byte
+		read, err := mp4.handle.ReadAt(brand[:], 4)
+		require.NoError(t, err)
+		assert.Equal(t, len(brand), read)
+		assert.Equal(t, []byte("ftyp"), brand[:])
 		assert.Equal(t, 1, body.closeCalls)
+
 		require.NoError(t, content.Body.Close())
+		requireContentHandleClosed(t, mp4.handle)
+		_, err = os.Stat(mp4.path)
+		require.ErrorIs(t, err, os.ErrNotExist)
 		require.NoError(t, content.Body.Close())
+		requireContentHandleClosed(t, mp4.handle)
 		requireContentTempDirEmpty(t, directory)
 	})
 
@@ -1263,26 +1360,10 @@ func TestFetchVideoContentTempFileStages(t *testing.T) {
 			directory := useContentTempDir(t)
 			createErr := errors.New(failLabel + " tempfile creation stopped")
 			fetcher := newContentTestFetcher(directory)
-			type observedTemp struct {
-				path string
-				temp *contentTempFile
-			}
-			var observed []observedTemp
-			fetcher.deps.newTempFile = func(label string) (*contentTempFile, error) {
-				if label == failLabel {
-					return nil, createErr
-				}
-				temp, err := newContentTempFileIn(directory, label)
-				require.NoError(t, err)
-				info, err := os.Stat(temp.path)
-				require.NoError(t, err)
-				require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
-				observed = append(observed, observedTemp{
-					path: temp.path,
-					temp: temp,
-				})
-				return temp, nil
-			}
+			recorder := newContentTempRecorder(directory)
+			recorder.failLabel = failLabel
+			recorder.failErr = createErr
+			fetcher.deps.newTempFile = recorder.allocator(t)
 			body := &contentTestReadCloser{
 				reader: strings.NewReader(videoSuccessJSON(validEncoded)),
 			}
@@ -1312,12 +1393,7 @@ func TestFetchVideoContentTempFileStages(t *testing.T) {
 			)
 			require.ErrorIs(t, contentErr.Cause, createErr)
 			assert.Equal(t, 1, body.closeCalls)
-			for _, item := range observed {
-				assert.Nil(t, item.temp.file)
-				assert.Empty(t, item.temp.path)
-				_, statErr := os.Stat(item.path)
-				require.ErrorIs(t, statErr, os.ErrNotExist)
-			}
+			recorder.requireAllCleaned(t)
 			requireContentTempDirEmpty(t, directory)
 		})
 	}
@@ -1365,6 +1441,8 @@ func TestFetchVideoContentTransportAndCopyFailures(t *testing.T) {
 			},
 		}
 		fetcher := newContentTestFetcher(directory)
+		recorder := newContentTempRecorder(directory)
+		fetcher.deps.newTempFile = recorder.allocator(t)
 		fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -1391,14 +1469,17 @@ func TestFetchVideoContentTransportAndCopyFailures(t *testing.T) {
 		)
 		require.ErrorIs(t, contentErr.Cause, readErr)
 		assert.Equal(t, 1, body.closeCalls)
+		recorder.requireAllCleaned(t)
 		requireContentTempDirEmpty(t, directory)
 	})
 
 	t.Run("raw destination writer error", func(t *testing.T) {
 		directory := useContentTempDir(t)
-		writeErr := errors.New("raw destination stopped")
 		body := &contentTestReadCloser{reader: strings.NewReader(validJSON)}
 		fetcher := newContentTestFetcher(directory)
+		recorder := newContentTempRecorder(directory)
+		recorder.closeBeforeReturnLabel = "raw"
+		fetcher.deps.newTempFile = recorder.allocator(t)
 		fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -1406,12 +1487,7 @@ func TestFetchVideoContentTransportAndCopyFailures(t *testing.T) {
 				Header:     make(http.Header),
 			}, nil
 		}
-		fetcher.deps.copyResponse = func(_ io.Writer, src io.Reader) (int64, error) {
-			return io.Copy(
-				&failAfterWriter{remaining: 7, err: writeErr},
-				src,
-			)
-		}
+		require.Nil(t, fetcher.deps.copyResponse, "test must exercise default io.Copy")
 
 		content, err := fetcher.FetchVideoContent(
 			context.Background(),
@@ -1429,8 +1505,14 @@ func TestFetchVideoContentTransportAndCopyFailures(t *testing.T) {
 			"upstream_error",
 			"upstream_connection_error",
 		)
-		require.ErrorIs(t, contentErr.Cause, writeErr)
+		require.ErrorIs(t, contentErr.Cause, os.ErrClosed)
+		var pathErr *os.PathError
+		require.ErrorAs(t, contentErr.Cause, &pathErr)
+		assert.Equal(t, "write", pathErr.Op)
+		raw := recorder.requireTemp(t, "raw")
+		assert.Equal(t, raw.path, pathErr.Path)
 		assert.Equal(t, 1, body.closeCalls)
+		recorder.requireAllCleaned(t)
 		requireContentTempDirEmpty(t, directory)
 	})
 
@@ -1442,6 +1524,8 @@ func TestFetchVideoContentTransportAndCopyFailures(t *testing.T) {
 			closeErr: closeErr,
 		}
 		fetcher := newContentTestFetcher(directory)
+		recorder := newContentTempRecorder(directory)
+		fetcher.deps.newTempFile = recorder.allocator(t)
 		fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -1468,6 +1552,7 @@ func TestFetchVideoContentTransportAndCopyFailures(t *testing.T) {
 		)
 		require.ErrorIs(t, contentErr.Cause, closeErr)
 		assert.Equal(t, 1, body.closeCalls)
+		recorder.requireAllCleaned(t)
 		requireContentTempDirEmpty(t, directory)
 	})
 
