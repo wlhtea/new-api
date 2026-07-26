@@ -76,6 +76,31 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if channel.Type == constant.ChannelTypeSeedDance {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequestWithContext(ctx, http.MethodGet, seedanceProbePathPrefix+"context", nil)
+		key, statusCode, err := testSeedDanceChannel(ctx, channel)
+		if key != "" {
+			common.SetContextKey(
+				c,
+				constant.ContextKeyChannelKey,
+				key,
+			)
+		}
+		if err != nil {
+			return testResult{
+				context:  c,
+				localErr: err,
+				newAPIError: types.NewErrorWithStatusCode(
+					err,
+					types.ErrorCodeBadResponseStatusCode,
+					statusCode,
+				),
+			}
+		}
+		return testResult{context: c}
+	}
 	tik := time.Now()
 	var unsupportedTestChannelTypes = []int{
 		constant.ChannelTypeMidjourney,
@@ -1027,6 +1052,152 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 		selected = append(selected, channel)
 	}
 	return selected
+}
+
+// seedanceChannelTestTimeout bounds the Seed Dance channel-test probe. It only
+// needs to reach /status once; a real status lookup takes well under 30 seconds.
+const seedanceChannelTestTimeout = 30 * time.Second
+
+// seedanceProbePathPrefix matches the path the Seed Dance probe sends to the
+// upstream /status endpoint. The random suffix is generated per probe.
+const seedanceProbePathPrefix = "/status/new-api-channel-test-"
+
+// seedanceProbeEnvelope captures only the business fields the probe inspects.
+// It mirrors the Seed Dance provider envelope without importing the channel
+// package, keeping controller decoupled from the adaptor internals.
+type seedanceProbeEnvelope struct {
+	Success    *bool           `json:"success,omitempty"`
+	ErrCode    json.RawMessage `json:"errCode,omitempty"`
+	ErrMessage string          `json:"errMessage,omitempty"`
+	Message    string          `json:"message,omitempty"`
+	Status     string          `json:"status,omitempty"`
+}
+
+// testSeedDanceChannel performs a zero-cost Seed Dance channel health probe.
+//
+// Instead of submitting a real video generation request, it looks up a
+// synthetic, guaranteed-missing task ID via GET /status/{probe-id}. A reachable
+// channel that authenticates the key and returns a well-formed business response
+// indicating the task does not exist is treated as healthy. Authentication
+// failures (401/403), transport errors, deadlines, malformed responses, and
+// unrelated business errors all fail the probe. The probe never calls /generate,
+// never creates a task, and does not touch user quota or the task table.
+func testSeedDanceChannel(
+	ctx context.Context,
+	channel *model.Channel,
+) (string, int, error) {
+	if channel == nil {
+		return "", http.StatusInternalServerError, errors.New("Seed Dance channel is nil")
+	}
+
+	key, _, apiErr := channel.GetNextEnabledKey()
+	if apiErr != nil {
+		return "", http.StatusInternalServerError, fmt.Errorf("resolve Seed Dance channel key: %w", apiErr)
+	}
+	if strings.TrimSpace(key) == "" {
+		return key, http.StatusInternalServerError, errors.New("Seed Dance channel key is empty")
+	}
+
+	probeID, err := common.GenerateRandomCharsKey(24)
+	if err != nil {
+		return key, http.StatusInternalServerError, fmt.Errorf("generate Seed Dance probe id: %w", err)
+	}
+	probeURL := strings.TrimRight(channel.GetBaseURL(), "/") + seedanceProbePathPrefix + probeID
+
+	probeCtx, cancel := context.WithTimeout(ctx, seedanceChannelTestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return key, http.StatusInternalServerError, fmt.Errorf("build Seed Dance probe request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Accept", "application/json")
+
+	baseClient, err := service.GetHttpClientWithProxy(channel.GetSetting().Proxy)
+	if err != nil {
+		return key, http.StatusInternalServerError, fmt.Errorf("configure Seed Dance channel proxy: %w", err)
+	}
+
+	resp, err := baseClient.Do(req)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
+			return key, http.StatusGatewayTimeout, fmt.Errorf("Seed Dance channel probe timed out: %w", err)
+		}
+		return key, http.StatusBadGateway, fmt.Errorf("Seed Dance channel probe transport error: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return key, http.StatusBadGateway, fmt.Errorf("read Seed Dance probe response: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return key, resp.StatusCode, fmt.Errorf("Seed Dance channel authentication failed (status %d)", resp.StatusCode)
+	}
+
+	var envelope seedanceProbeEnvelope
+	if err := common.Unmarshal(bytes.TrimSpace(body), &envelope); err != nil {
+		return key, seedanceProbeFailureStatus(resp.StatusCode), fmt.Errorf("Seed Dance channel returned a malformed response (status %d): %w", resp.StatusCode, err)
+	}
+
+	// A healthy probe reaches an authenticated upstream that confirms the
+	// synthetic task is unknown. Success=true means the upstream resolved a task
+	// we never created — treat that as an unexpected state, not a healthy probe.
+	if envelope.Success != nil && *envelope.Success {
+		return key, http.StatusBadGateway, errors.New("Seed Dance channel probe got an unexpected success for an unknown task")
+	}
+
+	errCode := strings.TrimSpace(string(envelope.ErrCode))
+	if errCode == "" || errCode == "\"\"" || errCode == "0" || errCode == "\"0\"" {
+		return key, seedanceProbeFailureStatus(resp.StatusCode), fmt.Errorf("Seed Dance channel returned a business response without an error code (status %d)", resp.StatusCode)
+	}
+	businessCode := strings.Trim(errCode, "\"")
+	if businessCode == strconv.Itoa(http.StatusUnauthorized) ||
+		businessCode == strconv.Itoa(http.StatusForbidden) {
+		statusCode, _ := strconv.Atoi(businessCode)
+		return key, statusCode, fmt.Errorf("Seed Dance channel authentication failed (business code %s)", businessCode)
+	}
+
+	// Only a clear task-specific "not found" verdict counts as healthy. Requiring
+	// the task subject prevents messages such as "API key not found" from being
+	// mistaken for successful reachability.
+	lowerMessage := strings.ToLower(envelope.ErrMessage + " " + envelope.Message)
+	hasTaskSubject := strings.Contains(lowerMessage, "task") ||
+		strings.Contains(lowerMessage, "任务")
+	if !hasTaskSubject ||
+		!containsAny(lowerMessage, "not found", "no such", "does not exist", "不存在", "未找到", "找不到") {
+		return key, seedanceProbeFailureStatus(resp.StatusCode), fmt.Errorf("Seed Dance channel returned an unrelated business error: code=%s message=%s", errCode, nonEmptyMessage(envelope))
+	}
+
+	return key, resp.StatusCode, nil
+}
+
+func seedanceProbeFailureStatus(upstreamStatus int) int {
+	if upstreamStatus >= http.StatusBadRequest {
+		return upstreamStatus
+	}
+	return http.StatusBadGateway
+}
+
+func containsAny(haystack string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(haystack, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func nonEmptyMessage(envelope seedanceProbeEnvelope) string {
+	if envelope.ErrMessage != "" {
+		return envelope.ErrMessage
+	}
+	if envelope.Message != "" {
+		return envelope.Message
+	}
+	return "(none)"
 }
 
 // TestAllChannels enqueues a channel_test system task instead of running the

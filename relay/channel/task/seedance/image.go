@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/service"
 )
@@ -109,7 +110,7 @@ func imageStrings(input *requestInput) ([]string, error) {
 		return sources, nil
 	}
 	var images []json.RawMessage
-	if err := json.Unmarshal(imagesRaw, &images); err != nil {
+	if err := common.Unmarshal(imagesRaw, &images); err != nil {
 		return nil, err
 	}
 	if len(images) > 1 {

@@ -222,7 +222,7 @@ func normalizeScalars(input *requestInput) (*NormalizedRequest, *dto.TaskError) 
 }
 
 func quotedRawMessage(value string) json.RawMessage {
-	encoded, _ := json.Marshal(value)
+	encoded, _ := common.Marshal(value)
 	return encoded
 }
 
@@ -287,7 +287,7 @@ func parseMultipartRequest(
 		if len(values) == 1 && strings.HasPrefix(strings.TrimSpace(values[0]), "[") {
 			input.Raw.Images = json.RawMessage(values[0])
 		} else {
-			encoded, err := json.Marshal(values)
+			encoded, err := common.Marshal(values)
 			if err != nil {
 				return nil, nil, service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
 			}
