@@ -58,6 +58,10 @@ Key 是两个不同的凭据。
 seedance-uncensored
 ```
 
+`model` 必须是精确、大小写敏感的字符串 `seedance-uncensored`，不能带前后
+空白。`prompt` 必须是字符串，经过前后空白移除后至少包含一个非空白字符。
+JSON 顶层和 `metadata` 中当前未识别的字段会被接受并忽略，不会转发给供应商。
+
 公开接口为：
 
 ```text
@@ -69,23 +73,25 @@ GET  /v1/videos/{task_id}/content
 ### 3.1 时长
 
 - 可通过顶层 `duration`、顶层 `seconds` 或 `metadata.duration` 指定；
-- 接受 JSON 整数或只包含十进制数字的字符串；
+- 三个入口都接受 JSON 整数或只包含 ASCII 十进制数字的字符串，例如
+  `1`、`"1"` 和 `"01"`；
 - 有效范围为 `1–15`；
 - 多处同时提供相同值时接受，不同值时返回 `400 invalid_duration`；
 - 缺省值为 `15`；为了让测试费用可预测，示例均显式传入 `duration`；
-- `0`、负数、小数、指数形式、空字符串和非数字值均会被拒绝。
+- `0`、负数、小数、指数形式、带正号、含前后空白、空字符串和非数字值均会
+  被拒绝。
 
 ### 3.2 分辨率
 
-| `size` | 规范化分辨率 | 倍率 |
+| `size` 或 `metadata.resolution` 的等价输入 | 规范化分辨率 | 倍率 |
 |---|---|---:|
-| `854x480`、`480x854` | `480P` | `0.5` |
-| `1280x720`、`720x1280` | `720P` | `1.0` |
-| `1920x1080`、`1080x1920` | `1080P` | `2.25` |
+| `854x480`、`480x854`、`480P` | `480P` | `0.5` |
+| `1280x720`、`720x1280`、`720P` | `720P` | `1.0` |
+| `1920x1080`、`1080x1920`、`1080P` | `1080P` | `2.25` |
 
-也可以通过 `metadata.resolution` 传入 `480P`、`720P` 或 `1080P`。如果
-`size` 与 `metadata.resolution` 同时存在，两者必须映射到相同分辨率。T2V
-不接受 `480P`；I2V 接受三个分辨率。缺省分辨率为 `720P`。
+`size` 和 `metadata.resolution` 使用同一组九个 alias；匹配前会移除两端空白
+并忽略大小写。如果两个入口同时存在，两者必须映射到相同分辨率。T2V 不接受
+`480P`；I2V 接受三个分辨率。缺省分辨率为 `720P`。
 
 ### 3.3 图片
 
@@ -95,11 +101,16 @@ I2V 只接受一张 JPG 或 PNG。可使用：
 - 单元素 `images`；
 - 顶层 `input_reference`；
 - `metadata.image_base64`；
+- multipart 文本字段 `image`、`images` 或 `input_reference`；
 - multipart 文件字段 `input_reference`。
 
 字符串图片来源可以是纯 Base64、JPG/PNG data URI，或通过平台 SSRF 防护
 检查的远程 URL。图片宽高必须在 `240–8000` 之间，宽高比必须在
 `1:8–8:1` 之间。
+
+Base64 使用标准字母表和严格 padding，不接受 URL-safe 字母表或内嵌空格、
+Tab、CR、LF 等 ASCII 空白。data URI 前缀必须精确为
+`data:image/jpeg;base64,` 或 `data:image/png;base64,`。
 
 供应商资料中的 **5 MB 是建议，不是 New API 的 Seed Dance 硬限制**。New
 API 不因图片超过该建议值而添加 Seed Dance 专用的 `5 MB` 或 `5 MiB`
@@ -121,7 +132,9 @@ API 不因图片超过该建议值而添加 Seed Dance 专用的 `5 MB` 或 `5 M
 JSON 请求中的布尔字段必须是真正的布尔值。multipart 的 `metadata` 是一个
 JSON 编码字符串，其中 `prompt_optimization`、`multi_shot` 和
 `strict_duration` 当前必须写成文本 `"true"` 或 `"false"`；适配器会在发送
-上游前将其规范化为布尔值。`strict_duration` 的供应商缺省值为 `false`。
+上游前将其规范化为布尔值。三个布尔字段未提供时不会由适配器注入 `false`，
+而是从供应商请求中省略；`strict_duration` 的供应商缺省值为 `false`。
+`negative_prompt` 必须是字符串且不会 trim，空字符串会从供应商请求中省略。
 
 ## 4. 计费配置与公式
 
@@ -143,11 +156,12 @@ G = 核心计费逻辑解析出的最终 GroupRatio
 Q = QuotaPerUnit（当前为 500000）
 ```
 
-公式：
+精确结算分两阶段执行，每一阶段都向零截断：
 
 ```text
-费用  = P × D × R × G
-quota = P × D × R × G × Q
+base_quota = truncate_toward_zero(P × Q × G)
+quota      = truncate_toward_zero(base_quota × D × R)
+费用       = quota / Q
 ```
 
 例如 `P=0.15`、`D=1`、`R=1.0`、`G=1` 时：
@@ -157,6 +171,9 @@ quota = P × D × R × G × Q
 quota = 75000
 ```
 
+不要用 `truncate(P × D × R × G × Q)` 代替上述两阶段公式；当第一阶段乘积不是
+整数时，一次性公式可能与实际账单相差一个或多个 quota。
+
 ### 4.2 ModelRatio 兼容模式
 
 如果没有配置 `ModelPrice`，但配置了：
@@ -165,10 +182,11 @@ quota = 75000
 ModelRatio["seedance-uncensored"] = M
 ```
 
-则使用：
+则同样分两阶段使用：
 
 ```text
-quota = M / 2 × D × R × G × Q
+base_quota = truncate_toward_zero(M / 2 × Q × G)
+quota      = truncate_toward_zero(base_quota × D × R)
 ```
 
 `ModelPrice` 和 `ModelRatio` 同时存在时，`ModelPrice` 优先；值为零沿用平台
@@ -312,7 +330,18 @@ curl -fsS \
 ```
 
 不要手动设置 multipart 的 `Content-Type`；`curl` 会生成包含 boundary 的正确
-请求头。
+请求头。multipart 也接受文本图片入口：
+
+```bash
+-F 'image=IMAGE_REFERENCE'
+-F 'images=["IMAGE_REFERENCE"]'
+-F 'input_reference=IMAGE_REFERENCE'
+```
+
+其中 `IMAGE_REFERENCE` 可以是纯 Base64、受支持的 data URI 或 HTTP(S) URL；
+最终仍只能规范化出一张图片。`images` 也可以由一个或多个同名文本 part 表达，
+但最终超过一项会返回 `400 invalid_image`。未知文本 part 当前会被忽略，未知
+且非空的文件 part 会被拒绝。
 
 ## 10. 查询状态
 
@@ -339,6 +368,8 @@ curl -fsS \
 ```
 
 供应商建议轮询间隔至少 5 秒；本文自动化示例统一使用 10 秒，避免高频轮询。
+非终态 `queued` 和 `in_progress` 响应不会出现 `completed_at`；该字段只在
+`completed` 或 `failed` 终态出现。
 
 ## 11. 下载 MP4
 
@@ -362,6 +393,19 @@ ffprobe \
 预期响应类型是 `video/mp4`，可验证视频流为 H.264、音频流为 AAC。任务未完成
 时下载返回 `400 task_not_completed`；任务不存在或不属于当前用户时返回
 `404 task_not_found`。
+
+供应商内容接口的最小成功 JSON 可以只有：
+
+```json
+{
+  "requestId": "REQUEST_ID",
+  "video_base64": "BASE64_MP4"
+}
+```
+
+`task_id`、`status`、`success` 等字段不是内容下载成功的必填项。New API 校验
+严格标准 Base64 和 MP4 `ftyp` 后，向客户端流式返回解码后的 `video/mp4`，
+不会把该供应商 JSON 或 Base64 回显给客户端。
 
 ## 12. Bash 自动提交、轮询和下载
 
@@ -566,15 +610,22 @@ Content-Type: application/json
 
 | 场景 | HTTP | `error.type` | `error.code` |
 |---|---:|---|---|
+| malformed JSON、`model` 非字符串或缺失 | 400 | `new_api_error` | 空字符串 |
 | 参数缺失、冲突或越界 | 400 | `invalid_request_error` | 对应稳定参数 code |
 | 模型价格未配置 | 400 | `invalid_request_error` | `model_price_error` |
+| 模型没有可用渠道 | 503 | `new_api_error` | `model_not_found` |
 | 客户端 API Key 无效 | 401 | `new_api_error` | 空字符串 |
 | 任务不存在或越权 | 404 | `invalid_request_error` | `task_not_found` |
 | 任务未完成时下载 | 400 | `invalid_request_error` | `task_not_completed` |
-| 供应商认证失败 | 502 | `upstream_error` | `upstream_authentication_error` |
-| 提交/任务接口收到供应商限流 | 429 | `rate_limit_error` | `upstream_rate_limit_error` |
+| 提交时供应商返回 401 | 401 | `invalid_request_error` | `upstream_authentication_error` |
+| 提交时供应商返回 403 | 403 | `invalid_request_error` | `upstream_authentication_error` |
+| 提交时收到可明确安全重试的供应商限流 | 429 | `rate_limit_error` | `upstream_rate_limit_error` |
+| 提交结果不确定（超时、连接中断、502/503/504 等） | 502 | `server_error` | `seedance_submit_outcome_unknown` |
+| 提交 HTTP 200 但供应商显式业务失败 | 502 | `server_error` | `upstream_error` |
+| 查询任务数据库失败 | 500 | `server_error` | `get_task_failed` |
+| 下载时供应商认证失败 | 502 | `upstream_error` | `upstream_authentication_error` |
 | 视频下载接口收到供应商限流 | 429 | `upstream_rate_limit_error` | `upstream_rate_limit_error` |
-| 供应商连接异常 | 502 | `upstream_error` | `upstream_connection_error` |
+| 下载时供应商连接异常 | 502 | `upstream_error` | `upstream_connection_error` |
 | 供应商下载超时 | 504 | `upstream_timeout_error` | `upstream_timeout_error` |
 | 供应商 JSON、Base64 或 MP4 无效 | 502 | `invalid_upstream_response` | `invalid_upstream_response` |
 
@@ -611,10 +662,12 @@ Content-Type: application/json
 | `status-processing.json` | 合成的 `processing` 状态 |
 | `status-completed.json` | 合成的 `completed` 状态 |
 | `status-business-error.json` | HTTP 200 业务错误 |
+| `video-response-minimal.json` | 仅含 `requestId` 和合成最小 MP4 Base64 的内容成功响应 |
 | `ffprobe-output.json` | 不含绝对路径的合成 H.264/AAC 媒体描述 |
 
 这些文件只用于确定性 Mock 和文档复核，不包含请求头、凭据、真实任务 ID、
-图片 Base64 或视频 Base64。
+图片 Base64 或真实视频。`video-response-minimal.json` 中的 `video_base64`
+只编码一个确定性的合成 `ftyp` box，用于锁定供应商最小响应契约。
 
 可执行：
 
@@ -670,9 +723,15 @@ done
 ### 长时间停留在 `queued` 或 `in_progress`
 
 - 保持至少 5 秒的轮询间隔，推荐 10 秒；
+- 客户端 GET 只读取已持久化的任务快照，不会同步触发供应商查询；默认
+  `async_task_poll` 调度与执行周期约为 15 秒，提交后数秒仍为 `queued` 属于
+  正常现象；
+- 超过 30–60 秒完全不变化时，检查 `UPDATE_TASK`、系统任务
+  `async_task_poll`、供应商 `/status/{task_id}` 请求和 durable ledger；
 - 查看管理员日志中的安全错误 code，不记录完整供应商响应；
 - 瞬时网络错误会保留原状态并在后续调度周期重试；
-- 不要使用供应商任务 ID查询公开接口。
+- 不要使用供应商任务 ID 查询公开接口，也不要重新 POST 来代替轮询，否则会
+  创建新的付费任务。
 
 ### 下载失败
 

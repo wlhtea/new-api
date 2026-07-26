@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,6 +34,7 @@ func TestSeedDanceStandaloneOpenAPIContract(t *testing.T) {
 	assertSeedDanceResponseExamples(t, doc)
 	assertSeedDanceMultipartMetadataExample(t, doc)
 	assertSeedDanceErrorExamples(t, doc)
+	assertSeedDanceSubmitErrorExamples(t, doc)
 	assertLocalRefsResolve(t, doc)
 	assertExamplesMatchBasicSchema(t, doc)
 }
@@ -54,6 +56,7 @@ func assertSeedDanceResponseExamples(t *testing.T, document map[string]any) {
 	)
 	assert.Equal(t, "queued", stringAt(t, createExample, "status"))
 	assert.Equal(t, float64(10), numberAt(t, createExample, "progress"))
+	assert.NotContains(t, createExample, "completed_at")
 
 	statusExample := objectAt(
 		t,
@@ -69,6 +72,7 @@ func assertSeedDanceResponseExamples(t *testing.T, document map[string]any) {
 	)
 	assert.Equal(t, "in_progress", stringAt(t, statusExample, "status"))
 	assert.Equal(t, float64(30), numberAt(t, statusExample, "progress"))
+	assert.NotContains(t, statusExample, "completed_at")
 }
 
 func assertSeedDanceMultipartMetadataExample(t *testing.T, document map[string]any) {
@@ -127,36 +131,50 @@ func assertSeedDanceErrorExamples(t *testing.T, document map[string]any) {
 		"post",
 		"401",
 	)
-	unauthorizedError := objectAt(
+	unauthorizedExamples := objectAt(
 		t,
 		unauthorized,
 		"content",
 		"application/json",
-		"example",
+		"examples",
+	)
+	unauthorizedError := objectAt(
+		t,
+		objectAt(t, unauthorizedExamples, "clientAuthentication"),
+		"value",
 		"error",
 	)
 	assert.Equal(t, "new_api_error", stringAt(t, unauthorizedError, "type"))
 	assert.Equal(t, "", stringAt(t, unauthorizedError, "code"))
 
-	for _, path := range []string{
-		"/v1/videos",
-		"/v1/videos/{task_id}",
-	} {
-		rateLimited := resolvedOperationResponse(t, document, path, map[string]string{
-			"/v1/videos":           "post",
-			"/v1/videos/{task_id}": "get",
-		}[path], "429")
-		rateError := objectAt(
-			t,
-			rateLimited,
-			"content",
-			"application/json",
-			"example",
-			"error",
-		)
-		assert.Equal(t, "rate_limit_error", stringAt(t, rateError, "type"))
-		assert.Equal(t, "upstream_rate_limit_error", stringAt(t, rateError, "code"))
-	}
+	upstreamAuthenticationError := objectAt(
+		t,
+		objectAt(t, unauthorizedExamples, "upstreamAuthentication"),
+		"value",
+		"error",
+	)
+	assert.Equal(
+		t,
+		"invalid_request_error",
+		stringAt(t, upstreamAuthenticationError, "type"),
+	)
+	assert.Equal(
+		t,
+		"upstream_authentication_error",
+		stringAt(t, upstreamAuthenticationError, "code"),
+	)
+
+	rateLimited := resolvedOperationResponse(t, document, "/v1/videos", "post", "429")
+	rateError := objectAt(
+		t,
+		rateLimited,
+		"content",
+		"application/json",
+		"example",
+		"error",
+	)
+	assert.Equal(t, "rate_limit_error", stringAt(t, rateError, "type"))
+	assert.Equal(t, "upstream_rate_limit_error", stringAt(t, rateError, "code"))
 
 	contentRateLimited := resolvedOperationResponse(
 		t,
@@ -183,6 +201,88 @@ func assertSeedDanceErrorExamples(t *testing.T, document map[string]any) {
 		"upstream_rate_limit_error",
 		stringAt(t, contentRateError, "code"),
 	)
+}
+
+func assertSeedDanceSubmitErrorExamples(t *testing.T, document map[string]any) {
+	t.Helper()
+
+	create := objectAt(t, document, "paths", "/v1/videos", "post")
+	assert.NotContains(t, objectAt(t, create, "responses"), "504")
+
+	badRequest := resolvedOperationResponse(t, document, "/v1/videos", "post", "400")
+	badRequestExamples := objectAt(
+		t,
+		badRequest,
+		"content",
+		"application/json",
+		"examples",
+	)
+	malformedError := objectAt(
+		t,
+		objectAt(t, badRequestExamples, "malformedRequest"),
+		"value",
+		"error",
+	)
+	assert.Equal(t, "new_api_error", stringAt(t, malformedError, "type"))
+	assert.Equal(t, "", stringAt(t, malformedError, "code"))
+	parameterError := objectAt(
+		t,
+		objectAt(t, badRequestExamples, "invalidParameter"),
+		"value",
+		"error",
+	)
+	assert.Equal(t, "invalid_request_error", stringAt(t, parameterError, "type"))
+	assert.Equal(t, "invalid_duration", stringAt(t, parameterError, "code"))
+
+	forbidden := resolvedOperationResponse(t, document, "/v1/videos", "post", "403")
+	forbiddenError := objectAt(
+		t,
+		forbidden,
+		"content",
+		"application/json",
+		"example",
+		"error",
+	)
+	assert.Equal(t, "invalid_request_error", stringAt(t, forbiddenError, "type"))
+	assert.Equal(t, "upstream_authentication_error", stringAt(t, forbiddenError, "code"))
+
+	unavailable := resolvedOperationResponse(t, document, "/v1/videos", "post", "503")
+	unavailableError := objectAt(
+		t,
+		unavailable,
+		"content",
+		"application/json",
+		"example",
+		"error",
+	)
+	assert.Equal(t, "new_api_error", stringAt(t, unavailableError, "type"))
+	assert.Equal(t, "model_not_found", stringAt(t, unavailableError, "code"))
+
+	upstream := resolvedOperationResponse(t, document, "/v1/videos", "post", "502")
+	upstreamExamples := objectAt(
+		t,
+		upstream,
+		"content",
+		"application/json",
+		"examples",
+	)
+	upstreamError := objectAt(
+		t,
+		objectAt(t, upstreamExamples, "outcomeUnknown"),
+		"value",
+		"error",
+	)
+	assert.Equal(t, "server_error", stringAt(t, upstreamError, "type"))
+	assert.Equal(t, "seedance_submit_outcome_unknown", stringAt(t, upstreamError, "code"))
+
+	businessError := objectAt(
+		t,
+		objectAt(t, upstreamExamples, "businessFailure"),
+		"value",
+		"error",
+	)
+	assert.Equal(t, "server_error", stringAt(t, businessError, "type"))
+	assert.Equal(t, "upstream_error", stringAt(t, businessError, "code"))
 }
 
 func resolvedOperationResponse(
@@ -254,9 +354,22 @@ func TestSeedDanceFixturesAreSanitizedContracts(t *testing.T) {
 		assert.Equal(t, "audio", stringAt(t, objectValue(t, streams[1]), "codec_type"))
 	})
 
+	t.Run("video-response-minimal.json", func(t *testing.T) {
+		document := loadJSONDocument(t, filepath.Join(fixtureDir, "video-response-minimal.json"))
+		assert.ElementsMatch(t, []string{"requestId", "video_base64"}, mapKeys(document))
+		assert.Equal(t, "REQUEST_ID", stringAt(t, document, "requestId"))
+
+		decoded, decodeErr := base64.StdEncoding.Strict().DecodeString(
+			stringAt(t, document, "video_base64"),
+		)
+		require.NoError(t, decodeErr)
+		require.GreaterOrEqual(t, len(decoded), 8)
+		assert.Equal(t, "ftyp", string(decoded[4:8]))
+	})
+
 	matches, err := filepath.Glob(filepath.Join(fixtureDir, "*.json"))
 	require.NoError(t, err)
-	require.Len(t, matches, 6)
+	require.Len(t, matches, 7)
 
 	for _, name := range matches {
 		data, readErr := os.ReadFile(name)
@@ -264,7 +377,9 @@ func TestSeedDanceFixturesAreSanitizedContracts(t *testing.T) {
 		text := string(data)
 		assert.NotContains(t, text, "Authorization")
 		assert.NotContains(t, text, "image_base64")
-		assert.NotContains(t, text, "video_base64")
+		if filepath.Base(name) != "video-response-minimal.json" {
+			assert.NotContains(t, text, "video_base64")
+		}
 		assert.NotRegexp(t, regexp.MustCompile(`(?i)\b(?:sk|key|token)-[a-z0-9_-]+\b`), text)
 	}
 }
@@ -295,18 +410,45 @@ func assertVideoOperations(t *testing.T, document map[string]any) {
 	t.Helper()
 
 	operations := []struct {
-		path   string
-		method string
+		path          string
+		method        string
+		errorStatuses []string
 	}{
-		{path: "/v1/videos", method: "post"},
-		{path: "/v1/videos/{task_id}", method: "get"},
-		{path: "/v1/videos/{task_id}/content", method: "get"},
+		{
+			path:          "/v1/videos",
+			method:        "post",
+			errorStatuses: []string{"400", "401", "403", "429", "502", "503"},
+		},
+		{
+			path:          "/v1/videos/{task_id}",
+			method:        "get",
+			errorStatuses: []string{"400", "401", "404", "500"},
+		},
+		{
+			path:          "/v1/videos/{task_id}/content",
+			method:        "get",
+			errorStatuses: []string{"400", "401", "404", "429", "502", "504"},
+		},
 	}
 
 	for _, expected := range operations {
 		operation := objectAt(t, document, "paths", expected.path, expected.method)
 		assertBearerSecurity(t, operation, expected.method+" "+expected.path)
-		assertNestedErrorResponses(t, document, operation, expected.method+" "+expected.path)
+		assert.ElementsMatch(
+			t,
+			append([]string{"200"}, expected.errorStatuses...),
+			mapKeys(objectAt(t, operation, "responses")),
+			"%s %s response status contract",
+			expected.method,
+			expected.path,
+		)
+		assertNestedErrorResponses(
+			t,
+			document,
+			operation,
+			expected.method+" "+expected.path,
+			expected.errorStatuses,
+		)
 	}
 
 	createContent := objectAt(t, document, "paths", "/v1/videos", "post", "requestBody", "content")
@@ -343,29 +485,34 @@ func assertSeedDanceRequestSchemas(t *testing.T, document map[string]any) {
 
 	jsonSchema := objectAt(t, document, "components", "schemas", "VideoCreateJSON")
 	assert.ElementsMatch(t, []string{"model", "prompt"}, stringSlice(t, jsonSchema, "required"))
+	assert.NotEqual(t, false, jsonSchema["additionalProperties"])
 	for _, field := range []string{"model", "prompt", "image", "input_reference"} {
 		assert.Equal(t, "string", stringAt(t, jsonSchema, "properties", field, "type"))
 	}
+	assert.Equal(
+		t,
+		[]any{"seedance-uncensored"},
+		sliceAt(t, jsonSchema, "properties", "model", "enum"),
+	)
+	assert.Equal(t, float64(1), numberAt(t, jsonSchema, "properties", "prompt", "minLength"))
+	assert.Equal(t, `\S`, stringAt(t, jsonSchema, "properties", "prompt", "pattern"))
 
 	duration := objectAt(t, jsonSchema, "properties", "duration")
-	assert.Equal(t, "integer", stringAt(t, duration, "type"))
-	assert.Equal(t, float64(1), numberAt(t, duration, "minimum"))
-	assert.Equal(t, float64(15), numberAt(t, duration, "maximum"))
+	assertDurationAlternatives(t, duration)
 	assert.Equal(t, float64(15), numberAt(t, duration, "default"))
 
-	secondsAlternatives := sliceAt(t, jsonSchema, "properties", "seconds", "oneOf")
-	require.Len(t, secondsAlternatives, 2)
-	assert.Equal(t, "integer", stringAt(t, objectValue(t, secondsAlternatives[0]), "type"))
-	assert.Equal(t, "string", stringAt(t, objectValue(t, secondsAlternatives[1]), "type"))
-	assert.Equal(t, "^[0-9]+$", stringAt(t, objectValue(t, secondsAlternatives[1]), "pattern"))
+	assertDurationAlternatives(t, objectAt(t, jsonSchema, "properties", "seconds"))
 
 	expectedSizes := []any{
 		"854x480",
 		"480x854",
+		"480P",
 		"1280x720",
 		"720x1280",
+		"720P",
 		"1920x1080",
 		"1080x1920",
+		"1080P",
 	}
 	assert.Equal(t, expectedSizes, sliceAt(t, jsonSchema, "properties", "size", "enum"))
 	assert.Equal(t, "array", stringAt(t, jsonSchema, "properties", "images", "type"))
@@ -375,12 +522,10 @@ func assertSeedDanceRequestSchemas(t *testing.T, document map[string]any) {
 	image := objectAt(t, jsonSchema, "properties", "image")
 	assert.NotContains(t, image, "maxLength")
 	metadata := objectAt(t, document, "components", "schemas", "VideoMetadata")
+	assert.NotEqual(t, false, metadata["additionalProperties"])
 	assert.Contains(t, objectAt(t, metadata, "properties"), "duration")
-	assert.Equal(
-		t,
-		[]any{"480P", "720P", "1080P"},
-		sliceAt(t, metadata, "properties", "resolution", "enum"),
-	)
+	assertDurationAlternatives(t, objectAt(t, metadata, "properties", "duration"))
+	assert.Equal(t, expectedSizes, sliceAt(t, metadata, "properties", "resolution", "enum"))
 	imageBase64 := objectAt(t, metadata, "properties", "image_base64")
 	assert.Equal(t, "string", stringAt(t, imageBase64, "type"))
 	assert.NotContains(t, imageBase64, "maxLength")
@@ -391,11 +536,32 @@ func assertSeedDanceRequestSchemas(t *testing.T, document map[string]any) {
 
 	multipart := objectAt(t, document, "components", "schemas", "VideoCreateMultipart")
 	assert.ElementsMatch(t, []string{"model", "prompt"}, stringSlice(t, multipart, "required"))
+	assert.NotEqual(t, false, multipart["additionalProperties"])
 	for _, field := range []string{"model", "prompt", "duration", "seconds", "size", "metadata"} {
 		assert.Equal(t, "string", stringAt(t, multipart, "properties", field, "type"))
 	}
-	assert.Equal(t, "string", stringAt(t, multipart, "properties", "input_reference", "type"))
-	assert.Equal(t, "binary", stringAt(t, multipart, "properties", "input_reference", "format"))
+	assert.Equal(
+		t,
+		[]any{"seedance-uncensored"},
+		sliceAt(t, multipart, "properties", "model", "enum"),
+	)
+	assert.Equal(t, float64(1), numberAt(t, multipart, "properties", "prompt", "minLength"))
+	assert.Equal(t, `\S`, stringAt(t, multipart, "properties", "prompt", "pattern"))
+	assert.Equal(t, expectedSizes, sliceAt(t, multipart, "properties", "size", "enum"))
+	for _, field := range []string{"image", "images"} {
+		assert.Equal(t, "string", stringAt(t, multipart, "properties", field, "type"))
+	}
+	inputReferenceAlternatives := sliceAt(
+		t,
+		multipart,
+		"properties",
+		"input_reference",
+		"anyOf",
+	)
+	require.Len(t, inputReferenceAlternatives, 2)
+	assert.Equal(t, "string", stringAt(t, objectValue(t, inputReferenceAlternatives[0]), "type"))
+	assert.Equal(t, "string", stringAt(t, objectValue(t, inputReferenceAlternatives[1]), "type"))
+	assert.Equal(t, "binary", stringAt(t, objectValue(t, inputReferenceAlternatives[1]), "format"))
 
 	video := objectAt(t, document, "components", "schemas", "OpenAIVideo")
 	for _, field := range []string{
@@ -414,6 +580,24 @@ func assertSeedDanceRequestSchemas(t *testing.T, document map[string]any) {
 	} {
 		assert.Contains(t, objectAt(t, video, "properties"), field)
 	}
+	completedAt := objectAt(t, video, "properties", "completed_at")
+	assert.NotContains(t, completedAt, "nullable")
+	assert.Contains(t, stringAt(t, completedAt, "description"), "completed")
+	assert.Contains(t, stringAt(t, completedAt, "description"), "failed")
+}
+
+func assertDurationAlternatives(t *testing.T, schema map[string]any) {
+	t.Helper()
+
+	alternatives := sliceAt(t, schema, "oneOf")
+	require.Len(t, alternatives, 2)
+	integerSchema := objectValue(t, alternatives[0])
+	assert.Equal(t, "integer", stringAt(t, integerSchema, "type"))
+	assert.Equal(t, float64(1), numberAt(t, integerSchema, "minimum"))
+	assert.Equal(t, float64(15), numberAt(t, integerSchema, "maximum"))
+	stringSchema := objectValue(t, alternatives[1])
+	assert.Equal(t, "string", stringAt(t, stringSchema, "type"))
+	assert.Equal(t, "^[0-9]+$", stringAt(t, stringSchema, "pattern"))
 }
 
 func assertBearerSecurity(t *testing.T, operation map[string]any, operationName string) {
@@ -429,10 +613,11 @@ func assertNestedErrorResponses(
 	document map[string]any,
 	operation map[string]any,
 	operationName string,
+	statuses []string,
 ) {
 	t.Helper()
 
-	for _, status := range []string{"400", "401", "404", "429", "502", "504"} {
+	for _, status := range statuses {
 		response := responseAt(t, operation, status)
 		if ref, ok := response["$ref"].(string); ok {
 			response = resolveRef(t, document, ref)
@@ -486,25 +671,52 @@ func assertExamplesMatchBasicSchema(t *testing.T, document map[string]any) {
 	}
 
 	for _, operationPath := range [][]string{
-		{"paths", "/v1/videos", "post"},
-		{"paths", "/v1/videos/{task_id}", "get"},
-		{"paths", "/v1/videos/{task_id}/content", "get"},
+		{"paths", "/v1/videos", "post", "400", "401", "403", "429", "502", "503"},
+		{"paths", "/v1/videos/{task_id}", "get", "400", "401", "404", "500"},
+		{"paths", "/v1/videos/{task_id}/content", "get", "400", "401", "404", "429", "502", "504"},
 	} {
-		operation := objectAt(t, document, operationPath...)
-		for _, status := range []string{"400", "401", "404", "429", "502", "504"} {
+		operation := objectAt(t, document, operationPath[:3]...)
+		for _, status := range operationPath[3:] {
 			response := responseAt(t, operation, status)
 			if ref, ok := response["$ref"].(string); ok {
 				response = resolveRef(t, document, ref)
 			}
 			media := objectAt(t, response, "content", "application/json")
-			validateBasicSchema(
+			validateMediaExamples(
 				t,
 				document,
-				objectAt(t, media, "schema"),
-				valueAt(t, media, "example"),
-				strings.Join(operationPath, "/")+" "+status+" example",
+				media,
+				strings.Join(operationPath[:3], "/")+" "+status,
 			)
 		}
+	}
+}
+
+func validateMediaExamples(
+	t *testing.T,
+	document map[string]any,
+	media map[string]any,
+	location string,
+) {
+	t.Helper()
+
+	schema := objectAt(t, media, "schema")
+	if example, ok := media["example"]; ok {
+		validateBasicSchema(t, document, schema, example, location+" example")
+		return
+	}
+
+	examples := objectAt(t, media, "examples")
+	require.NotEmpty(t, examples, "%s must publish at least one example", location)
+	for name, rawExample := range examples {
+		example := objectValue(t, rawExample)
+		validateBasicSchema(
+			t,
+			document,
+			schema,
+			valueAt(t, example, "value"),
+			location+" "+name+" example",
+		)
 	}
 }
 
@@ -535,6 +747,16 @@ func validateBasicSchema(
 			}
 		}
 		assert.Fail(t, "example does not match any oneOf schema", location)
+		return
+	}
+
+	if alternatives, ok := schema["anyOf"].([]any); ok {
+		for _, alternative := range alternatives {
+			if basicSchemaMatches(document, objectValue(t, alternative), value) {
+				return
+			}
+		}
+		assert.Fail(t, "example does not match any anyOf schema", location)
 		return
 	}
 
@@ -775,4 +997,12 @@ func numberValue(value any) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func mapKeys(object map[string]any) []string {
+	keys := make([]string, 0, len(object))
+	for key := range object {
+		keys = append(keys, key)
+	}
+	return keys
 }

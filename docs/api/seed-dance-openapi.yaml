@@ -65,17 +65,17 @@ paths:
                 seconds: "10"
                 size: 720P
         "400":
-          $ref: "#/components/responses/BadRequest"
+          $ref: "#/components/responses/SubmitBadRequest"
         "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          $ref: "#/components/responses/NotFound"
+          $ref: "#/components/responses/SubmitUnauthorized"
+        "403":
+          $ref: "#/components/responses/SubmitForbidden"
         "429":
           $ref: "#/components/responses/TaskRateLimited"
         "502":
-          $ref: "#/components/responses/UpstreamError"
-        "504":
-          $ref: "#/components/responses/UpstreamTimeout"
+          $ref: "#/components/responses/SubmitOutcomeUnknown"
+        "503":
+          $ref: "#/components/responses/ModelUnavailable"
   /v1/videos/{task_id}:
     get:
       tags: [Videos]
@@ -108,12 +108,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
-        "429":
-          $ref: "#/components/responses/TaskRateLimited"
-        "502":
-          $ref: "#/components/responses/UpstreamError"
-        "504":
-          $ref: "#/components/responses/UpstreamTimeout"
+        "500":
+          $ref: "#/components/responses/TaskReadError"
   /v1/videos/{task_id}/content:
     get:
       tags: [Videos]
@@ -125,7 +121,10 @@ paths:
         - $ref: "#/components/parameters/TaskId"
       responses:
         "200":
-          description: Validated MP4 content for a completed task.
+          description: |
+            Validated MP4 content for a completed task. The provider response
+            may contain only requestId and video_base64; New API validates and
+            decodes it before returning this binary response.
           headers:
             Content-Length:
               description: Decoded MP4 size in bytes.
@@ -146,7 +145,7 @@ paths:
         "429":
           $ref: "#/components/responses/ContentRateLimited"
         "502":
-          $ref: "#/components/responses/UpstreamError"
+          $ref: "#/components/responses/ContentUpstreamError"
         "504":
           $ref: "#/components/responses/UpstreamTimeout"
 components:
@@ -165,6 +164,27 @@ components:
         type: string
       example: "{{task_id}}"
   responses:
+    SubmitBadRequest:
+      description: The submit payload was malformed or failed Seed Dance validation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          examples:
+            malformedRequest:
+              summary: Malformed JSON or a missing/non-string model
+              value:
+                error:
+                  message: Invalid request
+                  type: new_api_error
+                  code: ""
+            invalidParameter:
+              summary: Seed Dance parameter validation failed
+              value:
+                error:
+                  message: duration must be between 1 and 15
+                  type: invalid_request_error
+                  code: invalid_duration
     BadRequest:
       description: The request failed validation.
       content:
@@ -176,8 +196,43 @@ components:
               message: duration must be between 1 and 15
               type: invalid_request_error
               code: invalid_duration
+    SubmitUnauthorized:
+      description: |
+        Client authentication failed, or the upstream generate request returned
+        HTTP 401. These cases intentionally preserve their distinct runtime
+        error types and codes.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          examples:
+            clientAuthentication:
+              summary: Invalid New API client credential
+              value:
+                error:
+                  message: Invalid API key
+                  type: new_api_error
+                  code: ""
+            upstreamAuthentication:
+              summary: The Seed Dance provider rejected its stored credential
+              value:
+                error:
+                  message: Upstream authentication failed
+                  type: invalid_request_error
+                  code: upstream_authentication_error
+    SubmitForbidden:
+      description: The upstream generate request returned HTTP 403.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          example:
+            error:
+              message: Upstream authentication failed
+              type: invalid_request_error
+              code: upstream_authentication_error
     Unauthorized:
-      description: Authentication failed.
+      description: New API client authentication failed.
       content:
         application/json:
           schema:
@@ -220,16 +275,66 @@ components:
               message: Upstream rate limit exceeded
               type: upstream_rate_limit_error
               code: upstream_rate_limit_error
-    UpstreamError:
-      description: The upstream provider returned an invalid response or error.
+    SubmitOutcomeUnknown:
+      description: |
+        The generate request had an ambiguous outcome, including connection
+        interruption, timeout, upstream 502/503/504, or a lost response. New
+        API returns HTTP 502 and does not retry automatically because a paid
+        upstream task might already exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          examples:
+            outcomeUnknown:
+              summary: The paid-task creation outcome cannot be determined safely
+              value:
+                error:
+                  message: Seed Dance submit outcome is unknown
+                  type: server_error
+                  code: seedance_submit_outcome_unknown
+            businessFailure:
+              summary: HTTP 200 carried an explicit provider business failure
+              value:
+                error:
+                  message: Upstream video service rejected the task
+                  type: server_error
+                  code: upstream_error
+    ModelUnavailable:
+      description: No enabled channel can route the requested model.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/OpenAIError"
           example:
             error:
-              message: Upstream video service error
-              type: upstream_error
+              message: The model seedance-uncensored has no available channel
+              type: new_api_error
+              code: model_not_found
+    TaskReadError:
+      description: The persisted task snapshot could not be read.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          example:
+            error:
+              message: Failed to get video task
+              type: server_error
+              code: get_task_failed
+    ContentUpstreamError:
+      description: |
+        The content proxy could not restore its channel state, connect to the
+        provider, or validate the provider JSON, Base64, or MP4 response.
+        Runtime error codes distinguish these cases.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          example:
+            error:
+              message: Invalid upstream video response
+              type: invalid_upstream_response
               code: invalid_upstream_response
     UpstreamTimeout:
       description: The upstream provider did not complete within the deadline.
@@ -245,28 +350,38 @@ components:
   schemas:
     VideoCreateJSON:
       type: object
-      additionalProperties: false
       required:
         - model
         - prompt
       properties:
         model:
           type: string
+          enum:
+            - seedance-uncensored
           description: Model routed to the Seed Dance channel.
           example: seedance-uncensored
         prompt:
           type: string
-          description: Video-generation prompt.
+          minLength: 1
+          pattern: "\\S"
+          description: Video-generation prompt; it must remain non-empty after trimming.
           example: TEST_PROMPT
         duration:
-          type: integer
-          minimum: 1
-          maximum: 15
+          oneOf:
+            - type: integer
+              minimum: 1
+              maximum: 15
+            - type: string
+              pattern: "^[0-9]+$"
           default: 15
-          description: Requested duration in seconds.
+          description: |
+            Requested duration in seconds. Decimal digit strings are parsed as
+            integers and the parsed value must be between 1 and 15.
           example: 10
         seconds:
-          description: Alias for duration.
+          description: |
+            Alias for duration. Decimal digit strings are parsed as integers
+            and the parsed value must be between 1 and 15.
           oneOf:
             - type: integer
               minimum: 1
@@ -279,11 +394,16 @@ components:
           enum:
             - 854x480
             - 480x854
+            - 480P
             - 1280x720
             - 720x1280
+            - 720P
             - 1920x1080
             - 1080x1920
-          description: Output dimensions.
+            - 1080P
+          description: |
+            Output-resolution alias. Runtime matching trims surrounding
+            whitespace and is case-insensitive. Text-to-video rejects 480P.
           example: 1280x720
         image:
           type: string
@@ -305,10 +425,11 @@ components:
           $ref: "#/components/schemas/VideoMetadata"
     VideoMetadata:
       type: object
-      additionalProperties: false
       properties:
         duration:
-          description: Duration alias inside metadata.
+          description: |
+            Duration alias inside metadata. Decimal digit strings are parsed as
+            integers and the parsed value must be between 1 and 15.
           oneOf:
             - type: integer
               minimum: 1
@@ -319,9 +440,18 @@ components:
         resolution:
           type: string
           enum:
+            - 854x480
+            - 480x854
             - 480P
+            - 1280x720
+            - 720x1280
             - 720P
+            - 1920x1080
+            - 1080x1920
             - 1080P
+          description: |
+            Uses the same nine aliases, whitespace trimming, and
+            case-insensitive matching as the top-level size field.
           example: 720P
         image_base64:
           type: string
@@ -329,55 +459,80 @@ components:
           example: IMAGE_DATA_PLACEHOLDER
         prompt_optimization:
           type: boolean
-          default: false
+          description: Omitted from the upstream request when not supplied.
         multi_shot:
           type: boolean
-          default: false
+          description: Omitted from the upstream request when not supplied.
         strict_duration:
           type: boolean
-          default: false
+          description: Omitted from the upstream request when not supplied.
         negative_prompt:
           type: string
           example: TEST_NEGATIVE_PROMPT
     VideoCreateMultipart:
       type: object
-      additionalProperties: false
       required:
         - model
         - prompt
       properties:
         model:
           type: string
+          enum:
+            - seedance-uncensored
           example: seedance-uncensored
         prompt:
           type: string
+          minLength: 1
+          pattern: "\\S"
           example: TEST_PROMPT
         duration:
           type: string
           pattern: "^[0-9]+$"
+          description: Decimal digits whose parsed value must be between 1 and 15.
           example: "10"
         seconds:
           type: string
           pattern: "^[0-9]+$"
+          description: Decimal-digit alias whose parsed value must be between 1 and 15.
           example: "10"
         size:
           type: string
           enum:
             - 854x480
             - 480x854
+            - 480P
             - 1280x720
             - 720x1280
+            - 720P
             - 1920x1080
             - 1080x1920
+            - 1080P
+          description: |
+            Runtime matching trims surrounding whitespace and is
+            case-insensitive. Text-to-video rejects 480P.
           example: 1280x720
         metadata:
           type: string
           description: JSON-encoded VideoMetadata object.
           example: '{"prompt_optimization":"false","multi_shot":"false","strict_duration":"true","negative_prompt":""}'
-        input_reference:
+        image:
           type: string
-          format: binary
-          description: JPG or PNG reference image.
+          description: Text image reference using pure Base64, a supported data URI, or an HTTP(S) URL.
+          example: IMAGE_REFERENCE
+        images:
+          type: string
+          description: |
+            A text image reference, a JSON-encoded single-item array, or one
+            repeated text part. The normalized request may contain one image.
+          example: '["IMAGE_REFERENCE"]'
+        input_reference:
+          description: Text image reference or a JPG/PNG file part.
+          anyOf:
+            - type: string
+              description: Pure Base64, supported data URI, or HTTP(S) URL.
+            - type: string
+              format: binary
+              description: JPG or PNG reference image file.
     OpenAIVideo:
       type: object
       required:
@@ -405,6 +560,8 @@ components:
           example: video
         model:
           type: string
+          enum:
+            - seedance-uncensored
           example: seedance-uncensored
         status:
           type: string
@@ -426,7 +583,7 @@ components:
         completed_at:
           type: integer
           format: int64
-          nullable: true
+          description: Present only when status is completed or failed.
           example: 1753372810
         expires_at:
           type: integer
