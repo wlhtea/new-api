@@ -1,0 +1,5 @@
+{
+  "requestId": "REQUEST_ID",
+  "task_id": "UPSTREAM_TASK_ID",
+  "status": "processing"
+}
