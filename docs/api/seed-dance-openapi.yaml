@@ -45,7 +45,7 @@ paths:
               prompt: TEST_PROMPT
               duration: "10"
               size: 1280x720
-              metadata: '{"strict_duration":false}'
+              metadata: '{"prompt_optimization":"false","multi_shot":"false","strict_duration":"true","negative_prompt":""}'
               input_reference: FILE_BYTES
       responses:
         "200":
@@ -71,7 +71,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "429":
-          $ref: "#/components/responses/RateLimited"
+          $ref: "#/components/responses/TaskRateLimited"
         "502":
           $ref: "#/components/responses/UpstreamError"
         "504":
@@ -109,7 +109,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "429":
-          $ref: "#/components/responses/RateLimited"
+          $ref: "#/components/responses/TaskRateLimited"
         "502":
           $ref: "#/components/responses/UpstreamError"
         "504":
@@ -144,7 +144,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "429":
-          $ref: "#/components/responses/RateLimited"
+          $ref: "#/components/responses/ContentRateLimited"
         "502":
           $ref: "#/components/responses/UpstreamError"
         "504":
@@ -185,8 +185,8 @@ components:
           example:
             error:
               message: Invalid API key
-              type: authentication_error
-              code: invalid_api_key
+              type: new_api_error
+              code: ""
     NotFound:
       description: The public task does not exist or is not owned by the caller.
       content:
@@ -198,8 +198,8 @@ components:
               message: Video task not found
               type: invalid_request_error
               code: task_not_found
-    RateLimited:
-      description: The request was rate limited.
+    TaskRateLimited:
+      description: The video task request was rate limited.
       content:
         application/json:
           schema:
@@ -207,6 +207,17 @@ components:
           example:
             error:
               message: Too many requests
+              type: rate_limit_error
+              code: upstream_rate_limit_error
+    ContentRateLimited:
+      description: The upstream video-content request was rate limited.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+          example:
+            error:
+              message: Upstream rate limit exceeded
               type: upstream_rate_limit_error
               code: upstream_rate_limit_error
     UpstreamError:
@@ -362,7 +373,7 @@ components:
         metadata:
           type: string
           description: JSON-encoded VideoMetadata object.
-          example: '{"strict_duration":false}'
+          example: '{"prompt_optimization":"false","multi_shot":"false","strict_duration":"true","negative_prompt":""}'
         input_reference:
           type: string
           format: binary

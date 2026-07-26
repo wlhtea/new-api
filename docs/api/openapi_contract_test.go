@@ -31,6 +31,8 @@ func TestSeedDanceStandaloneOpenAPIContract(t *testing.T) {
 	assert.Equal(t, "API key", stringAt(t, bearerAuth, "bearerFormat"))
 	assertVideoOperations(t, doc)
 	assertSeedDanceResponseExamples(t, doc)
+	assertSeedDanceMultipartMetadataExample(t, doc)
+	assertSeedDanceErrorExamples(t, doc)
 	assertLocalRefsResolve(t, doc)
 	assertExamplesMatchBasicSchema(t, doc)
 }
@@ -67,6 +69,140 @@ func assertSeedDanceResponseExamples(t *testing.T, document map[string]any) {
 	)
 	assert.Equal(t, "in_progress", stringAt(t, statusExample, "status"))
 	assert.Equal(t, float64(30), numberAt(t, statusExample, "progress"))
+}
+
+func assertSeedDanceMultipartMetadataExample(t *testing.T, document map[string]any) {
+	t.Helper()
+
+	multipart := objectAt(
+		t,
+		document,
+		"paths",
+		"/v1/videos",
+		"post",
+		"requestBody",
+		"content",
+		"multipart/form-data",
+	)
+	metadataText := stringAt(t, objectAt(t, multipart, "example"), "metadata")
+	assertMultipartMetadataTextBooleans(t, metadataText)
+	assertMultipartMetadataTextBooleans(
+		t,
+		stringAt(
+			t,
+			document,
+			"components",
+			"schemas",
+			"VideoCreateMultipart",
+			"properties",
+			"metadata",
+			"example",
+		),
+	)
+}
+
+func assertMultipartMetadataTextBooleans(t *testing.T, metadataText string) {
+	t.Helper()
+
+	var metadata map[string]any
+	require.NoError(t, common.Unmarshal([]byte(metadataText), &metadata))
+	for _, field := range []string{
+		"prompt_optimization",
+		"multi_shot",
+		"strict_duration",
+	} {
+		value, ok := metadata[field].(string)
+		require.True(t, ok, "multipart metadata %s must be a JSON string", field)
+		assert.Contains(t, []string{"true", "false"}, value)
+	}
+}
+
+func assertSeedDanceErrorExamples(t *testing.T, document map[string]any) {
+	t.Helper()
+
+	unauthorized := resolvedOperationResponse(
+		t,
+		document,
+		"/v1/videos",
+		"post",
+		"401",
+	)
+	unauthorizedError := objectAt(
+		t,
+		unauthorized,
+		"content",
+		"application/json",
+		"example",
+		"error",
+	)
+	assert.Equal(t, "new_api_error", stringAt(t, unauthorizedError, "type"))
+	assert.Equal(t, "", stringAt(t, unauthorizedError, "code"))
+
+	for _, path := range []string{
+		"/v1/videos",
+		"/v1/videos/{task_id}",
+	} {
+		rateLimited := resolvedOperationResponse(t, document, path, map[string]string{
+			"/v1/videos":           "post",
+			"/v1/videos/{task_id}": "get",
+		}[path], "429")
+		rateError := objectAt(
+			t,
+			rateLimited,
+			"content",
+			"application/json",
+			"example",
+			"error",
+		)
+		assert.Equal(t, "rate_limit_error", stringAt(t, rateError, "type"))
+		assert.Equal(t, "upstream_rate_limit_error", stringAt(t, rateError, "code"))
+	}
+
+	contentRateLimited := resolvedOperationResponse(
+		t,
+		document,
+		"/v1/videos/{task_id}/content",
+		"get",
+		"429",
+	)
+	contentRateError := objectAt(
+		t,
+		contentRateLimited,
+		"content",
+		"application/json",
+		"example",
+		"error",
+	)
+	assert.Equal(
+		t,
+		"upstream_rate_limit_error",
+		stringAt(t, contentRateError, "type"),
+	)
+	assert.Equal(
+		t,
+		"upstream_rate_limit_error",
+		stringAt(t, contentRateError, "code"),
+	)
+}
+
+func resolvedOperationResponse(
+	t *testing.T,
+	document map[string]any,
+	path string,
+	method string,
+	status string,
+) map[string]any {
+	t.Helper()
+
+	response := responseAt(
+		t,
+		objectAt(t, document, "paths", path, method),
+		status,
+	)
+	if ref, ok := response["$ref"].(string); ok {
+		return resolveRef(t, document, ref)
+	}
+	return response
 }
 
 func TestSeedDanceFixturesAreSanitizedContracts(t *testing.T) {
