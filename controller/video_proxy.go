@@ -57,6 +57,26 @@ func videoProxyError(c *gin.Context, status int, errType, code, message string) 
 	})
 }
 
+func validVideoContentError(err *channel.VideoContentError) bool {
+	return err != nil &&
+		err.StatusCode >= http.StatusBadRequest &&
+		err.StatusCode <= 599 &&
+		strings.TrimSpace(err.Type) != "" &&
+		strings.TrimSpace(err.Code) != "" &&
+		strings.TrimSpace(err.Message) != ""
+}
+
+func videoContentFetchFailure(c *gin.Context, logMessage string) {
+	logger.LogError(c, logMessage)
+	videoProxyError(
+		c,
+		http.StatusBadGateway,
+		"upstream_error",
+		"upstream_connection_error",
+		"failed to fetch video content",
+	)
+}
+
 func VideoProxy(c *gin.Context) {
 	taskID := c.Param("task_id")
 	if taskID == "" {
@@ -112,19 +132,24 @@ func VideoProxy(c *gin.Context) {
 			}
 			var structured *channel.VideoContentError
 			if errors.As(fetchErr, &structured) && structured != nil {
-				if structured.Cause != nil {
-					logger.LogError(c, structured.Cause.Error())
+				if !validVideoContentError(structured) {
+					videoContentFetchFailure(c, "video content fetch returned a malformed structured error")
+					return
 				}
+				logger.LogError(c, "video content fetch failed with a structured upstream error")
 				videoProxyError(c, structured.StatusCode, structured.Type, structured.Code, structured.Message)
 				return
 			}
-			logger.LogError(c, fetchErr.Error())
-			videoProxyError(c, http.StatusBadGateway, "upstream_error", "upstream_connection_error", "failed to fetch video content")
+			videoContentFetchFailure(c, "video content fetch failed")
 			return
 		}
 		if content == nil || content.Body == nil {
-			logger.LogError(c, "video content fetch returned an empty body")
-			videoProxyError(c, http.StatusBadGateway, "upstream_error", "upstream_connection_error", "failed to fetch video content")
+			videoContentFetchFailure(c, "video content fetch returned an empty body")
+			return
+		}
+		if content.ContentLength < 0 {
+			_ = content.Body.Close()
+			videoContentFetchFailure(c, "video content fetch returned an invalid content length")
 			return
 		}
 		defer content.Body.Close()

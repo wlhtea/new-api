@@ -210,6 +210,22 @@ func decodeOpenAIVideoError(t *testing.T, body []byte) openAIVideoErrorResponse 
 	return response
 }
 
+func captureVideoProxyErrorLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	buffer := &bytes.Buffer{}
+	common.LogWriterMu.Lock()
+	previous := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = buffer
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = previous
+		common.LogWriterMu.Unlock()
+	})
+	return buffer
+}
+
 func TestVideoProxyMissingTaskUsesNestedNotFound(t *testing.T) {
 	setupVideoProxyDB(t)
 	writer := newTrackingWriter()
@@ -436,6 +452,178 @@ func TestVideoProxyPlainFetchErrorIsSanitizedBeforeAny200(t *testing.T) {
 	assert.NotContains(t, writer.Body.String(), "PROVIDER_PRIVATE_DETAIL")
 	assert.NotContains(t, writer.Body.String(), "STORED_KEY")
 	assert.NotContains(t, writer.Body.String(), "UPSTREAM_PRIVATE")
+}
+
+func TestVideoProxyFetchErrorsDoNotLogStoredCredentialsOrUpstreamTaskIDs(t *testing.T) {
+	tests := []struct {
+		name       string
+		fetchError error
+	}{
+		{
+			name: "structured error",
+			fetchError: &channel.VideoContentError{
+				StatusCode: http.StatusBadGateway,
+				Type:       "upstream_error",
+				Code:       "upstream_connection_error",
+				Message:    "failed to fetch video content",
+				Cause: errors.New(
+					`Get "https://seedance.fixture/video/UPSTREAM_PRIVATE?key=STORED_KEY": connection reset`,
+				),
+			},
+		},
+		{
+			name: "plain error",
+			fetchError: errors.New(
+				`Get "https://seedance.fixture/video/UPSTREAM_PRIVATE?key=STORED_KEY": connection reset`,
+			),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupVideoProxyDB(t)
+			createVideoProxyChannel(
+				t, db, 501, constant.ChannelTypeSeedDance,
+				"STORED_KEY", "https://seedance.fixture", "",
+			)
+			createVideoProxyTask(
+				t, db, "task_private_log", 41, 501, constant.TaskPlatform("59"),
+				model.TaskStatusSuccess, "STORED_KEY", "UPSTREAM_PRIVATE", "",
+			)
+			fetcher := &videoProxyFetcherFixture{
+				fetch: func(context.Context, string, string, string, string) (*channel.VideoContent, error) {
+					return nil, test.fetchError
+				},
+			}
+			logs := captureVideoProxyErrorLogs(t)
+			writer := newTrackingWriter()
+			ctx := newVideoProxyContext(
+				writer,
+				"/v1/videos/task_private_log/content",
+				"task_private_log",
+				41,
+			)
+			ctx.Set(videoProxyTaskAdaptorLookupContextKey, videoProxyTaskAdaptorLookupFunc(
+				func(constant.TaskPlatform) channel.TaskAdaptor { return fetcher },
+			))
+
+			VideoProxy(ctx)
+
+			require.Equal(t, http.StatusBadGateway, writer.Code)
+			assert.NotContains(t, logs.String(), "STORED_KEY")
+			assert.NotContains(t, logs.String(), "UPSTREAM_PRIVATE")
+			assert.NotContains(t, writer.Body.String(), "STORED_KEY")
+			assert.NotContains(t, writer.Body.String(), "UPSTREAM_PRIVATE")
+		})
+	}
+}
+
+func TestVideoProxyMalformedFetcherResultsFailClosedBeforeAny200(t *testing.T) {
+	tests := []struct {
+		name        string
+		fetchResult func(*videoProxyReadCloser) (*channel.VideoContent, error)
+	}{
+		{
+			name: "zero structured status",
+			fetchResult: func(body *videoProxyReadCloser) (*channel.VideoContent, error) {
+				return &channel.VideoContent{Body: body}, &channel.VideoContentError{
+					Type:    "upstream_error",
+					Code:    "upstream_connection_error",
+					Message: "failed to fetch video content",
+				}
+			},
+		},
+		{
+			name: "non-error structured status",
+			fetchResult: func(body *videoProxyReadCloser) (*channel.VideoContent, error) {
+				return &channel.VideoContent{Body: body}, &channel.VideoContentError{
+					StatusCode: http.StatusOK,
+					Type:       "upstream_error",
+					Code:       "upstream_connection_error",
+					Message:    "failed to fetch video content",
+				}
+			},
+		},
+		{
+			name: "blank structured type",
+			fetchResult: func(body *videoProxyReadCloser) (*channel.VideoContent, error) {
+				return &channel.VideoContent{Body: body}, &channel.VideoContentError{
+					StatusCode: http.StatusBadGateway,
+					Code:       "upstream_connection_error",
+					Message:    "failed to fetch video content",
+				}
+			},
+		},
+		{
+			name: "blank structured code",
+			fetchResult: func(body *videoProxyReadCloser) (*channel.VideoContent, error) {
+				return &channel.VideoContent{Body: body}, &channel.VideoContentError{
+					StatusCode: http.StatusBadGateway,
+					Type:       "upstream_error",
+					Message:    "failed to fetch video content",
+				}
+			},
+		},
+		{
+			name: "blank structured message",
+			fetchResult: func(body *videoProxyReadCloser) (*channel.VideoContent, error) {
+				return &channel.VideoContent{Body: body}, &channel.VideoContentError{
+					StatusCode: http.StatusBadGateway,
+					Type:       "upstream_error",
+					Code:       "upstream_connection_error",
+				}
+			},
+		},
+		{
+			name: "negative content length",
+			fetchResult: func(body *videoProxyReadCloser) (*channel.VideoContent, error) {
+				return &channel.VideoContent{
+					ContentLength: -1,
+					Body:          body,
+				}, nil
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupVideoProxyDB(t)
+			createVideoProxyChannel(
+				t, db, 501, constant.ChannelTypeSeedDance,
+				"STORED_KEY", "https://seedance.fixture", "",
+			)
+			createVideoProxyTask(
+				t, db, "task_malformed_fetch", 41, 501, constant.TaskPlatform("59"),
+				model.TaskStatusSuccess, "STORED_KEY", "UPSTREAM_PRIVATE", "",
+			)
+			body := &videoProxyReadCloser{Reader: strings.NewReader("unused")}
+			fetcher := &videoProxyFetcherFixture{
+				fetch: func(context.Context, string, string, string, string) (*channel.VideoContent, error) {
+					return test.fetchResult(body)
+				},
+			}
+			writer := newTrackingWriter()
+			ctx := newVideoProxyContext(
+				writer,
+				"/v1/videos/task_malformed_fetch/content",
+				"task_malformed_fetch",
+				41,
+			)
+			ctx.Set(videoProxyTaskAdaptorLookupContextKey, videoProxyTaskAdaptorLookupFunc(
+				func(constant.TaskPlatform) channel.TaskAdaptor { return fetcher },
+			))
+
+			VideoProxy(ctx)
+
+			require.Equal(t, http.StatusBadGateway, writer.Code)
+			require.Equal(t, []int{http.StatusBadGateway}, writer.statusCodes)
+			response := decodeOpenAIVideoError(t, writer.Body.Bytes())
+			assert.Equal(t, "upstream_error", response.Error.Type)
+			assert.Equal(t, "upstream_connection_error", response.Error.Code)
+			assert.Equal(t, "failed to fetch video content", response.Error.Message)
+			assert.Equal(t, 1, body.closeCalls)
+		})
+	}
 }
 
 func TestVideoProxyFetchErrorClosesReturnedBody(t *testing.T) {
