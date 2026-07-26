@@ -718,9 +718,8 @@ func TestExtractVideoBase64JSONBusinessState(t *testing.T) {
 			input: `{"success":true,"errCode":"  ","video_base64":"QQ=="}`,
 		},
 		{
-			name:            "missing success",
-			input:           `{"status":"completed","video_base64":"QQ=="}`,
-			wantBusinessErr: errInvalidContentBusinessEnvelope,
+			name:  "provider response without success",
+			input: `{"requestId":"REQUEST_ID","video_base64":"QQ=="}`,
 		},
 		{
 			name:           "success has wrong type",
@@ -1017,6 +1016,34 @@ func TestFetchVideoContent(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, validVideo, body)
 		require.NoError(t, content.Body.Close())
+		require.NoError(t, content.Body.Close())
+		requireContentTempDirEmpty(t, directory)
+	})
+
+	t.Run("HTTP 200 provider envelope without success flag", func(t *testing.T) {
+		directory := useContentTempDir(t)
+		upstream := httptest.NewServer(http.HandlerFunc(func(
+			writer http.ResponseWriter,
+			_ *http.Request,
+		) {
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(
+				writer,
+				`{"requestId":"REQUEST_ID","video_base64":"`+validEncoded+`"}`,
+			)
+		}))
+		defer upstream.Close()
+
+		content, err := newContentTestFetcher(directory).FetchVideoContent(
+			context.Background(), upstream.URL, "TEST_KEY", "UPSTREAM_TASK_ID", "",
+		)
+		require.NoError(t, err)
+		require.NotNil(t, content)
+		assert.Equal(t, int64(len(validVideo)), content.ContentLength)
+
+		body, err := io.ReadAll(content.Body)
+		require.NoError(t, err)
+		assert.Equal(t, validVideo, body)
 		require.NoError(t, content.Body.Close())
 		requireContentTempDirEmpty(t, directory)
 	})
@@ -1611,11 +1638,6 @@ func TestFetchVideoContentBusinessCauseContract(t *testing.T) {
 			name:      "nonzero errCode",
 			response:  `{"success":true,"errCode":"RATE_LIMIT","video_base64":"` + validEncoded + `"}`,
 			wantCause: errContentBusinessFailure,
-		},
-		{
-			name:      "missing success",
-			response:  `{"status":"completed","video_base64":"` + validEncoded + `"}`,
-			wantCause: errInvalidContentBusinessEnvelope,
 		},
 		{
 			name:      "invalid success shape",

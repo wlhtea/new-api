@@ -689,10 +689,23 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(
 	video.Status = originTask.Status.ToVideoStatus()
 	video.SetProgressStr(originTask.Progress)
 	video.CreatedAt = originTask.CreatedAt
-	if originTask.FinishTime > 0 {
-		video.CompletedAt = originTask.FinishTime
-	} else if originTask.UpdatedAt > 0 {
-		video.CompletedAt = originTask.UpdatedAt
+	if originTask.Status == model.TaskStatusSuccess ||
+		originTask.Status == model.TaskStatusFailure {
+		if originTask.FinishTime > 0 {
+			video.CompletedAt = originTask.FinishTime
+		} else if originTask.UpdatedAt > 0 {
+			video.CompletedAt = originTask.UpdatedAt
+		}
+	}
+	if originTask.Status == model.TaskStatusFailure {
+		message := strings.TrimSpace(originTask.FailReason)
+		if message == "" {
+			message = "video generation failed"
+		}
+		video.Error = &dto.OpenAIVideoError{
+			Code:    "task_failed",
+			Message: common.MaskSensitiveInfo(message),
+		}
 	}
 
 	if billing := originTask.PrivateData.BillingContext; billing != nil {
