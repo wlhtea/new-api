@@ -155,6 +155,7 @@ import {
   transformChannelToFormDefaults,
   type ChannelFormValues,
   deduplicateKeys,
+  getChannelTypeCreateDefaults,
   getChannelTypeIcon,
   getKeyPromptForType,
   parseModelsString,
@@ -958,7 +959,7 @@ export function ChannelMutateDrawer({
   )
   const advancedHaveErrors =
     hasAdvancedSettingsErrors(formErrors) || Boolean(formErrors.advanced_custom)
-  const providerRequiresBaseUrl = [3, 8, 36, 45].includes(currentType)
+  const providerRequiresBaseUrl = [3, 8, 36, 45, 59].includes(currentType)
   const providerRequiresOther = [3, 18, 21, 39, 41, 49].includes(currentType)
   const identityComplete = Boolean(currentName?.trim() && currentType > 0)
   const credentialsComplete = Boolean(
@@ -1266,6 +1267,18 @@ export function ChannelMutateDrawer({
       if (!currentBaseUrlValue || currentBaseUrlValue === '') {
         form.setValue('base_url', 'https://ark.cn-beijing.volces.com')
       }
+    }
+
+    if (currentType === 59) {
+      const defaults = getChannelTypeCreateDefaults(59)
+      form.setValue('base_url', defaults.baseUrl, {
+        shouldDirty: true,
+        shouldValidate: true,
+      })
+      form.setValue('models', defaults.models, {
+        shouldDirty: true,
+        shouldValidate: true,
+      })
     }
 
     // Type 18 (Xunfei) - set default other (version)
