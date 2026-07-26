@@ -313,10 +313,9 @@ func (t *zeroJSONNumberTracker) IsZero() bool {
 }
 
 func validateContentBusinessState(state contentBusinessState) error {
-	if !state.successSeen {
-		return errInvalidContentBusinessEnvelope
-	}
-	if !state.success || state.statusFailed || state.errCodeNonZero {
+	if state.successSeen && !state.success ||
+		state.statusFailed ||
+		state.errCodeNonZero {
 		return errContentBusinessFailure
 	}
 	return nil

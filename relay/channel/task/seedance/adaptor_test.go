@@ -911,3 +911,49 @@ func TestSeedDanceTaskAdaptorConvertToOpenAIVideoUsesPublicFieldsAndBillingSnaps
 	assert.NotContains(t, string(encoded), "SECRET_BASE64")
 	assert.NotContains(t, string(encoded), "SECRET_SIZE")
 }
+
+func TestSeedDanceTaskAdaptorConvertToOpenAIVideoOmitsCompletedAtUntilTerminal(
+	t *testing.T,
+) {
+	task := &model.Task{
+		TaskID:    "PUBLIC_TASK_ID",
+		Status:    model.TaskStatusQueued,
+		Progress:  "10%",
+		CreatedAt: 100,
+		UpdatedAt: 101,
+	}
+
+	encoded, err := (&TaskAdaptor{}).ConvertToOpenAIVideo(task)
+	require.NoError(t, err)
+
+	var video dto.OpenAIVideo
+	require.NoError(t, common.Unmarshal(encoded, &video))
+	assert.Equal(t, dto.VideoStatusQueued, video.Status)
+	assert.Zero(t, video.CompletedAt)
+	assert.NotContains(t, string(encoded), `"completed_at"`)
+}
+
+func TestSeedDanceTaskAdaptorConvertToOpenAIVideoIncludesTerminalFailure(
+	t *testing.T,
+) {
+	task := &model.Task{
+		TaskID:     "PUBLIC_TASK_ID",
+		Status:     model.TaskStatusFailure,
+		Progress:   "100%",
+		CreatedAt:  100,
+		UpdatedAt:  199,
+		FinishTime: 200,
+		FailReason: "provider rejected the request",
+	}
+
+	encoded, err := (&TaskAdaptor{}).ConvertToOpenAIVideo(task)
+	require.NoError(t, err)
+
+	var video dto.OpenAIVideo
+	require.NoError(t, common.Unmarshal(encoded, &video))
+	assert.Equal(t, dto.VideoStatusFailed, video.Status)
+	assert.Equal(t, int64(200), video.CompletedAt)
+	require.NotNil(t, video.Error)
+	assert.Equal(t, "task_failed", video.Error.Code)
+	assert.Equal(t, "provider rejected the request", video.Error.Message)
+}
