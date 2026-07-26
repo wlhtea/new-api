@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,43 +24,285 @@ import (
 var _ channel.VideoContentFetcher = (*TaskAdaptor)(nil)
 
 var errContentTrackingReader = errors.New("content tracking reader stopped")
+var errContentTestWriter = errors.New("content test writer stopped")
 
-type contentTrackingReadSeeker struct {
-	reader    *bytes.Reader
-	failAfter int64
-	read      int64
+type failAfterWriter struct {
+	remaining int
 	err       error
 }
 
-func (r *contentTrackingReadSeeker) Read(p []byte) (int, error) {
-	if r.read >= r.failAfter {
-		return 0, r.err
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, w.err
 	}
-	remaining := r.failAfter - r.read
-	if int64(len(p)) > remaining {
-		p = p[:remaining]
+	if len(p) > w.remaining {
+		written := w.remaining
+		w.remaining = 0
+		return written, w.err
+	}
+	w.remaining -= len(p)
+	return len(p), nil
+}
+
+type dataAndErrorReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *dataAndErrorReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	return copy(p, r.data), r.err
+}
+
+type contentTestReadCloser struct {
+	reader     io.Reader
+	closeErr   error
+	closeCalls int
+}
+
+func (r *contentTestReadCloser) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+
+func (r *contentTestReadCloser) Close() error {
+	r.closeCalls++
+	return r.closeErr
+}
+
+type controlledBase64ReadSeeker struct {
+	reader           *bytes.Reader
+	maxChunk         int
+	failAfterDecode  int64
+	decodeBytesRead  int64
+	decodeMode       bool
+	zeroSeeks        int
+	pendingErr       error
+	maxRequested     int
+	totalDecodeReads int
+}
+
+func newControlledBase64ReadSeeker(
+	input string,
+	maxChunk int,
+	failAfterDecode int64,
+	pendingErr error,
+) *controlledBase64ReadSeeker {
+	return &controlledBase64ReadSeeker{
+		reader:          bytes.NewReader([]byte(input)),
+		maxChunk:        maxChunk,
+		failAfterDecode: failAfterDecode,
+		pendingErr:      pendingErr,
+	}
+}
+
+func (r *controlledBase64ReadSeeker) Read(p []byte) (int, error) {
+	if len(p) > r.maxRequested {
+		r.maxRequested = len(p)
+	}
+	if r.decodeMode {
+		r.totalDecodeReads++
+	}
+	if r.maxChunk > 0 && len(p) > r.maxChunk {
+		p = p[:r.maxChunk]
+	}
+	if r.decodeMode && r.pendingErr != nil && r.failAfterDecode >= 0 {
+		remaining := r.failAfterDecode - r.decodeBytesRead
+		if remaining <= 0 {
+			err := r.pendingErr
+			r.pendingErr = nil
+			return 0, err
+		}
+		if int64(len(p)) > remaining {
+			p = p[:remaining]
+		}
 	}
 	n, err := r.reader.Read(p)
-	r.read += int64(n)
-	if n > 0 {
-		return n, nil
+	if r.decodeMode {
+		r.decodeBytesRead += int64(n)
+		if r.pendingErr != nil &&
+			r.failAfterDecode >= 0 &&
+			r.decodeBytesRead >= r.failAfterDecode {
+			deferred := r.pendingErr
+			r.pendingErr = nil
+			return n, deferred
+		}
 	}
 	return n, err
 }
 
-func (r *contentTrackingReadSeeker) Seek(offset int64, whence int) (int64, error) {
-	return r.reader.Seek(offset, whence)
+func (r *controlledBase64ReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	position, err := r.reader.Seek(offset, whence)
+	if err == nil && offset == 0 && whence == io.SeekStart && position == 0 {
+		r.zeroSeeks++
+		if r.zeroSeeks >= 2 {
+			r.decodeMode = true
+			r.decodeBytesRead = 0
+		}
+	}
+	return position, err
+}
+
+type lazyNestedJSONReader struct {
+	prefixOffset int
+	opensLeft    int64
+	middleDone   bool
+	closesLeft   int64
+	suffixOffset int
+	totalRead    int64
+	maxRead      int
+}
+
+func newLazyNestedJSONReader(depth int64) *lazyNestedJSONReader {
+	return &lazyNestedJSONReader{
+		opensLeft:  depth,
+		closesLeft: depth,
+	}
+}
+
+func (r *lazyNestedJSONReader) Read(p []byte) (int, error) {
+	const prefix = `{"nested":`
+	const suffix = `,"video_base64":"QQ=="}`
+	requested := len(p)
+	written := 0
+	for written < len(p) {
+		switch {
+		case r.prefixOffset < len(prefix):
+			count := copy(p[written:], prefix[r.prefixOffset:])
+			r.prefixOffset += count
+			written += count
+		case r.opensLeft > 0:
+			p[written] = '['
+			r.opensLeft--
+			written++
+		case !r.middleDone:
+			p[written] = '0'
+			r.middleDone = true
+			written++
+		case r.closesLeft > 0:
+			p[written] = ']'
+			r.closesLeft--
+			written++
+		case r.suffixOffset < len(suffix):
+			count := copy(p[written:], suffix[r.suffixOffset:])
+			r.suffixOffset += count
+			written += count
+		default:
+			r.totalRead += int64(written)
+			if requested > r.maxRead {
+				r.maxRead = requested
+			}
+			if written == 0 {
+				return 0, io.EOF
+			}
+			return written, nil
+		}
+	}
+	r.totalRead += int64(written)
+	if requested > r.maxRead {
+		r.maxRead = requested
+	}
+	return written, nil
+}
+
+type lazyBusinessJSONReader struct {
+	prefixOffset int
+	dataLeft     int64
+	suffixOffset int
+	totalRead    int64
+	maxRead      int
+}
+
+func newLazyBusinessJSONReader(dataBytes int64) *lazyBusinessJSONReader {
+	return &lazyBusinessJSONReader{dataLeft: dataBytes}
+}
+
+func (r *lazyBusinessJSONReader) Read(p []byte) (int, error) {
+	const prefix = `{"success":true,"data":"`
+	const suffix = `","requestId":"IGNORED","message":"IGNORED","video_base64":"QQ=="}`
+	requested := len(p)
+	written := 0
+	for written < len(p) {
+		switch {
+		case r.prefixOffset < len(prefix):
+			count := copy(p[written:], prefix[r.prefixOffset:])
+			r.prefixOffset += count
+			written += count
+		case r.dataLeft > 0:
+			count := len(p) - written
+			if int64(count) > r.dataLeft {
+				count = int(r.dataLeft)
+			}
+			for index := 0; index < count; index++ {
+				p[written+index] = 'A'
+			}
+			r.dataLeft -= int64(count)
+			written += count
+		case r.suffixOffset < len(suffix):
+			count := copy(p[written:], suffix[r.suffixOffset:])
+			r.suffixOffset += count
+			written += count
+		default:
+			r.totalRead += int64(written)
+			if requested > r.maxRead {
+				r.maxRead = requested
+			}
+			if written == 0 {
+				return 0, io.EOF
+			}
+			return written, nil
+		}
+	}
+	r.totalRead += int64(written)
+	if requested > r.maxRead {
+		r.maxRead = requested
+	}
+	return written, nil
 }
 
 func useContentTempDir(t *testing.T) string {
 	t.Helper()
-	previous := contentTempDir
-	directory := t.TempDir()
-	contentTempDir = directory
-	t.Cleanup(func() {
-		contentTempDir = previous
-	})
-	return directory
+	return t.TempDir()
+}
+
+func contentTestDependencies(directory string) contentFetchDependencies {
+	return contentFetchDependencies{
+		newTempFile: func(label string) (*contentTempFile, error) {
+			return newContentTempFileIn(directory, label)
+		},
+	}
+}
+
+type contentTestFetcher struct {
+	adaptor *TaskAdaptor
+	deps    contentFetchDependencies
+}
+
+func newContentTestFetcher(directory string) *contentTestFetcher {
+	return &contentTestFetcher{
+		adaptor: &TaskAdaptor{},
+		deps:    contentTestDependencies(directory),
+	}
+}
+
+func (f *contentTestFetcher) FetchVideoContent(
+	parent context.Context,
+	baseURL string,
+	key string,
+	upstreamTaskID string,
+	proxy string,
+) (*channel.VideoContent, error) {
+	return f.adaptor.fetchVideoContentWithDependencies(
+		parent,
+		baseURL,
+		key,
+		upstreamTaskID,
+		proxy,
+		f.deps,
+	)
 }
 
 func requireContentTempDirEmpty(t *testing.T, directory string) {
@@ -94,7 +338,15 @@ func assertVideoContentError(
 	assert.Equal(t, wantStatus, contentErr.StatusCode)
 	assert.Equal(t, wantType, contentErr.Type)
 	assert.Equal(t, wantCode, contentErr.Code)
-	assert.NotEmpty(t, contentErr.Message)
+	expectedMessages := map[string]string{
+		"upstream_authentication_error": contentAuthenticationMessage,
+		"upstream_rate_limit_error":     contentRateLimitMessage,
+		"upstream_timeout_error":        contentTimeoutMessage,
+		"upstream_connection_error":     contentConnectionMessage,
+		"invalid_upstream_response":     contentInvalidMessage,
+	}
+	assert.Equal(t, expectedMessages[wantCode], contentErr.Message)
+	require.Error(t, contentErr.Cause)
 	assert.NotContains(t, contentErr.Error(), "TEST_KEY")
 	assert.NotContains(t, contentErr.Error(), "PROVIDER_PRIVATE_DETAIL")
 	return contentErr
@@ -145,7 +397,7 @@ func TestExtractVideoBase64JSON(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, test.encoded, encoded.String())
 			var redactedObject map[string]json.RawMessage
-			require.NoError(t, json.Unmarshal(redacted.Bytes(), &redactedObject))
+			require.NoError(t, common.DecodeJson(bytes.NewReader(redacted.Bytes()), &redactedObject))
 			assert.JSONEq(t, `"[redacted]"`, string(redactedObject["video_base64"]))
 			assert.NotContains(t, redacted.String(), test.encoded)
 		})
@@ -162,6 +414,274 @@ func TestExtractVideoBase64JSONRejectsTrailingJunkBeforeMissingField(t *testing.
 	)
 	require.ErrorIs(t, err, errInvalidVideoJSON)
 	assert.NotErrorIs(t, err, errVideoBase64Missing)
+}
+
+func TestExtractVideoBase64JSONGrammarMatrix(t *testing.T) {
+	validCases := []struct {
+		name  string
+		input []byte
+	}{
+		{
+			name:  "nested empty objects and arrays",
+			input: []byte(`{"nested":{"object":{},"array":[[],{}]},"video_base64":"QQ=="}`),
+		},
+		{
+			name:  "complete literals",
+			input: []byte(`{"t":true,"f":false,"n":null,"video_base64":"QQ=="}`),
+		},
+		{
+			name:  "valid JSON numbers",
+			input: []byte(`{"numbers":[0,-0,17,-42,1.25,-2.5,1e3,2E+4,-3.5e-2],"video_base64":"QQ=="}`),
+		},
+		{
+			name:  "escaped target key",
+			input: []byte(`{"video\u005fbase64":"QQ=="}`),
+		},
+		{
+			name:  "valid surrogate pair",
+			input: []byte(`{"note":"\uD83D\uDE00","video_base64":"QQ=="}`),
+		},
+	}
+
+	for _, test := range validCases {
+		t.Run(test.name, func(t *testing.T) {
+			var redacted bytes.Buffer
+			var encoded bytes.Buffer
+			require.NoError(t, extractVideoBase64JSON(
+				bytes.NewReader(test.input),
+				&redacted,
+				&encoded,
+			))
+			assert.Equal(t, "QQ==", encoded.String())
+
+			var oracle map[string]json.RawMessage
+			require.NoError(
+				t,
+				common.DecodeJson(bytes.NewReader(redacted.Bytes()), &oracle),
+			)
+			assert.JSONEq(t, `"[redacted]"`, string(oracle["video_base64"]))
+		})
+	}
+
+	invalidCases := []struct {
+		name    string
+		input   []byte
+		wantErr error
+	}{
+		{"root string", []byte(`"QQ=="`), errInvalidVideoJSON},
+		{"root array", []byte(`["QQ=="]`), errInvalidVideoJSON},
+		{"empty root object", []byte(`{}`), errVideoBase64Missing},
+		{"mismatched brackets", []byte(`{"nested":[},"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{"leading object comma", []byte(`{,"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{"trailing object comma", []byte(`{"video_base64":"QQ==",}`), errInvalidVideoJSON},
+		{"leading array comma", []byte(`{"nested":[,0],"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{"trailing array comma", []byte(`{"nested":[0,],"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{"incomplete true literal", []byte(`{"value":tru,"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{"literal without delimiter", []byte(`{"value":truex,"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{"leading zero", []byte(`{"value":01,"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{"dangling decimal point", []byte(`{"value":1.,"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{"dangling exponent", []byte(`{"value":1e,"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{"dangling exponent sign", []byte(`{"value":1e+,"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{"dangling number sign", []byte(`{"value":-,"video_base64":"QQ=="}`), errInvalidVideoJSON},
+		{
+			"escaped duplicate target key",
+			[]byte(`{"video_base64":"QQ==","video\u005fbase64":"Qg=="}`),
+			errDuplicateVideoBase64,
+		},
+		{
+			"isolated low surrogate",
+			[]byte(`{"note":"\uDC00","video_base64":"QQ=="}`),
+			errInvalidJSONStringEscape,
+		},
+		{
+			"high surrogate followed by non surrogate",
+			[]byte(`{"note":"\uD800\u0041","video_base64":"QQ=="}`),
+			errInvalidJSONStringEscape,
+		},
+		{
+			"invalid raw UTF-8",
+			append(
+				append([]byte(`{"note":"`), byte(0xff)),
+				[]byte(`","video_base64":"QQ=="}`)...,
+			),
+			errInvalidVideoJSON,
+		},
+	}
+
+	for _, test := range invalidCases {
+		t.Run(test.name, func(t *testing.T) {
+			err := extractVideoBase64JSON(
+				bytes.NewReader(test.input),
+				io.Discard,
+				io.Discard,
+			)
+			require.ErrorIs(t, err, test.wantErr)
+		})
+	}
+}
+
+func TestExtractVideoBase64JSONStreamingIOErrors(t *testing.T) {
+	const validJSON = `{"success":true,"video_base64":"QUJDRA=="}`
+
+	t.Run("source data and error are both observed", func(t *testing.T) {
+		sourceErr := errors.New("JSON source stopped")
+		err := extractVideoBase64JSON(
+			&dataAndErrorReader{data: []byte(validJSON), err: sourceErr},
+			io.Discard,
+			io.Discard,
+		)
+		require.ErrorIs(t, err, sourceErr)
+	})
+
+	t.Run("redacted writer error is surfaced", func(t *testing.T) {
+		writerErr := errors.New("redacted writer stopped")
+		err := extractVideoBase64JSON(
+			strings.NewReader(validJSON),
+			&failAfterWriter{remaining: 8, err: writerErr},
+			io.Discard,
+		)
+		require.ErrorIs(t, err, writerErr)
+	})
+
+	t.Run("encoded writer error is surfaced", func(t *testing.T) {
+		writerErr := errors.New("encoded writer stopped")
+		err := extractVideoBase64JSON(
+			strings.NewReader(validJSON),
+			io.Discard,
+			&failAfterWriter{remaining: 3, err: writerErr},
+		)
+		require.ErrorIs(t, err, writerErr)
+	})
+}
+
+func TestExtractVideoBase64JSONBoundsNestingDepth(t *testing.T) {
+	const declaredDepth = int64(1_000_000_000)
+	reader := newLazyNestedJSONReader(declaredDepth)
+
+	err := extractVideoBase64JSON(reader, io.Discard, io.Discard)
+
+	require.ErrorIs(t, err, errJSONNestingTooDeep)
+	assert.Less(t, reader.totalRead, int64(128*1024))
+	assert.LessOrEqual(t, reader.maxRead, 32*1024)
+	assert.Greater(t, reader.opensLeft, declaredDepth/2)
+}
+
+func TestExtractVideoBase64JSONBusinessState(t *testing.T) {
+	cases := []struct {
+		name            string
+		input           string
+		wantExtractErr  error
+		wantBusinessErr error
+	}{
+		{
+			name:  "success true with absent optional fields",
+			input: `{"success":true,"video_base64":"QQ=="}`,
+		},
+		{
+			name:            "success false",
+			input:           `{"success":false,"video_base64":"QQ=="}`,
+			wantBusinessErr: errContentBusinessFailure,
+		},
+		{
+			name:            "failed status",
+			input:           `{"success":true,"status":"FaIlEd","video_base64":"QQ=="}`,
+			wantBusinessErr: errContentBusinessFailure,
+		},
+		{
+			name:            "nonzero string error code",
+			input:           `{"success":true,"errCode":"RATE_LIMIT","video_base64":"QQ=="}`,
+			wantBusinessErr: errContentBusinessFailure,
+		},
+		{
+			name:            "nonzero numeric error code",
+			input:           `{"success":true,"errCode":401,"video_base64":"QQ=="}`,
+			wantBusinessErr: errContentBusinessFailure,
+		},
+		{
+			name:  "numeric zero error code",
+			input: `{"success":true,"errCode":0,"video_base64":"QQ=="}`,
+		},
+		{
+			name:  "string zero error code",
+			input: `{"success":true,"errCode":" -0.00e+12 ","video_base64":"QQ=="}`,
+		},
+		{
+			name:  "empty string error code",
+			input: `{"success":true,"errCode":"  ","video_base64":"QQ=="}`,
+		},
+		{
+			name:            "missing success",
+			input:           `{"status":"completed","video_base64":"QQ=="}`,
+			wantBusinessErr: errInvalidContentBusinessEnvelope,
+		},
+		{
+			name:           "success has wrong type",
+			input:          `{"success":"true","video_base64":"QQ=="}`,
+			wantExtractErr: errInvalidContentBusinessEnvelope,
+		},
+		{
+			name:           "status has wrong type",
+			input:          `{"success":true,"status":0,"video_base64":"QQ=="}`,
+			wantExtractErr: errInvalidContentBusinessEnvelope,
+		},
+		{
+			name:           "error code object is malformed",
+			input:          `{"success":true,"errCode":{},"video_base64":"QQ=="}`,
+			wantExtractErr: errInvalidContentBusinessEnvelope,
+		},
+		{
+			name:           "error code null is malformed",
+			input:          `{"success":true,"errCode":null,"video_base64":"QQ=="}`,
+			wantExtractErr: errInvalidContentBusinessEnvelope,
+		},
+		{
+			name:           "duplicate success is ambiguous",
+			input:          `{"success":true,"success":false,"video_base64":"QQ=="}`,
+			wantExtractErr: errInvalidContentBusinessEnvelope,
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			var redacted bytes.Buffer
+			var encoded bytes.Buffer
+			business, err := extractVideoBase64JSONWithBusiness(
+				strings.NewReader(test.input),
+				&redacted,
+				&encoded,
+			)
+			if test.wantExtractErr != nil {
+				require.ErrorIs(t, err, test.wantExtractErr)
+				return
+			}
+			require.NoError(t, err)
+			err = validateContentBusinessState(business)
+			if test.wantBusinessErr != nil {
+				require.ErrorIs(t, err, test.wantBusinessErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestExtractVideoBase64JSONBusinessStateDoesNotMaterializeIgnoredData(t *testing.T) {
+	const ignoredDataBytes = int64(8 * 1024 * 1024)
+	reader := newLazyBusinessJSONReader(ignoredDataBytes)
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	business, err := extractVideoBase64JSONWithBusiness(reader, io.Discard, io.Discard)
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	require.NoError(t, err)
+	require.NoError(t, validateContentBusinessState(business))
+	assert.Zero(t, reader.dataLeft)
+	assert.Greater(t, reader.totalRead, ignoredDataBytes)
+	assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(2*1024*1024))
+	assert.LessOrEqual(t, reader.maxRead, 32*1024)
 }
 
 func TestDecodeVideoBase64(t *testing.T) {
@@ -190,6 +710,7 @@ func TestDecodeVideoBase64(t *testing.T) {
 		{"invalid alphabet at tail", "QUJDRA=$", nil, true},
 		{"whitespace inside Base64", "QUJD\nRA==", nil, true},
 		{"non canonical padding", "AB==", nil, true},
+		{"non canonical single padding", "AAB=", nil, true},
 	}
 
 	for _, test := range cases {
@@ -205,15 +726,113 @@ func TestDecodeVideoBase64(t *testing.T) {
 			assert.Equal(t, test.want, decoded.Bytes())
 		})
 	}
+}
 
-	t.Run("tracking reader failure is surfaced", func(t *testing.T) {
-		reader := &contentTrackingReadSeeker{
-			reader:    bytes.NewReader([]byte(validEncoded)),
-			failAfter: 4,
-			err:       errContentTrackingReader,
-		}
+func TestDecodeVideoBase64StrictStreamingBoundaries(t *testing.T) {
+	payload := bytes.Repeat([]byte("stream-boundary-"), 8)
+	encoded := base64.StdEncoding.EncodeToString(payload)
+	require.Greater(t, len(encoded), len(videoDataPrefix))
+
+	t.Run("one byte short reads cross padding boundary", func(t *testing.T) {
+		reader := newControlledBase64ReadSeeker(encoded, 1, -1, nil)
+		var decoded bytes.Buffer
+
+		written, err := decodeVideoBase64(reader, &decoded)
+
+		require.NoError(t, err)
+		assert.Equal(t, int64(len(payload)), written)
+		assert.Equal(t, payload, decoded.Bytes())
+		assert.Greater(t, reader.totalDecodeReads, len(encoded)/2)
+		assert.Equal(t, int64(len(encoded)), reader.decodeBytesRead)
+	})
+
+	t.Run("data and deferred error after multiple quanta", func(t *testing.T) {
+		const failAfter = int64(20)
+		reader := newControlledBase64ReadSeeker(
+			encoded,
+			7,
+			failAfter,
+			errContentTrackingReader,
+		)
+
 		_, err := decodeVideoBase64(reader, io.Discard)
+
 		require.ErrorIs(t, err, errContentTrackingReader)
+		assert.Equal(t, failAfter, reader.decodeBytesRead)
+		assert.Greater(t, reader.totalDecodeReads, 1)
+	})
+
+	t.Run("padded final quantum and deferred error share one read", func(t *testing.T) {
+		paddedPayload := bytes.Repeat([]byte{0x5a}, 64)
+		padded := base64.StdEncoding.EncodeToString(paddedPayload)
+		require.True(t, strings.HasSuffix(padded, "=="))
+		reader := newControlledBase64ReadSeeker(
+			padded,
+			0,
+			int64(len(padded)),
+			errContentTrackingReader,
+		)
+		var decoded bytes.Buffer
+
+		written, err := decodeVideoBase64(reader, &decoded)
+
+		require.ErrorIs(t, err, errContentTrackingReader)
+		assert.Equal(t, int64(len(paddedPayload)), written)
+		assert.Equal(t, paddedPayload, decoded.Bytes())
+		assert.Equal(t, int64(len(padded)), reader.decodeBytesRead)
+	})
+
+	validLead := strings.Repeat("QUJD", 6)
+	invalidCases := []struct {
+		name  string
+		input string
+	}{
+		{"line feed rejected", validLead + "QQ==\n"},
+		{"carriage return rejected", validLead + "QQ==\r"},
+		{"space rejected", validLead + "QQ== "},
+		{"tab rejected", validLead + "QQ==\t"},
+		{"invalid alphabet in middle", validLead + "$UJD"},
+		{"invalid alphabet at tail", validLead + "QUJ$"},
+		{"padding in first position", validLead + "=AAA"},
+		{"padding in second position", validLead + "A=AA"},
+		{"alphabet after padding", validLead + "AA=A"},
+		{"more than two padding bytes", validLead + "A==="},
+		{"noncanonical double padding bits", validLead + "AB=="},
+		{"noncanonical single padding bits", validLead + "AAB="},
+		{"incomplete final quantum", validLead + "AAA"},
+	}
+	for _, test := range invalidCases {
+		t.Run(test.name, func(t *testing.T) {
+			reader := newControlledBase64ReadSeeker(test.input, 1, -1, nil)
+			_, err := decodeVideoBase64(reader, io.Discard)
+			require.ErrorIs(t, err, errInvalidVideoBase64)
+			assert.Greater(t, reader.totalDecodeReads, len(validLead)/2)
+		})
+	}
+
+	t.Run("destination writer error is surfaced", func(t *testing.T) {
+		reader := newControlledBase64ReadSeeker(encoded, 3, -1, nil)
+		writer := &failAfterWriter{remaining: 11, err: errContentTestWriter}
+
+		written, err := decodeVideoBase64(reader, writer)
+
+		require.ErrorIs(t, err, errContentTestWriter)
+		assert.Equal(t, int64(11), written)
+		assert.Greater(t, reader.decodeBytesRead, int64(0))
+	})
+
+	t.Run("source read requests stay bounded", func(t *testing.T) {
+		const quanta = 32 * 1024
+		largeEncoded := strings.Repeat("QUJD", quanta)
+		reader := newControlledBase64ReadSeeker(largeEncoded, 0, -1, nil)
+
+		written, err := decodeVideoBase64(reader, io.Discard)
+
+		require.NoError(t, err)
+		assert.Equal(t, int64(quanta*3), written)
+		assert.Equal(t, int64(len(largeEncoded)), reader.decodeBytesRead)
+		assert.LessOrEqual(t, reader.maxRequested, 1024)
+		assert.Greater(t, reader.totalDecodeReads, 2)
 	})
 }
 
@@ -262,7 +881,7 @@ func TestFetchVideoContent(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		content, err := (&TaskAdaptor{}).FetchVideoContent(
+		content, err := newContentTestFetcher(directory).FetchVideoContent(
 			context.Background(),
 			upstream.URL+"/",
 			"TEST_KEY",
@@ -307,7 +926,7 @@ func TestFetchVideoContent(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		content, err := (&TaskAdaptor{}).FetchVideoContent(
+		content, err := newContentTestFetcher(directory).FetchVideoContent(
 			context.Background(), upstream.URL, "TEST_KEY", "UPSTREAM_TASK_ID", "",
 		)
 		assert.Nil(t, content)
@@ -333,7 +952,7 @@ func TestFetchVideoContent(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			content, err := (&TaskAdaptor{}).FetchVideoContent(
+			content, err := newContentTestFetcher(directory).FetchVideoContent(
 				context.Background(), upstream.URL, "TEST_KEY", "UPSTREAM_TASK_ID", "",
 			)
 			assert.Nil(t, content)
@@ -358,7 +977,7 @@ func TestFetchVideoContent(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		content, err := (&TaskAdaptor{}).FetchVideoContent(
+		content, err := newContentTestFetcher(directory).FetchVideoContent(
 			context.Background(), upstream.URL, "TEST_KEY", "UPSTREAM_TASK_ID", "",
 		)
 		assert.Nil(t, content)
@@ -374,21 +993,30 @@ func TestFetchVideoContent(t *testing.T) {
 
 	t.Run("large declared Content-Length is not pre-rejected", func(t *testing.T) {
 		directory := useContentTempDir(t)
-		upstream := httptest.NewServer(http.HandlerFunc(func(
-			writer http.ResponseWriter,
-			_ *http.Request,
-		) {
-			writer.Header().Set("Content-Length", "1099511627776")
-			writer.Header().Set("Transfer-Encoding", "chunked")
-			_, _ = io.WriteString(writer, videoSuccessJSON(validEncoded))
-		}))
-		defer upstream.Close()
+		const declaredLength = int64(1 << 50)
+		body := &contentTestReadCloser{
+			reader: strings.NewReader(videoSuccessJSON(validEncoded)),
+		}
+		fetcher := newContentTestFetcher(directory)
+		responseObserved := false
+		fetcher.deps.doRequest = func(req *http.Request) (*http.Response, error) {
+			require.NotNil(t, req)
+			responseObserved = true
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				ContentLength: declaredLength,
+				Body:          body,
+				Header:        make(http.Header),
+			}, nil
+		}
 
-		content, err := (&TaskAdaptor{}).FetchVideoContent(
-			context.Background(), upstream.URL, "TEST_KEY", "UPSTREAM_TASK_ID", "",
+		content, err := fetcher.FetchVideoContent(
+			context.Background(), "http://content.test", "TEST_KEY", "UPSTREAM_TASK_ID", "",
 		)
 		require.NoError(t, err)
 		require.NotNil(t, content)
+		assert.True(t, responseObserved)
+		assert.Equal(t, 1, body.closeCalls)
 		assert.Equal(t, int64(len(validVideo)), content.ContentLength)
 		require.NoError(t, content.Body.Close())
 		requireContentTempDirEmpty(t, directory)
@@ -404,7 +1032,7 @@ func TestFetchVideoContent(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		content, err := (&TaskAdaptor{}).FetchVideoContent(
+		content, err := newContentTestFetcher(directory).FetchVideoContent(
 			context.Background(), upstream.URL, "TEST_KEY", "UPSTREAM_TASK_ID", "",
 		)
 		assert.Nil(t, content)
@@ -428,7 +1056,7 @@ func TestFetchVideoContent(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		content, err := (&TaskAdaptor{}).FetchVideoContent(
+		content, err := newContentTestFetcher(directory).FetchVideoContent(
 			context.Background(), upstream.URL, "TEST_KEY", "UPSTREAM_TASK_ID", "",
 		)
 		assert.Nil(t, content)
@@ -453,7 +1081,7 @@ func TestFetchVideoContent(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		content, err := (&TaskAdaptor{}).FetchVideoContent(
+		content, err := newContentTestFetcher(directory).FetchVideoContent(
 			context.Background(), upstream.URL, "TEST_KEY", "UPSTREAM_TASK_ID", "",
 		)
 		assert.Nil(t, content)
@@ -488,7 +1116,7 @@ func TestFetchVideoContent(t *testing.T) {
 		defer cancel()
 		result := make(chan error, 1)
 		go func() {
-			_, err := (&TaskAdaptor{}).FetchVideoContent(
+			_, err := newContentTestFetcher(directory).FetchVideoContent(
 				parent, upstream.URL, "TEST_KEY", "UPSTREAM_TASK_ID", "",
 			)
 			result <- err
@@ -532,7 +1160,7 @@ func TestFetchVideoContent(t *testing.T) {
 		defer cancel()
 		result := make(chan error, 1)
 		go func() {
-			_, err := (&TaskAdaptor{}).FetchVideoContent(
+			_, err := newContentTestFetcher(directory).FetchVideoContent(
 				parent, upstream.URL, "TEST_KEY", "UPSTREAM_TASK_ID", "",
 			)
 			result <- err
@@ -555,4 +1183,438 @@ func TestFetchVideoContent(t *testing.T) {
 		}
 		requireContentTempDirEmpty(t, directory)
 	})
+}
+
+func TestFetchVideoContentTempFileStages(t *testing.T) {
+	validEncoded := base64.StdEncoding.EncodeToString(testMP4Bytes())
+
+	t.Run("all four files coexist as mode 0600 before ownership transfer", func(t *testing.T) {
+		directory := useContentTempDir(t)
+		fetcher := newContentTestFetcher(directory)
+		type observedTemp struct {
+			label string
+			path  string
+			temp  *contentTempFile
+		}
+		var observed []observedTemp
+		fetcher.deps.newTempFile = func(label string) (*contentTempFile, error) {
+			temp, err := newContentTempFileIn(directory, label)
+			require.NoError(t, err)
+			info, err := os.Stat(temp.path)
+			require.NoError(t, err)
+			require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+			for _, existing := range observed {
+				_, err := os.Stat(existing.path)
+				require.NoErrorf(t, err, "%s must still exist", existing.label)
+			}
+			observed = append(observed, observedTemp{
+				label: label,
+				path:  temp.path,
+				temp:  temp,
+			})
+			return temp, nil
+		}
+		body := &contentTestReadCloser{
+			reader: strings.NewReader(videoSuccessJSON(validEncoded)),
+		}
+		fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       body,
+				Header:     make(http.Header),
+			}, nil
+		}
+
+		content, err := fetcher.FetchVideoContent(
+			context.Background(),
+			"http://content.test",
+			"TEST_KEY",
+			"UPSTREAM_TASK_ID",
+			"",
+		)
+
+		require.NoError(t, err)
+		require.Len(t, observed, 4)
+		assert.Equal(t, []string{"raw", "redacted", "base64", "mp4"}, []string{
+			observed[0].label,
+			observed[1].label,
+			observed[2].label,
+			observed[3].label,
+		})
+		for _, item := range observed {
+			assert.Nil(t, item.temp.file)
+			assert.Empty(t, item.temp.path)
+		}
+		for _, item := range observed[:3] {
+			_, statErr := os.Stat(item.path)
+			require.ErrorIs(t, statErr, os.ErrNotExist)
+		}
+		info, err := os.Stat(observed[3].path)
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+		assert.Equal(t, 1, body.closeCalls)
+		require.NoError(t, content.Body.Close())
+		require.NoError(t, content.Body.Close())
+		requireContentTempDirEmpty(t, directory)
+	})
+
+	for _, failLabel := range []string{"raw", "redacted", "base64", "mp4"} {
+		t.Run(failLabel+" creation failure cleans prior files", func(t *testing.T) {
+			directory := useContentTempDir(t)
+			createErr := errors.New(failLabel + " tempfile creation stopped")
+			fetcher := newContentTestFetcher(directory)
+			type observedTemp struct {
+				path string
+				temp *contentTempFile
+			}
+			var observed []observedTemp
+			fetcher.deps.newTempFile = func(label string) (*contentTempFile, error) {
+				if label == failLabel {
+					return nil, createErr
+				}
+				temp, err := newContentTempFileIn(directory, label)
+				require.NoError(t, err)
+				info, err := os.Stat(temp.path)
+				require.NoError(t, err)
+				require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+				observed = append(observed, observedTemp{
+					path: temp.path,
+					temp: temp,
+				})
+				return temp, nil
+			}
+			body := &contentTestReadCloser{
+				reader: strings.NewReader(videoSuccessJSON(validEncoded)),
+			}
+			fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       body,
+					Header:     make(http.Header),
+				}, nil
+			}
+
+			content, err := fetcher.FetchVideoContent(
+				context.Background(),
+				"http://content.test",
+				"TEST_KEY",
+				"UPSTREAM_TASK_ID",
+				"",
+			)
+
+			assert.Nil(t, content)
+			contentErr := assertVideoContentError(
+				t,
+				err,
+				http.StatusBadGateway,
+				"invalid_upstream_response",
+				"invalid_upstream_response",
+			)
+			require.ErrorIs(t, contentErr.Cause, createErr)
+			assert.Equal(t, 1, body.closeCalls)
+			for _, item := range observed {
+				assert.Nil(t, item.temp.file)
+				assert.Empty(t, item.temp.path)
+				_, statErr := os.Stat(item.path)
+				require.ErrorIs(t, statErr, os.ErrNotExist)
+			}
+			requireContentTempDirEmpty(t, directory)
+		})
+	}
+}
+
+func TestFetchVideoContentTransportAndCopyFailures(t *testing.T) {
+	validEncoded := base64.StdEncoding.EncodeToString(testMP4Bytes())
+	validJSON := videoSuccessJSON(validEncoded)
+
+	t.Run("general network error", func(t *testing.T) {
+		directory := useContentTempDir(t)
+		networkErr := errors.New("network stopped")
+		fetcher := newContentTestFetcher(directory)
+		fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
+			return nil, networkErr
+		}
+
+		content, err := fetcher.FetchVideoContent(
+			context.Background(),
+			"http://content.test",
+			"TEST_KEY",
+			"UPSTREAM_TASK_ID",
+			"",
+		)
+
+		assert.Nil(t, content)
+		contentErr := assertVideoContentError(
+			t,
+			err,
+			http.StatusBadGateway,
+			"upstream_error",
+			"upstream_connection_error",
+		)
+		require.ErrorIs(t, contentErr.Cause, networkErr)
+		requireContentTempDirEmpty(t, directory)
+	})
+
+	t.Run("upstream copy reader error", func(t *testing.T) {
+		directory := useContentTempDir(t)
+		readErr := errors.New("upstream body stopped")
+		body := &contentTestReadCloser{
+			reader: &dataAndErrorReader{
+				data: []byte(`{"success":true,`),
+				err:  readErr,
+			},
+		}
+		fetcher := newContentTestFetcher(directory)
+		fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       body,
+				Header:     make(http.Header),
+			}, nil
+		}
+
+		content, err := fetcher.FetchVideoContent(
+			context.Background(),
+			"http://content.test",
+			"TEST_KEY",
+			"UPSTREAM_TASK_ID",
+			"",
+		)
+
+		assert.Nil(t, content)
+		contentErr := assertVideoContentError(
+			t,
+			err,
+			http.StatusBadGateway,
+			"upstream_error",
+			"upstream_connection_error",
+		)
+		require.ErrorIs(t, contentErr.Cause, readErr)
+		assert.Equal(t, 1, body.closeCalls)
+		requireContentTempDirEmpty(t, directory)
+	})
+
+	t.Run("raw destination writer error", func(t *testing.T) {
+		directory := useContentTempDir(t)
+		writeErr := errors.New("raw destination stopped")
+		body := &contentTestReadCloser{reader: strings.NewReader(validJSON)}
+		fetcher := newContentTestFetcher(directory)
+		fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       body,
+				Header:     make(http.Header),
+			}, nil
+		}
+		fetcher.deps.copyResponse = func(_ io.Writer, src io.Reader) (int64, error) {
+			return io.Copy(
+				&failAfterWriter{remaining: 7, err: writeErr},
+				src,
+			)
+		}
+
+		content, err := fetcher.FetchVideoContent(
+			context.Background(),
+			"http://content.test",
+			"TEST_KEY",
+			"UPSTREAM_TASK_ID",
+			"",
+		)
+
+		assert.Nil(t, content)
+		contentErr := assertVideoContentError(
+			t,
+			err,
+			http.StatusBadGateway,
+			"upstream_error",
+			"upstream_connection_error",
+		)
+		require.ErrorIs(t, contentErr.Cause, writeErr)
+		assert.Equal(t, 1, body.closeCalls)
+		requireContentTempDirEmpty(t, directory)
+	})
+
+	t.Run("upstream body close error", func(t *testing.T) {
+		directory := useContentTempDir(t)
+		closeErr := errors.New("upstream close stopped")
+		body := &contentTestReadCloser{
+			reader:   strings.NewReader(validJSON),
+			closeErr: closeErr,
+		}
+		fetcher := newContentTestFetcher(directory)
+		fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       body,
+				Header:     make(http.Header),
+			}, nil
+		}
+
+		content, err := fetcher.FetchVideoContent(
+			context.Background(),
+			"http://content.test",
+			"TEST_KEY",
+			"UPSTREAM_TASK_ID",
+			"",
+		)
+
+		assert.Nil(t, content)
+		contentErr := assertVideoContentError(
+			t,
+			err,
+			http.StatusBadGateway,
+			"upstream_error",
+			"upstream_connection_error",
+		)
+		require.ErrorIs(t, contentErr.Cause, closeErr)
+		assert.Equal(t, 1, body.closeCalls)
+		requireContentTempDirEmpty(t, directory)
+	})
+
+	t.Run("other HTTP status has invalid response contract", func(t *testing.T) {
+		directory := useContentTempDir(t)
+		body := &contentTestReadCloser{reader: strings.NewReader("ignored")}
+		fetcher := newContentTestFetcher(directory)
+		fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       body,
+				Header:     make(http.Header),
+			}, nil
+		}
+
+		content, err := fetcher.FetchVideoContent(
+			context.Background(),
+			"http://content.test",
+			"TEST_KEY",
+			"UPSTREAM_TASK_ID",
+			"",
+		)
+
+		assert.Nil(t, content)
+		contentErr := assertVideoContentError(
+			t,
+			err,
+			http.StatusBadGateway,
+			"invalid_upstream_response",
+			"invalid_upstream_response",
+		)
+		assert.Contains(t, contentErr.Cause.Error(), "503")
+		assert.Equal(t, 1, body.closeCalls)
+		requireContentTempDirEmpty(t, directory)
+	})
+}
+
+func TestFetchVideoContentBusinessCauseContract(t *testing.T) {
+	validEncoded := base64.StdEncoding.EncodeToString(testMP4Bytes())
+	cases := []struct {
+		name      string
+		response  string
+		wantCause error
+	}{
+		{
+			name:      "success false",
+			response:  `{"success":false,"errMessage":"PROVIDER_PRIVATE_DETAIL","video_base64":"` + validEncoded + `"}`,
+			wantCause: errContentBusinessFailure,
+		},
+		{
+			name:      "failed status",
+			response:  `{"success":true,"status":"FAILED","message":"PROVIDER_PRIVATE_DETAIL","video_base64":"` + validEncoded + `"}`,
+			wantCause: errContentBusinessFailure,
+		},
+		{
+			name:      "nonzero errCode",
+			response:  `{"success":true,"errCode":"RATE_LIMIT","video_base64":"` + validEncoded + `"}`,
+			wantCause: errContentBusinessFailure,
+		},
+		{
+			name:      "missing success",
+			response:  `{"status":"completed","video_base64":"` + validEncoded + `"}`,
+			wantCause: errInvalidContentBusinessEnvelope,
+		},
+		{
+			name:      "invalid success shape",
+			response:  `{"success":"true","video_base64":"` + validEncoded + `"}`,
+			wantCause: errInvalidContentBusinessEnvelope,
+		},
+		{
+			name:      "invalid errCode shape",
+			response:  `{"success":true,"errCode":{},"video_base64":"` + validEncoded + `"}`,
+			wantCause: errInvalidContentBusinessEnvelope,
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			directory := useContentTempDir(t)
+			body := &contentTestReadCloser{
+				reader: strings.NewReader(test.response),
+			}
+			fetcher := newContentTestFetcher(directory)
+			fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       body,
+					Header:     make(http.Header),
+				}, nil
+			}
+
+			content, err := fetcher.FetchVideoContent(
+				context.Background(),
+				"http://content.test",
+				"TEST_KEY",
+				"UPSTREAM_TASK_ID",
+				"",
+			)
+
+			assert.Nil(t, content)
+			contentErr := assertVideoContentError(
+				t,
+				err,
+				http.StatusBadGateway,
+				"invalid_upstream_response",
+				"invalid_upstream_response",
+			)
+			require.ErrorIs(t, contentErr.Cause, test.wantCause)
+			assert.Equal(t, contentInvalidMessage, contentErr.Message)
+			assert.NotContains(t, contentErr.Cause.Error(), "PROVIDER_PRIVATE_DETAIL")
+			assert.Equal(t, 1, body.closeCalls)
+			requireContentTempDirEmpty(t, directory)
+		})
+	}
+}
+
+func TestFetchVideoContentConsumerReadFailureStillCleansUp(t *testing.T) {
+	directory := useContentTempDir(t)
+	validEncoded := base64.StdEncoding.EncodeToString(testMP4Bytes())
+	body := &contentTestReadCloser{
+		reader: strings.NewReader(videoSuccessJSON(validEncoded)),
+	}
+	fetcher := newContentTestFetcher(directory)
+	fetcher.deps.doRequest = func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       body,
+			Header:     make(http.Header),
+		}, nil
+	}
+
+	content, err := fetcher.FetchVideoContent(
+		context.Background(),
+		"http://content.test",
+		"TEST_KEY",
+		"UPSTREAM_TASK_ID",
+		"",
+	)
+	require.NoError(t, err)
+	removingBody, ok := content.Body.(*removingReadCloser)
+	require.True(t, ok)
+	require.NoError(t, removingBody.file.Close())
+
+	read, readErr := removingBody.Read(make([]byte, 1))
+	assert.Zero(t, read)
+	require.Error(t, readErr)
+	require.Error(t, content.Body.Close())
+	require.NoError(t, content.Body.Close())
+	requireContentTempDirEmpty(t, directory)
 }
