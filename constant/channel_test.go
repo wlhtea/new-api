@@ -9,7 +9,8 @@ import (
 
 func TestSeedDanceChannelConstantContract(t *testing.T) {
 	require.Equal(t, 59, ChannelTypeSeedDance)
-	assert.Equal(t, 60, ChannelTypeDummy)
+	require.Equal(t, 60, ChannelTypeSub2API)
+	assert.Equal(t, 61, ChannelTypeDummy)
 	assert.Len(t, ChannelBaseURLs, ChannelTypeDummy)
 	assert.Equal(t,
 		"http://alb-o13xqj8f2cpjsa67ym.ap-northeast-1.alb.aliyuncsslbintl.com/v1/public_api/m-predict/polar4ai-i2v",

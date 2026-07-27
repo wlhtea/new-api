@@ -57,7 +57,8 @@ const (
 	ChannelTypeCodex          = 57
 	ChannelTypeAdvancedCustom = 58
 	ChannelTypeSeedDance      = 59
-	ChannelTypeDummy          = 60 // this one is only for count, do not add any channel after this
+	ChannelTypeSub2API        = 60
+	ChannelTypeDummy          = 61 // this one is only for count, do not add any channel after this
 
 )
 
@@ -122,6 +123,7 @@ var ChannelBaseURLs = []string{
 	"https://chatgpt.com",                       //57
 	"",                                          //58
 	"http://alb-o13xqj8f2cpjsa67ym.ap-northeast-1.alb.aliyuncsslbintl.com/v1/public_api/m-predict/polar4ai-i2v", // 59
+	"", //60
 }
 
 var ChannelTypeNames = map[int]string{
@@ -180,6 +182,7 @@ var ChannelTypeNames = map[int]string{
 	ChannelTypeReplicate:      "Replicate",
 	ChannelTypeCodex:          "ChatGPT Subscription (Codex)",
 	ChannelTypeAdvancedCustom: "Advanced Custom",
+	ChannelTypeSub2API:        "Sub2API",
 	ChannelTypeSeedDance:      "SeedDance",
 }
 

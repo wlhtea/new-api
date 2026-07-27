@@ -303,8 +303,8 @@ func refundLegacyTaskQuota(ctx context.Context, task *model.Task, reason string)
 		Other:     other,
 	})
 
-	// 4. 资金退款完成后再清除持久化标记；失败时保留非零 quota，
-	// 由后续对账重试。回写失败必须显式告警，避免漏掉潜在的重复退款风险。
+	// 4. 资金退款完成后再清除持久化标记。
+	// 回写失败必须显式告警，避免漏掉潜在的重复退款风险。
 	task.Quota = 0
 	if err := task.UpdateQuota(); err != nil {
 		logger.LogError(ctx, fmt.Sprintf("退款成功但清除 task quota 失败 task %s: %s", task.TaskID, err.Error()))
