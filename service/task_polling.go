@@ -188,7 +188,8 @@ func sweepTimedOutTasks(ctx context.Context) {
 		task.FinishTime = now
 		if isLegacy {
 			task.FailReason = legacyReason
-			// 旧系统任务明确不退款，随终态 CAS 一并清掉 quota，避免被后续对账误判。
+			// 旧系统任务明确不退款，随终态 CAS 一并清掉 quota，
+			// 避免留下可再次退款的计费状态。
 			task.Quota = 0
 		} else {
 			task.FailReason = reason
@@ -214,9 +215,10 @@ func sweepTimedOutTasks(ctx context.Context) {
 	}
 }
 
-// sweepUnrefundedFailedTasks 重试已落 FAILURE 终态但仍保留 quota 的欠退款任务。
-// 先等待一个短暂宽限期，让终态 CAS 的胜出者完成主路径即时退款，避免正常
-// 轮询与对账同时处理刚失败的任务。
+// sweepUnrefundedFailedTasks recovers durable billing attempts whose owner
+// crashed before completing the terminal refund transition. Historical failed
+// tasks without a durable ledger are deliberately left for explicit retry or
+// manual reconciliation.
 func sweepUnrefundedFailedTasks(ctx context.Context) {
 	now := time.Now()
 	submittingBefore := int64(0)
@@ -280,14 +282,6 @@ func sweepUnrefundedFailedTasks(ctx context.Context) {
 		}
 	}
 
-	updatedBefore := now.Add(-refundReconciliationGracePeriod).Unix()
-	tasks := model.GetUnrefundedFailedTasks(updatedBefore, refundReconciliationLimit)
-	for _, task := range tasks {
-		if ctx.Err() != nil {
-			return
-		}
-		RefundTaskQuota(ctx, task, task.FailReason)
-	}
 }
 
 func finalizeDurableFinalSuccess(

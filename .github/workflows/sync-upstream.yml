@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout custom branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.CUSTOM_BRANCH }}
           fetch-depth: 0
@@ -89,6 +89,7 @@ jobs:
           git push origin "$CUSTOM_BRANCH"
 
       - name: Open conflict PR
+        id: conflict_pr
         if: steps.merge.outputs.result == 'conflict'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -96,6 +97,7 @@ jobs:
           EXISTING=$(gh pr list --base "$CUSTOM_BRANCH" --head "$MIRROR_BRANCH" --state open --json number --jq 'length')
           if [ "$EXISTING" != "0" ]; then
             echo "已存在打开状态的同步 PR，跳过创建（PR 会自动包含本次镜像的最新提交）。"
+            echo "result=existing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           {
@@ -121,11 +123,17 @@ jobs:
             echo ""
             echo "推送完成后，本 PR 会自动标记为已合并。"
           } > /tmp/pr_body.md
-          gh pr create \
-            --base "$CUSTOM_BRANCH" \
-            --head "$MIRROR_BRANCH" \
-            --title "🔄 上游同步冲突，需手动合并（$(date +%F)）" \
-            --body-file /tmp/pr_body.md
+          if PR_URL=$(gh pr create \
+              --base "$CUSTOM_BRANCH" \
+              --head "$MIRROR_BRANCH" \
+              --title "🔄 上游同步冲突，需手动合并（$(date +%F)）" \
+              --body-file /tmp/pr_body.md); then
+            echo "result=created" >> "$GITHUB_OUTPUT"
+            echo "url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=permission_denied" >> "$GITHUB_OUTPUT"
+            echo "::warning::仓库未允许 GitHub Actions 创建 Pull Request；冲突文件已写入本次运行日志和摘要。可在 Settings → Actions → General 中启用“Allow GitHub Actions to create and approve pull requests”。"
+          fi
 
       - name: Write summary
         if: always()
@@ -139,6 +147,13 @@ jobs:
             elif [ "${{ steps.merge.outputs.result }}" = "clean" ]; then
               echo "- 结果：无冲突，已自动合并并推送 ✅"
             elif [ "${{ steps.merge.outputs.result }}" = "conflict" ]; then
-              echo "- 结果：存在冲突，已创建/更新 PR，请手动处理 ⚠️"
+              echo "- 结果：存在冲突，需要手动处理 ⚠️"
+              if [ "${{ steps.conflict_pr.outputs.result }}" = "created" ]; then
+                echo "- 冲突 PR：${{ steps.conflict_pr.outputs.url }}"
+              elif [ "${{ steps.conflict_pr.outputs.result }}" = "existing" ]; then
+                echo "- 冲突 PR：已有打开状态的同步 PR"
+              else
+                echo "- 冲突 PR：仓库设置禁止 Actions 创建 PR；请启用对应设置，或按日志中的本地步骤处理"
+              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
