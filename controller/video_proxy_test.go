@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -169,7 +170,7 @@ func createVideoProxyChannel(
 	proxy string,
 ) *model.Channel {
 	t.Helper()
-	settingBytes, err := common.Marshal(dto.ChannelSettings{Proxy: proxy})
+	settingBytes, err := common.Marshal(relaydto.ChannelSettings{Proxy: proxy})
 	require.NoError(t, err)
 	channel := &model.Channel{
 		Id:      channelID,

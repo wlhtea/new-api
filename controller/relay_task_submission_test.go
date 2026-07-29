@@ -20,6 +20,8 @@ import (
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -154,7 +156,7 @@ func newSeedDanceControllerRelayContext(
 	c.Set("group", "default")
 	c.Set("user_group", "default")
 	c.Set("user_quota", 1_000_000)
-	c.Set("user_setting", dto.UserSetting{BillingPreference: "wallet_only"})
+	c.Set("user_setting", relaydto.UserSetting{BillingPreference: "wallet_only"})
 	c.Set("channel_name", "seedance-fixture")
 	return c
 }
@@ -166,7 +168,7 @@ func newSeedDanceControllerRelayInfo(requestID string) *relaycommon.RelayInfo {
 		RequestId:       requestID,
 		OriginModelName: "seedance-uncensored",
 		UsingGroup:      "default",
-		UserSetting: dto.UserSetting{
+		UserSetting: relaydto.UserSetting{
 			BillingPreference: "wallet_only",
 		},
 		TaskRelayInfo: &relaycommon.TaskRelayInfo{},
@@ -516,7 +518,7 @@ func TestReliablePartialProviderSentinelsNeverReachHTTPOrLogs(t *testing.T) {
 
 	processChannelError(
 		c,
-		*types.NewChannelError(
+		*relaytypes.NewChannelError(
 			59,
 			constant.ChannelTypeSeedDance,
 			"seedance-fixture",
@@ -524,9 +526,9 @@ func TestReliablePartialProviderSentinelsNeverReachHTTPOrLogs(t *testing.T) {
 			"SECRET_ROUTE_KEY",
 			false,
 		),
-		types.NewOpenAIError(
+		relaytypes.NewOpenAIError(
 			taskErr.Error,
-			types.ErrorCodeBadResponseStatusCode,
+			relaytypes.ErrorCodeBadResponseStatusCode,
 			taskErr.StatusCode,
 		),
 	)
@@ -721,7 +723,7 @@ func TestControllerSafe429RetryReusesDurableIdentityAndStopsAfterReliableID(t *t
 		context *gin.Context,
 		_ *relaycommon.RelayInfo,
 		_ *service.RetryParam,
-	) (*model.Channel, *types.NewAPIError) {
+	) (*model.Channel, *relaytypes.NewAPIError) {
 		context.Set(string(constant.ContextKeyChannelId), fixtureChannel.Id)
 		context.Set(string(constant.ContextKeyChannelName), fixtureChannel.Name)
 		context.Set(string(constant.ContextKeyChannelType), fixtureChannel.Type)
