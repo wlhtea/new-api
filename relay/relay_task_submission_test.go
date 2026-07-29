@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/common"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -393,7 +394,7 @@ func paidDurableRelayInfo(requestID string, submitTime int64) *common.RelayInfo 
 		RequestId:       requestID,
 		OriginModelName: "seedance-uncensored",
 		UsingGroup:      "default",
-		UserSetting: dto.UserSetting{
+		UserSetting: relaydto.UserSetting{
 			BillingPreference: "wallet_only",
 		},
 		PriceData: types.PriceData{

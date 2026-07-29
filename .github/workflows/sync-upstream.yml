@@ -9,6 +9,8 @@
 # 注意：
 #   - schedule 只会在【默认分支】上生效，请确保仓库默认分支已设置为 custom-main。
 #   - 也可以随时在 Actions 页面通过 "Run workflow" 手动触发。
+#   - UPSTREAM_SYNC_TOKEN 必须具备 repo 与 workflow scopes，GitHub 默认
+#     GITHUB_TOKEN 无权推送上游新增或修改的 workflow 文件。
 name: Sync Upstream
 
 on:
@@ -42,6 +44,7 @@ jobs:
         with:
           ref: ${{ env.CUSTOM_BRANCH }}
           fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
 
       - name: Configure git
         run: |
@@ -92,7 +95,7 @@ jobs:
         id: conflict_pr
         if: steps.merge.outputs.result == 'conflict'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
           EXISTING=$(gh pr list --base "$CUSTOM_BRANCH" --head "$MIRROR_BRANCH" --state open --json number --jq 'length')
           if [ "$EXISTING" != "0" ]; then

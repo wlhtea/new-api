@@ -16,10 +16,11 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
+	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -110,8 +111,8 @@ func (a *legacyTaskPollingAdaptor) FetchTask(
 		return nil, errors.New("invalid action")
 	}
 	taskID, _ := body["task_id"].(string)
-	encoded, err := common.Marshal(dto.TaskResponse[model.Task]{
-		Code: dto.TaskSuccessCode,
+	encoded, err := common.Marshal(taskdto.TaskResponse[model.Task]{
+		Code: taskdto.TaskSuccessCode,
 		Data: model.Task{
 			TaskID:   taskID,
 			Status:   model.TaskStatusInProgress,
@@ -273,9 +274,9 @@ func (a *sunoFailurePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
 
 func (a *sunoFailurePollingAdaptor) FetchTask(_ string, _ string, body map[string]any, _ string) (*http.Response, error) {
 	taskIDs, _ := body["ids"].([]string)
-	items := make([]dto.SunoDataResponse, 0, len(taskIDs))
+	items := make([]taskdto.SunoDataResponse, 0, len(taskIDs))
 	for _, taskID := range taskIDs {
-		items = append(items, dto.SunoDataResponse{
+		items = append(items, taskdto.SunoDataResponse{
 			TaskID:     taskID,
 			Status:     string(model.TaskStatusFailure),
 			FailReason: a.failReason,
@@ -284,8 +285,8 @@ func (a *sunoFailurePollingAdaptor) FetchTask(_ string, _ string, body map[strin
 		})
 	}
 
-	responseBody, err := common.Marshal(dto.TaskResponse[[]dto.SunoDataResponse]{
-		Code: dto.TaskSuccessCode,
+	responseBody, err := common.Marshal(taskdto.TaskResponse[[]taskdto.SunoDataResponse]{
+		Code: taskdto.TaskSuccessCode,
 		Data: items,
 	})
 	if err != nil {
@@ -313,8 +314,8 @@ func (a *videoFailurePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
 
 func (a *videoFailurePollingAdaptor) FetchTask(_ string, _ string, body map[string]any, _ string) (*http.Response, error) {
 	taskID, _ := body["task_id"].(string)
-	responseBody, err := common.Marshal(dto.TaskResponse[model.Task]{
-		Code: dto.TaskSuccessCode,
+	responseBody, err := common.Marshal(taskdto.TaskResponse[model.Task]{
+		Code: taskdto.TaskSuccessCode,
 		Data: model.Task{
 			TaskID:     taskID,
 			Status:     model.TaskStatus(model.TaskStatusFailure),
@@ -363,8 +364,8 @@ func (a *taskPollingFetchAdaptor) FetchTask(_ string, _ string, body map[string]
 		}
 	}
 
-	response := dto.TaskResponse[model.Task]{
-		Code: dto.TaskSuccessCode,
+	response := taskdto.TaskResponse[model.Task]{
+		Code: taskdto.TaskSuccessCode,
 		Data: model.Task{
 			TaskID:   taskID,
 			Status:   model.TaskStatusInProgress,

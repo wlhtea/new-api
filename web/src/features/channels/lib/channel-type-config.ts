@@ -169,6 +169,16 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
       models: 'Models fetched from upstream /v1/models',
     },
   },
+  61: {
+    id: 61,
+    name: CHANNEL_TYPES[61],
+    icon: 'NewAPI',
+    hints: {
+      baseUrl: 'Base URL is required for this channel type',
+      key: 'Enter API key for this channel',
+      models: 'Models',
+    },
+  },
 }
 
 /**

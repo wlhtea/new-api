@@ -14,11 +14,12 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
+	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
 	taskcommon "github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -79,7 +80,7 @@ func (*TaskAdaptor) GetChannelName() string {
 func (a *TaskAdaptor) ValidateRequestAndSetAction(
 	c *gin.Context,
 	info *relaycommon.RelayInfo,
-) *dto.TaskError {
+) *taskdto.TaskError {
 	normalized, taskErr := normalizeRequest(c)
 	if taskErr != nil {
 		return taskErr
@@ -187,9 +188,9 @@ func (a *TaskAdaptor) DoRequest(
 	return bindCancelToBody(resp, cancel), nil
 }
 
-func submitOutcomeUnknown(cause error) *dto.TaskError {
+func submitOutcomeUnknown(cause error) *taskdto.TaskError {
 	retryable := false
-	return &dto.TaskError{
+	return &taskdto.TaskError{
 		Code:       "seedance_submit_outcome_unknown",
 		Message:    "upstream submission result is unknown",
 		StatusCode: http.StatusBadGateway,
@@ -204,9 +205,9 @@ func nonRetryableTaskError(
 	message string,
 	statusCode int,
 	cause error,
-) *dto.TaskError {
+) *taskdto.TaskError {
 	retryable := false
-	return &dto.TaskError{
+	return &taskdto.TaskError{
 		Code:       code,
 		Message:    message,
 		StatusCode: statusCode,
@@ -323,7 +324,7 @@ func (a *TaskAdaptor) DoResponse(
 	c *gin.Context,
 	resp *http.Response,
 	_ *relaycommon.RelayInfo,
-) (taskID string, taskData []byte, taskErr *dto.TaskError) {
+) (taskID string, taskData []byte, taskErr *taskdto.TaskError) {
 	if resp == nil || resp.Body == nil {
 		return "", nil, submitOutcomeUnknown(errors.New("empty upstream response"))
 	}
@@ -477,7 +478,7 @@ func (a *TaskAdaptor) ClassifyTaskSubmitFailure(
 			provider.TaskID == "" &&
 			dataIsEmpty(provider.Data) {
 			retryable := true
-			classification.TaskError = &dto.TaskError{
+			classification.TaskError = &taskdto.TaskError{
 				Code:       "upstream_rate_limit_error",
 				Message:    providerErrorMessage(&provider),
 				StatusCode: http.StatusTooManyRequests,

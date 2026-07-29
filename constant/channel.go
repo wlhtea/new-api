@@ -58,7 +58,8 @@ const (
 	ChannelTypeAdvancedCustom = 58
 	ChannelTypeSeedDance      = 59
 	ChannelTypeSub2API        = 60
-	ChannelTypeDummy          = 61 // this one is only for count, do not add any channel after this
+	ChannelTypeNewAPI         = 61
+	ChannelTypeDummy          = 62 // this one is only for count, do not add any channel after this
 
 )
 
@@ -124,6 +125,7 @@ var ChannelBaseURLs = []string{
 	"",                                          //58
 	"http://alb-o13xqj8f2cpjsa67ym.ap-northeast-1.alb.aliyuncsslbintl.com/v1/public_api/m-predict/polar4ai-i2v", // 59
 	"", //60
+	"", //61
 }
 
 var ChannelTypeNames = map[int]string{
@@ -184,6 +186,7 @@ var ChannelTypeNames = map[int]string{
 	ChannelTypeAdvancedCustom: "Advanced Custom",
 	ChannelTypeSub2API:        "Sub2API",
 	ChannelTypeSeedDance:      "SeedDance",
+	ChannelTypeNewAPI:         "New API",
 }
 
 func GetChannelTypeName(channelType int) string {
