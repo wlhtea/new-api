@@ -20,6 +20,7 @@ import { z } from 'zod'
 
 import {
   CHANNEL_TYPE_NEW_API,
+  CHANNEL_TYPE_OPENCODE_GO,
   CHANNEL_STATUS,
   ERROR_MESSAGES,
   MODEL_FETCHABLE_TYPES,
@@ -34,6 +35,10 @@ import {
   validateAdvancedCustomConfig,
 } from './advanced-custom'
 import { usesLegacyChannelKey } from './channel-type-config'
+import {
+  parseOpenCodeGoProtocolOverrides,
+  stringifyOpenCodeGoProtocolOverrides,
+} from './opencode-go-pool'
 
 // ============================================================================
 // Form Validation Schema
@@ -201,7 +206,7 @@ export const channelFormSchema = z
     base_url: z.string().optional(),
     key: z.string(),
     openai_organization: z.string().optional(),
-    models: z.string().min(1, ERROR_MESSAGES.REQUIRED_MODELS),
+    models: z.string(),
     group: z.array(z.string()).min(1, ERROR_MESSAGES.REQUIRED_GROUP),
     model_mapping: z
       .string()
@@ -280,8 +285,36 @@ export const channelFormSchema = z
     upstream_model_update_check_enabled: z.boolean().optional(),
     upstream_model_update_auto_sync_enabled: z.boolean().optional(),
     upstream_model_update_ignored_models: z.string().optional(),
+    // OpenCode Go settings (stored under settings.opencode_go)
+    opencode_go_default_protocol: z
+      .enum(['', 'chat', 'messages', 'responses'])
+      .optional(),
+    opencode_go_model_protocols: z
+      .string()
+      .optional()
+      .refine((value) => {
+        try {
+          parseOpenCodeGoProtocolOverrides(value)
+          return true
+        } catch {
+          return false
+        }
+      }, 'OpenCode Go model protocols must be a JSON object using chat, messages, or responses'),
+    opencode_go_auto_enable_china_models: z.boolean().optional(),
+    opencode_go_auto_apply_referral_rewards: z.boolean().optional(),
+    opencode_go_referral_rewards_max_per_run: z
+      .number()
+      .int()
+      .min(0)
+      .max(20)
+      .default(3),
+    opencode_go_auto_cancel_subscription_renewal: z.boolean().optional(),
   })
   .superRefine((data, ctx) => {
+    if (data.type !== CHANNEL_TYPE_OPENCODE_GO && !data.models.trim()) {
+      addRequiredIssue(ctx, 'models', ERROR_MESSAGES.REQUIRED_MODELS)
+    }
+
     if (
       [3, 8, 36, 45, 59, CHANNEL_TYPE_NEW_API].includes(data.type) &&
       !data.base_url?.trim()
@@ -393,7 +426,8 @@ export const channelFormSchema = z
     }
   })
 
-export type ChannelFormValues = z.infer<typeof channelFormSchema>
+export type ChannelFormInput = z.input<typeof channelFormSchema>
+export type ChannelFormValues = z.output<typeof channelFormSchema>
 
 // ============================================================================
 // Default Form Values
@@ -451,6 +485,12 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   upstream_model_update_check_enabled: false,
   upstream_model_update_auto_sync_enabled: false,
   upstream_model_update_ignored_models: '',
+  opencode_go_default_protocol: '',
+  opencode_go_model_protocols: '',
+  opencode_go_auto_enable_china_models: true,
+  opencode_go_auto_apply_referral_rewards: true,
+  opencode_go_referral_rewards_max_per_run: 3,
+  opencode_go_auto_cancel_subscription_renewal: false,
   advanced_custom: '',
 }
 
@@ -515,6 +555,12 @@ export function transformChannelToFormDefaults(
   let upstreamModelUpdateCheckEnabled = false
   let upstreamModelUpdateAutoSyncEnabled = false
   let upstreamModelUpdateIgnoredModels = ''
+  let openCodeGoDefaultProtocol: '' | 'chat' | 'messages' | 'responses' = ''
+  let openCodeGoModelProtocols = ''
+  let openCodeGoAutoEnableChinaModels = true
+  let openCodeGoAutoApplyReferralRewards = true
+  let openCodeGoReferralRewardsMaxPerRun = 3
+  let openCodeGoAutoCancelSubscriptionRenewal = false
   let advancedCustom = ''
 
   if (channel.settings) {
@@ -541,6 +587,41 @@ export function transformChannelToFormDefaults(
       )
         ? parsed.upstream_model_update_ignored_models.join(',')
         : ''
+      const openCodeGo = parsed.opencode_go
+      if (
+        openCodeGo &&
+        typeof openCodeGo === 'object' &&
+        !Array.isArray(openCodeGo)
+      ) {
+        if (
+          openCodeGo.default_protocol === 'chat' ||
+          openCodeGo.default_protocol === 'messages' ||
+          openCodeGo.default_protocol === 'responses'
+        ) {
+          openCodeGoDefaultProtocol = openCodeGo.default_protocol
+        }
+        openCodeGoModelProtocols = stringifyOpenCodeGoProtocolOverrides(
+          openCodeGo.model_protocols
+        )
+        openCodeGoAutoEnableChinaModels =
+          typeof openCodeGo.auto_enable_china_models === 'boolean'
+            ? openCodeGo.auto_enable_china_models
+            : true
+        openCodeGoAutoApplyReferralRewards =
+          typeof openCodeGo.auto_apply_referral_rewards === 'boolean'
+            ? openCodeGo.auto_apply_referral_rewards
+            : true
+        if (
+          Number.isInteger(openCodeGo.referral_rewards_max_per_run) &&
+          openCodeGo.referral_rewards_max_per_run >= 0 &&
+          openCodeGo.referral_rewards_max_per_run <= 20
+        ) {
+          openCodeGoReferralRewardsMaxPerRun =
+            openCodeGo.referral_rewards_max_per_run
+        }
+        openCodeGoAutoCancelSubscriptionRenewal =
+          openCodeGo.auto_cancel_subscription_renewal === true
+      }
       if (parsed.advanced_custom) {
         advancedCustom = stringifyAdvancedCustomConfig(parsed.advanced_custom)
       }
@@ -594,6 +675,14 @@ export function transformChannelToFormDefaults(
     upstream_model_update_check_enabled: upstreamModelUpdateCheckEnabled,
     upstream_model_update_auto_sync_enabled: upstreamModelUpdateAutoSyncEnabled,
     upstream_model_update_ignored_models: upstreamModelUpdateIgnoredModels,
+    opencode_go_default_protocol: openCodeGoDefaultProtocol,
+    opencode_go_model_protocols: openCodeGoModelProtocols,
+    opencode_go_auto_enable_china_models: openCodeGoAutoEnableChinaModels,
+    opencode_go_auto_apply_referral_rewards: openCodeGoAutoApplyReferralRewards,
+    opencode_go_referral_rewards_max_per_run:
+      openCodeGoReferralRewardsMaxPerRun,
+    opencode_go_auto_cancel_subscription_renewal:
+      openCodeGoAutoCancelSubscriptionRenewal,
     advanced_custom: advancedCustom,
   }
 }
@@ -754,6 +843,29 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     }
   } else if ('advanced_custom' in settingsObj) {
     delete settingsObj.advanced_custom
+  }
+
+  if (formData.type === CHANNEL_TYPE_OPENCODE_GO) {
+    const existing = settingsObj.opencode_go
+    const openCodeGo: Record<string, unknown> =
+      existing && typeof existing === 'object' && !Array.isArray(existing)
+        ? { ...existing }
+        : {}
+    openCodeGo.model_protocols = parseOpenCodeGoProtocolOverrides(
+      formData.opencode_go_model_protocols
+    )
+    openCodeGo.default_protocol = formData.opencode_go_default_protocol || ''
+    openCodeGo.auto_enable_china_models =
+      formData.opencode_go_auto_enable_china_models !== false
+    openCodeGo.auto_apply_referral_rewards =
+      formData.opencode_go_auto_apply_referral_rewards !== false
+    openCodeGo.referral_rewards_max_per_run =
+      formData.opencode_go_referral_rewards_max_per_run
+    openCodeGo.auto_cancel_subscription_renewal =
+      formData.opencode_go_auto_cancel_subscription_renewal === true
+    settingsObj.opencode_go = openCodeGo
+  } else if ('opencode_go' in settingsObj) {
+    delete settingsObj.opencode_go
   }
 
   return JSON.stringify(settingsObj)

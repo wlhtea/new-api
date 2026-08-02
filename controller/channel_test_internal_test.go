@@ -289,6 +289,88 @@ func TestUpdateOpenCodeGoChannelReconcilesDerivedModelsAndEmptyPoolStatus(t *tes
 	assert.Zero(t, abilityCount)
 }
 
+func TestUpdateOpenCodeGoChannelPreservesLifecyclePolicy(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.OpenCodeGoIdentity{},
+		&model.OpenCodeGoWorkspace{},
+		&model.OpenCodeGoQuotaWindow{},
+		&model.OpenCodeGoWorkspaceModel{},
+		&model.OpenCodeGoOperation{},
+	))
+	autoEnableChinaModels := false
+	autoApplyReferralRewards := false
+	rewardLimit := 0
+	channel := &model.Channel{
+		Type:   constant.ChannelTypeOpenCodeGo,
+		Name:   "OpenCode Go protected policy",
+		Status: common.ChannelStatusAutoDisabled,
+		Group:  "default",
+	}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{
+		OpenCodeGo: &dto.OpenCodeGoConfig{
+			ModelProtocols:                map[string]string{"old-*": dto.OpenCodeGoProtocolChat},
+			DefaultProtocol:               dto.OpenCodeGoProtocolChat,
+			AutoEnableChinaModels:         &autoEnableChinaModels,
+			AutoApplyReferralRewards:      &autoApplyReferralRewards,
+			ReferralRewardsMaxPerRun:      &rewardLimit,
+			AutoCancelSubscriptionRenewal: true,
+		},
+	})
+	service.PrepareOpenCodeGoPoolContainer(channel)
+	require.NoError(t, channel.Insert())
+
+	proposedSettings := dto.ChannelOtherSettings{
+		OpenCodeGo: &dto.OpenCodeGoConfig{
+			ModelProtocols:                map[string]string{"new-*": dto.OpenCodeGoProtocolMessages},
+			DefaultProtocol:               dto.OpenCodeGoProtocolResponses,
+			AutoEnableChinaModels:         common.GetPointer(true),
+			AutoApplyReferralRewards:      common.GetPointer(true),
+			ReferralRewardsMaxPerRun:      common.GetPointer(20),
+			AutoCancelSubscriptionRenewal: false,
+		},
+	}
+	encodedSettings, err := common.Marshal(proposedSettings)
+	require.NoError(t, err)
+	body, err := common.Marshal(map[string]any{
+		"id":       channel.Id,
+		"type":     constant.ChannelTypeOpenCodeGo,
+		"name":     "OpenCode Go protocol edited",
+		"key":      "",
+		"models":   "forged-model",
+		"group":    "default",
+		"settings": string(encodedSettings),
+	})
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Set("role", common.RoleRootUser)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/channel", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	UpdateChannel(ctx)
+
+	var response struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.True(t, response.Success, response.Message)
+	reloaded, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	config := reloaded.GetOtherSettings().OpenCodeGo
+	require.NotNil(t, config)
+	assert.Equal(t, dto.OpenCodeGoProtocolResponses, config.DefaultProtocol)
+	assert.Equal(t, map[string]string{"new-*": dto.OpenCodeGoProtocolMessages}, config.ModelProtocols)
+	require.NotNil(t, config.AutoEnableChinaModels)
+	assert.False(t, *config.AutoEnableChinaModels)
+	require.NotNil(t, config.AutoApplyReferralRewards)
+	assert.False(t, *config.AutoApplyReferralRewards)
+	require.NotNil(t, config.ReferralRewardsMaxPerRun)
+	assert.Zero(t, *config.ReferralRewardsMaxPerRun)
+	assert.True(t, config.AutoCancelSubscriptionRenewal)
+}
+
 func TestOpenCodeGoChannelTypeCannotBeChangedAfterCreation(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	channel := &model.Channel{

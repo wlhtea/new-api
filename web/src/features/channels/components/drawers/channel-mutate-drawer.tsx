@@ -155,6 +155,7 @@ import {
   channelsQueryKeys,
   getAdvancedCustomStats,
   transformChannelToFormDefaults,
+  type ChannelFormInput,
   type ChannelFormValues,
   deduplicateKeys,
   getChannelTypeCreateDefaults,
@@ -167,6 +168,7 @@ import {
   extractMappingSourceModels,
   hasModelConfigChanged,
   findMissingModelsInMapping,
+  shouldWarnAboutV1BaseUrl,
   validateModelMappingJson,
   hasAdvancedSettingsErrors,
   usesLegacyChannelKey,
@@ -193,6 +195,7 @@ import {
   ChannelBasicSection,
   ChannelEditorLoadingState,
   ChannelModelsSection,
+  OpenCodeGoChannelSettings,
 } from './sections'
 
 type ChannelMutateDrawerProps = {
@@ -713,7 +716,7 @@ export function ChannelMutateDrawer({
     isEditing && channelData?.data?.channel_info?.is_multi_key === true
 
   // Form setup
-  const form = useForm<ChannelFormValues>({
+  const form = useForm<ChannelFormInput, unknown, ChannelFormValues>({
     resolver: zodResolver(channelFormSchema),
     defaultValues: CHANNEL_FORM_DEFAULT_VALUES,
   })
@@ -1356,7 +1359,7 @@ export function ChannelMutateDrawer({
 
   // Validate base_url - warn if it ends with /v1
   useEffect(() => {
-    if (!currentBaseUrl || !currentBaseUrl.endsWith('/v1')) return
+    if (!open || !shouldWarnAboutV1BaseUrl(currentType, currentBaseUrl)) return
 
     // Show warning toast
     const timer = setTimeout(() => {
@@ -1369,8 +1372,7 @@ export function ChannelMutateDrawer({
     }, 500)
 
     return () => clearTimeout(timer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentBaseUrl])
+  }, [currentBaseUrl, currentType, open, t])
 
   // Handle key deduplication
   const handleDeduplicateKeys = () => {
@@ -1878,7 +1880,7 @@ export function ChannelMutateDrawer({
     }
   }, [isChannelDetailLoading, open, updateActiveEditorSection])
 
-  const onInvalid: SubmitErrorHandler<ChannelFormValues> = useCallback(
+  const onInvalid: SubmitErrorHandler<ChannelFormInput> = useCallback(
     (errors) => {
       if (hasAdvancedSettingsErrors(errors)) {
         handleAdvancedSettingsOpenChange(true)
@@ -2848,6 +2850,16 @@ export function ChannelMutateDrawer({
                               />
                             )}
 
+                            {currentType === CHANNEL_TYPE_OPENCODE_GO && (
+                              <OpenCodeGoChannelSettings
+                                disabled={sensitiveLocked}
+                                lifecyclePolicyReadOnly={isEditing}
+                                onOpenLifecyclePolicy={() =>
+                                  setOpen('opencode-go-policy')
+                                }
+                              />
+                            )}
+
                             {currentType === CHANNEL_TYPE_ADVANCED_CUSTOM && (
                               <FormField
                                 control={form.control}
@@ -3321,9 +3333,19 @@ export function ChannelMutateDrawer({
                                 <FormItem className='space-y-3'>
                                   <div className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
                                     <div className='space-y-1'>
-                                      <FormLabel>{t('Models *')}</FormLabel>
+                                      <FormLabel>
+                                        {currentType ===
+                                        CHANNEL_TYPE_OPENCODE_GO
+                                          ? t('Models')
+                                          : t('Models *')}
+                                      </FormLabel>
                                       <FormDescription>
-                                        {t(FIELD_DESCRIPTIONS.MODELS)}
+                                        {currentType ===
+                                        CHANNEL_TYPE_OPENCODE_GO
+                                          ? t(
+                                              'Models are derived from the account pool and cannot be edited here.'
+                                            )
+                                          : t(FIELD_DESCRIPTIONS.MODELS)}
                                       </FormDescription>
                                     </div>
                                     <Badge variant='outline' className='w-fit'>
@@ -3344,6 +3366,9 @@ export function ChannelMutateDrawer({
                                       createLabel='Add custom model "{{value}}"'
                                       maxVisibleChips={8}
                                       copyChipOnClick
+                                      disabled={
+                                        currentType === CHANNEL_TYPE_OPENCODE_GO
+                                      }
                                     />
                                   </FormControl>
                                   {modelMappingGuardrail.exposedTargetModels
@@ -3385,118 +3410,124 @@ export function ChannelMutateDrawer({
                               )}
                             />
 
-                            <Separator className='my-4' />
+                            {currentType !== CHANNEL_TYPE_OPENCODE_GO && (
+                              <Separator className='my-4' />
+                            )}
 
-                            <div className='space-y-3'>
-                              <div>
-                                <p className='text-sm font-medium'>
-                                  {t('Quick actions')}
-                                </p>
-                                <p className='text-muted-foreground text-xs'>
-                                  {t(
-                                    'Use presets or upstream discovery to populate the model list faster.'
-                                  )}
-                                </p>
-                              </div>
-                              <div className='flex flex-wrap gap-2'>
-                                <Button
-                                  type='button'
-                                  variant='outline'
-                                  size='sm'
-                                  onClick={handleFillRelatedModels}
-                                  disabled={!basicModels.length}
-                                >
-                                  <FileText
-                                    className='mr-2 h-4 w-4'
-                                    aria-hidden='true'
-                                  />
-                                  {t('Fill Related Models')}
-                                </Button>
-                                <Button
-                                  type='button'
-                                  variant='outline'
-                                  size='sm'
-                                  onClick={handleFillAllModels}
-                                  disabled={!allModelsList.length}
-                                >
-                                  <Plus
-                                    className='mr-2 h-4 w-4'
-                                    aria-hidden='true'
-                                  />
-                                  {t('Fill All Models')}
-                                </Button>
-                                {MODEL_FETCHABLE_TYPES.has(currentType) && (
-                                  <>
-                                    <Button
-                                      type='button'
-                                      variant='outline'
-                                      size='sm'
-                                      onClick={handleFetchModels}
-                                      disabled={!isEditing && !canEditSensitive}
-                                    >
-                                      <Sparkles
-                                        className='mr-2 h-4 w-4'
-                                        aria-hidden='true'
-                                      />
-                                      {t('Fetch from Upstream')}
-                                    </Button>
-                                    {!isEditing && !canEditSensitive && (
-                                      <span className='text-muted-foreground basis-full text-xs'>
-                                        {t(
-                                          'No permission to perform this action'
-                                        )}
-                                      </span>
+                            {currentType !== CHANNEL_TYPE_OPENCODE_GO && (
+                              <div className='space-y-3'>
+                                <div>
+                                  <p className='text-sm font-medium'>
+                                    {t('Quick actions')}
+                                  </p>
+                                  <p className='text-muted-foreground text-xs'>
+                                    {t(
+                                      'Use presets or upstream discovery to populate the model list faster.'
                                     )}
-                                  </>
-                                )}
-                                <Button
-                                  type='button'
-                                  variant='outline'
-                                  size='sm'
-                                  onClick={handleCopyModels}
-                                  disabled={currentModelsArray.length === 0}
-                                >
-                                  <Copy
-                                    className='mr-2 h-4 w-4'
-                                    aria-hidden='true'
-                                  />
-                                  {t('Copy All')}
-                                </Button>
-                                <Button
-                                  type='button'
-                                  variant='ghost'
-                                  size='sm'
-                                  onClick={handleClearModels}
-                                  disabled={currentModelsArray.length === 0}
-                                >
-                                  <Eraser
-                                    className='mr-2 h-4 w-4'
-                                    aria-hidden='true'
-                                  />
-                                  {t('Clear All')}
-                                </Button>
-                              </div>
-                              {prefillGroups.length > 0 && (
-                                <div className='flex flex-wrap items-center gap-2'>
-                                  <span className='text-muted-foreground text-xs'>
-                                    {t('Preset groups')}:
-                                  </span>
-                                  {prefillGroups.map((group) => (
-                                    <Button
-                                      key={group.id}
-                                      type='button'
-                                      variant='secondary'
-                                      size='sm'
-                                      onClick={() =>
-                                        handleAddPrefillGroup(group)
-                                      }
-                                    >
-                                      {group.name}
-                                    </Button>
-                                  ))}
+                                  </p>
                                 </div>
-                              )}
-                            </div>
+                                <div className='flex flex-wrap gap-2'>
+                                  <Button
+                                    type='button'
+                                    variant='outline'
+                                    size='sm'
+                                    onClick={handleFillRelatedModels}
+                                    disabled={!basicModels.length}
+                                  >
+                                    <FileText
+                                      className='mr-2 h-4 w-4'
+                                      aria-hidden='true'
+                                    />
+                                    {t('Fill Related Models')}
+                                  </Button>
+                                  <Button
+                                    type='button'
+                                    variant='outline'
+                                    size='sm'
+                                    onClick={handleFillAllModels}
+                                    disabled={!allModelsList.length}
+                                  >
+                                    <Plus
+                                      className='mr-2 h-4 w-4'
+                                      aria-hidden='true'
+                                    />
+                                    {t('Fill All Models')}
+                                  </Button>
+                                  {MODEL_FETCHABLE_TYPES.has(currentType) && (
+                                    <>
+                                      <Button
+                                        type='button'
+                                        variant='outline'
+                                        size='sm'
+                                        onClick={handleFetchModels}
+                                        disabled={
+                                          !isEditing && !canEditSensitive
+                                        }
+                                      >
+                                        <Sparkles
+                                          className='mr-2 h-4 w-4'
+                                          aria-hidden='true'
+                                        />
+                                        {t('Fetch from Upstream')}
+                                      </Button>
+                                      {!isEditing && !canEditSensitive && (
+                                        <span className='text-muted-foreground basis-full text-xs'>
+                                          {t(
+                                            'No permission to perform this action'
+                                          )}
+                                        </span>
+                                      )}
+                                    </>
+                                  )}
+                                  <Button
+                                    type='button'
+                                    variant='outline'
+                                    size='sm'
+                                    onClick={handleCopyModels}
+                                    disabled={currentModelsArray.length === 0}
+                                  >
+                                    <Copy
+                                      className='mr-2 h-4 w-4'
+                                      aria-hidden='true'
+                                    />
+                                    {t('Copy All')}
+                                  </Button>
+                                  <Button
+                                    type='button'
+                                    variant='ghost'
+                                    size='sm'
+                                    onClick={handleClearModels}
+                                    disabled={currentModelsArray.length === 0}
+                                  >
+                                    <Eraser
+                                      className='mr-2 h-4 w-4'
+                                      aria-hidden='true'
+                                    />
+                                    {t('Clear All')}
+                                  </Button>
+                                </div>
+                                {prefillGroups.length > 0 && (
+                                  <div className='flex flex-wrap items-center gap-2'>
+                                    <span className='text-muted-foreground text-xs'>
+                                      {t('Preset groups')}:
+                                    </span>
+                                    {prefillGroups.map((group) => (
+                                      <Button
+                                        key={group.id}
+                                        type='button'
+                                        variant='secondary'
+                                        size='sm'
+                                        onClick={() =>
+                                          handleAddPrefillGroup(group)
+                                        }
+                                      >
+                                        {group.name}
+                                      </Button>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </div>
 
                           <div className='border-border/60 rounded-lg border p-4'>

@@ -42,6 +42,8 @@ type DialogType =
   | 'fetch-models'
   | 'ollama-models'
   | 'multi-key-manage'
+  | 'opencode-go-pool'
+  | 'opencode-go-policy'
   | 'tag-batch-edit'
   | 'edit-tag'
   | 'copy-channel'

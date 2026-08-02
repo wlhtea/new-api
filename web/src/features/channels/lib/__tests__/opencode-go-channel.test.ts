@@ -20,10 +20,13 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 import { CHANNEL_TYPE_OPENCODE_GO, CHANNEL_TYPE_OPTIONS } from '../../constants'
+import { channelSchema } from '../../types'
 import {
   CHANNEL_FORM_DEFAULT_VALUES,
   channelFormSchema,
+  transformChannelToFormDefaults,
   transformFormDataToCreatePayload,
+  transformFormDataToUpdatePayload,
 } from '../channel-form'
 import {
   OPENCODE_GO_BASE_URL,
@@ -31,6 +34,7 @@ import {
   getChannelTypeConfig,
   getChannelTypeCreateDefaults,
   hasFixedBaseUrl,
+  shouldWarnAboutV1BaseUrl,
   usesLegacyChannelKey,
 } from '../channel-type-config'
 import { getChannelTypeIcon } from '../channel-utils'
@@ -58,6 +62,11 @@ describe('OpenCode Go channel configuration', () => {
       18
     )
     assert.equal(getChannelTypeIcon(CHANNEL_TYPE_OPENCODE_GO), 'OpenCode')
+    assert.equal(
+      shouldWarnAboutV1BaseUrl(CHANNEL_TYPE_OPENCODE_GO, OPENCODE_GO_BASE_URL),
+      false
+    )
+    assert.equal(shouldWarnAboutV1BaseUrl(8, 'https://proxy.example/v1'), true)
   })
 
   test('allows creation without a legacy channel key', () => {
@@ -84,5 +93,90 @@ describe('OpenCode Go channel configuration', () => {
     })
 
     assert.equal(result.channel.key, null)
+  })
+
+  test('serializes protocol routing and the full backend lifecycle range', () => {
+    const result = transformFormDataToCreatePayload({
+      ...CHANNEL_FORM_DEFAULT_VALUES,
+      name: 'OpenCode Go pool',
+      type: CHANNEL_TYPE_OPENCODE_GO,
+      base_url: OPENCODE_GO_BASE_URL,
+      key: '',
+      models: OPENCODE_GO_MODELS.join(','),
+      opencode_go_default_protocol: 'responses',
+      opencode_go_model_protocols: '{"GLM-*":"messages","kimi-k3":"chat"}',
+      opencode_go_auto_enable_china_models: false,
+      opencode_go_auto_apply_referral_rewards: true,
+      opencode_go_referral_rewards_max_per_run: 0,
+      opencode_go_auto_cancel_subscription_renewal: false,
+    })
+    const settings = JSON.parse(String(result.channel.settings))
+
+    assert.deepEqual(settings.opencode_go, {
+      model_protocols: {
+        'glm-*': 'messages',
+        'kimi-k3': 'chat',
+      },
+      default_protocol: 'responses',
+      auto_enable_china_models: false,
+      auto_apply_referral_rewards: true,
+      referral_rewards_max_per_run: 0,
+      auto_cancel_subscription_renewal: false,
+    })
+    assert.equal(
+      channelFormSchema.safeParse({
+        ...CHANNEL_FORM_DEFAULT_VALUES,
+        name: 'OpenCode Go pool',
+        type: CHANNEL_TYPE_OPENCODE_GO,
+        models: '',
+        opencode_go_referral_rewards_max_per_run: 0,
+      }).success,
+      true
+    )
+  })
+
+  test('round-trips an empty-pool channel without exposing a key', () => {
+    const channel = channelSchema.parse({
+      id: 62,
+      type: CHANNEL_TYPE_OPENCODE_GO,
+      key: '',
+      status: 1,
+      name: 'Empty OpenCode Go pool',
+      created_time: 1,
+      test_time: 0,
+      response_time: 0,
+      balance_updated_time: 0,
+      base_url: OPENCODE_GO_BASE_URL,
+      models: '',
+      settings: JSON.stringify({
+        retained_setting: 'keep-me',
+        opencode_go: {
+          default_protocol: 'messages',
+          model_protocols: { 'glm-*': 'messages' },
+          auto_enable_china_models: true,
+          auto_apply_referral_rewards: false,
+          referral_rewards_max_per_run: 0,
+          auto_cancel_subscription_renewal: false,
+        },
+      }),
+    })
+    const defaults = transformChannelToFormDefaults(channel)
+
+    assert.equal(defaults.key, '')
+    assert.equal(defaults.models, '')
+    assert.equal(defaults.opencode_go_default_protocol, 'messages')
+    assert.equal(defaults.opencode_go_referral_rewards_max_per_run, 0)
+    const protocolOverrides = defaults.opencode_go_model_protocols
+    assert.ok(protocolOverrides)
+    assert.deepEqual(JSON.parse(protocolOverrides), {
+      'glm-*': 'messages',
+    })
+    assert.equal(channelFormSchema.safeParse(defaults).success, true)
+
+    const update = transformFormDataToUpdatePayload(defaults, channel.id)
+    const settings = JSON.parse(String(update.settings))
+    assert.equal('key' in update, false)
+    assert.equal(settings.retained_setting, 'keep-me')
+    assert.equal(settings.opencode_go.referral_rewards_max_per_run, 0)
   })
 })

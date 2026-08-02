@@ -278,6 +278,16 @@ func TestOpenCodeGoLifecyclePolicyDefaultsAndUpdatePreserveProtocolSettings(t *t
 	assert.Equal(t, relaydto.OpenCodeGoProtocolMessages, persisted.DefaultProtocol)
 	assert.Equal(t, relaydto.OpenCodeGoProtocolResponses, persisted.ModelProtocols["model-a"])
 
+	zeroLimit, err := UpdateOpenCodeGoLifecyclePolicy(channel.Id, OpenCodeGoLifecyclePolicy{
+		ReferralRewardsMaxPerRun: 0,
+	})
+	require.NoError(t, err)
+	assert.Zero(t, zeroLimit.ReferralRewardsMaxPerRun)
+	reloaded, err = model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded.GetOtherSettings().OpenCodeGo.ReferralRewardsMaxPerRun)
+	assert.Zero(t, *reloaded.GetOtherSettings().OpenCodeGo.ReferralRewardsMaxPerRun)
+
 	_, err = UpdateOpenCodeGoLifecyclePolicy(channel.Id, OpenCodeGoLifecyclePolicy{ReferralRewardsMaxPerRun: 21})
 	require.ErrorContains(t, err, "between 0 and 20")
 }
