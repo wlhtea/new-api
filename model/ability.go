@@ -199,7 +199,13 @@ func (channel *Channel) AddAbilities(tx *gorm.DB) error {
 	abilitySet := make(map[string]struct{})
 	abilities := make([]Ability, 0, len(models_))
 	for _, model := range models_ {
+		if model == "" {
+			continue
+		}
 		for _, group := range groups_ {
+			if group == "" {
+				continue
+			}
 			key := group + "|" + model
 			if _, exists := abilitySet[key]; exists {
 				continue
@@ -271,7 +277,13 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 	abilitySet := make(map[string]struct{})
 	abilities := make([]Ability, 0, len(models_))
 	for _, model := range models_ {
+		if model == "" {
+			continue
+		}
 		for _, group := range groups_ {
+			if group == "" {
+				continue
+			}
 			key := group + "|" + model
 			if _, exists := abilitySet[key]; exists {
 				continue

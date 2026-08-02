@@ -219,6 +219,29 @@ func EnqueueSystemTask(taskType string, payload any) (*model.SystemTask, bool, e
 	return task, true, nil
 }
 
+// EnqueueSystemTaskWithActiveKey deduplicates an on-demand task by a caller-
+// supplied active key while retaining the task type's cross-instance lease.
+func EnqueueSystemTaskWithActiveKey(taskType string, activeKey string, payload any) (*model.SystemTask, bool, error) {
+	activeTask, err := model.GetActiveSystemTaskByActiveKey(taskType, activeKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if activeTask != nil {
+		return activeTask, false, nil
+	}
+
+	task, err := model.CreateSystemTaskWithActiveKey(taskType, activeKey, payload, nil)
+	if err != nil {
+		activeTask, activeErr := model.GetActiveSystemTaskByActiveKey(taskType, activeKey)
+		if activeErr == nil && activeTask != nil {
+			return activeTask, false, nil
+		}
+		return nil, false, err
+	}
+	notifySystemTaskRunner()
+	return task, true, nil
+}
+
 // runSystemTaskClaimPass tries to claim one pending task per registered type
 // and dispatches each claimed task in its own goroutine so a long-running
 // handler (e.g. channel test) never blocks another type (e.g. log cleanup).
