@@ -20,6 +20,7 @@ export type VerificationMethod = '2fa' | 'passkey'
 
 export type SecurityProofScope =
   | 'channel.key.read'
+  | 'channel.opencode_go.pool.write'
   | 'passkey.register'
   | 'passkey.delete'
 

@@ -100,7 +100,7 @@ type OpenCodeGoConfig struct {
 	DefaultProtocol               string            `json:"default_protocol,omitempty"`
 	AutoEnableChinaModels         *bool             `json:"auto_enable_china_models,omitempty"`
 	AutoApplyReferralRewards      *bool             `json:"auto_apply_referral_rewards,omitempty"`
-	ReferralRewardsMaxPerRun      int               `json:"referral_rewards_max_per_run,omitempty"`
+	ReferralRewardsMaxPerRun      *int              `json:"referral_rewards_max_per_run,omitempty"`
 	AutoCancelSubscriptionRenewal bool              `json:"auto_cancel_subscription_renewal,omitempty"`
 }
 
@@ -113,7 +113,8 @@ func (c *OpenCodeGoConfig) Validate() error {
 			return fmt.Errorf("invalid OpenCode Go default protocol: %w", err)
 		}
 	}
-	if c.ReferralRewardsMaxPerRun < 0 || c.ReferralRewardsMaxPerRun > 20 {
+	if c.ReferralRewardsMaxPerRun != nil &&
+		(*c.ReferralRewardsMaxPerRun < 0 || *c.ReferralRewardsMaxPerRun > 20) {
 		return fmt.Errorf("OpenCode Go referral_rewards_max_per_run must be between 0 and 20")
 	}
 	seenPatterns := make(map[string]struct{}, len(c.ModelProtocols))

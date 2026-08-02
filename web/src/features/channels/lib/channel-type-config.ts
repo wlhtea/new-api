@@ -263,6 +263,13 @@ export function hasFixedBaseUrl(type: number): boolean {
   return CHANNEL_TYPE_CONFIGS[type]?.fixedBaseUrl === true
 }
 
+export function shouldWarnAboutV1BaseUrl(
+  type: number,
+  baseUrl: string | undefined
+): boolean {
+  return !hasFixedBaseUrl(type) && baseUrl?.endsWith('/v1') === true
+}
+
 export function usesLegacyChannelKey(type: number): boolean {
   return CHANNEL_TYPE_CONFIGS[type]?.usesLegacyKey !== false
 }

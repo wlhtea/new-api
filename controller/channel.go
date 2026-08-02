@@ -969,6 +969,26 @@ type ChannelStatusBatchRequest struct {
 	Status int   `json:"status"`
 }
 
+func preserveOpenCodeGoLifecycleSettings(channel *model.Channel, origin *model.Channel) {
+	proposedSettings := channel.GetOtherSettings()
+	originSettings := origin.GetOtherSettings()
+	if proposedSettings.OpenCodeGo == nil {
+		proposedSettings.OpenCodeGo = &dto.OpenCodeGoConfig{}
+	}
+	if originSettings.OpenCodeGo == nil {
+		proposedSettings.OpenCodeGo.AutoEnableChinaModels = nil
+		proposedSettings.OpenCodeGo.AutoApplyReferralRewards = nil
+		proposedSettings.OpenCodeGo.ReferralRewardsMaxPerRun = nil
+		proposedSettings.OpenCodeGo.AutoCancelSubscriptionRenewal = false
+	} else {
+		proposedSettings.OpenCodeGo.AutoEnableChinaModels = originSettings.OpenCodeGo.AutoEnableChinaModels
+		proposedSettings.OpenCodeGo.AutoApplyReferralRewards = originSettings.OpenCodeGo.AutoApplyReferralRewards
+		proposedSettings.OpenCodeGo.ReferralRewardsMaxPerRun = originSettings.OpenCodeGo.ReferralRewardsMaxPerRun
+		proposedSettings.OpenCodeGo.AutoCancelSubscriptionRenewal = originSettings.OpenCodeGo.AutoCancelSubscriptionRenewal
+	}
+	channel.SetOtherSettings(proposedSettings)
+}
+
 func UpdateChannel(c *gin.Context) {
 	channel := PatchChannel{}
 	rawBody, err := c.GetRawData()
@@ -1015,6 +1035,7 @@ func UpdateChannel(c *gin.Context) {
 	}
 	if channel.Type == constant.ChannelTypeOpenCodeGo {
 		channel.Models = originChannel.Models
+		preserveOpenCodeGoLifecycleSettings(&channel.Channel, originChannel)
 	}
 	originProxy := originChannel.GetSetting().Proxy
 	proxyChanged := false

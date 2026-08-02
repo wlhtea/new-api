@@ -27,6 +27,7 @@ import { OllamaModelsDialog } from './dialogs/ollama-models-dialog'
 import { TagBatchEditDialog } from './dialogs/tag-batch-edit-dialog'
 import { UpstreamUpdateDialog } from './dialogs/upstream-update-dialog'
 import { ChannelMutateDrawer } from './drawers/channel-mutate-drawer'
+import { OpenCodeGoPoolDrawer } from './drawers/opencode-go-pool-drawer'
 
 export function ChannelsDialogs() {
   const { open, setOpen, currentRow, upstream } = useChannels()
@@ -38,6 +39,17 @@ export function ChannelsDialogs() {
         open={open === 'create-channel' || open === 'update-channel'}
         onOpenChange={(v) => !v && setOpen(null)}
         currentRow={open === 'update-channel' ? currentRow : null}
+      />
+
+      <OpenCodeGoPoolDrawer
+        open={open === 'opencode-go-pool' || open === 'opencode-go-policy'}
+        onOpenChange={(v) => !v && setOpen(null)}
+        channel={
+          open === 'opencode-go-pool' || open === 'opencode-go-policy'
+            ? currentRow
+            : null
+        }
+        initialTab={open === 'opencode-go-policy' ? 'policy' : 'accounts'}
       />
 
       {/* Test Channel Dialog */}

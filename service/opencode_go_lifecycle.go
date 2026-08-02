@@ -193,8 +193,8 @@ func openCodeGoLifecyclePolicyFromConfig(config *relaydto.OpenCodeGoConfig) Open
 	if config.AutoApplyReferralRewards != nil {
 		policy.AutoApplyReferralRewards = *config.AutoApplyReferralRewards
 	}
-	if config.ReferralRewardsMaxPerRun > 0 {
-		policy.ReferralRewardsMaxPerRun = normalizeOpenCodeGoReferralRewardLimit(config.ReferralRewardsMaxPerRun)
+	if config.ReferralRewardsMaxPerRun != nil {
+		policy.ReferralRewardsMaxPerRun = normalizeOpenCodeGoReferralRewardLimit(*config.ReferralRewardsMaxPerRun)
 	}
 	policy.AutoCancelSubscriptionRenewal = config.AutoCancelSubscriptionRenewal
 	return policy
@@ -743,8 +743,8 @@ func containsOpenCodeGoReferralReward(page *OpenCodeGoConsolePage, rewardID stri
 }
 
 func normalizeOpenCodeGoReferralRewardLimit(limit int) int {
-	if limit <= 0 {
-		return OpenCodeGoDefaultReferralRewardsPerRun
+	if limit < 0 {
+		return 0
 	}
 	if limit > OpenCodeGoMaxReferralRewardsPerRun {
 		return OpenCodeGoMaxReferralRewardsPerRun
@@ -758,7 +758,8 @@ func applyOpenCodeGoLifecyclePolicy(config *relaydto.OpenCodeGoConfig, policy Op
 	}
 	config.AutoEnableChinaModels = &policy.AutoEnableChinaModels
 	config.AutoApplyReferralRewards = &policy.AutoApplyReferralRewards
-	config.ReferralRewardsMaxPerRun = normalizeOpenCodeGoReferralRewardLimit(policy.ReferralRewardsMaxPerRun)
+	limit := normalizeOpenCodeGoReferralRewardLimit(policy.ReferralRewardsMaxPerRun)
+	config.ReferralRewardsMaxPerRun = &limit
 	config.AutoCancelSubscriptionRenewal = policy.AutoCancelSubscriptionRenewal
 }
 
