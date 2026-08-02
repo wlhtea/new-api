@@ -20,19 +20,25 @@ import (
 )
 
 type Adaptor struct {
-	protocol      Protocol
-	protocolErr   error
-	cacheIdentity string
-	converted     bool
-	openai        openai.Adaptor
-	claude        claude.Adaptor
+	protocol             Protocol
+	protocolErr          error
+	cacheIdentity        string
+	converted            bool
+	workspaceSelected    bool
+	selectedWorkspaceUID string
+	openai               openai.Adaptor
+	claude               claude.Adaptor
 }
+
+var selectOpenCodeGoWorkspace = service.SelectOpenCodeGoWorkspace
 
 func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	a.protocol = ""
 	a.protocolErr = nil
 	a.cacheIdentity = ""
 	a.converted = false
+	a.workspaceSelected = false
+	a.selectedWorkspaceUID = ""
 	if info == nil {
 		return
 	}
@@ -74,6 +80,16 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 	protocol, err := a.resolveProtocol(info)
 	if err != nil {
 		return err
+	}
+	if !a.workspaceSelected {
+		selection, selectErr := selectOpenCodeGoWorkspace(info.ChannelId, info.UpstreamModelName)
+		if selectErr != nil {
+			return selectErr
+		}
+		info.ApiKey = selection.APIKey
+		a.selectedWorkspaceUID = selection.WorkspaceUID
+		a.workspaceSelected = true
+		common.SetContextKey(c, constant.ContextKeyOpenCodeGoWorkspaceUID, selection.WorkspaceUID)
 	}
 	if strings.TrimSpace(info.ApiKey) == "" {
 		return errors.New("OpenCode Go request has no selected account API key")

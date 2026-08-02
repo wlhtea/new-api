@@ -232,3 +232,33 @@ func TestEnqueueSystemTaskReportsCreatedAndExistingActive(t *testing.T) {
 	require.NotNil(t, second)
 	assert.NotEqual(t, first.TaskID, second.TaskID)
 }
+
+func TestEnqueueSystemTaskWithActiveKeyDeduplicatesPerChannel(t *testing.T) {
+	truncate(t)
+
+	first, created, err := EnqueueSystemTaskWithActiveKey(
+		model.SystemTaskTypeOpenCodeGoRefresh,
+		"opencode_go_refresh:101",
+		map[string]int{"channel_id": 101},
+	)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	duplicate, created, err := EnqueueSystemTaskWithActiveKey(
+		model.SystemTaskTypeOpenCodeGoRefresh,
+		"opencode_go_refresh:101",
+		map[string]int{"channel_id": 101},
+	)
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, first.TaskID, duplicate.TaskID)
+
+	secondChannel, created, err := EnqueueSystemTaskWithActiveKey(
+		model.SystemTaskTypeOpenCodeGoRefresh,
+		"opencode_go_refresh:202",
+		map[string]int{"channel_id": 202},
+	)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NotEqual(t, first.TaskID, secondChannel.TaskID)
+}

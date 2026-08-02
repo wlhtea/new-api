@@ -12,8 +12,12 @@ import (
 // SecureVerificationRequired protects channel key disclosure. Other sensitive
 // operations validate their narrower proof scopes in their controller.
 func SecureVerificationRequired() gin.HandlerFunc {
+	return SecurityProofRequired("channel.key.read", []string{"2fa", "passkey"})
+}
+
+func SecurityProofRequired(requiredScope string, allowedMethods []string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if !RequireSecurityProof(c, "channel.key.read", []string{"2fa", "passkey"}) {
+		if !RequireSecurityProof(c, requiredScope, allowedMethods) {
 			return
 		}
 		c.Set("secure_verified", true)
