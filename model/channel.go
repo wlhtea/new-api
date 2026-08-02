@@ -979,6 +979,11 @@ func (channel *Channel) ValidateSettings() error {
 			return fmt.Errorf("advanced custom channels require a %s route when upstream model update checks are enabled", dto.AdvancedCustomModelListPath)
 		}
 	}
+	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		if err := channelOtherSettings.OpenCodeGo.Validate(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

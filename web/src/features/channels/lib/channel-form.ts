@@ -33,6 +33,7 @@ import {
   stringifyAdvancedCustomConfig,
   validateAdvancedCustomConfig,
 } from './advanced-custom'
+import { usesLegacyChannelKey } from './channel-type-config'
 
 // ============================================================================
 // Form Validation Schema
@@ -779,7 +780,7 @@ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
     name: formData.name,
     type: formData.type,
     base_url: normalizeBaseUrl(formData.base_url) || null,
-    key: formData.key,
+    key: usesLegacyChannelKey(formData.type) ? formData.key : '',
     openai_organization: formData.openai_organization || null,
     models: formData.models,
     group: formatGroups(formData.group),
@@ -847,7 +848,11 @@ export function transformFormDataToUpdatePayload(
   }
 
   // Only include key if it was changed (not empty)
-  if (formData.key && formData.key.trim()) {
+  if (
+    usesLegacyChannelKey(formData.type) &&
+    formData.key &&
+    formData.key.trim()
+  ) {
     payload.key = formData.key
   }
 

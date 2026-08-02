@@ -95,6 +95,85 @@ func TestNewAPIChannelRegistration(t *testing.T) {
 	assert.Empty(t, constant.ChannelBaseURLs[constant.ChannelTypeNewAPI])
 }
 
+func TestOpenCodeGoChannelRegistration(t *testing.T) {
+	apiType, ok := common.ChannelType2APIType(constant.ChannelTypeOpenCodeGo)
+
+	require.True(t, ok)
+	assert.Equal(t, constant.APITypeOpenCodeGo, apiType)
+	assert.Equal(t, "OpenCode Go", constant.GetChannelTypeName(constant.ChannelTypeOpenCodeGo))
+	require.Greater(t, len(constant.ChannelBaseURLs), constant.ChannelTypeOpenCodeGo)
+	assert.Equal(t, "https://opencode.ai/zen/go/v1", constant.ChannelBaseURLs[constant.ChannelTypeOpenCodeGo])
+	assert.Equal(t, []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+		constant.EndpointTypeAnthropic,
+	}, common.GetEndpointTypesByChannelType(constant.ChannelTypeOpenCodeGo, "glm-5.2"))
+}
+
+func TestValidateOpenCodeGoChannelUsesFixedBaseURLAndPoolCredentials(t *testing.T) {
+	tests := []struct {
+		name        string
+		baseURL     *string
+		key         string
+		wantErrText string
+	}{
+		{name: "empty legacy key and implicit fixed URL"},
+		{name: "explicit fixed URL", baseURL: common.GetPointer("https://opencode.ai/zen/go/v1/")},
+		{name: "custom URL rejected", baseURL: common.GetPointer("https://proxy.example/v1"), wantErrText: "base URL is fixed"},
+		{name: "legacy key rejected", key: "must-not-be-stored", wantErrText: "credentials must be managed by the account pool"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			channel := &model.Channel{
+				Type:    constant.ChannelTypeOpenCodeGo,
+				BaseURL: test.baseURL,
+				Key:     test.key,
+			}
+
+			err := validateChannel(channel, true)
+			if test.wantErrText != "" {
+				require.ErrorContains(t, err, test.wantErrText)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestAddOpenCodeGoChannelWithoutLegacyKey(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	body := []byte(`{
+		"mode":"single",
+		"channel":{
+			"name":"OpenCode Go pool",
+			"type":62,
+			"key":"",
+			"models":"glm-5.2",
+			"group":"default",
+			"status":1
+		}
+	}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	AddChannel(ctx)
+
+	var response struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.True(t, response.Success, response.Message)
+
+	var channels []model.Channel
+	require.NoError(t, db.Where("type = ?", constant.ChannelTypeOpenCodeGo).Find(&channels).Error)
+	require.Len(t, channels, 1)
+	assert.Empty(t, channels[0].Key)
+}
+
 func TestResponsesCompactAPITypeSupport(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -106,6 +185,7 @@ func TestResponsesCompactAPITypeSupport(t *testing.T) {
 		{name: "Advanced Custom", apiType: constant.APITypeAdvancedCustom, want: true},
 		{name: "Sub2API", apiType: constant.APITypeSub2API, want: true},
 		{name: "New API", apiType: constant.APITypeNewAPI, want: true},
+		{name: "OpenCode Go", apiType: constant.APITypeOpenCodeGo, want: false},
 		{name: "Anthropic", apiType: constant.APITypeAnthropic, want: false},
 	}
 

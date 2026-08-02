@@ -33,6 +33,48 @@ type Adaptor interface {
 	ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error)
 }
 
+const ContextKeyNon2xxResponseObservation = "non_2xx_response_observation"
+
+// Non2xxResponseObservation is a secret-free provider error summary. Provider
+// adaptors may attach one to the request context for health reducers without
+// retaining the upstream response body.
+type Non2xxResponseObservation struct {
+	Provider   string `json:"provider"`
+	StatusCode int    `json:"status_code"`
+	ErrorType  string `json:"error_type,omitempty"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	Message    string `json:"message,omitempty"`
+	RetryAfter string `json:"retry_after,omitempty"`
+	LimitName  string `json:"limit_name,omitempty"`
+}
+
+// Non2xxResponseHandler lets a provider preserve structured failure metadata
+// before the generic relay error handler consumes the response body.
+type Non2xxResponseHandler interface {
+	HandleNon2xxResponse(
+		c *gin.Context,
+		resp *http.Response,
+		info *relaycommon.RelayInfo,
+	) (*types.NewAPIError, *Non2xxResponseObservation)
+}
+
+func TryHandleNon2xxResponse(
+	c *gin.Context,
+	adaptor Adaptor,
+	resp *http.Response,
+	info *relaycommon.RelayInfo,
+) (*types.NewAPIError, bool) {
+	handler, ok := adaptor.(Non2xxResponseHandler)
+	if !ok {
+		return nil, false
+	}
+	err, observation := handler.HandleNon2xxResponse(c, resp, info)
+	if observation != nil && c != nil {
+		c.Set(ContextKeyNon2xxResponseObservation, observation)
+	}
+	return err, err != nil
+}
+
 type TaskAdaptor interface {
 	Init(info *relaycommon.RelayInfo)
 

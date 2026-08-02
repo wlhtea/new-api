@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -76,6 +77,15 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		return types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
 	}
 	adaptor.Init(info)
+	if info.ChannelType == constant.ChannelTypeOpenCodeGo &&
+		(model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled) {
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("OpenCode Go does not allow pass-through request bodies"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
 	var requestBody io.Reader
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
 		storage, err := common.GetBodyStorage(c)
@@ -131,7 +141,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		httpResp = resp.(*http.Response)
 
 		if httpResp.StatusCode != http.StatusOK {
-			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+			newAPIError = handleNon2xxResponse(c, adaptor, httpResp, info)
 			// reset status code 重置状态码
 			service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 			return newAPIError

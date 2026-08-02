@@ -484,10 +484,23 @@ func validateChannel(channel *model.Channel, isAdd bool) error {
 	if channel.Type == constant.ChannelTypeNewAPI && strings.TrimSpace(channel.GetBaseURL()) == "" {
 		return fmt.Errorf("New API channel base URL cannot be empty")
 	}
+	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		if strings.TrimSpace(channel.Key) != "" {
+			return fmt.Errorf("OpenCode Go channel credentials must be managed by the account pool")
+		}
+		configuredBaseURL := ""
+		if channel.BaseURL != nil {
+			configuredBaseURL = strings.TrimRight(strings.TrimSpace(*channel.BaseURL), "/")
+		}
+		fixedBaseURL := strings.TrimRight(constant.ChannelBaseURLs[constant.ChannelTypeOpenCodeGo], "/")
+		if configuredBaseURL != "" && configuredBaseURL != fixedBaseURL {
+			return fmt.Errorf("OpenCode Go channel base URL is fixed at %s", fixedBaseURL)
+		}
+	}
 
 	// 如果是添加操作，检查 channel 和 key 是否为空
 	if isAdd {
-		if channel.Key == "" {
+		if channel.Key == "" && channel.Type != constant.ChannelTypeOpenCodeGo {
 			return fmt.Errorf("channel cannot be empty")
 		}
 
@@ -627,6 +640,13 @@ func AddChannel(c *gin.Context) {
 	}
 
 	addChannelRequest.Channel.CreatedTime = common.GetTimestamp()
+	if addChannelRequest.Channel.Type == constant.ChannelTypeOpenCodeGo && addChannelRequest.Mode != "single" {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "OpenCode Go channels only support single creation; accounts are managed by the account pool",
+		})
+		return
+	}
 	keys := make([]string, 0)
 	switch addChannelRequest.Mode {
 	case "multi_to_single":
@@ -682,7 +702,7 @@ func AddChannel(c *gin.Context) {
 
 	channels := make([]model.Channel, 0, len(keys))
 	for _, key := range keys {
-		if key == "" {
+		if key == "" && addChannelRequest.Channel.Type != constant.ChannelTypeOpenCodeGo {
 			continue
 		}
 		localChannel := addChannelRequest.Channel
