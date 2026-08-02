@@ -22,11 +22,13 @@ type OpenCodeGoRefreshResult struct {
 }
 
 type OpenCodeGoRefreshSummary struct {
-	Total     int                       `json:"total"`
-	Processed int                       `json:"processed"`
-	Succeeded int                       `json:"succeeded"`
-	Failed    int                       `json:"failed"`
-	Results   []OpenCodeGoRefreshResult `json:"results"`
+	Total         int                             `json:"total"`
+	Processed     int                             `json:"processed"`
+	Succeeded     int                             `json:"succeeded"`
+	Failed        int                             `json:"failed"`
+	Results       []OpenCodeGoRefreshResult       `json:"results"`
+	ModelRecovery OpenCodeGoModelRecoverySummary  `json:"model_recovery"`
+	Lifecycle     OpenCodeGoLifecycleBatchSummary `json:"lifecycle"`
 }
 
 type openCodeGoIndexedRefreshTarget struct {

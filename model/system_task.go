@@ -23,6 +23,7 @@ const (
 	SystemTaskTypeAsyncTaskPoll                 = "async_task_poll"
 	SystemTaskTypeSeedDanceSubmitReconciliation = "seedance_submit_reconciliation"
 	SystemTaskTypeOpenCodeGoRefresh             = "opencode_go_refresh"
+	SystemTaskTypeOpenCodeGoRiskRecheck         = "opencode_go_risk_recheck"
 )
 
 var ErrSystemTaskLockLost = errors.New("system task lock lost")

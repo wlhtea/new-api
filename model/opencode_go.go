@@ -47,6 +47,7 @@ const (
 	OpenCodeGoModelAvailable     = "available"
 	OpenCodeGoModelRegionBlocked = "region_blocked"
 	OpenCodeGoModelRPMCooldown   = "rpm_cooldown"
+	OpenCodeGoModelTransient     = "transient_cooldown"
 	OpenCodeGoModelDisabled      = "disabled"
 )
 
@@ -85,14 +86,21 @@ type OpenCodeGoWorkspace struct {
 	APIKeyPrefix             string                     `json:"api_key_prefix" gorm:"column:api_key_prefix;type:varchar(16)"`
 	CredentialStatus         string                     `json:"credential_status" gorm:"type:varchar(32);index"`
 	MembershipStatus         string                     `json:"membership_status" gorm:"type:varchar(32);index"`
+	SubscriptionReference    string                     `json:"-" gorm:"type:varchar(128)"`
 	SubscriptionEndsAt       int64                      `json:"subscription_ends_at" gorm:"bigint;index"`
+	RenewalCancelledAt       int64                      `json:"renewal_cancelled_at" gorm:"bigint"`
+	RenewalCheckedAt         int64                      `json:"renewal_checked_at" gorm:"bigint"`
+	RenewalCancelError       string                     `json:"renewal_cancel_error" gorm:"type:varchar(512)"`
 	ManualEnabled            bool                       `json:"manual_enabled" gorm:"not null;index"`
 	EffectiveState           string                     `json:"effective_state" gorm:"type:varchar(32);index"`
 	StateReason              string                     `json:"state_reason" gorm:"type:varchar(191)"`
+	HealthObservation        string                     `json:"health_observation" gorm:"type:varchar(48)"`
+	HealthObservedAt         int64                      `json:"health_observed_at" gorm:"bigint;index"`
 	CooldownUntil            int64                      `json:"cooldown_until" gorm:"bigint;index"`
 	QuotaSnapshotStatus      string                     `json:"quota_snapshot_status" gorm:"type:varchar(32);index"`
 	QuotaFetchedAt           int64                      `json:"quota_fetched_at" gorm:"bigint;index"`
 	QuotaNextRefreshAt       int64                      `json:"quota_next_refresh_at" gorm:"bigint;index"`
+	QuotaRecoveryAt          int64                      `json:"quota_recovery_at" gorm:"bigint;index"`
 	QuotaParserVersion       string                     `json:"quota_parser_version" gorm:"type:varchar(32)"`
 	QuotaError               string                     `json:"quota_error" gorm:"type:varchar(512)"`
 	ChinaModelsEnabled       *bool                      `json:"china_models_enabled"`
@@ -101,6 +109,7 @@ type OpenCodeGoWorkspace struct {
 	ReferralCode             string                     `json:"referral_code" gorm:"type:varchar(96)"`
 	AvailableReferralRewards int                        `json:"available_referral_rewards"`
 	UsedReferralRewards      int                        `json:"used_referral_rewards"`
+	ReferralRewardAppliedAt  int64                      `json:"referral_reward_applied_at" gorm:"bigint"`
 	RiskDetectedAt           int64                      `json:"risk_detected_at" gorm:"bigint;index"`
 	RiskLastCheckedAt        int64                      `json:"risk_last_checked_at" gorm:"bigint"`
 	LastSyncedAt             int64                      `json:"last_synced_at" gorm:"bigint;index"`
@@ -122,15 +131,17 @@ type OpenCodeGoQuotaWindow struct {
 }
 
 type OpenCodeGoWorkspaceModel struct {
-	ID            int64  `json:"-" gorm:"primaryKey;autoIncrement"`
-	WorkspaceID   int64  `json:"-" gorm:"index;uniqueIndex:idx_ocg_workspace_model,priority:1"`
-	Model         string `json:"model" gorm:"type:varchar(191);uniqueIndex:idx_ocg_workspace_model,priority:2"`
-	Discovered    bool   `json:"discovered" gorm:"not null;index"`
-	State         string `json:"state" gorm:"type:varchar(32);index"`
-	DisabledUntil int64  `json:"disabled_until" gorm:"bigint;index"`
-	LastErrorCode string `json:"last_error_code" gorm:"type:varchar(96)"`
-	LastError     string `json:"last_error" gorm:"type:varchar(512)"`
-	UpdatedAt     int64  `json:"updated_at" gorm:"bigint;index"`
+	ID                int64  `json:"-" gorm:"primaryKey;autoIncrement"`
+	WorkspaceID       int64  `json:"-" gorm:"index;uniqueIndex:idx_ocg_workspace_model,priority:1"`
+	Model             string `json:"model" gorm:"type:varchar(191);uniqueIndex:idx_ocg_workspace_model,priority:2"`
+	Discovered        bool   `json:"discovered" gorm:"not null;index"`
+	State             string `json:"state" gorm:"type:varchar(32);index"`
+	DisabledUntil     int64  `json:"disabled_until" gorm:"bigint;index"`
+	LastErrorCode     string `json:"last_error_code" gorm:"type:varchar(96)"`
+	LastError         string `json:"last_error" gorm:"type:varchar(512)"`
+	HealthObservation string `json:"health_observation" gorm:"type:varchar(48)"`
+	HealthObservedAt  int64  `json:"health_observed_at" gorm:"bigint;index"`
+	UpdatedAt         int64  `json:"updated_at" gorm:"bigint;index"`
 }
 
 type OpenCodeGoOperation struct {
@@ -153,6 +164,17 @@ type OpenCodeGoOperation struct {
 type OpenCodeGoRefreshTarget struct {
 	ChannelID   int    `json:"channel_id"`
 	IdentityUID string `json:"identity_uid"`
+}
+
+type OpenCodeGoModelRecoveryTarget struct {
+	ChannelID    int    `json:"channel_id"`
+	WorkspaceUID string `json:"workspace_uid"`
+	Model        string `json:"model"`
+}
+
+type OpenCodeGoRiskRecheckTarget struct {
+	ChannelID    int    `json:"channel_id"`
+	WorkspaceUID string `json:"workspace_uid"`
 }
 
 func setOpenCodeGoCreateTimestamps(createdAt *int64, updatedAt *int64) {
@@ -270,6 +292,21 @@ func ListOpenCodeGoIdentityUIDs(channelID int) ([]string, error) {
 	return identityUIDs, err
 }
 
+func ListOpenCodeGoOperations(channelID int, limit int) ([]OpenCodeGoOperation, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	var operations []OpenCodeGoOperation
+	err := DB.Where("channel_id = ?", channelID).
+		Order("id desc").
+		Limit(limit).
+		Find(&operations).Error
+	return operations, err
+}
+
 func ListOpenCodeGoDueRefreshTargets(now int64, staleBefore int64, limit int) ([]OpenCodeGoRefreshTarget, error) {
 	if limit <= 0 {
 		limit = 500
@@ -293,6 +330,58 @@ func ListOpenCodeGoDueRefreshTargets(now int64, staleBefore int64, limit int) ([
 			staleBefore,
 		).
 		Order("open_code_go_identities.channel_id asc, open_code_go_identities.uid asc").
+		Limit(limit).
+		Scan(&targets).Error
+	return targets, err
+}
+
+func ListOpenCodeGoDueModelRecoveryTargets(channelID int, now int64, limit int) ([]OpenCodeGoModelRecoveryTarget, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	query := DB.Model(&OpenCodeGoWorkspaceModel{}).
+		Select("open_code_go_workspaces.channel_id, open_code_go_workspaces.uid AS workspace_uid, open_code_go_workspace_models.model").
+		Joins("JOIN open_code_go_workspaces ON open_code_go_workspaces.id = open_code_go_workspace_models.workspace_id").
+		Where("open_code_go_workspace_models.discovered = ?", true).
+		Where("open_code_go_workspace_models.state IN ?", []string{
+			OpenCodeGoModelRegionBlocked,
+			OpenCodeGoModelRPMCooldown,
+			OpenCodeGoModelTransient,
+			OpenCodeGoModelDisabled,
+		}).
+		Where("open_code_go_workspace_models.disabled_until > 0 AND open_code_go_workspace_models.disabled_until <= ?", now)
+	if channelID > 0 {
+		query = query.Where("open_code_go_workspaces.channel_id = ?", channelID)
+	}
+	var targets []OpenCodeGoModelRecoveryTarget
+	err := query.
+		Order("open_code_go_workspaces.channel_id asc, open_code_go_workspaces.uid asc, open_code_go_workspace_models.model asc").
+		Limit(limit).
+		Scan(&targets).Error
+	return targets, err
+}
+
+func ListOpenCodeGoRiskRecheckTargets(channelID int, limit int) ([]OpenCodeGoRiskRecheckTarget, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	query := DB.Model(&OpenCodeGoWorkspace{}).
+		Select("channel_id, uid AS workspace_uid").
+		Where("effective_state = ?", OpenCodeGoStateRiskBlocked).
+		Where("manual_enabled = ?", true).
+		Where("credential_status = ? AND api_key_ciphertext <> ''", OpenCodeGoCredentialValid)
+	if channelID > 0 {
+		query = query.Where("channel_id = ?", channelID)
+	}
+	var targets []OpenCodeGoRiskRecheckTarget
+	err := query.
+		Order("channel_id asc, uid asc").
 		Limit(limit).
 		Scan(&targets).Error
 	return targets, err

@@ -262,3 +262,23 @@ func TestEnqueueSystemTaskWithActiveKeyDeduplicatesPerChannel(t *testing.T) {
 	require.True(t, created)
 	require.NotEqual(t, first.TaskID, secondChannel.TaskID)
 }
+
+func TestEnqueueOpenCodeGoRiskRecheckTaskDeduplicatesPerChannel(t *testing.T) {
+	truncate(t)
+	first, created, err := EnqueueSystemTaskWithActiveKey(
+		model.SystemTaskTypeOpenCodeGoRiskRecheck,
+		"opencode_go_risk_recheck:101",
+		map[string]int{"channel_id": 101},
+	)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	duplicate, created, err := EnqueueSystemTaskWithActiveKey(
+		model.SystemTaskTypeOpenCodeGoRiskRecheck,
+		"opencode_go_risk_recheck:101",
+		map[string]int{"channel_id": 101},
+	)
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, first.TaskID, duplicate.TaskID)
+}

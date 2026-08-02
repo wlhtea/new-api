@@ -7,9 +7,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,4 +83,38 @@ func TestHandleNon2xxResponseBoundsUnstructuredBody(t *testing.T) {
 	require.NotNil(t, observation)
 	assert.Equal(t, "OpenCode Go returned status 502", observation.Message)
 	assert.NotContains(t, apiErr.Error(), strings.Repeat("x", 100))
+}
+
+func TestHandleNon2xxResponsePersistsSelectedWorkspaceObservation(t *testing.T) {
+	originalObserver := observeOpenCodeGoProviderFailure
+	originalNow := openCodeGoHealthNow
+	t.Cleanup(func() {
+		observeOpenCodeGoProviderFailure = originalObserver
+		openCodeGoHealthNow = originalNow
+	})
+
+	fixedNow := time.Unix(1_900_000_000, 0)
+	openCodeGoHealthNow = func() time.Time { return fixedNow }
+	calls := 0
+	observeOpenCodeGoProviderFailure = func(channelID int, workspaceUID string, upstreamModel string, failure service.OpenCodeGoProviderFailure, observedAt time.Time) (bool, error) {
+		calls++
+		assert.Equal(t, 42, channelID)
+		assert.Equal(t, "workspace-provider", workspaceUID)
+		assert.Equal(t, "glm-5.2", upstreamModel)
+		assert.Equal(t, http.StatusForbidden, failure.StatusCode)
+		assert.Equal(t, "RegionError", failure.ErrorType)
+		assert.Equal(t, fixedNow, observedAt)
+		return true, nil
+	}
+
+	resp := &http.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"RegionError","message":"region unavailable"}}`)),
+	}
+	adaptor := &Adaptor{workspaceSelected: true, selectedWorkspaceUID: "workspace-provider"}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "glm-5.2"}}
+	_, observation := adaptor.HandleNon2xxResponse(newAdaptorTestContext(), resp, info)
+	require.NotNil(t, observation)
+	assert.Equal(t, 1, calls)
 }

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -24,6 +25,7 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
 	service.RegisterSystemTaskHandler(seedDanceSubmitReconciliationHandler{})
 	service.RegisterSystemTaskHandler(openCodeGoRefreshHandler{})
+	service.RegisterSystemTaskHandler(openCodeGoRiskRecheckHandler{})
 }
 
 const (
@@ -45,6 +47,54 @@ func (openCodeGoRefreshHandler) Type() string { return model.SystemTaskTypeOpenC
 func (openCodeGoRefreshHandler) Enabled() bool {
 	return common.CryptoSecretExplicitlyConfigured &&
 		common.GetEnvOrDefaultBool("OPENCODE_GO_REFRESH_TASK_ENABLED", true)
+}
+
+type openCodeGoRiskRecheckTaskPayload struct {
+	ChannelID   int `json:"channel_id"`
+	Concurrency int `json:"concurrency,omitempty"`
+	Limit       int `json:"limit,omitempty"`
+}
+
+type openCodeGoRiskRecheckHandler struct{}
+
+func (openCodeGoRiskRecheckHandler) Type() string {
+	return model.SystemTaskTypeOpenCodeGoRiskRecheck
+}
+
+func (openCodeGoRiskRecheckHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	payload := openCodeGoRiskRecheckTaskPayload{}
+	if err := task.DecodePayload(&payload); err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	if payload.ChannelID <= 0 {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, errors.New("OpenCode Go risk recheck channel is required"))
+		return
+	}
+	if payload.Concurrency <= 0 {
+		payload.Concurrency = configuredOpenCodeGoRiskRecheckConcurrency()
+	}
+	if payload.Limit <= 0 {
+		payload.Limit = configuredOpenCodeGoRiskRecheckBatchSize()
+	}
+	riskService, err := service.NewConfiguredOpenCodeGoRiskRecheckService()
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	summary, err := riskService.RecheckRiskWorkspaces(
+		ctx,
+		payload.ChannelID,
+		payload.Concurrency,
+		payload.Limit,
+		"task",
+		service.NewSystemTaskProgressReporter(task, runnerID),
+	)
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, err)
+		return
+	}
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
 }
 
 func (openCodeGoRefreshHandler) Interval() time.Duration {
@@ -79,6 +129,19 @@ func (openCodeGoRefreshHandler) Run(ctx context.Context, task *model.SystemTask,
 	if payload.Concurrency <= 0 {
 		payload.Concurrency = configuredOpenCodeGoRefreshConcurrency()
 	}
+	batchSize := common.GetEnvOrDefault(
+		"OPENCODE_GO_REFRESH_TASK_BATCH_SIZE",
+		openCodeGoRefreshTaskDefaultBatchSize,
+	)
+	modelRecovery, err := service.RecoverOpenCodeGoModelCooldowns(
+		payload.ChannelID,
+		time.Now(),
+		batchSize,
+	)
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
 	reportProgress := service.NewSystemTaskProgressReporter(task, runnerID)
 	var summary service.OpenCodeGoRefreshSummary
 	if payload.ChannelID > 0 {
@@ -97,10 +160,6 @@ func (openCodeGoRefreshHandler) Run(ctx context.Context, task *model.SystemTask,
 		if staleMinutes < 1 {
 			staleMinutes = openCodeGoRefreshTaskDefaultStaleMinutes
 		}
-		batchSize := common.GetEnvOrDefault(
-			"OPENCODE_GO_REFRESH_TASK_BATCH_SIZE",
-			openCodeGoRefreshTaskDefaultBatchSize,
-		)
 		targets, queryErr := model.ListOpenCodeGoDueRefreshTargets(
 			now,
 			now-int64(staleMinutes*60),
@@ -118,8 +177,22 @@ func (openCodeGoRefreshHandler) Run(ctx context.Context, task *model.SystemTask,
 		)
 	}
 	if err != nil {
+		summary.ModelRecovery = modelRecovery
 		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, err)
 		return
+	}
+	summary.ModelRecovery = modelRecovery
+	if summary.Succeeded > 0 {
+		lifecycle, lifecycleErr := service.NewConfiguredOpenCodeGoLifecycleService()
+		if lifecycleErr != nil {
+			finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, lifecycleErr)
+			return
+		}
+		summary.Lifecycle, lifecycleErr = lifecycle.RunRefreshAutomations(ctx, summary.Results, "refresh_task")
+		if lifecycleErr != nil {
+			finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, lifecycleErr)
+			return
+		}
 	}
 	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
 }
@@ -136,6 +209,31 @@ func configuredOpenCodeGoRefreshConcurrency() int {
 		return service.OpenCodeGoMaxRefreshConcurrency
 	}
 	return concurrency
+}
+
+func configuredOpenCodeGoRiskRecheckConcurrency() int {
+	concurrency := common.GetEnvOrDefault(
+		"OPENCODE_GO_RISK_RECHECK_CONCURRENCY",
+		service.OpenCodeGoDefaultRiskRecheckConcurrency,
+	)
+	if concurrency < 1 {
+		return service.OpenCodeGoDefaultRiskRecheckConcurrency
+	}
+	if concurrency > service.OpenCodeGoMaxRiskRecheckConcurrency {
+		return service.OpenCodeGoMaxRiskRecheckConcurrency
+	}
+	return concurrency
+}
+
+func configuredOpenCodeGoRiskRecheckBatchSize() int {
+	batchSize := common.GetEnvOrDefault("OPENCODE_GO_RISK_RECHECK_BATCH_SIZE", 500)
+	if batchSize < 1 {
+		return 500
+	}
+	if batchSize > 5000 {
+		return 5000
+	}
+	return batchSize
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and

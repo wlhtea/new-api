@@ -23,3 +23,9 @@ func lockForUpdate(tx *gorm.DB) *gorm.DB {
 	}
 	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
 }
+
+// LockForUpdate lets service transactions use the same dialect-safe row-lock
+// behavior as model-owned transactions.
+func LockForUpdate(tx *gorm.DB) *gorm.DB {
+	return lockForUpdate(tx)
+}

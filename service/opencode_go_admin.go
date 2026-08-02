@@ -21,10 +21,12 @@ var openCodeGoCalculatedQuotaLimits = map[string]float64{
 }
 
 type OpenCodeGoPoolView struct {
-	ChannelID              int                      `json:"channel_id"`
-	EligibleWorkspaceCount int                      `json:"eligible_workspace_count"`
-	CryptoSecretConfigured bool                     `json:"crypto_secret_configured"`
-	Identities             []OpenCodeGoIdentityView `json:"identities"`
+	ChannelID              int                       `json:"channel_id"`
+	EligibleWorkspaceCount int                       `json:"eligible_workspace_count"`
+	CryptoSecretConfigured bool                      `json:"crypto_secret_configured"`
+	LifecyclePolicy        OpenCodeGoLifecyclePolicy `json:"lifecycle_policy"`
+	Identities             []OpenCodeGoIdentityView  `json:"identities"`
+	Operations             []OpenCodeGoOperationView `json:"operations"`
 }
 
 type OpenCodeGoIdentityView struct {
@@ -49,13 +51,19 @@ type OpenCodeGoWorkspaceView struct {
 	CredentialStatus         string                         `json:"credential_status"`
 	MembershipStatus         string                         `json:"membership_status"`
 	SubscriptionEndsAt       int64                          `json:"subscription_ends_at"`
+	RenewalCancelledAt       int64                          `json:"renewal_cancelled_at"`
+	RenewalCheckedAt         int64                          `json:"renewal_checked_at"`
+	RenewalCancelError       string                         `json:"renewal_cancel_error"`
 	ManualEnabled            bool                           `json:"manual_enabled"`
 	EffectiveState           string                         `json:"effective_state"`
 	StateReason              string                         `json:"state_reason"`
+	HealthObservation        string                         `json:"health_observation"`
+	HealthObservedAt         int64                          `json:"health_observed_at"`
 	CooldownUntil            int64                          `json:"cooldown_until"`
 	QuotaSnapshotStatus      string                         `json:"quota_snapshot_status"`
 	QuotaFetchedAt           int64                          `json:"quota_fetched_at"`
 	QuotaNextRefreshAt       int64                          `json:"quota_next_refresh_at"`
+	QuotaRecoveryAt          int64                          `json:"quota_recovery_at"`
 	QuotaParserVersion       string                         `json:"quota_parser_version"`
 	QuotaError               string                         `json:"quota_error"`
 	QuotaWindows             []OpenCodeGoQuotaWindowView    `json:"quota_windows"`
@@ -66,6 +74,7 @@ type OpenCodeGoWorkspaceView struct {
 	ReferralCode             string                         `json:"referral_code"`
 	AvailableReferralRewards int                            `json:"available_referral_rewards"`
 	UsedReferralRewards      int                            `json:"used_referral_rewards"`
+	ReferralRewardAppliedAt  int64                          `json:"referral_reward_applied_at"`
 	RiskDetectedAt           int64                          `json:"risk_detected_at"`
 	RiskLastCheckedAt        int64                          `json:"risk_last_checked_at"`
 	LastSyncedAt             int64                          `json:"last_synced_at"`
@@ -89,13 +98,27 @@ type OpenCodeGoQuotaWindowView struct {
 }
 
 type OpenCodeGoWorkspaceModelView struct {
-	Model         string `json:"model"`
-	Discovered    bool   `json:"discovered"`
-	State         string `json:"state"`
-	DisabledUntil int64  `json:"disabled_until"`
-	LastErrorCode string `json:"last_error_code"`
-	LastError     string `json:"last_error"`
-	UpdatedAt     int64  `json:"updated_at"`
+	Model             string `json:"model"`
+	Discovered        bool   `json:"discovered"`
+	State             string `json:"state"`
+	DisabledUntil     int64  `json:"disabled_until"`
+	LastErrorCode     string `json:"last_error_code"`
+	LastError         string `json:"last_error"`
+	HealthObservation string `json:"health_observation"`
+	HealthObservedAt  int64  `json:"health_observed_at"`
+	UpdatedAt         int64  `json:"updated_at"`
+}
+
+type OpenCodeGoOperationView struct {
+	UID          string `json:"uid"`
+	WorkspaceUID string `json:"workspace_uid"`
+	Action       string `json:"action"`
+	Source       string `json:"source"`
+	Status       string `json:"status"`
+	StartedAt    int64  `json:"started_at"`
+	FinishedAt   int64  `json:"finished_at"`
+	Result       string `json:"result"`
+	Error        string `json:"error"`
 }
 
 func GetOpenCodeGoPoolView(channelID int) (*OpenCodeGoPoolView, error) {
@@ -106,11 +129,21 @@ func GetOpenCodeGoPoolView(channelID int) (*OpenCodeGoPoolView, error) {
 	if err != nil {
 		return nil, err
 	}
+	policy, err := GetOpenCodeGoLifecyclePolicy(channelID)
+	if err != nil {
+		return nil, err
+	}
+	operations, err := model.ListOpenCodeGoOperations(channelID, 50)
+	if err != nil {
+		return nil, err
+	}
 	view := &OpenCodeGoPoolView{
 		ChannelID:              channelID,
 		EligibleWorkspaceCount: openCodeGoPoolEligibleCount(channelID),
 		CryptoSecretConfigured: common.CryptoSecretExplicitlyConfigured,
+		LifecyclePolicy:        policy,
 		Identities:             make([]OpenCodeGoIdentityView, 0, len(identities)),
+		Operations:             make([]OpenCodeGoOperationView, 0, len(operations)),
 	}
 	for _, identity := range identities {
 		identityView := OpenCodeGoIdentityView{
@@ -131,6 +164,19 @@ func GetOpenCodeGoPoolView(channelID int) (*OpenCodeGoPoolView, error) {
 		}
 		view.Identities = append(view.Identities, identityView)
 	}
+	for _, operation := range operations {
+		view.Operations = append(view.Operations, OpenCodeGoOperationView{
+			UID:          operation.UID,
+			WorkspaceUID: operation.WorkspaceUID,
+			Action:       operation.Action,
+			Source:       operation.Source,
+			Status:       operation.Status,
+			StartedAt:    operation.StartedAt,
+			FinishedAt:   operation.FinishedAt,
+			Result:       sanitizeOpenCodeGoStoredMessage(operation.Result),
+			Error:        sanitizeOpenCodeGoStoredMessage(operation.Error),
+		})
+	}
 	return view, nil
 }
 
@@ -143,13 +189,19 @@ func openCodeGoWorkspaceToView(workspace model.OpenCodeGoWorkspace) OpenCodeGoWo
 		CredentialStatus:         workspace.CredentialStatus,
 		MembershipStatus:         workspace.MembershipStatus,
 		SubscriptionEndsAt:       workspace.SubscriptionEndsAt,
+		RenewalCancelledAt:       workspace.RenewalCancelledAt,
+		RenewalCheckedAt:         workspace.RenewalCheckedAt,
+		RenewalCancelError:       sanitizeOpenCodeGoStoredMessage(workspace.RenewalCancelError),
 		ManualEnabled:            workspace.ManualEnabled,
 		EffectiveState:           workspace.EffectiveState,
 		StateReason:              sanitizeOpenCodeGoStoredMessage(workspace.StateReason),
+		HealthObservation:        workspace.HealthObservation,
+		HealthObservedAt:         workspace.HealthObservedAt,
 		CooldownUntil:            workspace.CooldownUntil,
 		QuotaSnapshotStatus:      workspace.QuotaSnapshotStatus,
 		QuotaFetchedAt:           workspace.QuotaFetchedAt,
 		QuotaNextRefreshAt:       workspace.QuotaNextRefreshAt,
+		QuotaRecoveryAt:          workspace.QuotaRecoveryAt,
 		QuotaParserVersion:       workspace.QuotaParserVersion,
 		QuotaError:               sanitizeOpenCodeGoStoredMessage(workspace.QuotaError),
 		QuotaWindows:             make([]OpenCodeGoQuotaWindowView, 0, len(workspace.QuotaWindows)),
@@ -160,6 +212,7 @@ func openCodeGoWorkspaceToView(workspace model.OpenCodeGoWorkspace) OpenCodeGoWo
 		ReferralCode:             workspace.ReferralCode,
 		AvailableReferralRewards: workspace.AvailableReferralRewards,
 		UsedReferralRewards:      workspace.UsedReferralRewards,
+		ReferralRewardAppliedAt:  workspace.ReferralRewardAppliedAt,
 		RiskDetectedAt:           workspace.RiskDetectedAt,
 		RiskLastCheckedAt:        workspace.RiskLastCheckedAt,
 		LastSyncedAt:             workspace.LastSyncedAt,
@@ -186,13 +239,15 @@ func openCodeGoWorkspaceToView(workspace model.OpenCodeGoWorkspace) OpenCodeGoWo
 	}
 	for _, entry := range workspace.Models {
 		view.Models = append(view.Models, OpenCodeGoWorkspaceModelView{
-			Model:         entry.Model,
-			Discovered:    entry.Discovered,
-			State:         entry.State,
-			DisabledUntil: entry.DisabledUntil,
-			LastErrorCode: entry.LastErrorCode,
-			LastError:     sanitizeOpenCodeGoStoredMessage(entry.LastError),
-			UpdatedAt:     entry.UpdatedAt,
+			Model:             entry.Model,
+			Discovered:        entry.Discovered,
+			State:             entry.State,
+			DisabledUntil:     entry.DisabledUntil,
+			LastErrorCode:     entry.LastErrorCode,
+			LastError:         sanitizeOpenCodeGoStoredMessage(entry.LastError),
+			HealthObservation: entry.HealthObservation,
+			HealthObservedAt:  entry.HealthObservedAt,
+			UpdatedAt:         entry.UpdatedAt,
 		})
 	}
 	sort.Slice(view.QuotaWindows, func(i, j int) bool {
@@ -228,32 +283,48 @@ func (service *OpenCodeGoAccountPoolService) SetIdentityEnabled(channelID int, i
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return err
 	}
-	identity, err := model.GetOpenCodeGoIdentityPool(channelID, identityUID)
-	if err != nil {
-		return err
-	}
-	if identity == nil {
-		return gorm.ErrRecordNotFound
-	}
-	status := model.OpenCodeGoIdentityStatusManualDisabled
-	if enabled {
-		status = model.OpenCodeGoIdentityStatusStale
-		now := service.now().Unix()
-		for _, workspace := range identity.Workspaces {
-			if isOpenCodeGoWorkspaceEligibleForSnapshot(workspace, now) {
-				status = model.OpenCodeGoIdentityStatusActive
-				break
-			}
+	changed := false
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		var identity model.OpenCodeGoIdentity
+		if err := model.LockForUpdate(tx).
+			Where("channel_id = ? AND uid = ?", channelID, identityUID).
+			Preload("Workspaces", func(query *gorm.DB) *gorm.DB { return query.Order("id asc") }).
+			Preload("Workspaces.QuotaWindows").
+			First(&identity).Error; err != nil {
+			return err
 		}
-	}
-	result := model.DB.Model(&model.OpenCodeGoIdentity{}).
-		Where("id = ?", identity.ID).
-		Updates(map[string]interface{}{
-			"status":     status,
-			"updated_at": common.GetTimestamp(),
-		})
-	if result.Error != nil {
-		return result.Error
+
+		status := model.OpenCodeGoIdentityStatusManualDisabled
+		if enabled {
+			if identity.Status != model.OpenCodeGoIdentityStatusManualDisabled {
+				return nil
+			}
+			status = model.OpenCodeGoIdentityStatusStale
+			now := service.now().Unix()
+			for _, workspace := range identity.Workspaces {
+				if isOpenCodeGoWorkspaceEligibleForSnapshot(workspace, now) {
+					status = model.OpenCodeGoIdentityStatusActive
+					break
+				}
+			}
+		} else if identity.Status == model.OpenCodeGoIdentityStatusManualDisabled {
+			return nil
+		}
+
+		result := tx.Model(&model.OpenCodeGoIdentity{}).
+			Where("id = ?", identity.ID).
+			Updates(map[string]interface{}{
+				"status":     status,
+				"updated_at": common.GetTimestamp(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		changed = result.RowsAffected == 1
+		return nil
+	})
+	if err != nil || !changed {
+		return err
 	}
 	return service.rebuildChannel(channelID)
 }
@@ -262,35 +333,55 @@ func (service *OpenCodeGoAccountPoolService) SetWorkspaceEnabled(channelID int, 
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return err
 	}
-	workspace, err := model.GetOpenCodeGoWorkspace(channelID, workspaceUID)
-	if err != nil {
-		return err
-	}
-	if workspace == nil {
-		return gorm.ErrRecordNotFound
-	}
-	workspace.ManualEnabled = enabled
-	state := model.OpenCodeGoStateManualDisabled
-	reason := "workspace is manually disabled"
-	if enabled {
-		state, reason = effectiveOpenCodeGoWorkspaceState(
-			*workspace,
-			workspace.QuotaWindows,
-			nil,
-			false,
+	changed := false
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		var workspace model.OpenCodeGoWorkspace
+		if err := model.LockForUpdate(tx).
+			Where("channel_id = ? AND uid = ?", channelID, workspaceUID).
+			Preload("QuotaWindows").
+			Preload("Models").
+			First(&workspace).Error; err != nil {
+			return err
+		}
+		candidate := workspace
+		candidate.ManualEnabled = enabled
+		kind := OpenCodeGoObservationManualDisabled
+		if enabled {
+			kind = OpenCodeGoObservationManualEnabled
+		}
+		reduced, applied, err := ReduceOpenCodeGoWorkspaceHealth(
 			workspace,
+			candidate,
+			workspace.QuotaWindows,
+			OpenCodeGoHealthObservation{
+				Kind:            kind,
+				ObservedAt:      service.now(),
+				HasUsableModels: hasUsableOpenCodeGoModels(nil, false, &workspace),
+			},
 		)
-	}
-	result := model.DB.Model(&model.OpenCodeGoWorkspace{}).
-		Where("id = ?", workspace.ID).
-		Updates(map[string]interface{}{
-			"manual_enabled":  enabled,
-			"effective_state": state,
-			"state_reason":    reason,
-			"updated_at":      common.GetTimestamp(),
-		})
-	if result.Error != nil {
-		return result.Error
+		if err != nil || !applied {
+			return err
+		}
+		result := tx.Model(&model.OpenCodeGoWorkspace{}).
+			Where("id = ?", workspace.ID).
+			Updates(map[string]interface{}{
+				"manual_enabled":     reduced.ManualEnabled,
+				"effective_state":    reduced.EffectiveState,
+				"state_reason":       reduced.StateReason,
+				"health_observation": reduced.HealthObservation,
+				"health_observed_at": reduced.HealthObservedAt,
+				"quota_recovery_at":  reduced.QuotaRecoveryAt,
+				"cooldown_until":     reduced.CooldownUntil,
+				"updated_at":         common.GetTimestamp(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		changed = result.RowsAffected == 1
+		return nil
+	})
+	if err != nil || !changed {
+		return err
 	}
 	return service.rebuildChannel(channelID)
 }

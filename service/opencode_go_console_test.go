@@ -15,6 +15,7 @@ import (
 func TestOpenCodeGoConsoleClientDiscoversWorkspacesKeysAndModels(t *testing.T) {
 	fixedNow := time.Unix(1_900_000_000, 0)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(t, http.MethodGet, request.Method)
 		if request.URL.Path != "/zen/go/v1/models" {
 			require.Equal(t, "auth=synthetic-cookie; oc_locale=zh", request.Header.Get("Cookie"))
 		}
