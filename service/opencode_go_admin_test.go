@@ -3,9 +3,11 @@ package service
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
@@ -38,6 +40,16 @@ func TestOpenCodeGoPoolViewRedactsEveryCredentialAndStoredDiagnostic(t *testing.
 			"quota_error":        diagnostic,
 			"last_error":         diagnostic,
 		}).Error)
+	require.NoError(t, db.Create(&model.OpenCodeGoOperation{
+		UID:          "operation-redaction",
+		ChannelID:    channel.Id,
+		WorkspaceID:  workspace.ID,
+		WorkspaceUID: workspace.UID,
+		Action:       OpenCodeGoOperationApplyReferral,
+		Source:       "manual",
+		Status:       OpenCodeGoOperationStatusFailed,
+		Error:        diagnostic + " ref_SECRET1",
+	}).Error)
 
 	view, err := GetOpenCodeGoPoolView(channel.Id)
 	require.NoError(t, err)
@@ -51,6 +63,8 @@ func TestOpenCodeGoPoolViewRedactsEveryCredentialAndStoredDiagnostic(t *testing.
 	require.Len(t, workspaceView.QuotaWindows, 3)
 	require.Equal(t, openCodeGoQuotaSourceConsole, workspaceView.QuotaWindows[0].Source)
 	require.False(t, workspaceView.QuotaWindows[0].AmountsAuthoritative)
+	require.Len(t, view.Operations, 1)
+	require.Contains(t, view.Operations[0].Error, "[redacted")
 
 	payload, err := common.Marshal(view)
 	require.NoError(t, err)
@@ -60,6 +74,7 @@ func TestOpenCodeGoPoolViewRedactsEveryCredentialAndStoredDiagnostic(t *testing.
 		"hidden-key",
 		"sk-hidd",
 		"wrk_SECRET1",
+		"ref_SECRET1",
 		"auth_cookie_ciphertext",
 		"api_key_ciphertext",
 		"api_key_prefix",
@@ -113,6 +128,50 @@ func TestOpenCodeGoManualEnablementInvalidatesModelsAndPoolSnapshots(t *testing.
 	require.NoError(t, adminService.SetWorkspaceEnabled(channel.Id, workspace.UID, true))
 	_, err = SelectOpenCodeGoWorkspace(channel.Id, "model-a")
 	require.NoError(t, err)
+}
+
+func TestSetOpenCodeGoWorkspaceEnabledCannotClearRiskBlock(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t,
+		db,
+		codec,
+		channel.Id,
+		"risk-enable",
+		"workspace-risk-enable",
+		"wrk_RISKENABLE",
+		[]string{"model-a"},
+	)
+	riskAt := time.Unix(1_900_000_100, 0)
+	classified, ok := ClassifyOpenCodeGoProviderFailure(OpenCodeGoProviderFailure{
+		StatusCode: 401,
+		ErrorType:  "AuthError",
+		Message:    "Request blocked by upstream provider.",
+	}, riskAt)
+	require.True(t, ok)
+	applied, err := applyOpenCodeGoClassifiedFailure(channel.Id, workspace.UID, "model-a", classified, nil)
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	adminService := NewOpenCodeGoAccountPoolAdminService()
+	adminService.now = func() time.Time { return riskAt.Add(time.Minute) }
+	require.NoError(t, adminService.SetWorkspaceEnabled(channel.Id, workspace.UID, false))
+
+	disabled, err := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+	require.NoError(t, err)
+	assert.False(t, disabled.ManualEnabled)
+	assert.Equal(t, model.OpenCodeGoStateManualDisabled, disabled.EffectiveState)
+	assert.Equal(t, riskAt.Unix(), disabled.RiskDetectedAt)
+
+	adminService.now = func() time.Time { return riskAt.Add(2 * time.Minute) }
+	require.NoError(t, adminService.SetWorkspaceEnabled(channel.Id, workspace.UID, true))
+
+	after, err := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+	require.NoError(t, err)
+	assert.True(t, after.ManualEnabled)
+	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, after.EffectiveState)
+	assert.Equal(t, string(OpenCodeGoObservationManualEnabled), after.HealthObservation)
+	assert.Equal(t, riskAt.Unix(), after.RiskDetectedAt)
 }
 
 func TestOpenCodeGoAdminDeletesOwnedRowsAndRebuildsDerivedState(t *testing.T) {

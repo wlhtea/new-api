@@ -4,15 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
@@ -27,6 +30,8 @@ type fakeOpenCodeGoConsole struct {
 	discoverCalls          atomic.Int32
 	activeDiscoveries      atomic.Int32
 	maxActiveDiscoveries   atomic.Int32
+	discoverStarted        chan<- struct{}
+	discoverRelease        <-chan struct{}
 	keys                   map[string]string
 	keyErrors              map[string]error
 	models                 map[string][]string
@@ -34,7 +39,7 @@ type fakeOpenCodeGoConsole struct {
 }
 
 func (fake *fakeOpenCodeGoConsole) DiscoverWorkspacePages(
-	_ context.Context,
+	ctx context.Context,
 	authCookie string,
 	_ string,
 ) ([]OpenCodeGoWorkspacePageResult, error) {
@@ -49,6 +54,8 @@ func (fake *fakeOpenCodeGoConsole) DiscoverWorkspacePages(
 		discoverErr = value
 	}
 	delay := fake.discoverDelay
+	discoverStarted := fake.discoverStarted
+	discoverRelease := fake.discoverRelease
 	fake.mutex.Unlock()
 	active := fake.activeDiscoveries.Add(1)
 	for {
@@ -58,6 +65,19 @@ func (fake *fakeOpenCodeGoConsole) DiscoverWorkspacePages(
 		}
 	}
 	defer fake.activeDiscoveries.Add(-1)
+	if discoverStarted != nil {
+		select {
+		case discoverStarted <- struct{}{}:
+		default:
+		}
+	}
+	if discoverRelease != nil {
+		select {
+		case <-discoverRelease:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if delay > 0 {
 		time.Sleep(delay)
 	}
@@ -428,6 +448,257 @@ func TestOpenCodeGoRefreshTargetsUsesBoundedConcurrentWorkers(t *testing.T) {
 	require.Equal(t, [2]int{2, 2}, progress[len(progress)-1])
 	require.Equal(t, "identity-one", summary.Results[0].IdentityUID)
 	require.Equal(t, "identity-two", summary.Results[1].IdentityUID)
+}
+
+func TestOpenCodeGoOlderConsoleCommitCannotOverwriteNewerRiskObservation(t *testing.T) {
+	_, channel, _ := setupOpenCodeGoPoolTestDB(t)
+	identity := model.OpenCodeGoIdentity{
+		UID:                   "identity-console-race",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie-console-race",
+		AuthCookieFingerprint: "fingerprint-console-race",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, model.DB.Create(&identity).Error)
+	seeded := seedOpenCodeGoHealthWorkspace(t, channel.Id, identity.ID, "workspace-console-race", "glm-5.2")
+	current, err := model.GetOpenCodeGoWorkspace(channel.Id, seeded.UID)
+	require.NoError(t, err)
+	require.NotNil(t, current)
+
+	consoleTime := time.Unix(1_900_000_100, 0)
+	prepared := openCodeGoPreparedWorkspace{
+		record:      *current,
+		models:      []string{"glm-5.2"},
+		modelsFresh: true,
+		healthObservation: OpenCodeGoHealthObservation{
+			Kind:            OpenCodeGoObservationConsoleSnapshot,
+			ObservedAt:      consoleTime,
+			HasUsableModels: true,
+		},
+	}
+	prepared.record.QuotaFetchedAt = consoleTime.Unix()
+	prepared.record.QuotaNextRefreshAt = consoleTime.Add(time.Hour).Unix()
+	prepared.record.LastSyncedAt = consoleTime.Unix()
+	prepared.windows = make([]model.OpenCodeGoQuotaWindow, 0, len(model.OpenCodeGoQuotaKinds))
+	for index, kind := range model.OpenCodeGoQuotaKinds {
+		prepared.windows = append(prepared.windows, model.OpenCodeGoQuotaWindow{
+			Kind:        kind,
+			UsedPercent: 20 + float64(index),
+			ResetAt:     consoleTime.Add(time.Duration(index+1) * time.Hour).Unix(),
+			FetchedAt:   consoleTime.Unix(),
+		})
+	}
+
+	riskTime := consoleTime.Add(time.Second)
+	risk, ok := ClassifyOpenCodeGoProviderFailure(OpenCodeGoProviderFailure{
+		StatusCode: 401,
+		ErrorType:  "AuthError",
+		Message:    "Request blocked by upstream provider.",
+	}, riskTime)
+	require.True(t, ok)
+	applied, err := applyOpenCodeGoClassifiedFailure(channel.Id, seeded.UID, "glm-5.2", risk, nil)
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	require.NoError(t, model.DB.Transaction(func(tx *gorm.DB) error {
+		return updateOpenCodeGoPreparedWorkspaceTx(tx, &prepared, riskTime.Add(time.Second).Unix())
+	}))
+	after, err := model.GetOpenCodeGoWorkspace(channel.Id, seeded.UID)
+	require.NoError(t, err)
+	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, after.EffectiveState)
+	assert.Equal(t, string(OpenCodeGoObservationRiskBlocked), after.HealthObservation)
+	assert.Equal(t, riskTime.UnixNano(), after.HealthObservedAt)
+	assert.Equal(t, consoleTime.Unix(), after.QuotaFetchedAt)
+	require.Len(t, after.QuotaWindows, len(model.OpenCodeGoQuotaKinds))
+	percentByKind := make(map[string]float64, len(after.QuotaWindows))
+	for _, window := range after.QuotaWindows {
+		percentByKind[window.Kind] = window.UsedPercent
+	}
+	assert.Equal(t, float64(20), percentByKind[model.OpenCodeGoQuotaRolling])
+}
+
+func TestOpenCodeGoOlderConsoleCommitCannotOverwriteNewerConsoleFields(t *testing.T) {
+	_, channel, _ := setupOpenCodeGoPoolTestDB(t)
+	identity := model.OpenCodeGoIdentity{
+		UID:                   "identity-console-order",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie-console-order",
+		AuthCookieFingerprint: "fingerprint-console-order",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, model.DB.Create(&identity).Error)
+	seeded := seedOpenCodeGoHealthWorkspace(t, channel.Id, identity.ID, "workspace-console-order", "newer-model")
+
+	newer := time.Unix(1_900_000_200, 0)
+	require.NoError(t, model.DB.Model(&model.OpenCodeGoWorkspace{}).
+		Where("id = ?", seeded.ID).
+		Updates(map[string]interface{}{
+			"name":                       "newer workspace",
+			"email":                      "newer@example.test",
+			"membership_status":          model.OpenCodeGoMembershipActive,
+			"subscription_reference":     "sub_NEWER",
+			"china_models_enabled":       true,
+			"referral_code":              "NEWER",
+			"available_referral_rewards": 3,
+			"used_referral_rewards":      2,
+			"last_synced_at":             newer.Unix(),
+			"health_observation":         string(OpenCodeGoObservationConsoleSnapshot),
+			"health_observed_at":         newer.UnixNano(),
+		}).Error)
+	current, err := model.GetOpenCodeGoWorkspace(channel.Id, seeded.UID)
+	require.NoError(t, err)
+	require.NotNil(t, current)
+
+	older := newer.Add(-time.Minute)
+	chinaModelsDisabled := false
+	prepared := openCodeGoPreparedWorkspace{
+		record:      *current,
+		models:      []string{"older-model"},
+		modelsFresh: true,
+		healthObservation: OpenCodeGoHealthObservation{
+			Kind:            OpenCodeGoObservationConsoleSnapshot,
+			ObservedAt:      older,
+			HasUsableModels: true,
+		},
+	}
+	prepared.record.Name = "older workspace"
+	prepared.record.Email = "older@example.test"
+	prepared.record.MembershipStatus = model.OpenCodeGoMembershipInactive
+	prepared.record.SubscriptionReference = "sub_OLDER"
+	prepared.record.ChinaModelsEnabled = &chinaModelsDisabled
+	prepared.record.ReferralCode = "OLDER"
+	prepared.record.AvailableReferralRewards = 0
+	prepared.record.UsedReferralRewards = 0
+	prepared.record.LastSyncedAt = older.Unix()
+
+	require.NoError(t, model.DB.Transaction(func(tx *gorm.DB) error {
+		return updateOpenCodeGoPreparedWorkspaceTx(tx, &prepared, newer.Add(time.Minute).Unix())
+	}))
+	after, err := model.GetOpenCodeGoWorkspace(channel.Id, seeded.UID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, "newer workspace", after.Name)
+	assert.Equal(t, "newer@example.test", after.Email)
+	assert.Equal(t, model.OpenCodeGoMembershipActive, after.MembershipStatus)
+	assert.Equal(t, "sub_NEWER", after.SubscriptionReference)
+	require.NotNil(t, after.ChinaModelsEnabled)
+	assert.True(t, *after.ChinaModelsEnabled)
+	assert.Equal(t, "NEWER", after.ReferralCode)
+	assert.Equal(t, 3, after.AvailableReferralRewards)
+	assert.Equal(t, 2, after.UsedReferralRewards)
+	assert.Equal(t, newer.Unix(), after.LastSyncedAt)
+	require.Len(t, after.Models, 1)
+	assert.Equal(t, "newer-model", after.Models[0].Model)
+}
+
+func TestOpenCodeGoRefreshCommitPreservesConcurrentManualDisable(t *testing.T) {
+	_, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	fetchedAt := int64(1_900_000_000)
+	fake := &fakeOpenCodeGoConsole{
+		discovered: []OpenCodeGoWorkspacePageResult{{
+			Workspace: OpenCodeGoDiscoveredWorkspace{ID: "wrk_ALPHA1"},
+			Page:      completeOpenCodeGoConsolePage("wrk_ALPHA1", 10, fetchedAt),
+		}},
+		keys:        map[string]string{"wrk_ALPHA1": "sk-synthetic-one"},
+		keyErrors:   map[string]error{},
+		models:      map[string][]string{"sk-synthetic-one": {"model-a"}},
+		modelErrors: map[string]error{},
+	}
+	poolService := newOpenCodeGoAccountPoolService(fake, codec)
+	poolService.now = func() time.Time { return time.Unix(fetchedAt, 0) }
+	poolService.rebuild = nil
+	results, err := poolService.ImportAuthCookies(context.Background(), channel.Id, "", "synthetic-cookie")
+	require.NoError(t, err)
+	identity, err := model.GetOpenCodeGoIdentityPool(channel.Id, results[0].IdentityUID)
+	require.NoError(t, err)
+	require.Len(t, identity.Workspaces, 1)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	fake.mutex.Lock()
+	fake.discovered = []OpenCodeGoWorkspacePageResult{{
+		Workspace: OpenCodeGoDiscoveredWorkspace{ID: "wrk_ALPHA1"},
+		Page:      completeOpenCodeGoConsolePage("wrk_ALPHA1", 20, fetchedAt+60),
+	}}
+	fake.discoverStarted = started
+	fake.discoverRelease = release
+	fake.mutex.Unlock()
+	poolService.now = func() time.Time { return time.Unix(fetchedAt+60, 0) }
+
+	refreshResult := make(chan error, 1)
+	go func() {
+		_, refreshErr := poolService.RefreshIdentity(context.Background(), channel.Id, identity.UID)
+		refreshResult <- refreshErr
+	}()
+	<-started
+	require.NoError(t, poolService.SetIdentityEnabled(channel.Id, identity.UID, false))
+	require.NoError(t, poolService.SetWorkspaceEnabled(channel.Id, identity.Workspaces[0].UID, false))
+	close(release)
+	require.NoError(t, <-refreshResult)
+
+	after, err := model.GetOpenCodeGoIdentityPool(channel.Id, identity.UID)
+	require.NoError(t, err)
+	assert.Equal(t, model.OpenCodeGoIdentityStatusManualDisabled, after.Status)
+	require.Len(t, after.Workspaces, 1)
+	assert.False(t, after.Workspaces[0].ManualEnabled)
+	assert.Equal(t, model.OpenCodeGoStateManualDisabled, after.Workspaces[0].EffectiveState)
+}
+
+func TestOpenCodeGoOlderRefreshFailureCannotInvalidateNewerSnapshot(t *testing.T) {
+	_, channel, _ := setupOpenCodeGoPoolTestDB(t)
+	identity := model.OpenCodeGoIdentity{
+		UID:                   "identity-old-failure",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie-old-failure",
+		AuthCookieFingerprint: "fingerprint-old-failure",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, model.DB.Create(&identity).Error)
+	workspace := seedOpenCodeGoHealthWorkspace(t, channel.Id, identity.ID, "workspace-old-failure", "glm-5.2")
+	staleIdentity, err := model.GetOpenCodeGoIdentityPool(channel.Id, identity.UID)
+	require.NoError(t, err)
+
+	newer := time.Unix(1_900_000_200, 0)
+	require.NoError(t, model.DB.Model(&model.OpenCodeGoIdentity{}).
+		Where("id = ?", identity.ID).
+		Updates(map[string]interface{}{"last_synced_at": newer.Unix(), "last_error": ""}).Error)
+	require.NoError(t, model.DB.Model(&model.OpenCodeGoWorkspace{}).
+		Where("id = ?", workspace.ID).
+		Updates(map[string]interface{}{
+			"health_observation":    string(OpenCodeGoObservationConsoleSnapshot),
+			"health_observed_at":    newer.UnixNano(),
+			"last_synced_at":        newer.Unix(),
+			"quota_snapshot_status": model.OpenCodeGoQuotaSnapshotComplete,
+			"quota_error":           "",
+		}).Error)
+
+	poolService := NewOpenCodeGoAccountPoolAdminService()
+	poolService.now = func() time.Time { return newer.Add(-time.Second) }
+	poolService.rebuild = nil
+	require.NoError(t, poolService.markIdentityRefreshFailure(
+		channel.Id,
+		staleIdentity,
+		model.OpenCodeGoIdentityStatusAuthError,
+		ErrOpenCodeGoAuthenticationInvalid,
+	))
+
+	after, err := model.GetOpenCodeGoIdentityPool(channel.Id, identity.UID)
+	require.NoError(t, err)
+	assert.Equal(t, model.OpenCodeGoIdentityStatusActive, after.Status)
+	assert.Equal(t, newer.Unix(), after.LastSyncedAt)
+	require.Len(t, after.Workspaces, 1)
+	assert.Equal(t, model.OpenCodeGoQuotaSnapshotComplete, after.Workspaces[0].QuotaSnapshotStatus)
+	assert.Equal(t, string(OpenCodeGoObservationConsoleSnapshot), after.Workspaces[0].HealthObservation)
+	assert.Equal(t, newer.UnixNano(), after.Workspaces[0].HealthObservedAt)
+}
+
+func TestSanitizeOpenCodeGoErrorTruncatesAtUTF8Boundary(t *testing.T) {
+	message := strings.Repeat("\u754c", 200) + string([]byte{0xff})
+	sanitized := sanitizeOpenCodeGoError(errors.New(message))
+
+	assert.True(t, utf8.ValidString(sanitized))
+	assert.LessOrEqual(t, len(sanitized), 512)
+	assert.NotContains(t, sanitized, string([]byte{0xff}))
 }
 
 func TestRefreshOpenCodeGoWorkspaceRefreshesItsOwningIdentityOnce(t *testing.T) {

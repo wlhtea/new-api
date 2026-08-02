@@ -121,8 +121,12 @@ func (codec *OpenCodeGoCredentialCodec) Decrypt(
 		return "", errors.New("unsupported OpenCode Go credential envelope")
 	}
 
-	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(envelope, openCodeGoCredentialEnvelopePrefix))
+	encodedPayload := strings.TrimPrefix(envelope, openCodeGoCredentialEnvelopePrefix)
+	payload, err := base64.RawURLEncoding.DecodeString(encodedPayload)
 	if err != nil {
+		return "", errors.New("invalid OpenCode Go credential envelope")
+	}
+	if base64.RawURLEncoding.EncodeToString(payload) != encodedPayload {
 		return "", errors.New("invalid OpenCode Go credential envelope")
 	}
 	nonceSize := codec.aead.NonceSize()

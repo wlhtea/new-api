@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/mail"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -24,6 +25,11 @@ const (
 )
 
 var openCodeGoWorkspaceIDPattern = regexp.MustCompile(`(?i)^wrk_[a-z0-9]+$`)
+
+var (
+	openCodeGoServerActionIDPattern   = regexp.MustCompile(`(?i)^[a-f0-9]{64}$`)
+	openCodeGoReferralRewardIDPattern = regexp.MustCompile(`(?i)^ref_[a-z0-9]+$`)
+)
 
 type OpenCodeGoDiscoveredWorkspace struct {
 	ID   string
@@ -45,18 +51,28 @@ type OpenCodeGoAuthoritativeQuotaSnapshot struct {
 }
 
 type OpenCodeGoConsolePage struct {
-	WorkspaceID              string
-	WorkspaceName            string
-	Email                    string
-	Workspaces               []OpenCodeGoDiscoveredWorkspace
-	MembershipStatus         string
-	SubscriptionReference    string
-	Quota                    *OpenCodeGoAuthoritativeQuotaSnapshot
-	QuotaParseError          string
-	ReferralCode             string
-	AvailableReferralRewards int
-	UsedReferralRewards      int
-	ChinaModelsEnabled       *bool
+	WorkspaceID                string
+	WorkspaceName              string
+	Email                      string
+	Workspaces                 []OpenCodeGoDiscoveredWorkspace
+	MembershipStatus           string
+	SubscriptionReference      string
+	Quota                      *OpenCodeGoAuthoritativeQuotaSnapshot
+	QuotaParseError            string
+	ReferralCode               string
+	AvailableReferralRewards   int
+	UsedReferralRewards        int
+	AvailableReferralRewardIDs []string
+	UsedReferralRewardIDs      []string
+	ChinaModelsEnabled         *bool
+	ChinaModelsServerID        string
+	RouteModuleAssets          []string
+}
+
+type openCodeGoConsoleHTMLMetadata struct {
+	chinaModelsEnabled  *bool
+	chinaModelsServerID string
+	routeModuleAssets   []string
 }
 
 type openCodeGoSSRTokenKind uint8
@@ -88,16 +104,18 @@ func ParseOpenCodeGoConsolePage(document string, currentWorkspaceID string, fetc
 	if err != nil {
 		return nil, errors.New("OpenCode Go console HTML could not be parsed")
 	}
-	scriptSource, visibleText, chinaModelsEnabled := extractOpenCodeGoConsoleHTML(doc)
+	scriptSource, visibleText, metadata := extractOpenCodeGoConsoleHTML(doc)
 	tokens := lexOpenCodeGoSSR(scriptSource)
 	if len(tokens) > openCodeGoMaxSSRTokens {
 		return nil, errors.New("OpenCode Go console hydration payload is too large")
 	}
 
 	page := &OpenCodeGoConsolePage{
-		WorkspaceID:        currentWorkspaceID,
-		MembershipStatus:   model.OpenCodeGoMembershipUnknown,
-		ChinaModelsEnabled: chinaModelsEnabled,
+		WorkspaceID:         currentWorkspaceID,
+		MembershipStatus:    model.OpenCodeGoMembershipUnknown,
+		ChinaModelsEnabled:  metadata.chinaModelsEnabled,
+		ChinaModelsServerID: metadata.chinaModelsServerID,
+		RouteModuleAssets:   metadata.routeModuleAssets,
 	}
 	page.Workspaces = extractOpenCodeGoWorkspaces(tokens)
 	for _, workspace := range page.Workspaces {
@@ -113,7 +131,9 @@ func ParseOpenCodeGoConsolePage(document string, currentWorkspaceID string, fetc
 
 	page.Email = extractOpenCodeGoEmail(tokens)
 	page.ReferralCode, _ = findOpenCodeGoSSRStringProperty(tokens, "referralCode")
-	page.AvailableReferralRewards, page.UsedReferralRewards = countOpenCodeGoReferralRewards(tokens)
+	page.AvailableReferralRewardIDs, page.UsedReferralRewardIDs = extractOpenCodeGoReferralRewardIDs(tokens)
+	page.AvailableReferralRewards = len(page.AvailableReferralRewardIDs)
+	page.UsedReferralRewards = len(page.UsedReferralRewardIDs)
 	page.MembershipStatus, page.SubscriptionReference = parseOpenCodeGoMembership(tokens, visibleText)
 
 	if page.MembershipStatus != model.OpenCodeGoMembershipActive {
@@ -157,10 +177,11 @@ func ParseOpenCodeGoAPIKeyPage(document string) (string, error) {
 	return "", nil
 }
 
-func extractOpenCodeGoConsoleHTML(doc *html.Node) (string, string, *bool) {
+func extractOpenCodeGoConsoleHTML(doc *html.Node) (string, string, openCodeGoConsoleHTMLMetadata) {
 	var scripts strings.Builder
 	var visible strings.Builder
-	var chinaModelsEnabled *bool
+	metadata := openCodeGoConsoleHTMLMetadata{}
+	seenAssets := make(map[string]struct{})
 
 	var walk func(*html.Node, bool)
 	walk = func(node *html.Node, inScript bool) {
@@ -174,18 +195,35 @@ func extractOpenCodeGoConsoleHTML(doc *html.Node) (string, string, *bool) {
 				visible.WriteByte(' ')
 			}
 		}
-		if chinaModelsEnabled == nil && node.Type == html.ElementNode && strings.EqualFold(node.Data, "form") {
-			chinaModelsEnabled = extractOpenCodeGoChinaModelForm(node)
+		if metadata.chinaModelsEnabled == nil && node.Type == html.ElementNode && strings.EqualFold(node.Data, "form") {
+			metadata.chinaModelsEnabled, metadata.chinaModelsServerID = extractOpenCodeGoChinaModelForm(node)
+		}
+		if node.Type == html.ElementNode && strings.EqualFold(node.Data, "link") && len(metadata.routeModuleAssets) < 128 {
+			rel := strings.Fields(strings.ToLower(openCodeGoHTMLAttribute(node, "rel")))
+			isModulePreload := false
+			for _, value := range rel {
+				if value == "modulepreload" {
+					isModulePreload = true
+					break
+				}
+			}
+			href := strings.TrimSpace(openCodeGoHTMLAttribute(node, "href"))
+			if isModulePreload && href != "" && len(href) <= 2048 {
+				if _, exists := seenAssets[href]; !exists {
+					seenAssets[href] = struct{}{}
+					metadata.routeModuleAssets = append(metadata.routeModuleAssets, href)
+				}
+			}
 		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
 			walk(child, nextInScript)
 		}
 	}
 	walk(doc, false)
-	return scripts.String(), visible.String(), chinaModelsEnabled
+	return scripts.String(), visible.String(), metadata
 }
 
-func extractOpenCodeGoChinaModelForm(form *html.Node) *bool {
+func extractOpenCodeGoChinaModelForm(form *html.Node) (*bool, string) {
 	var result *bool
 	var walk func(*html.Node)
 	walk = func(node *html.Node) {
@@ -207,7 +245,18 @@ func extractOpenCodeGoChinaModelForm(form *html.Node) *bool {
 		}
 	}
 	walk(form)
-	return result
+	if result == nil {
+		return nil, ""
+	}
+	action, err := url.Parse(openCodeGoHTMLAttribute(form, "action"))
+	if err != nil {
+		return result, ""
+	}
+	serverID := action.Query().Get("id")
+	if !openCodeGoServerActionIDPattern.MatchString(serverID) {
+		serverID = ""
+	}
+	return result, serverID
 }
 
 func openCodeGoHTMLAttribute(node *html.Node, name string) string {
@@ -492,7 +541,7 @@ func parseOpenCodeGoMembership(tokens []openCodeGoSSRToken, visibleText string) 
 	return model.OpenCodeGoMembershipUnknown, ""
 }
 
-func countOpenCodeGoReferralRewards(tokens []openCodeGoSSRToken) (int, int) {
+func extractOpenCodeGoReferralRewardIDs(tokens []openCodeGoSSRToken) ([]string, []string) {
 	available := make(map[string]struct{})
 	used := make(map[string]struct{})
 	for _, object := range collectOpenCodeGoSSRObjects(tokens) {
@@ -502,7 +551,7 @@ func countOpenCodeGoReferralRewards(tokens []openCodeGoSSRToken) (int, int) {
 		if !hasID || !hasSource || !hasStatus || id.kind != openCodeGoSSRTokenString || source.kind != openCodeGoSSRTokenString || status.kind != openCodeGoSSRTokenString {
 			continue
 		}
-		if !strings.HasPrefix(strings.ToLower(id.value), "ref_") || (source.value != "inviter" && source.value != "invitee") {
+		if !openCodeGoReferralRewardIDPattern.MatchString(id.value) || len(id.value) > 96 || (source.value != "inviter" && source.value != "invitee") {
 			continue
 		}
 		switch status.value {
@@ -512,7 +561,17 @@ func countOpenCodeGoReferralRewards(tokens []openCodeGoSSRToken) (int, int) {
 			used[id.value] = struct{}{}
 		}
 	}
-	return len(available), len(used)
+	availableIDs := make([]string, 0, len(available))
+	for id := range available {
+		availableIDs = append(availableIDs, id)
+	}
+	usedIDs := make([]string, 0, len(used))
+	for id := range used {
+		usedIDs = append(usedIDs, id)
+	}
+	sort.Strings(availableIDs)
+	sort.Strings(usedIDs)
+	return availableIDs, usedIDs
 }
 
 func parseOpenCodeGoAuthoritativeQuota(tokens []openCodeGoSSRToken, fetchedAt time.Time) (*OpenCodeGoAuthoritativeQuotaSnapshot, error) {

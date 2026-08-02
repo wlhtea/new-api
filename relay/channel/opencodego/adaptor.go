@@ -1,11 +1,13 @@
 package opencodego
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -31,6 +33,12 @@ type Adaptor struct {
 }
 
 var selectOpenCodeGoWorkspace = service.SelectOpenCodeGoWorkspace
+
+var doOpenCodeGoAPIRequest = channel.DoApiRequest
+
+var observeOpenCodeGoTransportFailure = service.ObserveOpenCodeGoTransportFailure
+
+var openCodeGoHealthNow = time.Now
 
 func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	a.protocol = ""
@@ -202,7 +210,32 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 	if !a.converted {
 		return nil, errors.New("OpenCode Go does not allow pass-through request bodies")
 	}
-	return channel.DoApiRequest(a, c, info, requestBody)
+	response, err := doOpenCodeGoAPIRequest(a, c, info, requestBody)
+	if err != nil && a.workspaceSelected && !openCodeGoCallerCancelled(c, err) && info != nil {
+		reason := sanitizeErrorMessage(err.Error())
+		if _, observeErr := observeOpenCodeGoTransportFailure(
+			info.ChannelId,
+			a.selectedWorkspaceUID,
+			info.UpstreamModelName,
+			reason,
+			openCodeGoHealthNow(),
+		); observeErr != nil {
+			common.SysError(fmt.Sprintf(
+				"failed to persist OpenCode Go transport health observation: channel_id=%d workspace_uid=%s error=%v",
+				info.ChannelId,
+				a.selectedWorkspaceUID,
+				observeErr,
+			))
+		}
+	}
+	return response, err
+}
+
+func openCodeGoCallerCancelled(c *gin.Context, err error) bool {
+	if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+		return true
+	}
+	return errors.Is(err, context.Canceled)
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {

@@ -1,13 +1,18 @@
 package opencodego
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/constant"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -182,4 +187,54 @@ func TestAdaptorRejectsPassThroughAndUnknownProtocol(t *testing.T) {
 	adaptor.Init(info)
 	_, err = adaptor.GetRequestURL(info)
 	require.ErrorContains(t, err, "protocol is not configured")
+}
+
+func TestAdaptorPersistsTransportFailureAndSkipsCallerCancellation(t *testing.T) {
+	originalDoRequest := doOpenCodeGoAPIRequest
+	originalObserver := observeOpenCodeGoTransportFailure
+	originalNow := openCodeGoHealthNow
+	t.Cleanup(func() {
+		doOpenCodeGoAPIRequest = originalDoRequest
+		observeOpenCodeGoTransportFailure = originalObserver
+		openCodeGoHealthNow = originalNow
+	})
+
+	fixedNow := time.Unix(1_900_000_000, 0)
+	openCodeGoHealthNow = func() time.Time { return fixedNow }
+	doOpenCodeGoAPIRequest = func(_ relaychannel.Adaptor, _ *gin.Context, _ *relaycommon.RelayInfo, _ io.Reader) (*http.Response, error) {
+		return nil, errors.New("connection reset")
+	}
+
+	observations := 0
+	observeOpenCodeGoTransportFailure = func(channelID int, workspaceUID string, upstreamModel string, reason string, observedAt time.Time) (bool, error) {
+		observations++
+		assert.Equal(t, 42, channelID)
+		assert.Equal(t, "workspace-transport", workspaceUID)
+		assert.Equal(t, "glm-5.2", upstreamModel)
+		assert.Equal(t, "connection reset", reason)
+		assert.Equal(t, fixedNow, observedAt)
+		return true, nil
+	}
+
+	info := newAdaptorTestInfo("glm-5.2", false)
+	info.ChannelId = 42
+	adaptor := &Adaptor{
+		converted:            true,
+		workspaceSelected:    true,
+		selectedWorkspaceUID: "workspace-transport",
+	}
+	_, err := adaptor.DoRequest(newAdaptorTestContext(), info, nil)
+	require.Error(t, err)
+	assert.Equal(t, 1, observations)
+
+	c := newAdaptorTestContext()
+	requestContext, cancel := context.WithCancel(c.Request.Context())
+	c.Request = c.Request.WithContext(requestContext)
+	cancel()
+	doOpenCodeGoAPIRequest = func(_ relaychannel.Adaptor, _ *gin.Context, _ *relaycommon.RelayInfo, _ io.Reader) (*http.Response, error) {
+		return nil, context.Canceled
+	}
+	_, err = adaptor.DoRequest(c, info, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, observations)
 }

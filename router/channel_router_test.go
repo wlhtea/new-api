@@ -32,13 +32,21 @@ func TestChannelDeleteRoutesUseSensitiveWritePermission(t *testing.T) {
 
 func TestOpenCodeGoPoolRoutesUseScopedChannelPermissions(t *testing.T) {
 	assertChannelRoutePermission(t, http.MethodGet, "/:id/opencode-go/pool", authz.ChannelRead, controller.GetOpenCodeGoPool)
+	assertChannelRoutePermission(t, http.MethodGet, "/:id/opencode-go/lifecycle-policy", authz.ChannelRead, controller.GetOpenCodeGoLifecyclePolicy)
 	assertChannelRoutePermission(t, http.MethodGet, "/:id/opencode-go/refresh-tasks/:task_id", authz.ChannelRead, controller.GetOpenCodeGoRefreshTask)
+	assertChannelRoutePermission(t, http.MethodGet, "/:id/opencode-go/risk-recheck-tasks/:task_id", authz.ChannelRead, controller.GetOpenCodeGoRiskRecheckTask)
 	assertChannelRoutePermission(t, http.MethodPatch, "/:id/opencode-go/identities/:identity_uid", authz.ChannelOperate, controller.UpdateOpenCodeGoIdentity)
 	assertChannelRoutePermission(t, http.MethodPost, "/:id/opencode-go/identities/:identity_uid/refresh", authz.ChannelOperate, controller.RefreshOpenCodeGoIdentity)
 	assertChannelRoutePermission(t, http.MethodPatch, "/:id/opencode-go/identities/:identity_uid/enabled", authz.ChannelOperate, controller.SetOpenCodeGoIdentityEnabled)
 	assertChannelRoutePermission(t, http.MethodPatch, "/:id/opencode-go/workspaces/:workspace_uid/enabled", authz.ChannelOperate, controller.SetOpenCodeGoWorkspaceEnabled)
 	assertChannelRoutePermission(t, http.MethodPost, "/:id/opencode-go/workspaces/:workspace_uid/refresh", authz.ChannelOperate, controller.RefreshOpenCodeGoWorkspace)
+	assertChannelRoutePermission(t, http.MethodPost, "/:id/opencode-go/workspaces/:workspace_uid/risk-recheck", authz.ChannelOperate, controller.RecheckOpenCodeGoWorkspaceRisk)
 	assertChannelRoutePermission(t, http.MethodPost, "/:id/opencode-go/refresh-all", authz.ChannelOperate, controller.RefreshAllOpenCodeGoIdentities)
+	assertChannelRoutePermission(t, http.MethodPost, "/:id/opencode-go/risk-recheck-all", authz.ChannelOperate, controller.RecheckAllOpenCodeGoWorkspaceRisks)
+	assertChannelRoutePermission(t, http.MethodPut, "/:id/opencode-go/lifecycle-policy", authz.ChannelSensitiveWrite, controller.UpdateOpenCodeGoLifecyclePolicy)
+	assertChannelRoutePermission(t, http.MethodPost, "/:id/opencode-go/workspaces/:workspace_uid/china-models/enable", authz.ChannelSensitiveWrite, controller.EnableOpenCodeGoChinaModels)
+	assertChannelRoutePermission(t, http.MethodPost, "/:id/opencode-go/workspaces/:workspace_uid/referral-rewards/apply", authz.ChannelSensitiveWrite, controller.ApplyOpenCodeGoReferralReward)
+	assertChannelRoutePermission(t, http.MethodPost, "/:id/opencode-go/workspaces/:workspace_uid/subscription/cancel-renewal", authz.ChannelSensitiveWrite, controller.CancelOpenCodeGoSubscriptionRenewal)
 	assertChannelRoutePermission(t, http.MethodPost, "/:id/opencode-go/identities/import", authz.ChannelSensitiveWrite, controller.ImportOpenCodeGoIdentities)
 	assertChannelRoutePermission(t, http.MethodPut, "/:id/opencode-go/identities/:identity_uid/cookie", authz.ChannelSensitiveWrite, controller.ReplaceOpenCodeGoIdentityCookie)
 	assertChannelRoutePermission(t, http.MethodDelete, "/:id/opencode-go/identities/:identity_uid", authz.ChannelSensitiveWrite, controller.DeleteOpenCodeGoIdentity)
@@ -108,6 +116,31 @@ func TestOpenCodeGoSensitiveRouteRequiresDedicatedSecurityProofScope(t *testing.
 	status, _, reached = run(correctProof)
 	assert.Equal(t, http.StatusNoContent, status)
 	assert.True(t, reached)
+}
+
+func TestOpenCodeGoLifecycleWriteRoutesUseCriticalScopedMiddleware(t *testing.T) {
+	paths := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPut, "/:id/opencode-go/lifecycle-policy"},
+		{http.MethodPost, "/:id/opencode-go/workspaces/:workspace_uid/china-models/enable"},
+		{http.MethodPost, "/:id/opencode-go/workspaces/:workspace_uid/referral-rewards/apply"},
+		{http.MethodPost, "/:id/opencode-go/workspaces/:workspace_uid/subscription/cancel-renewal"},
+	}
+	for _, expected := range paths {
+		found := false
+		for _, route := range channelPermissionRoutes {
+			if route.method != expected.method || route.path != expected.path {
+				continue
+			}
+			found = true
+			require.Equal(t, authz.ChannelSensitiveWrite, route.permission)
+			require.Len(t, route.middlewares, 3)
+			break
+		}
+		require.True(t, found, "route %s %s not found", expected.method, expected.path)
+	}
 }
 
 func TestChannelStatusRoutesRegisterWithoutConflict(t *testing.T) {

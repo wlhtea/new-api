@@ -13,8 +13,9 @@ import (
 func openCodeGoCompleteSSRFixture(currentWorkspaceID string, subscriptionReference string) string {
 	return fmt.Sprintf(`
 <!doctype html>
-<html>
-  <body>
+	<html>
+	  <head><link href="/_build/assets/go-route.js" rel="modulepreload"></head>
+	  <body>
     <form action="/_server?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">
       <input value="false" name="useChinaProviders">
     </form>
@@ -62,8 +63,12 @@ func TestParseOpenCodeGoConsolePageCompleteSnapshot(t *testing.T) {
 	require.Equal(t, "SAMPLECODE", page.ReferralCode)
 	require.Equal(t, 1, page.AvailableReferralRewards)
 	require.Equal(t, 1, page.UsedReferralRewards)
+	require.Equal(t, []string{"ref_SAMPLE1"}, page.AvailableReferralRewardIDs)
+	require.Equal(t, []string{"ref_SAMPLE2"}, page.UsedReferralRewardIDs)
 	require.NotNil(t, page.ChinaModelsEnabled)
 	require.False(t, *page.ChinaModelsEnabled)
+	require.Equal(t, strings.Repeat("a", 64), page.ChinaModelsServerID)
+	require.Equal(t, []string{"/_build/assets/go-route.js"}, page.RouteModuleAssets)
 	require.Equal(t, []OpenCodeGoDiscoveredWorkspace{
 		{ID: "wrk_ALPHA1", Name: "Primary"},
 		{ID: "wrk_BETA2", Name: "Secondary"},
