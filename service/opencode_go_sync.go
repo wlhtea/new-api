@@ -859,7 +859,13 @@ func (service *OpenCodeGoAccountPoolService) markIdentityRefreshFailure(
 			identityUpdateAllowed = false
 		}
 		if identityUpdateAllowed {
-			identityStatus = status
+			// A transient console failure is not evidence that an active identity
+			// or its last complete quota snapshot became invalid. Keep routing from
+			// that snapshot while recording the failed refresh attempt. Explicit
+			// authentication failures still invalidate the identity immediately.
+			if status != model.OpenCodeGoIdentityStatusStale || currentIdentity.Status != model.OpenCodeGoIdentityStatusActive {
+				identityStatus = status
+			}
 			if err := tx.Model(&model.OpenCodeGoIdentity{}).Where("id = ?", currentIdentity.ID).Updates(map[string]interface{}{
 				"status":         identityStatus,
 				"last_synced_at": now,
@@ -880,6 +886,23 @@ func (service *OpenCodeGoAccountPoolService) markIdentityRefreshFailure(
 		}
 		for index := range workspaces {
 			workspace := workspaces[index]
+			if status == model.OpenCodeGoIdentityStatusStale &&
+				workspace.QuotaSnapshotStatus == model.OpenCodeGoQuotaSnapshotComplete &&
+				workspace.QuotaFetchedAt > 0 {
+				lastSyncedAt := workspace.LastSyncedAt
+				if lastSyncedAt < now {
+					lastSyncedAt = now
+				}
+				if err := tx.Model(&model.OpenCodeGoWorkspace{}).Where("id = ?", workspace.ID).Updates(map[string]interface{}{
+					"quota_error":    message,
+					"last_error":     message,
+					"last_synced_at": lastSyncedAt,
+					"updated_at":     now,
+				}).Error; err != nil {
+					return err
+				}
+				continue
+			}
 			observation := OpenCodeGoHealthObservation{
 				Kind:       observationKind,
 				ObservedAt: observedAt,

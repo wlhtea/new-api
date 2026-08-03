@@ -228,6 +228,9 @@ func TestAdaptorBuffersStreamingClaudeFunctionToolsUpstream(t *testing.T) {
 	require.NotNil(t, responses.Stream)
 	assert.False(t, *responses.Stream)
 	assert.True(t, adaptor.bufferClaudeToolCall)
+	assert.False(t, adaptor.requestUpstreamStream)
+	assert.Equal(t, 1, adaptor.requestInputItems)
+	assert.Equal(t, 1, adaptor.requestToolCount)
 }
 
 func TestAdaptorAddsOpenCodeGoResponsesFunctionCallID(t *testing.T) {
