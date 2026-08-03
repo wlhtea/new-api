@@ -2332,6 +2332,8 @@
     "Input price is required before saving dependent prices.": "Le prix d’entrée est requis avant d’enregistrer les prix dépendants.",
     "Input tokens": "Jetons d’entrée",
     "Input Tokens": "Tokens d'entrée",
+    "Total Input Tokens": "Total des tokens d'entrée",
+    "Uncached Input Tokens": "Tokens d'entrée hors cache",
     "Inset": "Encastré",
     "Inspect requests, errors, and billing details": "Inspecter les requêtes, les erreurs et les détails de facturation",
     "Inspect user prompts": "Inspecter les invites utilisateur",

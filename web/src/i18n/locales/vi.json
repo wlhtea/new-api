@@ -2332,6 +2332,8 @@
     "Input price is required before saving dependent prices.": "Cần có giá đầu vào trước khi lưu các giá phụ thuộc.",
     "Input tokens": "Token đầu vào",
     "Input Tokens": "Token đầu vào",
+    "Total Input Tokens": "Tổng token đầu vào",
+    "Uncached Input Tokens": "Token đầu vào không lưu đệm",
     "Inset": "Khung trong",
     "Inspect requests, errors, and billing details": "Kiểm tra yêu cầu, lỗi và chi tiết thanh toán",
     "Inspect user prompts": "Kiểm tra lời nhắc của người dùng",

@@ -168,6 +168,7 @@ export interface LogOtherData {
   audio_output?: number
   text_input?: number
   text_output?: number
+  input_tokens_total?: number
   cache_tokens?: number
   cache_creation_tokens?: number
   cache_creation_tokens_5m?: number

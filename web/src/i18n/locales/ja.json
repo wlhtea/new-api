@@ -2332,6 +2332,8 @@
     "Input price is required before saving dependent prices.": "依存する価格を保存する前に入力価格が必要です。",
     "Input tokens": "入力トークン",
     "Input Tokens": "入力トークン",
+    "Total Input Tokens": "入力トークン合計",
+    "Uncached Input Tokens": "キャッシュ未使用入力トークン",
     "Inset": "インセット",
     "Inspect requests, errors, and billing details": "リクエスト、エラー、請求詳細を確認",
     "Inspect user prompts": "ユーザープロンプトの検査",

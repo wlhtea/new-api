@@ -2332,6 +2332,8 @@
     "Input price is required before saving dependent prices.": "保存依赖价格前必须先填写输入价格。",
     "Input tokens": "输入 token",
     "Input Tokens": "输入 Token",
+    "Total Input Tokens": "总输入 Token",
+    "Uncached Input Tokens": "未缓存输入 Token",
     "Inset": "内嵌",
     "Inspect requests, errors, and billing details": "查看请求、错误和计费详情",
     "Inspect user prompts": "检查用户提示",
