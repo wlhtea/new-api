@@ -166,7 +166,8 @@ function workspaceFixture(
 
 async function renderWorkspace(
   workspace: OpenCodeGoWorkspace,
-  canOperate = true
+  canOperate = true,
+  locale = 'en'
 ): Promise<HTMLDivElement> {
   const host = document.createElement('div')
   document.body.append(host)
@@ -180,7 +181,7 @@ async function renderWorkspace(
           <OpenCodeGoWorkspaceRow
             workspace={workspace}
             nowSeconds={1_900_000_000}
-            locale='en'
+            locale={locale}
             canOperate={canOperate}
             canSensitiveWrite={false}
             busyKey={null}
@@ -221,6 +222,13 @@ describe('OpenCode Go workspace status row', () => {
     assert.equal(host.textContent?.includes('$45.00'), true)
     assert.equal(host.querySelectorAll('time[dateTime]').length, 3)
     assert.equal(host.textContent?.includes('Snapshot time'), true)
+  })
+
+  test('accepts the Simplified Chinese interface locale when formatting dates', async () => {
+    const host = await renderWorkspace(workspaceFixture(), true, 'zhCN')
+
+    assert.equal(host.querySelectorAll('time[dateTime]').length, 3)
+    assert.equal(host.querySelectorAll('[data-state="complete"]').length, 3)
   })
 
   test('renders a manually disabled workspace with an enable action', async () => {

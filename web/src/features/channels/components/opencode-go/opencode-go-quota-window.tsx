@@ -25,6 +25,7 @@ import {
   ProgressLabel,
   ProgressValue,
 } from '@/components/ui/progress'
+import { toIntlLocale } from '@/i18n/languages'
 import { cn } from '@/lib/utils'
 
 import {
@@ -49,7 +50,7 @@ type OpenCodeGoQuotaWindowProps = {
 
 function formatTimestamp(timestamp: number, locale?: string): string {
   if (timestamp <= 0) return '-'
-  return new Intl.DateTimeFormat(locale, {
+  return new Intl.DateTimeFormat(toIntlLocale(locale), {
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(new Date(timestamp * 1000))
@@ -137,7 +138,7 @@ export function OpenCodeGoQuotaWindowView(props: OpenCodeGoQuotaWindowProps) {
             {formatOpenCodeGoResetCountdown(
               props.window.reset_at,
               props.nowSeconds,
-              props.locale
+              toIntlLocale(props.locale)
             )}
           </span>
         </div>

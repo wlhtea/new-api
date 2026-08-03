@@ -48,6 +48,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { toIntlLocale } from '@/i18n/languages'
 import { cn } from '@/lib/utils'
 
 import {
@@ -104,7 +105,7 @@ type OpenCodeGoWorkspaceRowProps = {
 
 function formatTimestamp(timestamp: number, locale?: string): string {
   if (timestamp <= 0) return '-'
-  return new Intl.DateTimeFormat(locale, {
+  return new Intl.DateTimeFormat(toIntlLocale(locale), {
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(new Date(timestamp * 1000))
