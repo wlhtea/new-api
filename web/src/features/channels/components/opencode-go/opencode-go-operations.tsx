@@ -28,6 +28,7 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty'
+import { toIntlLocale } from '@/i18n/languages'
 
 import {
   isOpenCodeGoBulkResultFailure,
@@ -72,7 +73,7 @@ type OpenCodeGoOperationsProps = {
 
 function formatTimestamp(timestamp: number, locale?: string): string {
   if (timestamp <= 0) return '-'
-  return new Intl.DateTimeFormat(locale, {
+  return new Intl.DateTimeFormat(toIntlLocale(locale), {
     dateStyle: 'medium',
     timeStyle: 'medium',
   }).format(new Date(timestamp * 1000))
