@@ -1,7 +1,10 @@
 package opencodego
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -128,8 +131,25 @@ func prepareOpenCodeGoResponsesToolHistory(request *dto.OpenAIResponsesRequest) 
 		return nil
 	}
 	changed := false
-	for _, item := range input {
+	for index, item := range input {
 		itemType, _ := item["type"].(string)
+		if itemType == "reasoning" {
+			if id, _ := item["id"].(string); strings.TrimSpace(id) == "" {
+				raw, err := common.Marshal(item)
+				if err != nil {
+					return err
+				}
+				seed := append([]byte(strconv.Itoa(index)+"\x00"), raw...)
+				digest := sha256.Sum256(seed)
+				item["id"] = "rs_" + hex.EncodeToString(digest[:12])
+				changed = true
+			}
+			if status, _ := item["status"].(string); strings.TrimSpace(status) == "" {
+				item["status"] = "completed"
+				changed = true
+			}
+			continue
+		}
 		if itemType != "function_call" {
 			continue
 		}

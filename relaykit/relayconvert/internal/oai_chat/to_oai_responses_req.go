@@ -155,10 +155,12 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 		item := map[string]any{
 			"role": role,
 		}
+		reasoningItems := responsesReasoningItems(msg, role)
 		functionCallItems := responsesFunctionCallItems(msg, role)
+		inputItems = append(inputItems, reasoningItems...)
 
 		if msg.Content == nil {
-			if len(functionCallItems) == 0 {
+			if len(functionCallItems) == 0 && len(reasoningItems) == 0 {
 				item["content"] = ""
 				inputItems = append(inputItems, item)
 			}
@@ -168,7 +170,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 
 		if msg.IsStringContent() {
 			content := msg.StringContent()
-			if content != "" || len(functionCallItems) == 0 {
+			if content != "" || (len(functionCallItems) == 0 && len(reasoningItems) == 0) {
 				item["content"] = content
 				inputItems = append(inputItems, item)
 			}
@@ -215,7 +217,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 				})
 			}
 		}
-		if len(contentParts) > 0 || len(functionCallItems) == 0 {
+		if len(contentParts) > 0 || (len(functionCallItems) == 0 && len(reasoningItems) == 0) {
 			item["content"] = contentParts
 			inputItems = append(inputItems, item)
 		}
@@ -349,6 +351,27 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 	}
 
 	return out, nil
+}
+
+func responsesReasoningItems(msg dto.Message, role string) []map[string]any {
+	if role != "assistant" {
+		return nil
+	}
+	reasoning := msg.GetReasoningContent()
+	if strings.TrimSpace(reasoning) == "" {
+		return nil
+	}
+	return []map[string]any{
+		{
+			"type": "reasoning",
+			"summary": []map[string]any{
+				{
+					"type": "summary_text",
+					"text": reasoning,
+				},
+			},
+		},
+	}
 }
 
 func responsesFunctionCallItems(msg dto.Message, role string) []map[string]any {

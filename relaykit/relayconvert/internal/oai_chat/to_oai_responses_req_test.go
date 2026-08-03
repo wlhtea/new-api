@@ -102,6 +102,36 @@ func TestChatCompletionsRequestToResponsesRequestOmitsEmptyAssistantBeforeToolCa
 	}
 }
 
+func TestChatCompletionsRequestToResponsesRequestPreservesReasoningBeforeToolCall(t *testing.T) {
+	assistant := assistantMessageWithTool("", "call_1", "Bash", `{"command":"pwd"}`)
+	assistant.Content = nil
+	reasoning := "inspect the repository before calling Bash"
+	assistant.ReasoningContent = &reasoning
+	req := &dto.GeneralOpenAIRequest{
+		Model: "deepseek-test",
+		Messages: []dto.Message{
+			{Role: "user", Content: "inspect the repository"},
+			assistant,
+			{Role: "tool", ToolCallId: "call_1", Content: "/workspace"},
+		},
+	}
+
+	got, err := ChatCompletionsRequestToResponsesRequest(req)
+	require.NoError(t, err)
+
+	var input []map[string]any
+	require.NoError(t, json.Unmarshal(got.Input, &input))
+	require.Len(t, input, 4)
+	assert.Equal(t, "reasoning", input[1]["type"])
+	assert.Equal(t, reasoning, input[1]["summary"].([]any)[0].(map[string]any)["text"])
+	assert.Equal(t, "function_call", input[2]["type"])
+	assert.Equal(t, "call_1", input[2]["call_id"])
+	assert.Equal(t, "function_call_output", input[3]["type"])
+	for _, item := range input {
+		assert.False(t, item["role"] == "assistant" && item["content"] == "")
+	}
+}
+
 func TestChatCompletionsRequestToResponsesRequestRejectsMultipleChoices(t *testing.T) {
 	_, err := ChatCompletionsRequestToResponsesRequest(&dto.GeneralOpenAIRequest{
 		Model: "gpt-test",
