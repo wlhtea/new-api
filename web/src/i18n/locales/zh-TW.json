@@ -2332,6 +2332,8 @@
     "Input price is required before saving dependent prices.": "儲存依賴價格前必須先填寫輸入價格。",
     "Input tokens": "輸入 token",
     "Input Tokens": "輸入 Token",
+    "Total Input Tokens": "總輸入 Token",
+    "Uncached Input Tokens": "未快取輸入 Token",
     "Inset": "內嵌",
     "Inspect requests, errors, and billing details": "查看請求、錯誤和收費詳情",
     "Inspect user prompts": "檢查用戶提示",

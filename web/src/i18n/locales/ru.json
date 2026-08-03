@@ -2332,6 +2332,8 @@
     "Input price is required before saving dependent prices.": "Перед сохранением зависимых цен укажите входную цену.",
     "Input tokens": "Входные токены",
     "Input Tokens": "Входные токены",
+    "Total Input Tokens": "Всего входных токенов",
+    "Uncached Input Tokens": "Входные токены без кэша",
     "Inset": "Встроенная",
     "Inspect requests, errors, and billing details": "Проверяйте запросы, ошибки и детали оплаты",
     "Inspect user prompts": "Просмотр запросов пользователя",
