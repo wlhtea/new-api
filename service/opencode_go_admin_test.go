@@ -87,6 +87,24 @@ func TestOpenCodeGoPoolViewRedactsEveryCredentialAndStoredDiagnostic(t *testing.
 	require.Contains(t, sanitizeOpenCodeGoStoredMessage(errors.New(diagnostic).Error()), "[redacted")
 }
 
+func TestOpenCodeGoPoolViewConvertsHealthObservationNanosecondsToSeconds(t *testing.T) {
+	observedAt := time.Unix(1_900_000_000, 987_654_321)
+	workspace := model.OpenCodeGoWorkspace{
+		HealthObservedAt: observedAt.UnixNano(),
+		Models: []model.OpenCodeGoWorkspaceModel{
+			{HealthObservedAt: observedAt.Add(time.Second).UnixNano()},
+		},
+	}
+
+	view := openCodeGoWorkspaceToView(workspace)
+
+	require.Equal(t, observedAt.Unix(), view.HealthObservedAt)
+	require.Len(t, view.Models, 1)
+	require.Equal(t, observedAt.Add(time.Second).Unix(), view.Models[0].HealthObservedAt)
+	require.LessOrEqual(t, view.HealthObservedAt, int64(9_007_199_254_740_991))
+	require.Zero(t, openCodeGoHealthObservedAtForView(0))
+}
+
 func TestOpenCodeGoManualEnablementInvalidatesModelsAndPoolSnapshots(t *testing.T) {
 	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
 	workspace := createEligibleOpenCodeGoWorkspace(
