@@ -67,3 +67,32 @@ func TestCacheIdentityHashesLongAndUserDerivedValues(t *testing.T) {
 	assert.NotContains(t, fallbackA, "17")
 	assert.NotContains(t, fallbackA, "29")
 }
+
+func TestClaudeCodeSessionIdentityDrivesCacheAndAffinity(t *testing.T) {
+	info := &relaycommon.RelayInfo{OriginModelName: "public-model", UserId: 17, TokenId: 29}
+	c := newCacheIdentityContext("explicit-cache-key")
+	c.Request.Header.Set(claudeCodeSessionHeader, "claude-session-raw")
+	metadata, err := json.Marshal(dto.ClaudeMetadata{UserId: `{"account_uuid":"account","session_id":"metadata-session"}`})
+	require.NoError(t, err)
+	request := &dto.ClaudeRequest{Metadata: metadata}
+
+	identity := affinityIdentityForRequest(c, request)
+	assert.Equal(t, identity, cacheIdentityForRequest(c, info, request))
+	assert.True(t, strings.HasPrefix(identity, cacheIdentityPrefix))
+	assert.NotContains(t, identity, "claude-session-raw")
+
+	c.Request.Header.Del(claudeCodeSessionHeader)
+	metadataIdentity := affinityIdentityForRequest(c, request)
+	assert.NotEmpty(t, metadataIdentity)
+	assert.NotEqual(t, identity, metadataIdentity)
+	assert.NotContains(t, metadataIdentity, "metadata-session")
+}
+
+func TestAffinityIdentityIsEmptyWithoutSessionMarker(t *testing.T) {
+	metadata, err := json.Marshal(dto.ClaudeMetadata{UserId: "plain-customer-id"})
+	require.NoError(t, err)
+	request := &dto.ClaudeRequest{Metadata: metadata}
+
+	assert.Empty(t, affinityIdentityForRequest(newCacheIdentityContext(""), request))
+	assert.NotEmpty(t, cacheIdentityForRequest(newCacheIdentityContext(""), nil, request))
+}

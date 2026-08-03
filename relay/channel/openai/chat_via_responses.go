@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 
@@ -75,6 +76,139 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 	return usage, nil
+}
+
+// OaiResponsesToClaudeBufferedStreamHandler works around Responses providers
+// that omit function arguments only in streaming mode. The upstream request is
+// non-streaming; this handler emits the complete result as a valid Claude SSE
+// sequence without retrying or selecting another account.
+func OaiResponsesToClaudeBufferedStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	if resp == nil || resp.Body == nil {
+		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+	defer service.CloseResponseBodyGracefully(resp)
+
+	var responsesResp dto.OpenAIResponsesResponse
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	}
+	if err := common.Unmarshal(body, &responsesResp); err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	if oaiError := responsesResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+	}
+
+	result, err := relayconvert.ConvertResponse(c, info, types.RelayFormatClaude, &responsesResp)
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	claudeResp, ok := result.Value.(*dto.ClaudeResponse)
+	if !ok || claudeResp == nil {
+		return nil, types.NewOpenAIError(fmt.Errorf("expected Claude response, got %T", result.Value), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	usage := result.Usage
+	if usage == nil || usage.TotalTokens == 0 {
+		text := service.ExtractOutputTextFromResponses(&responsesResp)
+		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
+	}
+
+	helper.SetEventStreamHeaders(c)
+	emitBufferedClaudeResponse(c, claudeResp)
+	return usage, nil
+}
+
+func emitBufferedClaudeResponse(c *gin.Context, response *dto.ClaudeResponse) {
+	if response == nil {
+		return
+	}
+	startUsage := cloneClaudeUsage(response.Usage)
+	if startUsage != nil {
+		startUsage.OutputTokens = 0
+	}
+	message := &dto.ClaudeMediaMessage{
+		Id:    response.Id,
+		Type:  "message",
+		Role:  "assistant",
+		Model: response.Model,
+		Usage: startUsage,
+	}
+	message.SetContent(make([]any, 0))
+	_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "message_start", Message: message})
+
+	for index, block := range response.Content {
+		startBlock := block
+		switch block.Type {
+		case "tool_use":
+			startBlock.Input = map[string]any{}
+		case "text":
+			startBlock.SetText("")
+		case "thinking":
+			startBlock.Thinking = kitutil.GetPointer("")
+		}
+		_ = helper.ClaudeData(c, dto.ClaudeResponse{
+			Type:         "content_block_start",
+			Index:        kitutil.GetPointer(index),
+			ContentBlock: &startBlock,
+		})
+
+		switch block.Type {
+		case "tool_use":
+			partialJSON, err := common.Marshal(block.Input)
+			if err == nil {
+				partial := string(partialJSON)
+				_ = helper.ClaudeData(c, dto.ClaudeResponse{
+					Type:  "content_block_delta",
+					Index: kitutil.GetPointer(index),
+					Delta: &dto.ClaudeMediaMessage{Type: "input_json_delta", PartialJson: &partial},
+				})
+			}
+		case "text":
+			if text := block.GetText(); text != "" {
+				_ = helper.ClaudeData(c, dto.ClaudeResponse{
+					Type:  "content_block_delta",
+					Index: kitutil.GetPointer(index),
+					Delta: &dto.ClaudeMediaMessage{Type: "text_delta", Text: &text},
+				})
+			}
+		case "thinking":
+			if block.Thinking != nil && *block.Thinking != "" {
+				thinking := *block.Thinking
+				_ = helper.ClaudeData(c, dto.ClaudeResponse{
+					Type:  "content_block_delta",
+					Index: kitutil.GetPointer(index),
+					Delta: &dto.ClaudeMediaMessage{Type: "thinking_delta", Thinking: &thinking},
+				})
+			}
+		}
+		_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "content_block_stop", Index: kitutil.GetPointer(index)})
+	}
+
+	outputUsage := &dto.ClaudeUsage{}
+	if response.Usage != nil {
+		outputUsage.OutputTokens = response.Usage.OutputTokens
+	}
+	stopReason := response.StopReason
+	_ = helper.ClaudeData(c, dto.ClaudeResponse{
+		Type:  "message_delta",
+		Delta: &dto.ClaudeMediaMessage{StopReason: &stopReason},
+		Usage: outputUsage,
+	})
+	_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "message_stop"})
+}
+
+func cloneClaudeUsage(usage *dto.ClaudeUsage) *dto.ClaudeUsage {
+	if usage == nil {
+		return nil
+	}
+	cloned := *usage
+	if usage.CacheCreation != nil {
+		cacheCreation := *usage.CacheCreation
+		cloned.CacheCreation = &cacheCreation
+	}
+	cloned.BillingUsage = dto.CloneBillingUsage(usage.BillingUsage)
+	return &cloned
 }
 
 func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {

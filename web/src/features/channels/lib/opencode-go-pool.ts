@@ -32,6 +32,9 @@ import {
 export const OPENCODE_GO_PROTOCOLS = ['chat', 'messages', 'responses'] as const
 export type OpenCodeGoProtocol = (typeof OPENCODE_GO_PROTOCOLS)[number]
 
+export const openCodeGoAccountGridClasses =
+  'grid min-w-0 gap-3 md:grid-cols-2 xl:grid-cols-3'
+
 export const openCodeGoQuotaLayoutClasses = {
   grid: 'grid min-w-0 gap-3 md:grid-cols-3',
   window:

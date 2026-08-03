@@ -38,7 +38,7 @@ func TestClassifyOpenCodeGoProviderFailureMatrix(t *testing.T) {
 		{name: "unknown 401", failure: OpenCodeGoProviderFailure{StatusCode: 401}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
 		{name: "unknown 403", failure: OpenCodeGoProviderFailure{StatusCode: 403}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationRegionBlocked, wantDelay: openCodeGoDefaultRegionCooldown},
 		{name: "unknown 429", failure: OpenCodeGoProviderFailure{StatusCode: 429}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationRPMThrottled, wantDelay: openCodeGoDefaultRPMCooldown},
-		{name: "upstream 500", failure: OpenCodeGoProviderFailure{StatusCode: 500}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationTransientFailure, wantDelay: openCodeGoDefaultTransientCooldown},
+		{name: "upstream 500", failure: OpenCodeGoProviderFailure{StatusCode: 500}, wantOK: false},
 		{name: "caller abort", failure: OpenCodeGoProviderFailure{StatusCode: 499, ErrorType: "error"}},
 		{name: "client request error", failure: OpenCodeGoProviderFailure{StatusCode: 400, ErrorType: "invalid_request_error"}},
 	}
@@ -62,6 +62,19 @@ func TestClassifyOpenCodeGoProviderFailureMatrix(t *testing.T) {
 	}
 }
 
+func TestObserveOpenCodeGoProviderFailureDoesNotPersistProvider5xx(t *testing.T) {
+	applied, err := ObserveOpenCodeGoProviderFailure(
+		999,
+		"workspace-does-not-exist",
+		"glm-5.2",
+		OpenCodeGoProviderFailure{StatusCode: http.StatusInternalServerError},
+		time.Unix(1_900_000_000, 0),
+	)
+
+	require.NoError(t, err)
+	assert.False(t, applied)
+}
+
 func TestParseOpenCodeGoRetryAfterSupportsHTTPDateAndBoundsValues(t *testing.T) {
 	now := time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)
 	deadline := now.Add(75 * time.Second).Format(http.TimeFormat)
@@ -75,6 +88,37 @@ func TestParseOpenCodeGoRetryAfterSupportsHTTPDateAndBoundsValues(t *testing.T) 
 
 	_, ok = parseOpenCodeGoRetryAfter("-1", now)
 	assert.False(t, ok)
+}
+
+func TestParseOpenCodeGoProviderFailurePreservesSafeValidationPath(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "top level zod issues",
+			body: `[{"code":"too_big","path":["tools",0,"input_schema"],"message":"Array must contain at most 20 element(s)"}]`,
+		},
+		{
+			name: "nested fastapi detail",
+			body: `{"detail":[{"code":"invalid_type","path":["body","thinking"],"message":"Expected string"}]}`,
+		},
+		{
+			name: "server sent event validation error",
+			body: "event: error\ndata: [{\"code\":\"invalid_value\",\"path\":[\"messages\",1,\"role\"],\"message\":\"Unsupported role\"}]\n\n",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			failure := ParseOpenCodeGoProviderFailure(http.StatusUnprocessableEntity, nil, []byte(test.body))
+
+			assert.Equal(t, "validation_error", failure.ErrorType)
+			assert.NotEqual(t, "validation_error", failure.ErrorCode)
+			assert.Contains(t, failure.Message, "OpenCode Go rejected")
+			assert.NotContains(t, failure.Message, "[")
+		})
+	}
 }
 
 func TestClassifyOpenCodeGoTransportFailureIsModelScoped(t *testing.T) {

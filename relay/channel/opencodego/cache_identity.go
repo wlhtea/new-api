@@ -16,17 +16,17 @@ import (
 )
 
 const (
-	cacheIdentityHeader    = "x-opencode-session"
-	cacheIdentityMaxLength = 64
-	cacheIdentityPrefix    = "ocg_"
-	cacheIdentityDomain    = "new-api/opencode-go/cache-identity/v1"
+	cacheIdentityHeader      = "x-opencode-session"
+	claudeCodeSessionHeader  = "x-claude-code-session-id"
+	cacheIdentityMaxLength   = 64
+	cacheIdentityPrefix      = "ocg_"
+	cacheIdentityDomain      = "new-api/opencode-go/cache-identity/v1"
+	claudeMetadataSessionKey = "session_id"
 )
 
 func cacheIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) string {
-	if c != nil && c.Request != nil {
-		if value := c.Request.Header.Get(cacheIdentityHeader); value != "" {
-			return canonicalCacheIdentity("header", value)
-		}
+	if identity := affinityIdentityForRequest(c, request); identity != "" {
+		return identity
 	}
 	if source, value := requestCacheIdentity(request); value != "" {
 		if source == "messages" {
@@ -43,6 +43,52 @@ func cacheIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, reques
 	}
 	seed := strconv.Itoa(userID) + "\x00" + strconv.Itoa(tokenID) + "\x00" + model
 	return hashCacheIdentity("fallback", seed)
+}
+
+func affinityIdentityForRequest(c *gin.Context, request any) string {
+	if c != nil && c.Request != nil {
+		if value := strings.TrimSpace(c.Request.Header.Get(claudeCodeSessionHeader)); value != "" {
+			return hashCacheIdentity("claude-code-session", value)
+		}
+	}
+	if sessionID := requestClaudeSessionID(request); sessionID != "" {
+		return hashCacheIdentity("claude-metadata-session", sessionID)
+	}
+	if c != nil && c.Request != nil {
+		if value := c.Request.Header.Get(cacheIdentityHeader); value != "" {
+			return canonicalCacheIdentity("header", value)
+		}
+	}
+	if source, value := requestCacheIdentity(request); value != "" && source != "messages" {
+		return canonicalCacheIdentity(source, value)
+	}
+	return ""
+}
+
+func requestClaudeSessionID(request any) string {
+	var metadata json.RawMessage
+	switch typed := request.(type) {
+	case *dto.ClaudeRequest:
+		if typed != nil {
+			metadata = typed.Metadata
+		}
+	case dto.ClaudeRequest:
+		metadata = typed.Metadata
+	}
+	return claudeMetadataSessionID(metadata)
+}
+
+func claudeMetadataSessionID(raw json.RawMessage) string {
+	userID := claudeMetadataUserID(raw)
+	if !strings.HasPrefix(strings.TrimSpace(userID), "{") {
+		return ""
+	}
+	var metadata map[string]any
+	if err := common.Unmarshal([]byte(userID), &metadata); err != nil {
+		return ""
+	}
+	sessionID, _ := metadata[claudeMetadataSessionKey].(string)
+	return strings.TrimSpace(sessionID)
 }
 
 func requestCacheIdentity(request any) (string, string) {

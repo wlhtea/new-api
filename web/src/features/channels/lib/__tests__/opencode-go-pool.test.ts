@@ -28,6 +28,7 @@ import {
   isOpenCodeGoWorkspaceStale,
   isOpenCodeGoBulkResultFailure,
   listOpenCodeGoWorkspaceRows,
+  openCodeGoAccountGridClasses,
 } from '../opencode-go-pool'
 import {
   openCodeGoImportResultSchema,
@@ -176,6 +177,11 @@ function systemTask(
 }
 
 describe('OpenCode Go pool contracts', () => {
+  test('uses multiple account columns at desktop widths', () => {
+    assert.match(openCodeGoAccountGridClasses, /md:grid-cols-2/)
+    assert.match(openCodeGoAccountGridClasses, /xl:grid-cols-3/)
+  })
+
   test('parses authoritative rolling, weekly, and monthly quota windows', () => {
     const parsed = openCodeGoPoolSchema.parse(poolFixture())
     const primary = parsed.identities[0]?.workspaces[0]

@@ -132,7 +132,7 @@ func TestAdaptorRequestConversionMatrix(t *testing.T) {
 
 func TestAdaptorUsesFixedURLsAndProtocolAuthentication(t *testing.T) {
 	originalSelector := selectOpenCodeGoWorkspace
-	selectOpenCodeGoWorkspace = func(_ int, _ string) (*service.OpenCodeGoPoolSelection, error) {
+	selectOpenCodeGoWorkspace = func(_ int, _ string, _ string) (*service.OpenCodeGoPoolSelection, error) {
 		return &service.OpenCodeGoPoolSelection{
 			WorkspaceID:  1,
 			WorkspaceUID: "workspace-test",
@@ -174,6 +174,95 @@ func TestAdaptorUsesFixedURLsAndProtocolAuthentication(t *testing.T) {
 			assert.Equal(t, adaptor.cacheIdentity, header.Get(cacheIdentityHeader))
 		})
 	}
+}
+
+func TestAdaptorRoutesChatFamilyFunctionToolsThroughResponses(t *testing.T) {
+	info := newAdaptorTestInfo("glm-5.2", false)
+	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
+	request.Tools = []map[string]any{
+		{
+			"name":        "Bash",
+			"description": "Run a command",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+	}
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+
+	converted, err := adaptor.ConvertClaudeRequest(newAdaptorTestContext(), info, request)
+	require.NoError(t, err)
+	require.IsType(t, &dto.OpenAIResponsesRequest{}, converted)
+	assert.Equal(t, ProtocolResponses, adaptor.protocol)
+	assert.Equal(t, types.RelayFormat(types.RelayFormatOpenAIResponses), info.FinalRequestRelayFormat)
+
+	requestURL, err := adaptor.GetRequestURL(info)
+	require.NoError(t, err)
+	assert.Equal(t, constant.ChannelBaseURLs[constant.ChannelTypeOpenCodeGo]+"/responses", requestURL)
+}
+
+func TestAdaptorBuffersStreamingClaudeFunctionToolsUpstream(t *testing.T) {
+	info := newAdaptorTestInfo("glm-5.2", true)
+	info.RelayFormat = types.RelayFormatClaude
+	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
+	request.Tools = []map[string]any{
+		{
+			"name": "Bash",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"command": map[string]any{"type": "string"},
+				},
+				"required": []string{"command"},
+			},
+		},
+	}
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+
+	converted, err := adaptor.ConvertClaudeRequest(newAdaptorTestContext(), info, request)
+	require.NoError(t, err)
+	responses := converted.(*dto.OpenAIResponsesRequest)
+	require.NotNil(t, responses.Stream)
+	assert.False(t, *responses.Stream)
+	assert.True(t, adaptor.bufferClaudeToolCall)
+}
+
+func TestAdaptorAddsOpenCodeGoResponsesFunctionCallID(t *testing.T) {
+	info := newAdaptorTestInfo("glm-5.2", false)
+	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
+	request.Tools = []map[string]any{
+		{"name": "Bash", "input_schema": map[string]any{"type": "object"}},
+	}
+	request.Messages = []dto.ClaudeMessage{
+		{Role: "assistant", Content: []any{map[string]any{
+			"type": "tool_use", "id": "toolu_test", "name": "Bash", "input": map[string]any{},
+		}}},
+		{Role: "user", Content: []any{map[string]any{
+			"type": "tool_result", "tool_use_id": "toolu_test", "content": "OK",
+		}}},
+	}
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+
+	converted, err := adaptor.ConvertClaudeRequest(newAdaptorTestContext(), info, request)
+	require.NoError(t, err)
+	responses := converted.(*dto.OpenAIResponsesRequest)
+	var input []map[string]any
+	require.NoError(t, json.Unmarshal(responses.Input, &input))
+
+	var functionCall map[string]any
+	for _, item := range input {
+		if item["type"] == "function_call" {
+			functionCall = item
+			break
+		}
+	}
+	require.NotNil(t, functionCall)
+	assert.Equal(t, "toolu_test", functionCall["call_id"])
+	assert.Equal(t, functionCall["call_id"], functionCall["id"])
 }
 
 func TestAdaptorRejectsPassThroughAndUnknownProtocol(t *testing.T) {

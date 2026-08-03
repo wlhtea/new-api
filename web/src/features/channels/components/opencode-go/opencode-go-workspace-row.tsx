@@ -59,19 +59,10 @@ import {
 } from '../../lib/opencode-go-pool'
 import type { OpenCodeGoWorkspace } from '../../lib/opencode-go-schemas'
 import { OpenCodeGoQuotaWindowView } from './opencode-go-quota-window'
-
-const WORKSPACE_STATE_LABELS: Record<string, string> = {
-  pending: 'Pending',
-  eligible: 'Eligible',
-  manual_disabled: 'Manual disabled',
-  stale: 'Stale snapshot',
-  auth_error: 'Authentication error',
-  key_error: 'Credential error',
-  membership_expired: 'Membership inactive',
-  quota_exhausted: 'Quota exhausted',
-  risk_blocked: 'Risk blocked',
-  cooldown: 'Cooling down',
-}
+import {
+  OPENCODE_GO_WORKSPACE_STATE_LABELS,
+  openCodeGoWorkspaceBadgeVariant,
+} from './opencode-go-status'
 
 const MODEL_STATE_LABELS: Record<string, string> = {
   available: 'Available',
@@ -109,16 +100,6 @@ function formatTimestamp(timestamp: number, locale?: string): string {
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(new Date(timestamp * 1000))
-}
-
-function workspaceBadgeVariant(
-  state: string
-): 'default' | 'secondary' | 'destructive' | 'warning' | 'outline' {
-  if (state === 'eligible') return 'default'
-  if (state === 'risk_blocked' || state === 'auth_error') return 'destructive'
-  if (state === 'quota_exhausted' || state === 'cooldown') return 'warning'
-  if (state === 'manual_disabled') return 'secondary'
-  return 'outline'
 }
 
 function modelBadgeVariant(
@@ -184,9 +165,13 @@ export function OpenCodeGoWorkspaceRow(props: OpenCodeGoWorkspaceRowProps) {
             <h4 className='max-w-full truncate text-sm font-semibold'>
               {workspace.name || workspace.email || workspace.uid}
             </h4>
-            <Badge variant={workspaceBadgeVariant(workspace.effective_state)}>
+            <Badge
+              variant={openCodeGoWorkspaceBadgeVariant(
+                workspace.effective_state
+              )}
+            >
               {t(
-                WORKSPACE_STATE_LABELS[workspace.effective_state] ||
+                OPENCODE_GO_WORKSPACE_STATE_LABELS[workspace.effective_state] ||
                   workspace.effective_state
               )}
             </Badge>

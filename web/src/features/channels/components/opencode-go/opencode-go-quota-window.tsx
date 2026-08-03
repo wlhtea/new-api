@@ -33,12 +33,7 @@ import {
   openCodeGoQuotaLayoutClasses,
 } from '../../lib/opencode-go-pool'
 import type { OpenCodeGoQuotaWindow } from '../../lib/opencode-go-schemas'
-
-const QUOTA_WINDOW_LABELS: Record<OpenCodeGoQuotaWindow['kind'], string> = {
-  rolling: 'Rolling window',
-  weekly: 'Weekly window',
-  monthly: 'Monthly window',
-}
+import { OPENCODE_GO_QUOTA_WINDOW_LABELS } from './opencode-go-status'
 
 type OpenCodeGoQuotaWindowProps = {
   kind: OpenCodeGoQuotaWindow['kind']
@@ -68,7 +63,9 @@ export function OpenCodeGoQuotaWindowView(props: OpenCodeGoQuotaWindowProps) {
         )}
         data-state='missing'
       >
-        <p className='font-medium'>{t(QUOTA_WINDOW_LABELS[props.kind])}</p>
+        <p className='font-medium'>
+          {t(OPENCODE_GO_QUOTA_WINDOW_LABELS[props.kind])}
+        </p>
         <p className='text-muted-foreground text-xs'>
           {t('No authoritative quota snapshot')}
         </p>
@@ -89,7 +86,7 @@ export function OpenCodeGoQuotaWindowView(props: OpenCodeGoQuotaWindowProps) {
     >
       <div className='flex min-w-0 items-center justify-between gap-2'>
         <p className='truncate font-medium'>
-          {t(QUOTA_WINDOW_LABELS[props.kind])}
+          {t(OPENCODE_GO_QUOTA_WINDOW_LABELS[props.kind])}
         </p>
         <Badge variant={props.stale ? 'warning' : 'outline'}>
           {props.stale ? t('Stale') : t('Console %')}
