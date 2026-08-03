@@ -75,6 +75,33 @@ func TestChatCompletionsRequestToResponsesRequestPreservesQwenThinkingBudget(t *
 	}
 }
 
+func TestChatCompletionsRequestToResponsesRequestOmitsEmptyAssistantBeforeToolCall(t *testing.T) {
+	assistant := assistantMessageWithTool("", "call_1", "Bash", `{"command":"pwd"}`)
+	assistant.Content = nil
+	req := &dto.GeneralOpenAIRequest{
+		Model: "gpt-test",
+		Messages: []dto.Message{
+			{Role: "user", Content: "inspect the repository"},
+			assistant,
+			{Role: "tool", ToolCallId: "call_1", Content: "/workspace"},
+		},
+	}
+
+	got, err := ChatCompletionsRequestToResponsesRequest(req)
+	require.NoError(t, err)
+
+	var input []map[string]any
+	require.NoError(t, json.Unmarshal(got.Input, &input))
+	require.Len(t, input, 3)
+	assert.Equal(t, "user", input[0]["role"])
+	assert.Equal(t, "function_call", input[1]["type"])
+	assert.Equal(t, "call_1", input[1]["call_id"])
+	assert.Equal(t, "function_call_output", input[2]["type"])
+	for _, item := range input {
+		assert.False(t, item["role"] == "assistant" && item["content"] == "")
+	}
+}
+
 func TestChatCompletionsRequestToResponsesRequestRejectsMultipleChoices(t *testing.T) {
 	_, err := ChatCompletionsRequestToResponsesRequest(&dto.GeneralOpenAIRequest{
 		Model: "gpt-test",

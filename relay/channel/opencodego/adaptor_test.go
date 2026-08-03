@@ -258,6 +258,7 @@ func TestAdaptorAddsOpenCodeGoResponsesFunctionCallID(t *testing.T) {
 
 	var functionCall map[string]any
 	for _, item := range input {
+		assert.False(t, item["role"] == "assistant" && item["content"] == "")
 		if item["type"] == "function_call" {
 			functionCall = item
 			break
