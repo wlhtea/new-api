@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -196,7 +197,7 @@ func openCodeGoWorkspaceToView(workspace model.OpenCodeGoWorkspace) OpenCodeGoWo
 		EffectiveState:           workspace.EffectiveState,
 		StateReason:              sanitizeOpenCodeGoStoredMessage(workspace.StateReason),
 		HealthObservation:        workspace.HealthObservation,
-		HealthObservedAt:         workspace.HealthObservedAt,
+		HealthObservedAt:         openCodeGoHealthObservedAtForView(workspace.HealthObservedAt),
 		CooldownUntil:            workspace.CooldownUntil,
 		QuotaSnapshotStatus:      workspace.QuotaSnapshotStatus,
 		QuotaFetchedAt:           workspace.QuotaFetchedAt,
@@ -246,7 +247,7 @@ func openCodeGoWorkspaceToView(workspace model.OpenCodeGoWorkspace) OpenCodeGoWo
 			LastErrorCode:     entry.LastErrorCode,
 			LastError:         sanitizeOpenCodeGoStoredMessage(entry.LastError),
 			HealthObservation: entry.HealthObservation,
-			HealthObservedAt:  entry.HealthObservedAt,
+			HealthObservedAt:  openCodeGoHealthObservedAtForView(entry.HealthObservedAt),
 			UpdatedAt:         entry.UpdatedAt,
 		})
 	}
@@ -255,6 +256,15 @@ func openCodeGoWorkspaceToView(workspace model.OpenCodeGoWorkspace) OpenCodeGoWo
 	})
 	sort.Slice(view.Models, func(i, j int) bool { return view.Models[i].Model < view.Models[j].Model })
 	return view
+}
+
+func openCodeGoHealthObservedAtForView(observedAt int64) int64 {
+	if observedAt <= 0 {
+		return 0
+	}
+	// Internal health ordering uses Unix nanoseconds. Public timestamps use
+	// seconds so JSON consumers can represent them without precision loss.
+	return observedAt / int64(time.Second)
 }
 
 func (service *OpenCodeGoAccountPoolService) UpdateIdentityLabel(channelID int, identityUID string, label string) error {
