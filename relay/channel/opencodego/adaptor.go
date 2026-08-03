@@ -25,6 +25,8 @@ type Adaptor struct {
 	protocol             Protocol
 	protocolErr          error
 	cacheIdentity        string
+	affinityIdentity     string
+	bufferClaudeToolCall bool
 	converted            bool
 	workspaceSelected    bool
 	selectedWorkspaceUID string
@@ -32,7 +34,7 @@ type Adaptor struct {
 	claude               claude.Adaptor
 }
 
-var selectOpenCodeGoWorkspace = service.SelectOpenCodeGoWorkspace
+var selectOpenCodeGoWorkspace = service.SelectOpenCodeGoWorkspaceWithAffinity
 
 var doOpenCodeGoAPIRequest = channel.DoApiRequest
 
@@ -44,6 +46,8 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	a.protocol = ""
 	a.protocolErr = nil
 	a.cacheIdentity = ""
+	a.affinityIdentity = ""
+	a.bufferClaudeToolCall = false
 	a.converted = false
 	a.workspaceSelected = false
 	a.selectedWorkspaceUID = ""
@@ -90,7 +94,7 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 		return err
 	}
 	if !a.workspaceSelected {
-		selection, selectErr := selectOpenCodeGoWorkspace(info.ChannelId, info.UpstreamModelName)
+		selection, selectErr := selectOpenCodeGoWorkspace(info.ChannelId, info.UpstreamModelName, a.affinityIdentity)
 		if selectErr != nil {
 			return selectErr
 		}
@@ -136,8 +140,15 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	if err != nil {
 		return nil, err
 	}
+	if protocol == ProtocolChat && requestUsesFunctionTools(request) {
+		protocol = ProtocolResponses
+		a.protocol = protocol
+	}
 
 	a.cacheIdentity = cacheIdentityForRequest(c, info, request)
+	a.affinityIdentity = affinityIdentityForRequest(c, request)
+	a.bufferClaudeToolCall = protocol == ProtocolResponses &&
+		info.IsStream && info.RelayFormat == types.RelayFormatClaude && requestUsesFunctionTools(request)
 	result, err := service.ConvertRequest(c, info, protocol.RelayFormat(), request)
 	if err != nil {
 		return nil, err
@@ -160,6 +171,13 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 		converted.Model = info.UpstreamModelName
 	case *dto.OpenAIResponsesRequest:
 		converted.Model = info.UpstreamModelName
+		if a.bufferClaudeToolCall {
+			upstreamStream := false
+			converted.Stream = &upstreamStream
+		}
+		if err := prepareOpenCodeGoResponsesToolHistory(converted); err != nil {
+			return nil, err
+		}
 		cacheKey, marshalErr := common.Marshal(a.cacheIdentity)
 		if marshalErr != nil {
 			return nil, marshalErr
@@ -252,7 +270,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		clientModel = info.UpstreamModelName
 	}
 	state := &responseTransformState{model: clientModel, protocol: protocol}
-	if err := prepareResponseForRelay(resp, state, info.IsStream); err != nil {
+	if err := prepareResponseForRelay(resp, state, info.IsStream && !a.bufferClaudeToolCall); err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
 	}
 
@@ -287,7 +305,9 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 			usage, responseErr = a.claude.DoResponse(c, resp, info)
 		}
 	case ProtocolResponses:
-		if info.RelayFormat == types.RelayFormatOpenAIResponses {
+		if a.bufferClaudeToolCall {
+			usage, responseErr = openai.OaiResponsesToClaudeBufferedStreamHandler(c, info, resp)
+		} else if info.RelayFormat == types.RelayFormatOpenAIResponses {
 			if info.IsStream {
 				usage, responseErr = openai.OaiResponsesStreamHandler(c, info, resp)
 			} else {

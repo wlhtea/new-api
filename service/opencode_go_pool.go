@@ -1,6 +1,9 @@
 package service
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,6 +17,8 @@ import (
 )
 
 const openCodeGoNoEligibleWorkspaceReason = "opencode_go:no_eligible_workspace"
+
+const openCodeGoAffinityDomain = "new-api/opencode-go/workspace-affinity/v1"
 
 var ErrOpenCodeGoNoEligibleWorkspace = errors.New("OpenCode Go channel has no eligible workspace for the requested model")
 
@@ -142,6 +147,10 @@ func RebuildOpenCodeGoPoolChannel(channelID int) error {
 }
 
 func SelectOpenCodeGoWorkspace(channelID int, upstreamModel string) (*OpenCodeGoPoolSelection, error) {
+	return SelectOpenCodeGoWorkspaceWithAffinity(channelID, upstreamModel, "")
+}
+
+func SelectOpenCodeGoWorkspaceWithAffinity(channelID int, upstreamModel string, affinityKey string) (*OpenCodeGoPoolSelection, error) {
 	value, exists := openCodeGoPoolChannels.Load(channelID)
 	if !exists {
 		return nil, ErrOpenCodeGoNoEligibleWorkspace
@@ -155,9 +164,14 @@ func SelectOpenCodeGoWorkspace(channelID int, upstreamModel string) (*OpenCodeGo
 	if len(candidates) == 0 {
 		return nil, ErrOpenCodeGoNoEligibleWorkspace
 	}
-	cursorValue, _ := state.cursors.LoadOrStore(strings.TrimSpace(upstreamModel), &atomic.Uint64{})
-	cursor := cursorValue.(*atomic.Uint64)
-	index := (cursor.Add(1) - 1) % uint64(len(candidates))
+	index := 0
+	if strings.TrimSpace(affinityKey) == "" {
+		cursorValue, _ := state.cursors.LoadOrStore(strings.TrimSpace(upstreamModel), &atomic.Uint64{})
+		cursor := cursorValue.(*atomic.Uint64)
+		index = int((cursor.Add(1) - 1) % uint64(len(candidates)))
+	} else {
+		index = openCodeGoAffinityCandidateIndex(channelID, upstreamModel, affinityKey, candidates)
+	}
 	candidate := candidates[index]
 	if snapshot.codec == nil {
 		return nil, ErrOpenCodeGoSelectedCredentialUnavailable
@@ -176,6 +190,29 @@ func SelectOpenCodeGoWorkspace(channelID int, upstreamModel string) (*OpenCodeGo
 		WorkspaceUID: candidate.workspaceUID,
 		APIKey:       apiKey,
 	}, nil
+}
+
+func openCodeGoAffinityCandidateIndex(channelID int, upstreamModel string, affinityKey string, candidates []openCodeGoPoolCandidate) int {
+	selectedIndex := 0
+	var selectedScore uint64
+	for index, candidate := range candidates {
+		hash := hmac.New(sha256.New, []byte(common.CryptoSecret))
+		_, _ = fmt.Fprintf(
+			hash,
+			"%s\x00%d\x00%s\x00%s\x00%s",
+			openCodeGoAffinityDomain,
+			channelID,
+			strings.TrimSpace(upstreamModel),
+			affinityKey,
+			candidate.workspaceUID,
+		)
+		score := binary.BigEndian.Uint64(hash.Sum(nil)[:8])
+		if index == 0 || score > selectedScore || (score == selectedScore && candidate.workspaceUID < candidates[selectedIndex].workspaceUID) {
+			selectedIndex = index
+			selectedScore = score
+		}
+	}
+	return selectedIndex
 }
 
 func RemoveOpenCodeGoPoolChannel(channelID int) {

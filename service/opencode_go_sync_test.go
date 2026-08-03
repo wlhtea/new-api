@@ -993,6 +993,32 @@ func TestOpenCodeGoPoolConcurrentCursorIsBalanced(t *testing.T) {
 	require.Equal(t, int64(50), secondCount.(*atomic.Int64).Load())
 }
 
+func TestOpenCodeGoPoolSessionAffinityIsStableAndDistributed(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	first := createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "one", "workspace-one", "wrk_ALPHA1", []string{"model-a"})
+	second := createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "two", "workspace-two", "wrk_BETA2", []string{"model-a"})
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+
+	stable, err := SelectOpenCodeGoWorkspaceWithAffinity(channel.Id, "model-a", "session-stable")
+	require.NoError(t, err)
+	for index := 0; index < 20; index++ {
+		selection, selectErr := SelectOpenCodeGoWorkspaceWithAffinity(channel.Id, "model-a", "session-stable")
+		require.NoError(t, selectErr)
+		assert.Equal(t, stable.WorkspaceUID, selection.WorkspaceUID)
+	}
+
+	counts := map[string]int{first.UID: 0, second.UID: 0}
+	for index := 0; index < 200; index++ {
+		selection, selectErr := SelectOpenCodeGoWorkspaceWithAffinity(channel.Id, "model-a", fmt.Sprintf("session-%d", index))
+		require.NoError(t, selectErr)
+		counts[selection.WorkspaceUID]++
+	}
+	assert.Greater(t, counts[first.UID], 60)
+	assert.Greater(t, counts[second.UID], 60)
+	assert.Less(t, counts[first.UID], 140)
+	assert.Less(t, counts[second.UID], 140)
+}
+
 func TestOpenCodeGoWorkspaceEligibilityRejectsEverySchedulingBlocker(t *testing.T) {
 	now := int64(1_900_000_000)
 	base := model.OpenCodeGoWorkspace{

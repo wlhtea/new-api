@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +46,8 @@ type openCodeGoProviderErrorEnvelope struct {
 	Message  string          `json:"message"`
 	Code     any             `json:"code"`
 	Error    json.RawMessage `json:"error"`
+	Detail   json.RawMessage `json:"detail"`
+	Issues   json.RawMessage `json:"issues"`
 	Metadata struct {
 		LimitName string `json:"limitName"`
 	} `json:"metadata"`
@@ -56,17 +59,33 @@ type openCodeGoProviderErrorDetail struct {
 	Code    any    `json:"code"`
 }
 
+type openCodeGoProviderValidationIssue struct {
+	Code    string `json:"code"`
+	Path    []any  `json:"path"`
+	Message string `json:"message"`
+}
+
 func ParseOpenCodeGoProviderFailure(statusCode int, header http.Header, body []byte) OpenCodeGoProviderFailure {
 	failure := OpenCodeGoProviderFailure{StatusCode: statusCode}
+	body = openCodeGoProviderErrorPayload(body)
 	var envelope openCodeGoProviderErrorEnvelope
-	if len(body) > 0 && common.Unmarshal(body, &envelope) == nil {
+	if issue, ok := parseOpenCodeGoProviderValidationIssue(body); ok {
+		applyOpenCodeGoProviderValidationIssue(&failure, issue)
+	} else if len(body) > 0 && common.Unmarshal(body, &envelope) == nil {
 		failure.ErrorType = envelope.Type
 		failure.ErrorCode = stringifyOpenCodeGoProviderErrorCode(envelope.Code)
 		failure.Message = envelope.Message
 		failure.LimitName = sanitizeOpenCodeGoLimitName(envelope.Metadata.LimitName)
-		if len(envelope.Error) > 0 {
+		for _, rawDetail := range []json.RawMessage{envelope.Error, envelope.Detail, envelope.Issues} {
+			if len(rawDetail) == 0 {
+				continue
+			}
+			if issue, ok := parseOpenCodeGoProviderValidationIssue(rawDetail); ok {
+				applyOpenCodeGoProviderValidationIssue(&failure, issue)
+				break
+			}
 			var detail openCodeGoProviderErrorDetail
-			if common.Unmarshal(envelope.Error, &detail) == nil {
+			if common.Unmarshal(rawDetail, &detail) == nil {
 				if detail.Type != "" {
 					failure.ErrorType = detail.Type
 				}
@@ -78,10 +97,11 @@ func ParseOpenCodeGoProviderFailure(statusCode int, header http.Header, body []b
 				}
 			} else {
 				var stringError string
-				if common.Unmarshal(envelope.Error, &stringError) == nil && stringError != "" {
+				if common.Unmarshal(rawDetail, &stringError) == nil && stringError != "" {
 					failure.Message = stringError
 				}
 			}
+			break
 		}
 	}
 
@@ -101,6 +121,68 @@ func ParseOpenCodeGoProviderFailure(statusCode int, header http.Header, body []b
 		failure.RetryAfter = sanitizeOpenCodeGoRetryAfter(header.Get("Retry-After"))
 	}
 	return failure
+}
+
+func openCodeGoProviderErrorPayload(body []byte) []byte {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 || body[0] == '{' || body[0] == '[' {
+		return body
+	}
+	for _, line := range bytes.Split(body, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(payload) > 0 && (payload[0] == '{' || payload[0] == '[') {
+			return payload
+		}
+	}
+	return body
+}
+
+func parseOpenCodeGoProviderValidationIssue(raw []byte) (openCodeGoProviderValidationIssue, bool) {
+	if len(raw) == 0 {
+		return openCodeGoProviderValidationIssue{}, false
+	}
+	var issues []openCodeGoProviderValidationIssue
+	if common.Unmarshal(raw, &issues) != nil || len(issues) == 0 {
+		return openCodeGoProviderValidationIssue{}, false
+	}
+	issue := issues[0]
+	if strings.TrimSpace(issue.Code) == "" && len(issue.Path) == 0 && strings.TrimSpace(issue.Message) == "" {
+		return openCodeGoProviderValidationIssue{}, false
+	}
+	return issue, true
+}
+
+func applyOpenCodeGoProviderValidationIssue(failure *OpenCodeGoProviderFailure, issue openCodeGoProviderValidationIssue) {
+	if failure == nil {
+		return
+	}
+	failure.ErrorType = "validation_error"
+	failure.ErrorCode = firstNonEmptyOpenCodeGoMessage(issue.Code, "validation_error")
+	path := formatOpenCodeGoValidationPath(issue.Path)
+	message := strings.TrimSpace(issue.Message)
+	switch {
+	case path != "" && message != "":
+		failure.Message = fmt.Sprintf("OpenCode Go rejected %s: %s", path, message)
+	case path != "":
+		failure.Message = "OpenCode Go rejected " + path
+	case message != "":
+		failure.Message = message
+	}
+}
+
+func formatOpenCodeGoValidationPath(path []any) string {
+	parts := make([]string, 0, len(path))
+	for _, value := range path {
+		part := stringifyOpenCodeGoProviderErrorCode(value)
+		if part = sanitizeOpenCodeGoErrorIdentifier(part); part != "" {
+			parts = append(parts, part)
+		}
+	}
+	return strings.Join(parts, ".")
 }
 
 func SanitizeOpenCodeGoProviderMessage(message string) string {
@@ -209,9 +291,14 @@ func ClassifyOpenCodeGoProviderFailure(
 	case failure.StatusCode == http.StatusTooManyRequests:
 		return modelScope(OpenCodeGoObservationRPMThrottled, openCodeGoDefaultRPMCooldown)
 	case failure.StatusCode == http.StatusRequestTimeout,
-		failure.StatusCode == http.StatusTooEarly,
-		failure.StatusCode >= http.StatusInternalServerError:
+		failure.StatusCode == http.StatusTooEarly:
 		return modelScope(OpenCodeGoObservationTransientFailure, openCodeGoDefaultTransientCooldown)
+	case failure.StatusCode >= http.StatusInternalServerError:
+		// A provider-wide 5xx does not prove that the selected account or model is
+		// unhealthy. Cooling the account here shrinks the affinity candidate set;
+		// when every account observes the same outage, New API removes the model
+		// ability and turns subsequent upstream failures into local 503s.
+		return OpenCodeGoClassifiedFailure{}, false
 	default:
 		return OpenCodeGoClassifiedFailure{}, false
 	}

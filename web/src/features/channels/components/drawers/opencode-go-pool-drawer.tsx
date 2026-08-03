@@ -84,6 +84,7 @@ import {
   getOpenCodeGoTaskProgress,
   isOpenCodeGoWorkspaceStale,
   listOpenCodeGoWorkspaceRows,
+  openCodeGoAccountGridClasses,
 } from '../../lib/opencode-go-pool'
 import type {
   OpenCodeGoIdentity,
@@ -334,17 +335,12 @@ export function OpenCodeGoPoolDrawer(props: OpenCodeGoPoolDrawerProps) {
   let accountListContent: ReactNode
   if (pool.poolQuery.isLoading) {
     accountListContent = (
-      <div className='space-y-5' aria-label={t('Loading account pool')}>
-        {['primary', 'secondary'].map((skeletonKey) => (
-          <div key={skeletonKey} className='space-y-3 border-b pb-5'>
-            <Skeleton className='h-6 w-56' />
-            <Skeleton className='h-4 w-80 max-w-full' />
-            <div className='grid gap-3 md:grid-cols-3'>
-              <Skeleton className='h-44' />
-              <Skeleton className='h-44' />
-              <Skeleton className='h-44' />
-            </div>
-          </div>
+      <div
+        className={openCodeGoAccountGridClasses}
+        aria-label={t('Loading account pool')}
+      >
+        {['primary', 'secondary', 'tertiary'].map((skeletonKey) => (
+          <Skeleton key={skeletonKey} className='h-72 rounded-md' />
         ))}
       </div>
     )
@@ -414,59 +410,63 @@ export function OpenCodeGoPoolDrawer(props: OpenCodeGoPoolDrawerProps) {
       </Empty>
     )
   } else {
-    accountListContent = view.identities.map((identity) => (
-      <OpenCodeGoIdentitySection
-        key={identity.uid}
-        identity={identity}
-        visibleWorkspaceUids={visibleWorkspaceUids}
-        nowSeconds={nowSeconds}
-        locale={i18n.language}
-        canOperate={canOperate}
-        canSensitiveWrite={canSensitiveWrite}
-        busyKey={busyKey}
-        onEditLabel={setLabelIdentity}
-        onReplaceCookie={setCookieIdentity}
-        onRefreshIdentity={(identityUid) =>
-          pool.runOrdinaryAction({
-            kind: 'identity-refresh',
-            identityUid,
-          })
-        }
-        onToggleIdentity={(identityUid, enabled) =>
-          pool.runOrdinaryAction({
-            kind: 'identity-toggle',
-            identityUid,
-            enabled,
-          })
-        }
-        onDeleteIdentity={(identityValue) =>
-          setConfirmation({
-            kind: 'delete-identity',
-            identity: identityValue,
-          })
-        }
-        onRefreshWorkspace={(workspaceUid) =>
-          pool.runOrdinaryAction({
-            kind: 'workspace-refresh',
-            workspaceUid,
-          })
-        }
-        onRiskRecheckWorkspace={(workspaceUid) =>
-          pool.runOrdinaryAction({
-            kind: 'workspace-risk',
-            workspaceUid,
-          })
-        }
-        onToggleWorkspace={(workspaceUid, enabled) =>
-          pool.runOrdinaryAction({
-            kind: 'workspace-toggle',
-            workspaceUid,
-            enabled,
-          })
-        }
-        onWorkspaceSensitiveAction={runWorkspaceSensitiveAction}
-      />
-    ))
+    accountListContent = (
+      <div className={openCodeGoAccountGridClasses} data-account-grid>
+        {view.identities.map((identity) => (
+          <OpenCodeGoIdentitySection
+            key={identity.uid}
+            identity={identity}
+            visibleWorkspaceUids={visibleWorkspaceUids}
+            nowSeconds={nowSeconds}
+            locale={i18n.language}
+            canOperate={canOperate}
+            canSensitiveWrite={canSensitiveWrite}
+            busyKey={busyKey}
+            onEditLabel={setLabelIdentity}
+            onReplaceCookie={setCookieIdentity}
+            onRefreshIdentity={(identityUid) =>
+              pool.runOrdinaryAction({
+                kind: 'identity-refresh',
+                identityUid,
+              })
+            }
+            onToggleIdentity={(identityUid, enabled) =>
+              pool.runOrdinaryAction({
+                kind: 'identity-toggle',
+                identityUid,
+                enabled,
+              })
+            }
+            onDeleteIdentity={(identityValue) =>
+              setConfirmation({
+                kind: 'delete-identity',
+                identity: identityValue,
+              })
+            }
+            onRefreshWorkspace={(workspaceUid) =>
+              pool.runOrdinaryAction({
+                kind: 'workspace-refresh',
+                workspaceUid,
+              })
+            }
+            onRiskRecheckWorkspace={(workspaceUid) =>
+              pool.runOrdinaryAction({
+                kind: 'workspace-risk',
+                workspaceUid,
+              })
+            }
+            onToggleWorkspace={(workspaceUid, enabled) =>
+              pool.runOrdinaryAction({
+                kind: 'workspace-toggle',
+                workspaceUid,
+                enabled,
+              })
+            }
+            onWorkspaceSensitiveAction={runWorkspaceSensitiveAction}
+          />
+        ))}
+      </div>
+    )
   }
 
   let policyContent: ReactNode = null
