@@ -240,9 +240,14 @@ func TestAdaptorAddsOpenCodeGoResponsesFunctionCallID(t *testing.T) {
 		{"name": "Bash", "input_schema": map[string]any{"type": "object"}},
 	}
 	request.Messages = []dto.ClaudeMessage{
-		{Role: "assistant", Content: []any{map[string]any{
-			"type": "tool_use", "id": "toolu_test", "name": "Bash", "input": map[string]any{},
-		}}},
+		{Role: "assistant", Content: []any{
+			map[string]any{
+				"type": "thinking", "thinking": "inspect the repository before calling Bash",
+			},
+			map[string]any{
+				"type": "tool_use", "id": "toolu_test", "name": "Bash", "input": map[string]any{},
+			},
+		}},
 		{Role: "user", Content: []any{map[string]any{
 			"type": "tool_result", "tool_use_id": "toolu_test", "content": "OK",
 		}}},
@@ -256,14 +261,21 @@ func TestAdaptorAddsOpenCodeGoResponsesFunctionCallID(t *testing.T) {
 	var input []map[string]any
 	require.NoError(t, json.Unmarshal(responses.Input, &input))
 
+	var reasoningItem map[string]any
 	var functionCall map[string]any
 	for _, item := range input {
 		assert.False(t, item["role"] == "assistant" && item["content"] == "")
+		if item["type"] == "reasoning" {
+			reasoningItem = item
+		}
 		if item["type"] == "function_call" {
 			functionCall = item
-			break
 		}
 	}
+	require.NotNil(t, reasoningItem)
+	assert.Equal(t, "inspect the repository before calling Bash", reasoningItem["summary"].([]any)[0].(map[string]any)["text"])
+	assert.Regexp(t, `^rs_[0-9a-f]{24}$`, reasoningItem["id"])
+	assert.Equal(t, "completed", reasoningItem["status"])
 	require.NotNil(t, functionCall)
 	assert.Equal(t, "toolu_test", functionCall["call_id"])
 	assert.Equal(t, functionCall["call_id"], functionCall["id"])

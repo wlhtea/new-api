@@ -145,6 +145,7 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 				return nil, err
 			}
 			var toolCalls []dto.ToolCallRequest
+			reasoningParts := make([]string, 0)
 			mediaMessages := make([]dto.MediaContent, 0, len(content))
 
 			for _, mediaMsg := range content {
@@ -173,6 +174,10 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 						},
 					}
 					toolCalls = append(toolCalls, toolCall)
+				case "thinking":
+					if claudeMessage.Role == "assistant" && mediaMsg.Thinking != nil && strings.TrimSpace(*mediaMsg.Thinking) != "" {
+						reasoningParts = append(reasoningParts, *mediaMsg.Thinking)
+					}
 				case "tool_result":
 					toolName := mediaMsg.Name
 					if toolName == "" {
@@ -197,11 +202,15 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 			if len(toolCalls) > 0 {
 				openAIMessage.SetToolCalls(toolCalls)
 			}
+			if len(reasoningParts) > 0 {
+				reasoningContent := strings.Join(reasoningParts, "\n\n")
+				openAIMessage.ReasoningContent = &reasoningContent
+			}
 			if len(mediaMessages) > 0 && len(toolCalls) == 0 {
 				openAIMessage.SetMediaContent(mediaMessages)
 			}
 		}
-		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 {
+		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 || openAIMessage.GetReasoningContent() != "" {
 			openAIMessages = append(openAIMessages, openAIMessage)
 		}
 	}
