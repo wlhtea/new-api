@@ -692,6 +692,49 @@ func TestOpenCodeGoOlderRefreshFailureCannotInvalidateNewerSnapshot(t *testing.T
 	assert.Equal(t, newer.UnixNano(), after.Workspaces[0].HealthObservedAt)
 }
 
+func TestOpenCodeGoTransientRefreshFailurePreservesCompleteSnapshotEligibility(t *testing.T) {
+	_, channel, _ := setupOpenCodeGoPoolTestDB(t)
+	identity := model.OpenCodeGoIdentity{
+		UID:                   "identity-transient-refresh",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie-transient-refresh",
+		AuthCookieFingerprint: "fingerprint-transient-refresh",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+		LastSyncedAt:          1_900_000_000,
+	}
+	require.NoError(t, model.DB.Create(&identity).Error)
+	workspace := seedOpenCodeGoHealthWorkspace(t, channel.Id, identity.ID, "workspace-transient-refresh", "glm-5.2")
+	require.NoError(t, model.DB.Model(&model.OpenCodeGoWorkspace{}).
+		Where("id = ?", workspace.ID).
+		Updates(map[string]interface{}{
+			"last_synced_at":     int64(1_900_000_000),
+			"health_observation": string(OpenCodeGoObservationConsoleSnapshot),
+			"health_observed_at": time.Unix(1_900_000_000, 0).UnixNano(),
+		}).Error)
+
+	poolService := NewOpenCodeGoAccountPoolAdminService()
+	poolService.now = func() time.Time { return time.Unix(1_900_000_060, 0) }
+	poolService.rebuild = nil
+	require.NoError(t, poolService.markIdentityRefreshFailure(
+		channel.Id,
+		&identity,
+		model.OpenCodeGoIdentityStatusStale,
+		errors.New("OpenCode Go workspace request returned status 500"),
+	))
+
+	after, err := model.GetOpenCodeGoIdentityPool(channel.Id, identity.UID)
+	require.NoError(t, err)
+	assert.Equal(t, model.OpenCodeGoIdentityStatusActive, after.Status)
+	assert.Equal(t, int64(1_900_000_060), after.LastSyncedAt)
+	require.Len(t, after.Workspaces, 1)
+	assert.Equal(t, model.OpenCodeGoStateEligible, after.Workspaces[0].EffectiveState)
+	assert.Equal(t, model.OpenCodeGoQuotaSnapshotComplete, after.Workspaces[0].QuotaSnapshotStatus)
+	assert.Equal(t, string(OpenCodeGoObservationConsoleSnapshot), after.Workspaces[0].HealthObservation)
+	assert.Equal(t, int64(1_900_000_060), after.Workspaces[0].LastSyncedAt)
+	assert.Contains(t, after.Workspaces[0].LastError, "status 500")
+	assert.Contains(t, after.Workspaces[0].QuotaError, "status 500")
+}
+
 func TestSanitizeOpenCodeGoErrorTruncatesAtUTF8Boundary(t *testing.T) {
 	message := strings.Repeat("\u754c", 200) + string([]byte{0xff})
 	sanitized := sanitizeOpenCodeGoError(errors.New(message))

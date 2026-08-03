@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -39,6 +40,7 @@ func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info
 	}
 
 	failure := service.ParseOpenCodeGoProviderFailure(resp.StatusCode, resp.Header, body)
+	a.logProviderFailureDiagnostics(c, resp.StatusCode, info)
 	errorType := failure.ErrorType
 	errorCode := failure.ErrorCode
 	message := failure.Message
@@ -72,6 +74,35 @@ func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info
 	}
 	a.persistProviderFailure(info, observation)
 	return err, observation
+}
+
+func (a *Adaptor) logProviderFailureDiagnostics(c *gin.Context, statusCode int, info *relaycommon.RelayInfo) {
+	if a == nil || info == nil {
+		return
+	}
+	workspaceRef := ""
+	if a.selectedWorkspaceUID != "" {
+		workspaceRef = hashCacheIdentity("diagnostic-workspace", a.selectedWorkspaceUID)
+	}
+	affinityRef := ""
+	if a.affinityIdentity != "" {
+		affinityRef = hashCacheIdentity("diagnostic-affinity", a.affinityIdentity)
+	}
+	logger.LogWarn(c, fmt.Sprintf(
+		"OpenCode Go upstream failure diagnostics: status=%d channel_id=%d model=%q protocol=%q client_format=%q upstream_stream=%t buffered_tool=%t input_items=%d tools=%d body_bytes=%d workspace_ref=%s affinity_ref=%s",
+		statusCode,
+		info.ChannelId,
+		info.UpstreamModelName,
+		a.protocol,
+		info.RelayFormat,
+		a.requestUpstreamStream,
+		a.bufferClaudeToolCall,
+		a.requestInputItems,
+		a.requestToolCount,
+		info.UpstreamRequestBodySize,
+		workspaceRef,
+		affinityRef,
+	))
 }
 
 func (a *Adaptor) persistProviderFailure(info *relaycommon.RelayInfo, observation *channel.Non2xxResponseObservation) {

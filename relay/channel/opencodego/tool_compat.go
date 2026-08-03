@@ -59,6 +59,64 @@ func claudeToolsContainFunction(tools any) bool {
 	return false
 }
 
+func (a *Adaptor) captureRequestShape(request any) {
+	if a == nil {
+		return
+	}
+	a.requestInputItems = 0
+	a.requestToolCount = 0
+	a.requestUpstreamStream = false
+
+	switch typed := request.(type) {
+	case *dto.GeneralOpenAIRequest:
+		if typed == nil {
+			return
+		}
+		a.requestInputItems = len(typed.Messages)
+		a.requestToolCount = len(typed.Tools) + countJSONListItems(typed.Functions)
+		a.requestUpstreamStream = typed.Stream != nil && *typed.Stream
+	case *dto.ClaudeRequest:
+		if typed == nil {
+			return
+		}
+		a.requestInputItems = len(typed.Messages)
+		a.requestToolCount = countClaudeTools(typed.Tools)
+		a.requestUpstreamStream = typed.Stream != nil && *typed.Stream
+	case *dto.OpenAIResponsesRequest:
+		if typed == nil {
+			return
+		}
+		a.requestInputItems = countJSONListItems(typed.Input)
+		if a.requestInputItems == 0 && len(typed.Input) > 0 && string(typed.Input) != "null" {
+			a.requestInputItems = 1
+		}
+		a.requestToolCount = countJSONListItems(typed.Tools)
+		a.requestUpstreamStream = typed.Stream != nil && *typed.Stream
+	}
+}
+
+func countClaudeTools(tools any) int {
+	if tools == nil {
+		return 0
+	}
+	raw, err := common.Marshal(tools)
+	if err != nil {
+		return 0
+	}
+	return countJSONListItems(raw)
+}
+
+func countJSONListItems(raw []byte) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var entries []json.RawMessage
+	if err := common.Unmarshal(raw, &entries); err != nil {
+		return 0
+	}
+	return len(entries)
+}
+
 // OpenCode Go currently reconstructs Responses tool history from
 // function_call.id, while standard clients commonly send only call_id.
 func prepareOpenCodeGoResponsesToolHistory(request *dto.OpenAIResponsesRequest) error {

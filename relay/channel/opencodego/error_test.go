@@ -1,6 +1,7 @@
 package opencodego
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,51 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestHandleNon2xxResponseLogsOnlyPrivacySafeRequestShape(t *testing.T) {
+	originalWriter := gin.DefaultErrorWriter
+	var output bytes.Buffer
+	gin.DefaultErrorWriter = &output
+	t.Cleanup(func() { gin.DefaultErrorWriter = originalWriter })
+
+	adaptor := &Adaptor{
+		protocol:              ProtocolResponses,
+		bufferClaudeToolCall:  true,
+		requestInputItems:     37,
+		requestToolCount:      12,
+		requestUpstreamStream: false,
+		workspaceSelected:     true,
+		selectedWorkspaceUID:  "private-workspace-value",
+		affinityIdentity:      "private-session-value",
+	}
+	info := &relaycommon.RelayInfo{
+		RelayFormat:             types.RelayFormatClaude,
+		UpstreamRequestBodySize: 123_456,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         42,
+			UpstreamModelName: "glm-5.2",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusInternalServerError,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"Internal server error"}}`)),
+	}
+
+	_, observation := adaptor.HandleNon2xxResponse(newAdaptorTestContext(), resp, info)
+
+	require.NotNil(t, observation)
+	logOutput := output.String()
+	assert.Contains(t, logOutput, "status=500")
+	assert.Contains(t, logOutput, `protocol="responses"`)
+	assert.Contains(t, logOutput, `client_format="claude"`)
+	assert.Contains(t, logOutput, "buffered_tool=true")
+	assert.Contains(t, logOutput, "input_items=37")
+	assert.Contains(t, logOutput, "tools=12")
+	assert.Contains(t, logOutput, "body_bytes=123456")
+	assert.NotContains(t, logOutput, "private-workspace-value")
+	assert.NotContains(t, logOutput, "private-session-value")
+}
 
 func TestHandleNon2xxResponsePreservesSafeMetadataAndRedactsSecrets(t *testing.T) {
 	secret := "sk-" + strings.Repeat("A", 24)

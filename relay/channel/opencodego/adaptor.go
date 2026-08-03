@@ -22,16 +22,19 @@ import (
 )
 
 type Adaptor struct {
-	protocol             Protocol
-	protocolErr          error
-	cacheIdentity        string
-	affinityIdentity     string
-	bufferClaudeToolCall bool
-	converted            bool
-	workspaceSelected    bool
-	selectedWorkspaceUID string
-	openai               openai.Adaptor
-	claude               claude.Adaptor
+	protocol              Protocol
+	protocolErr           error
+	cacheIdentity         string
+	affinityIdentity      string
+	bufferClaudeToolCall  bool
+	requestInputItems     int
+	requestToolCount      int
+	requestUpstreamStream bool
+	converted             bool
+	workspaceSelected     bool
+	selectedWorkspaceUID  string
+	openai                openai.Adaptor
+	claude                claude.Adaptor
 }
 
 var selectOpenCodeGoWorkspace = service.SelectOpenCodeGoWorkspaceWithAffinity
@@ -48,6 +51,9 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	a.cacheIdentity = ""
 	a.affinityIdentity = ""
 	a.bufferClaudeToolCall = false
+	a.requestInputItems = 0
+	a.requestToolCount = 0
+	a.requestUpstreamStream = false
 	a.converted = false
 	a.workspaceSelected = false
 	a.selectedWorkspaceUID = ""
@@ -140,7 +146,8 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	if err != nil {
 		return nil, err
 	}
-	if protocol == ProtocolChat && requestUsesFunctionTools(request) {
+	usesFunctionTools := requestUsesFunctionTools(request)
+	if protocol == ProtocolChat && usesFunctionTools {
 		protocol = ProtocolResponses
 		a.protocol = protocol
 	}
@@ -148,7 +155,8 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	a.cacheIdentity = cacheIdentityForRequest(c, info, request)
 	a.affinityIdentity = affinityIdentityForRequest(c, request)
 	a.bufferClaudeToolCall = protocol == ProtocolResponses &&
-		info.IsStream && info.RelayFormat == types.RelayFormatClaude && requestUsesFunctionTools(request)
+		info.IsStream && info.RelayFormat == types.RelayFormatClaude && usesFunctionTools
+	a.captureRequestShape(request)
 	result, err := service.ConvertRequest(c, info, protocol.RelayFormat(), request)
 	if err != nil {
 		return nil, err
@@ -160,6 +168,7 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	switch converted := result.Value.(type) {
 	case *dto.GeneralOpenAIRequest:
 		converted.Model = info.UpstreamModelName
+		a.requestUpstreamStream = converted.Stream != nil && *converted.Stream
 		if info.IsStream {
 			converted.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
 		}
@@ -169,6 +178,7 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 		}
 	case *dto.ClaudeRequest:
 		converted.Model = info.UpstreamModelName
+		a.requestUpstreamStream = converted.Stream != nil && *converted.Stream
 	case *dto.OpenAIResponsesRequest:
 		converted.Model = info.UpstreamModelName
 		if a.bufferClaudeToolCall {
@@ -178,6 +188,7 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 		if err := prepareOpenCodeGoResponsesToolHistory(converted); err != nil {
 			return nil, err
 		}
+		a.requestUpstreamStream = converted.Stream != nil && *converted.Stream
 		cacheKey, marshalErr := common.Marshal(a.cacheIdentity)
 		if marshalErr != nil {
 			return nil, marshalErr
@@ -186,7 +197,6 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	default:
 		return nil, fmt.Errorf("unsupported OpenCode Go converted request type %T", result.Value)
 	}
-
 	info.FinalRequestRelayFormat = protocol.RelayFormat()
 	a.converted = true
 	return result.Value, nil
