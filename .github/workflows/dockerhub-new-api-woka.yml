@@ -22,11 +22,13 @@ concurrency:
 jobs:
   build-and-push:
     # Do not publish images when this workflow is copied into another fork.
-    if: github.repository == 'wlhtea/new-api'
+    # Manual dispatch is intentionally limited to the trusted release branch;
+    # otherwise an arbitrary branch could use the Docker Hub push secret.
+    if: github.repository == 'wlhtea/new-api' && github.ref == 'refs/heads/custom-main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/new-api-woka
+      IMAGE_NAME: wlhtea/new-api-woka
 
     steps:
       - name: Check out source
@@ -42,8 +44,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -n "$DOCKERHUB_USERNAME" || {
-            echo "::error::The DOCKERHUB_USERNAME repository secret is required"
+          test "$DOCKERHUB_USERNAME" = "wlhtea" || {
+            echo "::error::DOCKERHUB_USERNAME must be wlhtea for this repository"
             exit 1
           }
           test -n "$DOCKERHUB_TOKEN" || {
@@ -55,6 +57,12 @@ jobs:
             echo "::error::The optional Docker tag is invalid"
             exit 1
           fi
+          case "$EXTRA_TAG" in
+            latest|sha-*)
+              echo "::error::The tags latest and sha-* are reserved"
+              exit 1
+              ;;
+          esac
 
           BUILD_VERSION="$EXTRA_TAG"
           if [ -z "$BUILD_VERSION" ]; then
@@ -82,7 +90,7 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/custom-main' }}
-            type=sha,prefix=sha-,format=short
+            type=sha,prefix=sha-,format=long
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       - name: Build and push multi-architecture image
@@ -112,3 +120,12 @@ jobs:
             echo "- Tags:"
             printf '%s\n' "$IMAGE_TAGS" | sed 's/^/  - /'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify published manifests
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          SHA_TAG: sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE_NAME:latest"
+          docker buildx imagetools inspect "$IMAGE_NAME:$SHA_TAG"
