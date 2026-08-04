@@ -147,18 +147,23 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 		return nil, err
 	}
 	usesFunctionTools := requestUsesFunctionTools(request)
-	if protocol == ProtocolChat && usesFunctionTools && !requestContainsAssistantReasoning(request) {
+	// Claude tool turns must stay on Chat for Chat-family models. Console Go's
+	// Responses bridge drops oa-compatible reasoning_content from the first
+	// tool response, so Claude Code cannot replay the provider reasoning on the
+	// following tool-result turn. The buffered Chat path below already solves
+	// the incomplete streamed-tool-arguments problem without changing protocol.
+	if protocol == ProtocolChat && usesFunctionTools && info.RelayFormat != types.RelayFormatClaude &&
+		!requestContainsAssistantReasoning(request) {
 		protocol = ProtocolResponses
 		a.protocol = protocol
 	}
 
 	a.cacheIdentity = cacheIdentityForRequest(c, info, request)
 	a.affinityIdentity = affinityIdentityForRequest(c, request)
-	// Console Go's streaming Responses result historically omitted complete
-	// function-argument deltas. Buffer any streaming Claude function-tool turn
-	// (Chat-family reasoning continuation or Responses-routed first turn) into
-	// one non-streaming upstream request and synthesize Claude SSE without
-	// retrying or switching accounts.
+	// Console Go can omit complete function-argument deltas from streaming tool
+	// results. Buffer any streaming Claude function-tool turn, whether its model
+	// uses Chat or Responses, into one non-streaming upstream request and
+	// synthesize Claude SSE without retrying or switching accounts.
 	a.bufferClaudeToolCall = (protocol == ProtocolResponses || protocol == ProtocolChat) &&
 		info.IsStream && info.RelayFormat == types.RelayFormatClaude && usesFunctionTools
 	a.captureRequestShape(request)
