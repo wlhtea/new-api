@@ -34,6 +34,7 @@ var DefaultCollapseSidebar = false // default value of collapse sidebar
 
 var SessionSecret = uuid.New().String()
 var CryptoSecret = uuid.New().String()
+var CryptoSecretExplicitlyConfigured bool
 var SessionCookieSecure = false
 var SessionCookieTrustedURLs []string
 

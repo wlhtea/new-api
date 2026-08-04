@@ -139,6 +139,7 @@ import {
 import {
   ADD_MODE_OPTIONS,
   CHANNEL_STATUS_LABELS,
+  CHANNEL_TYPE_OPENCODE_GO,
   CHANNEL_TYPE_OPTIONS,
   CHANNEL_TYPE_WARNINGS,
   ERROR_MESSAGES,
@@ -154,19 +155,23 @@ import {
   channelsQueryKeys,
   getAdvancedCustomStats,
   transformChannelToFormDefaults,
+  type ChannelFormInput,
   type ChannelFormValues,
   deduplicateKeys,
   getChannelTypeCreateDefaults,
   getChannelTypeIcon,
   getKeyPromptForType,
+  hasFixedBaseUrl,
   parseModelsString,
   formatModelsArray,
   extractRedirectModels,
   extractMappingSourceModels,
   hasModelConfigChanged,
   findMissingModelsInMapping,
+  shouldWarnAboutV1BaseUrl,
   validateModelMappingJson,
   hasAdvancedSettingsErrors,
+  usesLegacyChannelKey,
 } from '../../lib'
 import {
   collectInvalidStatusCodeEntries,
@@ -190,6 +195,7 @@ import {
   ChannelBasicSection,
   ChannelEditorLoadingState,
   ChannelModelsSection,
+  OpenCodeGoChannelSettings,
 } from './sections'
 
 type ChannelMutateDrawerProps = {
@@ -710,7 +716,7 @@ export function ChannelMutateDrawer({
     isEditing && channelData?.data?.channel_info?.is_multi_key === true
 
   // Form setup
-  const form = useForm<ChannelFormValues>({
+  const form = useForm<ChannelFormInput, unknown, ChannelFormValues>({
     resolver: zodResolver(channelFormSchema),
     defaultValues: CHANNEL_FORM_DEFAULT_VALUES,
   })
@@ -791,14 +797,19 @@ export function ChannelMutateDrawer({
 
   const applyConnectionInfo = useCallback(
     (connectionInfo: ChannelConnectionInfo) => {
-      form.setValue('key', connectionInfo.key, {
-        shouldDirty: true,
-        shouldValidate: true,
-      })
-      form.setValue('base_url', connectionInfo.url, {
-        shouldDirty: true,
-        shouldValidate: true,
-      })
+      const type = form.getValues('type')
+      if (usesLegacyChannelKey(type)) {
+        form.setValue('key', connectionInfo.key, {
+          shouldDirty: true,
+          shouldValidate: true,
+        })
+      }
+      if (!hasFixedBaseUrl(type)) {
+        form.setValue('base_url', connectionInfo.url, {
+          shouldDirty: true,
+          shouldValidate: true,
+        })
+      }
       setClipboardConnectionInfo(null)
       toast.success(t('Connection info filled in'))
     },
@@ -825,7 +836,7 @@ export function ChannelMutateDrawer({
   }, [applyConnectionInfo, t])
 
   useEffect(() => {
-    if (!open || isEditing) {
+    if (!open || isEditing || !usesLegacyChannelKey(currentType)) {
       setClipboardConnectionInfo(null)
       return
     }
@@ -848,14 +859,18 @@ export function ChannelMutateDrawer({
     return () => {
       cancelled = true
     }
-  }, [isEditing, open])
+  }, [currentType, isEditing, open])
 
   // Helper computed values
   const isBatchMode =
     multiKeyMode === 'batch' || multiKeyMode === 'multi_to_single'
   const isChannelDetailLoading = isEditing && isChannelLoading
+  const currentTypeUsesLegacyKey = usesLegacyChannelKey(currentType)
+  const currentTypeHasFixedBaseUrl = hasFixedBaseUrl(currentType)
   const supportsMultiKeyAddMode =
-    currentType !== 57 && !(currentType === 41 && vertexKeyType === 'api_key')
+    currentTypeUsesLegacyKey &&
+    currentType !== 57 &&
+    !(currentType === 41 && vertexKeyType === 'api_key')
   const addModeOptions = useMemo(
     () =>
       supportsMultiKeyAddMode
@@ -971,7 +986,7 @@ export function ChannelMutateDrawer({
   const providerRequiresOther = [3, 18, 21, 39, 41, 49].includes(currentType)
   const identityComplete = Boolean(currentName?.trim() && currentType > 0)
   const credentialsComplete = Boolean(
-    (isEditing || currentKey?.trim()) &&
+    (!currentTypeUsesLegacyKey || isEditing || currentKey?.trim()) &&
     (!providerRequiresBaseUrl || currentBaseUrl?.trim()) &&
     (!providerRequiresOther || currentOther?.trim())
   )
@@ -1269,6 +1284,29 @@ export function ChannelMutateDrawer({
 
   // Handle type change - set default values for specific types
   useEffect(() => {
+    if (currentType === CHANNEL_TYPE_OPENCODE_GO) {
+      const defaults = getChannelTypeCreateDefaults(CHANNEL_TYPE_OPENCODE_GO)
+      form.setValue('base_url', defaults.baseUrl, {
+        shouldDirty: !isEditing,
+        shouldValidate: true,
+      })
+      form.setValue('key', '', {
+        shouldDirty: false,
+        shouldValidate: true,
+      })
+      form.setValue('multi_key_mode', 'single', {
+        shouldDirty: false,
+        shouldValidate: true,
+      })
+      if (!isEditing) {
+        form.setValue('models', defaults.models, {
+          shouldDirty: true,
+          shouldValidate: true,
+        })
+      }
+      return
+    }
+
     if (isEditing) return // Don't auto-set defaults when editing
 
     // Type 45 (VolcEngine) - set default base_url
@@ -1321,7 +1359,7 @@ export function ChannelMutateDrawer({
 
   // Validate base_url - warn if it ends with /v1
   useEffect(() => {
-    if (!currentBaseUrl || !currentBaseUrl.endsWith('/v1')) return
+    if (!open || !shouldWarnAboutV1BaseUrl(currentType, currentBaseUrl)) return
 
     // Show warning toast
     const timer = setTimeout(() => {
@@ -1334,8 +1372,7 @@ export function ChannelMutateDrawer({
     }, 500)
 
     return () => clearTimeout(timer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentBaseUrl])
+  }, [currentBaseUrl, currentType, open, t])
 
   // Handle key deduplication
   const handleDeduplicateKeys = () => {
@@ -1637,7 +1674,7 @@ export function ChannelMutateDrawer({
   const onSubmit = useCallback(
     async (data: ChannelFormValues) => {
       // Validate key is required when creating
-      if (!isEditing && !data.key?.trim()) {
+      if (!isEditing && usesLegacyChannelKey(data.type) && !data.key?.trim()) {
         form.setError('key', {
           type: 'manual',
           message: ERROR_MESSAGES.REQUIRED_KEY,
@@ -1843,7 +1880,7 @@ export function ChannelMutateDrawer({
     }
   }, [isChannelDetailLoading, open, updateActiveEditorSection])
 
-  const onInvalid: SubmitErrorHandler<ChannelFormValues> = useCallback(
+  const onInvalid: SubmitErrorHandler<ChannelFormInput> = useCallback(
     (errors) => {
       if (hasAdvancedSettingsErrors(errors)) {
         handleAdvancedSettingsOpenChange(true)
@@ -1897,7 +1934,7 @@ export function ChannelMutateDrawer({
                       )}
                 </SheetDescription>
               </div>
-              {!isEditing && (
+              {!isEditing && currentTypeUsesLegacyKey && (
                 <Button
                   type='button'
                   variant='outline'
@@ -1925,30 +1962,34 @@ export function ChannelMutateDrawer({
             </Alert>
           )}
 
-          {!isEditing && clipboardConnectionInfo && (
-            <Alert>
-              <AlertDescription className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
-                <span>{t('Connection info detected in clipboard')}</span>
-                <span className='flex shrink-0 gap-2'>
-                  <Button
-                    type='button'
-                    size='sm'
-                    onClick={() => applyConnectionInfo(clipboardConnectionInfo)}
-                  >
-                    {t('Fill in')}
-                  </Button>
-                  <Button
-                    type='button'
-                    variant='ghost'
-                    size='sm'
-                    onClick={() => setClipboardConnectionInfo(null)}
-                  >
-                    {t('Ignore')}
-                  </Button>
-                </span>
-              </AlertDescription>
-            </Alert>
-          )}
+          {!isEditing &&
+            currentTypeUsesLegacyKey &&
+            clipboardConnectionInfo && (
+              <Alert>
+                <AlertDescription className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
+                  <span>{t('Connection info detected in clipboard')}</span>
+                  <span className='flex shrink-0 gap-2'>
+                    <Button
+                      type='button'
+                      size='sm'
+                      onClick={() =>
+                        applyConnectionInfo(clipboardConnectionInfo)
+                      }
+                    >
+                      {t('Fill in')}
+                    </Button>
+                    <Button
+                      type='button'
+                      variant='ghost'
+                      size='sm'
+                      onClick={() => setClipboardConnectionInfo(null)}
+                    >
+                      {t('Ignore')}
+                    </Button>
+                  </span>
+                </AlertDescription>
+              </Alert>
+            )}
 
           <Form {...form}>
             <form
@@ -2792,17 +2833,30 @@ export function ChannelMutateDrawer({
                                         placeholder={t(
                                           FIELD_PLACEHOLDERS.BASE_URL
                                         )}
+                                        readOnly={currentTypeHasFixedBaseUrl}
                                         {...field}
                                       />
                                     </FormControl>
-                                    <FormDescription>
-                                      {t(
-                                        'Custom API base URL. For official channels, New API has built-in addresses. Only fill this for third-party proxy sites or special endpoints. Do not add /v1 or trailing slash.'
-                                      )}
-                                    </FormDescription>
+                                    {!currentTypeHasFixedBaseUrl && (
+                                      <FormDescription>
+                                        {t(
+                                          'Custom API base URL. For official channels, New API has built-in addresses. Only fill this for third-party proxy sites or special endpoints. Do not add /v1 or trailing slash.'
+                                        )}
+                                      </FormDescription>
+                                    )}
                                     <FormMessage />
                                   </FormItem>
                                 )}
+                              />
+                            )}
+
+                            {currentType === CHANNEL_TYPE_OPENCODE_GO && (
+                              <OpenCodeGoChannelSettings
+                                disabled={sensitiveLocked}
+                                lifecyclePolicyReadOnly={isEditing}
+                                onOpenLifecyclePolicy={() =>
+                                  setOpen('opencode-go-policy')
+                                }
                               />
                             )}
 
@@ -2878,337 +2932,287 @@ export function ChannelMutateDrawer({
                               />
                             )}
 
-                            <ChannelAuthSection>
-                              {!isEditing && (
+                            {currentTypeUsesLegacyKey && (
+                              <ChannelAuthSection>
+                                {!isEditing && (
+                                  <FormField
+                                    control={form.control}
+                                    name='multi_key_mode'
+                                    render={({ field }) => (
+                                      <FormItem className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
+                                        <FormLabel className='text-muted-foreground text-xs font-medium'>
+                                          {t('Add Mode')}
+                                        </FormLabel>
+                                        <Select
+                                          items={addModeOptions.map(
+                                            (option) => ({
+                                              value: option.value,
+                                              label: t(option.label),
+                                            })
+                                          )}
+                                          onValueChange={field.onChange}
+                                          value={field.value}
+                                        >
+                                          <FormControl>
+                                            <SelectTrigger
+                                              size='sm'
+                                              className='w-full sm:w-56'
+                                            >
+                                              <SelectValue />
+                                            </SelectTrigger>
+                                          </FormControl>
+                                          <SelectContent
+                                            alignItemWithTrigger={false}
+                                          >
+                                            <SelectGroup>
+                                              {addModeOptions.map((option) => (
+                                                <SelectItem
+                                                  key={option.value}
+                                                  value={option.value}
+                                                >
+                                                  {t(option.label)}
+                                                </SelectItem>
+                                              ))}
+                                            </SelectGroup>
+                                          </SelectContent>
+                                        </Select>
+                                        <FormMessage />
+                                      </FormItem>
+                                    )}
+                                  />
+                                )}
+
                                 <FormField
                                   control={form.control}
-                                  name='multi_key_mode'
-                                  render={({ field }) => (
-                                    <FormItem className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
-                                      <FormLabel className='text-muted-foreground text-xs font-medium'>
-                                        {t('Add Mode')}
-                                      </FormLabel>
-                                      <Select
-                                        items={addModeOptions.map((option) => ({
-                                          value: option.value,
-                                          label: t(option.label),
-                                        }))}
-                                        onValueChange={field.onChange}
-                                        value={field.value}
-                                      >
-                                        <FormControl>
-                                          <SelectTrigger
-                                            size='sm'
-                                            className='w-full sm:w-56'
-                                          >
-                                            <SelectValue />
-                                          </SelectTrigger>
-                                        </FormControl>
-                                        <SelectContent
-                                          alignItemWithTrigger={false}
-                                        >
-                                          <SelectGroup>
-                                            {addModeOptions.map((option) => (
-                                              <SelectItem
-                                                key={option.value}
-                                                value={option.value}
-                                              >
-                                                {t(option.label)}
-                                              </SelectItem>
-                                            ))}
-                                          </SelectGroup>
-                                        </SelectContent>
-                                      </Select>
-                                      <FormMessage />
-                                    </FormItem>
-                                  )}
-                                />
-                              )}
-
-                              <FormField
-                                control={form.control}
-                                name='key'
-                                render={({ field }) => {
-                                  let keyPlaceholder = t(
-                                    getKeyPromptForType(currentType)
-                                  )
-                                  if (isEditing) {
-                                    keyPlaceholder = t(
-                                      'Leave empty to keep existing key'
+                                  name='key'
+                                  render={({ field }) => {
+                                    let keyPlaceholder = t(
+                                      getKeyPromptForType(currentType)
                                     )
-                                  } else if (
-                                    currentType === 33 &&
-                                    awsKeyType === 'api_key' &&
-                                    isBatchMode
-                                  ) {
-                                    keyPlaceholder = t(
-                                      'Enter API Key, one per line, format: APIKey|Region'
-                                    )
-                                  } else if (
-                                    currentType === 33 &&
-                                    awsKeyType === 'api_key'
-                                  ) {
-                                    keyPlaceholder = t(
-                                      'Enter API Key, format: APIKey|Region'
-                                    )
-                                  } else if (
-                                    currentType === 33 &&
-                                    isBatchMode
-                                  ) {
-                                    keyPlaceholder = t(
-                                      'Enter key, one per line, format: AccessKey|SecretAccessKey|Region'
-                                    )
-                                  } else if (currentType === 33) {
-                                    keyPlaceholder = t(
-                                      'Enter key, format: AccessKey|SecretAccessKey|Region'
-                                    )
-                                  } else if (isBatchMode) {
-                                    keyPlaceholder = t(
-                                      'Enter one key per line for batch creation'
-                                    )
-                                  }
-
-                                  let keyDescription: ReactNode = t(
-                                    FIELD_DESCRIPTIONS.KEY
-                                  )
-                                  if (isEditing) {
-                                    let keyModeDescription = t(
-                                      'Append mode: New keys will be added to the end of the existing key list'
-                                    )
-                                    if (keyMode === 'replace') {
-                                      keyModeDescription = t(
-                                        'Replace mode: Will completely replace all existing keys'
+                                    if (isEditing) {
+                                      keyPlaceholder = t(
+                                        'Leave empty to keep existing key'
+                                      )
+                                    } else if (
+                                      currentType === 33 &&
+                                      awsKeyType === 'api_key' &&
+                                      isBatchMode
+                                    ) {
+                                      keyPlaceholder = t(
+                                        'Enter API Key, one per line, format: APIKey|Region'
+                                      )
+                                    } else if (
+                                      currentType === 33 &&
+                                      awsKeyType === 'api_key'
+                                    ) {
+                                      keyPlaceholder = t(
+                                        'Enter API Key, format: APIKey|Region'
+                                      )
+                                    } else if (
+                                      currentType === 33 &&
+                                      isBatchMode
+                                    ) {
+                                      keyPlaceholder = t(
+                                        'Enter key, one per line, format: AccessKey|SecretAccessKey|Region'
+                                      )
+                                    } else if (currentType === 33) {
+                                      keyPlaceholder = t(
+                                        'Enter key, format: AccessKey|SecretAccessKey|Region'
+                                      )
+                                    } else if (isBatchMode) {
+                                      keyPlaceholder = t(
+                                        'Enter one key per line for batch creation'
                                       )
                                     }
-                                    keyDescription = (
-                                      <>
-                                        {t(
-                                          'Enter new key to update, or leave empty to keep current key'
-                                        )}
-                                        {isMultiKeyChannel && (
-                                          <span className='text-warning mt-1 block'>
-                                            {keyModeDescription}
-                                          </span>
-                                        )}
-                                      </>
+
+                                    let keyDescription: ReactNode = t(
+                                      FIELD_DESCRIPTIONS.KEY
                                     )
-                                  } else if (isBatchMode) {
-                                    keyDescription = t(
-                                      'Enter one API key per line for batch creation'
-                                    )
-                                  }
-                                  return (
-                                    <FormItem>
-                                      <FormLabel>{t('API Key *')}</FormLabel>
-                                      <FormControl>
-                                        <Textarea
-                                          placeholder={keyPlaceholder}
-                                          rows={isBatchMode ? 8 : 4}
-                                          {...field}
-                                        />
-                                      </FormControl>
-                                      <FormDescription>
-                                        <div className='flex flex-col gap-2'>
-                                          <span>{keyDescription}</span>
-                                          {isBatchMode && (
-                                            <Button
-                                              type='button'
-                                              variant='outline'
-                                              size='sm'
-                                              onClick={handleDeduplicateKeys}
-                                              className='w-fit'
-                                            >
-                                              <Trash2 className='mr-2 h-4 w-4' />
-                                              {t('Remove Duplicates')}
-                                            </Button>
+                                    if (isEditing) {
+                                      let keyModeDescription = t(
+                                        'Append mode: New keys will be added to the end of the existing key list'
+                                      )
+                                      if (keyMode === 'replace') {
+                                        keyModeDescription = t(
+                                          'Replace mode: Will completely replace all existing keys'
+                                        )
+                                      }
+                                      keyDescription = (
+                                        <>
+                                          {t(
+                                            'Enter new key to update, or leave empty to keep current key'
                                           )}
-                                        </div>
-                                      </FormDescription>
-                                      {isEditing && canRevealChannelKey && (
-                                        <div className='border-border/60 mt-4 flex flex-col gap-3 border-y border-dashed py-4'>
-                                          <div className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
-                                            <div>
-                                              <p className='text-sm font-medium'>
-                                                {t('Current key')}
-                                              </p>
-                                              <p className='text-muted-foreground text-xs'>
-                                                {t(
-                                                  'Verification required to reveal the saved key.'
-                                                )}
-                                              </p>
-                                            </div>
-                                            <div className='flex items-center gap-2'>
+                                          {isMultiKeyChannel && (
+                                            <span className='text-warning mt-1 block'>
+                                              {keyModeDescription}
+                                            </span>
+                                          )}
+                                        </>
+                                      )
+                                    } else if (isBatchMode) {
+                                      keyDescription = t(
+                                        'Enter one API key per line for batch creation'
+                                      )
+                                    }
+                                    return (
+                                      <FormItem>
+                                        <FormLabel>{t('API Key *')}</FormLabel>
+                                        <FormControl>
+                                          <Textarea
+                                            placeholder={keyPlaceholder}
+                                            rows={isBatchMode ? 8 : 4}
+                                            {...field}
+                                          />
+                                        </FormControl>
+                                        <FormDescription>
+                                          <div className='flex flex-col gap-2'>
+                                            <span>{keyDescription}</span>
+                                            {isBatchMode && (
                                               <Button
                                                 type='button'
                                                 variant='outline'
                                                 size='sm'
-                                                onClick={handleRevealKey}
-                                                disabled={
-                                                  isChannelKeyLoading ||
-                                                  verificationState.loading
-                                                }
+                                                onClick={handleDeduplicateKeys}
+                                                className='w-fit'
                                               >
-                                                {isChannelKeyLoading ||
-                                                verificationState.loading ? (
-                                                  <Loader2 className='mr-2 h-4 w-4 animate-spin' />
-                                                ) : (
-                                                  <Eye className='mr-2 h-4 w-4' />
-                                                )}
-                                                {t('Reveal key')}
+                                                <Trash2 className='mr-2 h-4 w-4' />
+                                                {t('Remove Duplicates')}
                                               </Button>
-                                              <Button
-                                                type='button'
-                                                variant='ghost'
-                                                size='sm'
-                                                onClick={async () => {
-                                                  if (channelKey) {
-                                                    await copyToClipboard(
-                                                      channelKey
-                                                    )
-                                                  }
-                                                }}
-                                                disabled={!channelKey}
-                                              >
-                                                <Copy className='mr-2 h-4 w-4' />
-                                                {t('Copy')}
-                                              </Button>
-                                            </div>
+                                            )}
                                           </div>
-                                          <Input
-                                            readOnly
-                                            value={channelKey ?? ''}
-                                            placeholder={t(
-                                              'Hidden — verify to reveal'
-                                            )}
-                                            className='font-mono'
-                                          />
-                                        </div>
-                                      )}
-                                      <FormMessage />
-                                    </FormItem>
-                                  )
-                                }}
-                              />
-
-                              {currentType === 57 && (
-                                <div className='border-border/60 flex flex-col gap-3 border-y py-4'>
-                                  <div className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
-                                    <div className='text-muted-foreground text-xs'>
-                                      {t(
-                                        'Codex channels use an OAuth JSON credential as the key.'
-                                      )}
-                                    </div>
-                                    <div className='flex flex-wrap items-center gap-2'>
-                                      {isEditing && channelId && (
-                                        <Button
-                                          type='button'
-                                          variant='outline'
-                                          size='sm'
-                                          onClick={handleRefreshCodexCredential}
-                                          disabled={
-                                            sensitiveLocked ||
-                                            isCodexCredentialRefreshing
-                                          }
-                                        >
-                                          {isCodexCredentialRefreshing ? (
-                                            <Loader2 className='mr-2 h-4 w-4 animate-spin' />
-                                          ) : (
-                                            <RefreshCw className='mr-2 h-4 w-4' />
-                                          )}
-                                          {isCodexCredentialRefreshing
-                                            ? t('Refreshing...')
-                                            : t('Refresh credential')}
-                                        </Button>
-                                      )}
-                                    </div>
-                                  </div>
-                                  <Alert className='border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-50'>
-                                    <AlertDescription>
-                                      {t(
-                                        "Disclaimer: Personal use only. Do not distribute or share any credentials. This channel has prerequisites and requires prior setup; use it only if you understand the flow and risks, and comply with OpenAI's terms and policies. Credentials and configuration are for Codex CLI integration only, and are not intended for any other client, platform, or channel."
-                                      )}
-                                    </AlertDescription>
-                                  </Alert>
-                                </div>
-                              )}
-
-                              {isEditing && isMultiKeyChannel && (
-                                <FormField
-                                  control={form.control}
-                                  name='key_mode'
-                                  render={({ field }) => (
-                                    <FormItem>
-                                      <FormLabel>
-                                        {t('Key Update Mode')}
-                                      </FormLabel>
-                                      <Select
-                                        items={[
-                                          {
-                                            value: 'append',
-                                            label: t('Append to existing keys'),
-                                          },
-                                          {
-                                            value: 'replace',
-                                            label: t(
-                                              'Replace all existing keys'
-                                            ),
-                                          },
-                                        ]}
-                                        onValueChange={field.onChange}
-                                        value={field.value}
-                                      >
-                                        <FormControl>
-                                          <SelectTrigger>
-                                            <SelectValue />
-                                          </SelectTrigger>
-                                        </FormControl>
-                                        <SelectContent
-                                          alignItemWithTrigger={false}
-                                        >
-                                          <SelectGroup>
-                                            <SelectItem value='append'>
-                                              {t('Append to existing keys')}
-                                            </SelectItem>
-                                            <SelectItem value='replace'>
-                                              {t('Replace all existing keys')}
-                                            </SelectItem>
-                                          </SelectGroup>
-                                        </SelectContent>
-                                      </Select>
-                                      <FormDescription>
-                                        {field.value === 'replace'
-                                          ? t(
-                                              'Replace mode: Will completely replace all existing keys'
-                                            )
-                                          : t(
-                                              'Append mode: New keys will be added to the end of the existing key list'
-                                            )}
-                                      </FormDescription>
-                                      <FormMessage />
-                                    </FormItem>
-                                  )}
+                                        </FormDescription>
+                                        {isEditing && canRevealChannelKey && (
+                                          <div className='border-border/60 mt-4 flex flex-col gap-3 border-y border-dashed py-4'>
+                                            <div className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
+                                              <div>
+                                                <p className='text-sm font-medium'>
+                                                  {t('Current key')}
+                                                </p>
+                                                <p className='text-muted-foreground text-xs'>
+                                                  {t(
+                                                    'Verification required to reveal the saved key.'
+                                                  )}
+                                                </p>
+                                              </div>
+                                              <div className='flex items-center gap-2'>
+                                                <Button
+                                                  type='button'
+                                                  variant='outline'
+                                                  size='sm'
+                                                  onClick={handleRevealKey}
+                                                  disabled={
+                                                    isChannelKeyLoading ||
+                                                    verificationState.loading
+                                                  }
+                                                >
+                                                  {isChannelKeyLoading ||
+                                                  verificationState.loading ? (
+                                                    <Loader2 className='mr-2 h-4 w-4 animate-spin' />
+                                                  ) : (
+                                                    <Eye className='mr-2 h-4 w-4' />
+                                                  )}
+                                                  {t('Reveal key')}
+                                                </Button>
+                                                <Button
+                                                  type='button'
+                                                  variant='ghost'
+                                                  size='sm'
+                                                  onClick={async () => {
+                                                    if (channelKey) {
+                                                      await copyToClipboard(
+                                                        channelKey
+                                                      )
+                                                    }
+                                                  }}
+                                                  disabled={!channelKey}
+                                                >
+                                                  <Copy className='mr-2 h-4 w-4' />
+                                                  {t('Copy')}
+                                                </Button>
+                                              </div>
+                                            </div>
+                                            <Input
+                                              readOnly
+                                              value={channelKey ?? ''}
+                                              placeholder={t(
+                                                'Hidden — verify to reveal'
+                                              )}
+                                              className='font-mono'
+                                            />
+                                          </div>
+                                        )}
+                                        <FormMessage />
+                                      </FormItem>
+                                    )
+                                  }}
                                 />
-                              )}
 
-                              {!isEditing &&
-                                multiKeyMode === 'multi_to_single' && (
+                                {currentType === 57 && (
+                                  <div className='border-border/60 flex flex-col gap-3 border-y py-4'>
+                                    <div className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
+                                      <div className='text-muted-foreground text-xs'>
+                                        {t(
+                                          'Codex channels use an OAuth JSON credential as the key.'
+                                        )}
+                                      </div>
+                                      <div className='flex flex-wrap items-center gap-2'>
+                                        {isEditing && channelId && (
+                                          <Button
+                                            type='button'
+                                            variant='outline'
+                                            size='sm'
+                                            onClick={
+                                              handleRefreshCodexCredential
+                                            }
+                                            disabled={
+                                              sensitiveLocked ||
+                                              isCodexCredentialRefreshing
+                                            }
+                                          >
+                                            {isCodexCredentialRefreshing ? (
+                                              <Loader2 className='mr-2 h-4 w-4 animate-spin' />
+                                            ) : (
+                                              <RefreshCw className='mr-2 h-4 w-4' />
+                                            )}
+                                            {isCodexCredentialRefreshing
+                                              ? t('Refreshing...')
+                                              : t('Refresh credential')}
+                                          </Button>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <Alert className='border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-50'>
+                                      <AlertDescription>
+                                        {t(
+                                          "Disclaimer: Personal use only. Do not distribute or share any credentials. This channel has prerequisites and requires prior setup; use it only if you understand the flow and risks, and comply with OpenAI's terms and policies. Credentials and configuration are for Codex CLI integration only, and are not intended for any other client, platform, or channel."
+                                        )}
+                                      </AlertDescription>
+                                    </Alert>
+                                  </div>
+                                )}
+
+                                {isEditing && isMultiKeyChannel && (
                                   <FormField
                                     control={form.control}
-                                    name='multi_key_type'
+                                    name='key_mode'
                                     render={({ field }) => (
                                       <FormItem>
                                         <FormLabel>
-                                          {t('Multi-Key Strategy')}
+                                          {t('Key Update Mode')}
                                         </FormLabel>
                                         <Select
                                           items={[
                                             {
-                                              value: 'random',
-                                              label: t('Random'),
+                                              value: 'append',
+                                              label: t(
+                                                'Append to existing keys'
+                                              ),
                                             },
                                             {
-                                              value: 'polling',
-                                              label: t('Polling'),
+                                              value: 'replace',
+                                              label: t(
+                                                'Replace all existing keys'
+                                              ),
                                             },
                                           ]}
                                           onValueChange={field.onChange}
@@ -3223,34 +3227,92 @@ export function ChannelMutateDrawer({
                                             alignItemWithTrigger={false}
                                           >
                                             <SelectGroup>
-                                              <SelectItem value='random'>
-                                                {t('Random')}
+                                              <SelectItem value='append'>
+                                                {t('Append to existing keys')}
                                               </SelectItem>
-                                              <SelectItem value='polling'>
-                                                {t('Polling')}
+                                              <SelectItem value='replace'>
+                                                {t('Replace all existing keys')}
                                               </SelectItem>
                                             </SelectGroup>
                                           </SelectContent>
                                         </Select>
                                         <FormDescription>
-                                          {multiKeyType === 'polling' ? (
-                                            <span className='text-warning'>
-                                              {t(
-                                                'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
+                                          {field.value === 'replace'
+                                            ? t(
+                                                'Replace mode: Will completely replace all existing keys'
+                                              )
+                                            : t(
+                                                'Append mode: New keys will be added to the end of the existing key list'
                                               )}
-                                            </span>
-                                          ) : (
-                                            t(
-                                              'Randomly select a key from the pool for each request'
-                                            )
-                                          )}
                                         </FormDescription>
                                         <FormMessage />
                                       </FormItem>
                                     )}
                                   />
                                 )}
-                            </ChannelAuthSection>
+
+                                {!isEditing &&
+                                  multiKeyMode === 'multi_to_single' && (
+                                    <FormField
+                                      control={form.control}
+                                      name='multi_key_type'
+                                      render={({ field }) => (
+                                        <FormItem>
+                                          <FormLabel>
+                                            {t('Multi-Key Strategy')}
+                                          </FormLabel>
+                                          <Select
+                                            items={[
+                                              {
+                                                value: 'random',
+                                                label: t('Random'),
+                                              },
+                                              {
+                                                value: 'polling',
+                                                label: t('Polling'),
+                                              },
+                                            ]}
+                                            onValueChange={field.onChange}
+                                            value={field.value}
+                                          >
+                                            <FormControl>
+                                              <SelectTrigger>
+                                                <SelectValue />
+                                              </SelectTrigger>
+                                            </FormControl>
+                                            <SelectContent
+                                              alignItemWithTrigger={false}
+                                            >
+                                              <SelectGroup>
+                                                <SelectItem value='random'>
+                                                  {t('Random')}
+                                                </SelectItem>
+                                                <SelectItem value='polling'>
+                                                  {t('Polling')}
+                                                </SelectItem>
+                                              </SelectGroup>
+                                            </SelectContent>
+                                          </Select>
+                                          <FormDescription>
+                                            {multiKeyType === 'polling' ? (
+                                              <span className='text-warning'>
+                                                {t(
+                                                  'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
+                                                )}
+                                              </span>
+                                            ) : (
+                                              t(
+                                                'Randomly select a key from the pool for each request'
+                                              )
+                                            )}
+                                          </FormDescription>
+                                          <FormMessage />
+                                        </FormItem>
+                                      )}
+                                    />
+                                  )}
+                              </ChannelAuthSection>
+                            )}
                           </fieldset>
                         </div>
                       </ChannelApiAccessSection>
@@ -3271,9 +3333,19 @@ export function ChannelMutateDrawer({
                                 <FormItem className='space-y-3'>
                                   <div className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
                                     <div className='space-y-1'>
-                                      <FormLabel>{t('Models *')}</FormLabel>
+                                      <FormLabel>
+                                        {currentType ===
+                                        CHANNEL_TYPE_OPENCODE_GO
+                                          ? t('Models')
+                                          : t('Models *')}
+                                      </FormLabel>
                                       <FormDescription>
-                                        {t(FIELD_DESCRIPTIONS.MODELS)}
+                                        {currentType ===
+                                        CHANNEL_TYPE_OPENCODE_GO
+                                          ? t(
+                                              'Models are derived from the account pool and cannot be edited here.'
+                                            )
+                                          : t(FIELD_DESCRIPTIONS.MODELS)}
                                       </FormDescription>
                                     </div>
                                     <Badge variant='outline' className='w-fit'>
@@ -3294,6 +3366,9 @@ export function ChannelMutateDrawer({
                                       createLabel='Add custom model "{{value}}"'
                                       maxVisibleChips={8}
                                       copyChipOnClick
+                                      disabled={
+                                        currentType === CHANNEL_TYPE_OPENCODE_GO
+                                      }
                                     />
                                   </FormControl>
                                   {modelMappingGuardrail.exposedTargetModels
@@ -3335,118 +3410,124 @@ export function ChannelMutateDrawer({
                               )}
                             />
 
-                            <Separator className='my-4' />
+                            {currentType !== CHANNEL_TYPE_OPENCODE_GO && (
+                              <Separator className='my-4' />
+                            )}
 
-                            <div className='space-y-3'>
-                              <div>
-                                <p className='text-sm font-medium'>
-                                  {t('Quick actions')}
-                                </p>
-                                <p className='text-muted-foreground text-xs'>
-                                  {t(
-                                    'Use presets or upstream discovery to populate the model list faster.'
-                                  )}
-                                </p>
-                              </div>
-                              <div className='flex flex-wrap gap-2'>
-                                <Button
-                                  type='button'
-                                  variant='outline'
-                                  size='sm'
-                                  onClick={handleFillRelatedModels}
-                                  disabled={!basicModels.length}
-                                >
-                                  <FileText
-                                    className='mr-2 h-4 w-4'
-                                    aria-hidden='true'
-                                  />
-                                  {t('Fill Related Models')}
-                                </Button>
-                                <Button
-                                  type='button'
-                                  variant='outline'
-                                  size='sm'
-                                  onClick={handleFillAllModels}
-                                  disabled={!allModelsList.length}
-                                >
-                                  <Plus
-                                    className='mr-2 h-4 w-4'
-                                    aria-hidden='true'
-                                  />
-                                  {t('Fill All Models')}
-                                </Button>
-                                {MODEL_FETCHABLE_TYPES.has(currentType) && (
-                                  <>
-                                    <Button
-                                      type='button'
-                                      variant='outline'
-                                      size='sm'
-                                      onClick={handleFetchModels}
-                                      disabled={!isEditing && !canEditSensitive}
-                                    >
-                                      <Sparkles
-                                        className='mr-2 h-4 w-4'
-                                        aria-hidden='true'
-                                      />
-                                      {t('Fetch from Upstream')}
-                                    </Button>
-                                    {!isEditing && !canEditSensitive && (
-                                      <span className='text-muted-foreground basis-full text-xs'>
-                                        {t(
-                                          'No permission to perform this action'
-                                        )}
-                                      </span>
+                            {currentType !== CHANNEL_TYPE_OPENCODE_GO && (
+                              <div className='space-y-3'>
+                                <div>
+                                  <p className='text-sm font-medium'>
+                                    {t('Quick actions')}
+                                  </p>
+                                  <p className='text-muted-foreground text-xs'>
+                                    {t(
+                                      'Use presets or upstream discovery to populate the model list faster.'
                                     )}
-                                  </>
-                                )}
-                                <Button
-                                  type='button'
-                                  variant='outline'
-                                  size='sm'
-                                  onClick={handleCopyModels}
-                                  disabled={currentModelsArray.length === 0}
-                                >
-                                  <Copy
-                                    className='mr-2 h-4 w-4'
-                                    aria-hidden='true'
-                                  />
-                                  {t('Copy All')}
-                                </Button>
-                                <Button
-                                  type='button'
-                                  variant='ghost'
-                                  size='sm'
-                                  onClick={handleClearModels}
-                                  disabled={currentModelsArray.length === 0}
-                                >
-                                  <Eraser
-                                    className='mr-2 h-4 w-4'
-                                    aria-hidden='true'
-                                  />
-                                  {t('Clear All')}
-                                </Button>
-                              </div>
-                              {prefillGroups.length > 0 && (
-                                <div className='flex flex-wrap items-center gap-2'>
-                                  <span className='text-muted-foreground text-xs'>
-                                    {t('Preset groups')}:
-                                  </span>
-                                  {prefillGroups.map((group) => (
-                                    <Button
-                                      key={group.id}
-                                      type='button'
-                                      variant='secondary'
-                                      size='sm'
-                                      onClick={() =>
-                                        handleAddPrefillGroup(group)
-                                      }
-                                    >
-                                      {group.name}
-                                    </Button>
-                                  ))}
+                                  </p>
                                 </div>
-                              )}
-                            </div>
+                                <div className='flex flex-wrap gap-2'>
+                                  <Button
+                                    type='button'
+                                    variant='outline'
+                                    size='sm'
+                                    onClick={handleFillRelatedModels}
+                                    disabled={!basicModels.length}
+                                  >
+                                    <FileText
+                                      className='mr-2 h-4 w-4'
+                                      aria-hidden='true'
+                                    />
+                                    {t('Fill Related Models')}
+                                  </Button>
+                                  <Button
+                                    type='button'
+                                    variant='outline'
+                                    size='sm'
+                                    onClick={handleFillAllModels}
+                                    disabled={!allModelsList.length}
+                                  >
+                                    <Plus
+                                      className='mr-2 h-4 w-4'
+                                      aria-hidden='true'
+                                    />
+                                    {t('Fill All Models')}
+                                  </Button>
+                                  {MODEL_FETCHABLE_TYPES.has(currentType) && (
+                                    <>
+                                      <Button
+                                        type='button'
+                                        variant='outline'
+                                        size='sm'
+                                        onClick={handleFetchModels}
+                                        disabled={
+                                          !isEditing && !canEditSensitive
+                                        }
+                                      >
+                                        <Sparkles
+                                          className='mr-2 h-4 w-4'
+                                          aria-hidden='true'
+                                        />
+                                        {t('Fetch from Upstream')}
+                                      </Button>
+                                      {!isEditing && !canEditSensitive && (
+                                        <span className='text-muted-foreground basis-full text-xs'>
+                                          {t(
+                                            'No permission to perform this action'
+                                          )}
+                                        </span>
+                                      )}
+                                    </>
+                                  )}
+                                  <Button
+                                    type='button'
+                                    variant='outline'
+                                    size='sm'
+                                    onClick={handleCopyModels}
+                                    disabled={currentModelsArray.length === 0}
+                                  >
+                                    <Copy
+                                      className='mr-2 h-4 w-4'
+                                      aria-hidden='true'
+                                    />
+                                    {t('Copy All')}
+                                  </Button>
+                                  <Button
+                                    type='button'
+                                    variant='ghost'
+                                    size='sm'
+                                    onClick={handleClearModels}
+                                    disabled={currentModelsArray.length === 0}
+                                  >
+                                    <Eraser
+                                      className='mr-2 h-4 w-4'
+                                      aria-hidden='true'
+                                    />
+                                    {t('Clear All')}
+                                  </Button>
+                                </div>
+                                {prefillGroups.length > 0 && (
+                                  <div className='flex flex-wrap items-center gap-2'>
+                                    <span className='text-muted-foreground text-xs'>
+                                      {t('Preset groups')}:
+                                    </span>
+                                    {prefillGroups.map((group) => (
+                                      <Button
+                                        key={group.id}
+                                        type='button'
+                                        variant='secondary'
+                                        size='sm'
+                                        onClick={() =>
+                                          handleAddPrefillGroup(group)
+                                        }
+                                      >
+                                        {group.name}
+                                      </Button>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </div>
 
                           <div className='border-border/60 rounded-lg border p-4'>

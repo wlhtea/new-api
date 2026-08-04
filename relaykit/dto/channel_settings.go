@@ -3,6 +3,7 @@ package dto
 import (
 	"fmt"
 	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -85,6 +86,67 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastRemovedModels  []string              `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string              `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
 	AdvancedCustom                        *AdvancedCustomConfig `json:"advanced_custom,omitempty"`
+	OpenCodeGo                            *OpenCodeGoConfig     `json:"opencode_go,omitempty"`
+}
+
+const (
+	OpenCodeGoProtocolChat      = "chat"
+	OpenCodeGoProtocolMessages  = "messages"
+	OpenCodeGoProtocolResponses = "responses"
+)
+
+type OpenCodeGoConfig struct {
+	ModelProtocols                map[string]string `json:"model_protocols,omitempty"`
+	DefaultProtocol               string            `json:"default_protocol,omitempty"`
+	AutoEnableChinaModels         *bool             `json:"auto_enable_china_models,omitempty"`
+	AutoApplyReferralRewards      *bool             `json:"auto_apply_referral_rewards,omitempty"`
+	ReferralRewardsMaxPerRun      *int              `json:"referral_rewards_max_per_run,omitempty"`
+	AutoCancelSubscriptionRenewal bool              `json:"auto_cancel_subscription_renewal,omitempty"`
+}
+
+func (c *OpenCodeGoConfig) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.DefaultProtocol != "" {
+		if err := validateOpenCodeGoProtocol(c.DefaultProtocol); err != nil {
+			return fmt.Errorf("invalid OpenCode Go default protocol: %w", err)
+		}
+	}
+	if c.ReferralRewardsMaxPerRun != nil &&
+		(*c.ReferralRewardsMaxPerRun < 0 || *c.ReferralRewardsMaxPerRun > 20) {
+		return fmt.Errorf("OpenCode Go referral_rewards_max_per_run must be between 0 and 20")
+	}
+	seenPatterns := make(map[string]struct{}, len(c.ModelProtocols))
+	for pattern, protocol := range c.ModelProtocols {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			return fmt.Errorf("OpenCode Go model protocol pattern cannot be empty")
+		}
+		if strings.ContainsAny(pattern, "*?[") {
+			if _, err := path.Match(strings.ToLower(pattern), ""); err != nil {
+				return fmt.Errorf("invalid OpenCode Go model protocol pattern %q: %w", pattern, err)
+			}
+		}
+		normalizedPattern := strings.ToLower(pattern)
+		if _, exists := seenPatterns[normalizedPattern]; exists {
+			return fmt.Errorf("duplicate OpenCode Go model protocol pattern %q", normalizedPattern)
+		}
+		seenPatterns[normalizedPattern] = struct{}{}
+		if err := validateOpenCodeGoProtocol(protocol); err != nil {
+			return fmt.Errorf("invalid OpenCode Go protocol for %q: %w", pattern, err)
+		}
+	}
+	return nil
+}
+
+func validateOpenCodeGoProtocol(protocol string) error {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case OpenCodeGoProtocolChat, OpenCodeGoProtocolMessages, OpenCodeGoProtocolResponses:
+		return nil
+	default:
+		return fmt.Errorf("expected chat, messages, or responses, got %q", protocol)
+	}
 }
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {

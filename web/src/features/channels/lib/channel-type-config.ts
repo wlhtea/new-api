@@ -24,12 +24,36 @@ import { CHANNEL_TYPES } from '../constants'
 
 export const SEED_DANCE_DEFAULT_BASE_URL =
   'http://alb-o13xqj8f2cpjsa67ym.ap-northeast-1.alb.aliyuncsslbintl.com/v1/public_api/m-predict/polar4ai-i2v'
+export const OPENCODE_GO_BASE_URL = 'https://opencode.ai/zen/go/v1'
+
+export const OPENCODE_GO_MODELS = [
+  'grok-4.5',
+  'glm-5.2',
+  'glm-5.1',
+  'kimi-k3',
+  'kimi-k2.7-code',
+  'kimi-k2.6',
+  'deepseek-v4-pro',
+  'deepseek-v4-flash',
+  'mimo-v2.5',
+  'mimo-v2.5-pro',
+  'hy3',
+  'minimax-m3',
+  'minimax-m2.7',
+  'minimax-m2.5',
+  'qwen3.7-max',
+  'qwen3.7-plus',
+  'qwen3.6-plus',
+  'gpt-5.6-luna',
+] as const
 
 export interface ChannelTypeConfig {
   id: number
   name: string
   icon: string
   defaultBaseUrl?: string
+  fixedBaseUrl?: boolean
+  usesLegacyKey?: boolean
   requiresOrganization?: boolean
   requiresRegion?: boolean
   supportedModels?: string[]
@@ -179,6 +203,15 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
       models: 'Models',
     },
   },
+  62: {
+    id: 62,
+    name: CHANNEL_TYPES[62],
+    icon: 'OpenCode',
+    defaultBaseUrl: OPENCODE_GO_BASE_URL,
+    fixedBaseUrl: true,
+    usesLegacyKey: false,
+    supportedModels: [...OPENCODE_GO_MODELS],
+  },
 }
 
 /**
@@ -224,6 +257,21 @@ export function requiresRegion(type: number): boolean {
  */
 export function getDefaultBaseUrl(type: number): string {
   return CHANNEL_TYPE_CONFIGS[type]?.defaultBaseUrl || ''
+}
+
+export function hasFixedBaseUrl(type: number): boolean {
+  return CHANNEL_TYPE_CONFIGS[type]?.fixedBaseUrl === true
+}
+
+export function shouldWarnAboutV1BaseUrl(
+  type: number,
+  baseUrl: string | undefined
+): boolean {
+  return !hasFixedBaseUrl(type) && baseUrl?.endsWith('/v1') === true
+}
+
+export function usesLegacyChannelKey(type: number): boolean {
+  return CHANNEL_TYPE_CONFIGS[type]?.usesLegacyKey !== false
 }
 
 /**

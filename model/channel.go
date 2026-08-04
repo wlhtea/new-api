@@ -163,13 +163,23 @@ func ApplyChannelGroupFilter(query *gorm.DB, group string) *gorm.DB {
 
 // Value implements driver.Valuer interface
 func (c ChannelInfo) Value() (driver.Value, error) {
-	return common.Marshal(&c)
+	data, err := common.Marshal(&c)
+	if err != nil {
+		return nil, err
+	}
+	return string(data), nil
 }
 
 // Scan implements sql.Scanner interface
 func (c *ChannelInfo) Scan(value interface{}) error {
-	bytesValue, _ := value.([]byte)
-	return common.Unmarshal(bytesValue, c)
+	switch typed := value.(type) {
+	case []byte:
+		return common.Unmarshal(typed, c)
+	case string:
+		return common.Unmarshal([]byte(typed), c)
+	default:
+		return fmt.Errorf("unsupported channel info value type %T", value)
+	}
 }
 
 func (channel *Channel) GetKeys() []string {
@@ -463,6 +473,15 @@ func BatchDeleteChannels(ids []int) (int64, error) {
 	}
 	var deletedCount int64
 	for _, chunk := range lo.Chunk(ids, 200) {
+		openCodeGoChannelIDs, err := listOpenCodeGoChannelIDsTx(tx, chunk)
+		if err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+		if err := DeleteOpenCodeGoPoolByChannelTx(tx, openCodeGoChannelIDs); err != nil {
+			tx.Rollback()
+			return 0, err
+		}
 		result := tx.Where("id in (?)", chunk).Delete(&Channel{})
 		if result.Error != nil {
 			tx.Rollback()
@@ -599,13 +618,30 @@ func (channel *Channel) UpdateBalance(balance float64) {
 }
 
 func (channel *Channel) Delete() error {
-	var err error
-	err = DB.Delete(channel).Error
-	if err != nil {
-		return err
+	return DB.Transaction(func(tx *gorm.DB) error {
+		openCodeGoChannelIDs, err := listOpenCodeGoChannelIDsTx(tx, []int{channel.Id})
+		if err != nil {
+			return err
+		}
+		if err := DeleteOpenCodeGoPoolByChannelTx(tx, openCodeGoChannelIDs); err != nil {
+			return err
+		}
+		if err := tx.Delete(channel).Error; err != nil {
+			return err
+		}
+		return tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
+	})
+}
+
+func listOpenCodeGoChannelIDsTx(tx *gorm.DB, channelIDs []int) ([]int, error) {
+	if tx == nil || len(channelIDs) == 0 {
+		return nil, nil
 	}
-	err = channel.DeleteAbilities()
-	return err
+	var result []int
+	err := tx.Model(&Channel{}).
+		Where("id IN ? AND type = ?", channelIDs, constant.ChannelTypeOpenCodeGo).
+		Pluck("id", &result).Error
+	return result, err
 }
 
 var channelStatusLock sync.Mutex
@@ -874,13 +910,21 @@ func updateChannelUsedQuota(id int, quota int) {
 }
 
 func DeleteChannelByStatus(status int64) (int64, error) {
-	result := DB.Where("status = ?", status).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	var ids []int
+	if err := DB.Model(&Channel{}).Where("status = ?", status).Pluck("id", &ids).Error; err != nil {
+		return 0, err
+	}
+	return BatchDeleteChannels(ids)
 }
 
 func DeleteDisabledChannel() (int64, error) {
-	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	var ids []int
+	if err := DB.Model(&Channel{}).
+		Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).
+		Pluck("id", &ids).Error; err != nil {
+		return 0, err
+	}
+	return BatchDeleteChannels(ids)
 }
 
 func GetPaginatedTags(offset int, limit int) ([]*string, error) {
@@ -977,6 +1021,11 @@ func (channel *Channel) ValidateSettings() error {
 	if channel.Type == constant.ChannelTypeAdvancedCustom && channelOtherSettings.UpstreamModelUpdateCheckEnabled {
 		if _, ok := channelOtherSettings.AdvancedCustom.ModelListRoute(); !ok {
 			return fmt.Errorf("advanced custom channels require a %s route when upstream model update checks are enabled", dto.AdvancedCustomModelListPath)
+		}
+	}
+	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		if err := channelOtherSettings.OpenCodeGo.Validate(); err != nil {
+			return err
 		}
 	}
 	return nil

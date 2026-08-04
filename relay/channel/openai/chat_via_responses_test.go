@@ -141,6 +141,143 @@ func TestOaiResponsesToChatStreamHandlerConvertsClaudeSSETerminalsAndUsage(t *te
 	)
 }
 
+func TestOaiResponsesToChatStreamHandlerPreservesClaudeToolArguments(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_tool","model":"glm-test","created_at":1710000000}}`,
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reasoning_tool"}}`,
+		`data: {"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"reasoning_tool","delta":"Selecting Bash"}`,
+		`data: {"type":"response.output_item.added","output_index":1,"item_id":"call_tool","item":{"type":"function_call","id":"call_tool","call_id":"call_tool","name":"Bash","arguments":""}}`,
+		`data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"call_tool","delta":"{\"command\":\"pwd\"}"}`,
+		`data: {"type":"response.reasoning_summary_text.done","output_index":0,"item_id":"reasoning_tool"}`,
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"reasoning_tool"}}`,
+		`data: {"type":"response.function_call_arguments.done","output_index":1,"item_id":"call_tool"}`,
+		`data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"call_tool","call_id":"call_tool","name":"Bash","arguments":"{\"command\":\"pwd\"}"}}`,
+		`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+	info.RelayFormat = types.RelayFormatClaude
+
+	usage, err := OaiResponsesToChatStreamHandler(c, info, resp)
+	require.Nil(t, err)
+	require.NotNil(t, usage)
+	assert.Equal(t, 5, usage.TotalTokens)
+
+	got := recorder.Body.String()
+	assert.Contains(t, got, `"type":"tool_use"`)
+	assert.Contains(t, got, `"name":"Bash"`)
+	assert.Contains(t, got, `"type":"input_json_delta"`)
+	assert.Contains(t, got, `"partial_json":"{\"command\":\"pwd\"}"`)
+}
+
+func TestOaiResponsesToClaudeBufferedStreamHandlerEmitsCompleteToolInput(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	body := `{
+		"id":"resp_tool",
+		"model":"glm-test",
+		"status":"completed",
+		"output":[{
+			"type":"reasoning",
+			"summary":[{"type":"summary_text","text":"Selecting Bash"}]
+		},{
+			"type":"function_call",
+			"id":"call_tool",
+			"call_id":"call_tool",
+			"name":"Bash",
+			"arguments":"{\"command\":\"pwd\",\"description\":\"Show directory\"}"
+		}],
+		"usage":{"input_tokens":12,"output_tokens":7,"total_tokens":19,"input_tokens_details":{"cached_tokens":8}}
+	}`
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+	resp.Header.Set("Content-Type", "application/json")
+	info.RelayFormat = types.RelayFormatClaude
+
+	usage, err := OaiResponsesToClaudeBufferedStreamHandler(c, info, resp)
+	require.Nil(t, err)
+	require.NotNil(t, usage)
+	assert.Equal(t, 19, usage.TotalTokens)
+	require.NotNil(t, usage.InputTokensDetails)
+	assert.Equal(t, 8, usage.InputTokensDetails.CachedTokens)
+
+	got := recorder.Body.String()
+	assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+	assert.Contains(t, got, `"type":"tool_use"`)
+	assert.Contains(t, got, `"name":"Bash"`)
+	assert.Contains(t, got, `"type":"input_json_delta"`)
+	assert.Contains(t, got, `\"command\":\"pwd\"`)
+	assert.Contains(t, got, `\"description\":\"Show directory\"`)
+	assert.Contains(t, got, `"type":"thinking"`)
+	assert.Contains(t, got, `"type":"thinking_delta"`)
+	assert.Contains(t, got, `"cache_read_input_tokens":8`)
+	requireOrderedSubstrings(t, got,
+		"event: message_start",
+		"event: content_block_start",
+		"event: content_block_delta",
+		`"type":"thinking_delta"`,
+		`"type":"input_json_delta"`,
+		"event: content_block_stop",
+		"event: message_delta",
+		"event: message_stop",
+	)
+}
+
+func TestOaiChatToClaudeBufferedStreamHandlerPreservesReasoningAndToolInput(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	body := `{
+		"id":"chatcmpl_tool",
+		"model":"glm-test",
+		"choices":[{
+			"index":0,
+			"message":{
+				"role":"assistant",
+				"content":"I will inspect the repository.",
+				"reasoning_content":"Selecting Bash",
+				"tool_calls":[{"id":"call_tool","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"pwd\"}"}}]
+			},
+			"finish_reason":"tool_calls"
+		}],
+		"usage":{"prompt_tokens":12,"completion_tokens":7,"total_tokens":19,"prompt_tokens_details":{"cached_tokens":8}}
+	}`
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+	resp.Header.Set("Content-Type", "application/json")
+	info.RelayFormat = types.RelayFormatClaude
+
+	usage, err := OaiChatToClaudeBufferedStreamHandler(c, info, resp)
+	require.Nil(t, err)
+	require.NotNil(t, usage)
+	assert.Equal(t, 19, usage.TotalTokens)
+
+	got := recorder.Body.String()
+	assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+	assert.Contains(t, got, `"type":"thinking_delta"`)
+	assert.Contains(t, got, `"type":"text_delta"`)
+	assert.Contains(t, got, `"type":"input_json_delta"`)
+	assert.Contains(t, got, `\"command\":\"pwd\"`)
+	requireOrderedSubstrings(t, got,
+		`"type":"thinking_delta"`,
+		`"type":"text_delta"`,
+		`"type":"input_json_delta"`,
+		`"type":"message_delta"`,
+		`"type":"message_stop"`,
+	)
+}
+
 func TestOaiResponsesToChatBufferedStreamHandlerReturnsJSONFromSSE(t *testing.T) {
 	oldMode := gin.Mode()
 	gin.SetMode(gin.TestMode)

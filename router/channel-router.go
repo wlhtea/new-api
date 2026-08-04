@@ -10,10 +10,11 @@ import (
 )
 
 type permissionRoute struct {
-	method     string
-	path       string
-	permission authz.Permission
-	handler    gin.HandlerFunc
+	method      string
+	path        string
+	permission  authz.Permission
+	middlewares []gin.HandlerFunc
+	handler     gin.HandlerFunc
 }
 
 func registerChannelRoutes(apiRouter *gin.RouterGroup) {
@@ -29,10 +30,10 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 	)
 
 	for _, route := range channelPermissionRoutes {
-		channelRoute.Handle(route.method, route.path,
-			middleware.RequirePermission(route.permission),
-			route.handler,
-		)
+		handlers := []gin.HandlerFunc{middleware.RequirePermission(route.permission)}
+		handlers = append(handlers, route.middlewares...)
+		handlers = append(handlers, route.handler)
+		channelRoute.Handle(route.method, route.path, handlers...)
 	}
 }
 
@@ -76,4 +77,136 @@ var channelPermissionRoutes = []permissionRoute{
 	{method: http.MethodPost, path: "/upstream_updates/apply_all", permission: authz.ChannelWrite, handler: controller.ApplyAllChannelUpstreamModelUpdates},
 	{method: http.MethodPost, path: "/upstream_updates/detect", permission: authz.ChannelOperate, handler: controller.DetectChannelUpstreamModelUpdates},
 	{method: http.MethodPost, path: "/upstream_updates/detect_all", permission: authz.ChannelOperate, handler: controller.DetectAllChannelUpstreamModelUpdates},
+	{
+		method:      http.MethodGet,
+		path:        "/:id/opencode-go/pool",
+		permission:  authz.ChannelRead,
+		middlewares: []gin.HandlerFunc{middleware.DisableCache()},
+		handler:     controller.GetOpenCodeGoPool,
+	},
+	{
+		method:      http.MethodGet,
+		path:        "/:id/opencode-go/lifecycle-policy",
+		permission:  authz.ChannelRead,
+		middlewares: []gin.HandlerFunc{middleware.DisableCache()},
+		handler:     controller.GetOpenCodeGoLifecyclePolicy,
+	},
+	{
+		method:      http.MethodGet,
+		path:        "/:id/opencode-go/refresh-tasks/:task_id",
+		permission:  authz.ChannelRead,
+		middlewares: []gin.HandlerFunc{middleware.DisableCache()},
+		handler:     controller.GetOpenCodeGoRefreshTask,
+	},
+	{
+		method:      http.MethodGet,
+		path:        "/:id/opencode-go/risk-recheck-tasks/:task_id",
+		permission:  authz.ChannelRead,
+		middlewares: []gin.HandlerFunc{middleware.DisableCache()},
+		handler:     controller.GetOpenCodeGoRiskRecheckTask,
+	},
+	{method: http.MethodPatch, path: "/:id/opencode-go/identities/:identity_uid", permission: authz.ChannelOperate, handler: controller.UpdateOpenCodeGoIdentity},
+	{method: http.MethodPatch, path: "/:id/opencode-go/identities/:identity_uid/enabled", permission: authz.ChannelOperate, handler: controller.SetOpenCodeGoIdentityEnabled},
+	{method: http.MethodPost, path: "/:id/opencode-go/identities/:identity_uid/refresh", permission: authz.ChannelOperate, handler: controller.RefreshOpenCodeGoIdentity},
+	{method: http.MethodPatch, path: "/:id/opencode-go/workspaces/:workspace_uid/enabled", permission: authz.ChannelOperate, handler: controller.SetOpenCodeGoWorkspaceEnabled},
+	{method: http.MethodPost, path: "/:id/opencode-go/workspaces/:workspace_uid/refresh", permission: authz.ChannelOperate, handler: controller.RefreshOpenCodeGoWorkspace},
+	{method: http.MethodPost, path: "/:id/opencode-go/workspaces/:workspace_uid/risk-recheck", permission: authz.ChannelOperate, handler: controller.RecheckOpenCodeGoWorkspaceRisk},
+	{method: http.MethodPost, path: "/:id/opencode-go/refresh-all", permission: authz.ChannelOperate, handler: controller.RefreshAllOpenCodeGoIdentities},
+	{method: http.MethodPost, path: "/:id/opencode-go/risk-recheck-all", permission: authz.ChannelOperate, handler: controller.RecheckAllOpenCodeGoWorkspaceRisks},
+	{
+		method:     http.MethodPut,
+		path:       "/:id/opencode-go/lifecycle-policy",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.CriticalRateLimit(),
+			middleware.DisableCache(),
+			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
+		},
+		handler: controller.UpdateOpenCodeGoLifecyclePolicy,
+	},
+	{
+		method:     http.MethodPost,
+		path:       "/:id/opencode-go/workspaces/:workspace_uid/china-models/enable",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.CriticalRateLimit(),
+			middleware.DisableCache(),
+			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
+		},
+		handler: controller.EnableOpenCodeGoChinaModels,
+	},
+	{
+		method:     http.MethodPost,
+		path:       "/:id/opencode-go/workspaces/:workspace_uid/referral-rewards/apply",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.CriticalRateLimit(),
+			middleware.DisableCache(),
+			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
+		},
+		handler: controller.ApplyOpenCodeGoReferralReward,
+	},
+	{
+		method:     http.MethodPost,
+		path:       "/:id/opencode-go/workspaces/:workspace_uid/subscription/cancel-renewal",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.CriticalRateLimit(),
+			middleware.DisableCache(),
+			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
+		},
+		handler: controller.CancelOpenCodeGoSubscriptionRenewal,
+	},
+	{
+		method:     http.MethodPost,
+		path:       "/:id/opencode-go/identities/import",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.CriticalRateLimit(),
+			middleware.DisableCache(),
+			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
+		},
+		handler: controller.ImportOpenCodeGoIdentities,
+	},
+	{
+		method:     http.MethodPut,
+		path:       "/:id/opencode-go/identities/:identity_uid/cookie",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.CriticalRateLimit(),
+			middleware.DisableCache(),
+			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
+		},
+		handler: controller.ReplaceOpenCodeGoIdentityCookie,
+	},
+	{
+		method:     http.MethodDelete,
+		path:       "/:id/opencode-go/identities/:identity_uid",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.DisableCache(),
+			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
+		},
+		handler: controller.DeleteOpenCodeGoIdentity,
+	},
+	{
+		method:     http.MethodDelete,
+		path:       "/:id/opencode-go/workspaces/non-members",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.DisableCache(),
+			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
+		},
+		handler: controller.DeleteOpenCodeGoNonMemberWorkspaces,
+	},
+	{
+		method:     http.MethodDelete,
+		path:       "/:id/opencode-go/workspaces/:workspace_uid",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.DisableCache(),
+			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
+		},
+		handler: controller.DeleteOpenCodeGoWorkspace,
+	},
 }

@@ -52,6 +52,50 @@ func TestResponseOpenAI2ClaudeToolUseInputIsObject(t *testing.T) {
 	}
 }
 
+func TestResponseOpenAI2ClaudePreservesReasoningBeforeTextAndTools(t *testing.T) {
+	reasoning := "inspect the repository before calling Bash"
+	message := dto.Message{Role: "assistant", Content: "I will inspect it."}
+	message.ReasoningContent = &reasoning
+	message.SetToolCalls([]dto.ToolCallRequest{
+		{ID: "call_1", Type: "function", Function: dto.FunctionRequest{
+			Name: "Bash", Arguments: `{"command":"pwd"}`,
+		}},
+	})
+
+	resp := ResponseOpenAI2Claude(&dto.OpenAITextResponse{
+		Id:    "chatcmpl_1",
+		Model: "gpt-test",
+		Choices: []dto.OpenAITextResponseChoice{{
+			Message:      message,
+			FinishReason: "tool_calls",
+		}},
+	}, nil)
+
+	require.Len(t, resp.Content, 3)
+	assert.Equal(t, "thinking", resp.Content[0].Type)
+	assert.Equal(t, reasoning, *resp.Content[0].Thinking)
+	assert.Equal(t, "text", resp.Content[1].Type)
+	assert.Equal(t, "I will inspect it.", resp.Content[1].GetText())
+	assert.Equal(t, "tool_use", resp.Content[2].Type)
+	assert.Equal(t, "call_1", resp.Content[2].Id)
+}
+
+func TestResponseOpenAI2ClaudeOmitsEmptyReasoningAndTextBlocks(t *testing.T) {
+	empty := "  \n"
+	message := dto.Message{Role: "assistant"}
+	message.ReasoningContent = &empty
+	message.SetToolCalls([]dto.ToolCallRequest{{
+		ID: "call_1", Type: "function", Function: dto.FunctionRequest{Name: "Bash", Arguments: `{}`},
+	}})
+
+	resp := ResponseOpenAI2Claude(&dto.OpenAITextResponse{
+		Choices: []dto.OpenAITextResponseChoice{{Message: message, FinishReason: "tool_calls"}},
+	}, nil)
+
+	require.Len(t, resp.Content, 1)
+	assert.Equal(t, "tool_use", resp.Content[0].Type)
+}
+
 func TestResponseOpenAI2ClaudeUsageCarriesOpenAIBillingUsage(t *testing.T) {
 	resp := ResponseOpenAI2Claude(&dto.OpenAITextResponse{
 		Id:    "chatcmpl_1",

@@ -73,6 +73,7 @@ import {
   hasAnyCacheTokens,
   isViolationFeeLog,
   getFirstResponseTimeColor,
+  getInputTokenBreakdown,
   getResponseTimeColor,
   renderAuditContent,
 } from '../../lib/format'
@@ -403,23 +404,32 @@ function BillingBreakdown(props: {
   )
 }
 
-function TokenBreakdown(props: { log: UsageLog; other: LogOtherData }) {
+export function TokenBreakdown(props: { log: UsageLog; other: LogOtherData }) {
   const { t } = useTranslation()
   const { log, other } = props
 
-  const promptTokens = log.prompt_tokens || 0
+  const tokenBreakdown = getInputTokenBreakdown(log.prompt_tokens, other)
   const completionTokens = log.completion_tokens || 0
-  const cacheRead = other.cache_tokens || 0
+  const cacheRead = tokenBreakdown.cacheReadTokens
   const cacheWrite = other.cache_creation_tokens || 0
   const cacheWrite5m = other.cache_creation_tokens_5m || 0
   const cacheWrite1h = other.cache_creation_tokens_1h || 0
-  const hasTokens = promptTokens > 0 || completionTokens > 0
+  const hasTokens = tokenBreakdown.totalInputTokens > 0 || completionTokens > 0
 
   if (!hasTokens) return null
 
   const rows: Array<{ label: string; value: string }> = []
 
-  rows.push({ label: t('Input Tokens'), value: promptTokens.toLocaleString() })
+  rows.push({
+    label: t('Uncached Input Tokens'),
+    value: tokenBreakdown.uncachedInputTokens.toLocaleString(),
+  })
+  if (cacheRead > 0 && tokenBreakdown.hasExplicitTotal) {
+    rows.push({
+      label: t('Total Input Tokens'),
+      value: tokenBreakdown.totalInputTokens.toLocaleString(),
+    })
+  }
   rows.push({
     label: t('Output Tokens'),
     value: completionTokens.toLocaleString(),

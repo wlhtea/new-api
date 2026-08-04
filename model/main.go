@@ -291,6 +291,11 @@ func migrateDB() error {
 		&SystemInstance{},
 		&SystemTask{},
 		&SystemTaskLock{},
+		&OpenCodeGoIdentity{},
+		&OpenCodeGoWorkspace{},
+		&OpenCodeGoQuotaWindow{},
+		&OpenCodeGoWorkspaceModel{},
+		&OpenCodeGoOperation{},
 		&CasbinRule{},
 		&AuthzRole{},
 	)
@@ -355,6 +360,11 @@ func migrateDBFast() error {
 		{&SystemInstance{}, "SystemInstance"},
 		{&SystemTask{}, "SystemTask"},
 		{&SystemTaskLock{}, "SystemTaskLock"},
+		{&OpenCodeGoIdentity{}, "OpenCodeGoIdentity"},
+		{&OpenCodeGoWorkspace{}, "OpenCodeGoWorkspace"},
+		{&OpenCodeGoQuotaWindow{}, "OpenCodeGoQuotaWindow"},
+		{&OpenCodeGoWorkspaceModel{}, "OpenCodeGoWorkspaceModel"},
+		{&OpenCodeGoOperation{}, "OpenCodeGoOperation"},
 	}
 	// 动态计算migration数量，确保errChan缓冲区足够大
 	errChan := make(chan error, len(migrations))

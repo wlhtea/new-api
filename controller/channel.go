@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -484,10 +485,23 @@ func validateChannel(channel *model.Channel, isAdd bool) error {
 	if channel.Type == constant.ChannelTypeNewAPI && strings.TrimSpace(channel.GetBaseURL()) == "" {
 		return fmt.Errorf("New API channel base URL cannot be empty")
 	}
+	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		if strings.TrimSpace(channel.Key) != "" {
+			return fmt.Errorf("OpenCode Go channel credentials must be managed by the account pool")
+		}
+		configuredBaseURL := ""
+		if channel.BaseURL != nil {
+			configuredBaseURL = strings.TrimRight(strings.TrimSpace(*channel.BaseURL), "/")
+		}
+		fixedBaseURL := strings.TrimRight(constant.ChannelBaseURLs[constant.ChannelTypeOpenCodeGo], "/")
+		if configuredBaseURL != "" && configuredBaseURL != fixedBaseURL {
+			return fmt.Errorf("OpenCode Go channel base URL is fixed at %s", fixedBaseURL)
+		}
+	}
 
 	// 如果是添加操作，检查 channel 和 key 是否为空
 	if isAdd {
-		if channel.Key == "" {
+		if channel.Key == "" && channel.Type != constant.ChannelTypeOpenCodeGo {
 			return fmt.Errorf("channel cannot be empty")
 		}
 
@@ -627,6 +641,14 @@ func AddChannel(c *gin.Context) {
 	}
 
 	addChannelRequest.Channel.CreatedTime = common.GetTimestamp()
+	if addChannelRequest.Channel.Type == constant.ChannelTypeOpenCodeGo && addChannelRequest.Mode != "single" {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "OpenCode Go channels only support single creation; accounts are managed by the account pool",
+		})
+		return
+	}
+	service.PrepareOpenCodeGoPoolContainer(addChannelRequest.Channel)
 	keys := make([]string, 0)
 	switch addChannelRequest.Mode {
 	case "multi_to_single":
@@ -682,7 +704,7 @@ func AddChannel(c *gin.Context) {
 
 	channels := make([]model.Channel, 0, len(keys))
 	for _, key := range keys {
-		if key == "" {
+		if key == "" && addChannelRequest.Channel.Type != constant.ChannelTypeOpenCodeGo {
 			continue
 		}
 		localChannel := addChannelRequest.Channel
@@ -730,6 +752,7 @@ func DeleteChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	service.RemoveOpenCodeGoPoolChannel(id)
 	model.InitChannelCache()
 	if channelLookupFailed {
 		service.ResetProxyClientCache()
@@ -754,6 +777,7 @@ func DeleteDisabledChannel(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	service.ReloadOpenCodeGoPools()
 	if rows > 0 {
 		service.ResetProxyClientCache()
 	}
@@ -913,6 +937,9 @@ func DeleteChannelBatch(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	for _, id := range channelBatch.Ids {
+		service.RemoveOpenCodeGoPoolChannel(id)
+	}
 	if deletedCount > 0 {
 		service.ResetProxyClientCache()
 	}
@@ -940,6 +967,26 @@ type ChannelStatusRequest struct {
 type ChannelStatusBatchRequest struct {
 	Ids    []int `json:"ids"`
 	Status int   `json:"status"`
+}
+
+func preserveOpenCodeGoLifecycleSettings(channel *model.Channel, origin *model.Channel) {
+	proposedSettings := channel.GetOtherSettings()
+	originSettings := origin.GetOtherSettings()
+	if proposedSettings.OpenCodeGo == nil {
+		proposedSettings.OpenCodeGo = &dto.OpenCodeGoConfig{}
+	}
+	if originSettings.OpenCodeGo == nil {
+		proposedSettings.OpenCodeGo.AutoEnableChinaModels = nil
+		proposedSettings.OpenCodeGo.AutoApplyReferralRewards = nil
+		proposedSettings.OpenCodeGo.ReferralRewardsMaxPerRun = nil
+		proposedSettings.OpenCodeGo.AutoCancelSubscriptionRenewal = false
+	} else {
+		proposedSettings.OpenCodeGo.AutoEnableChinaModels = originSettings.OpenCodeGo.AutoEnableChinaModels
+		proposedSettings.OpenCodeGo.AutoApplyReferralRewards = originSettings.OpenCodeGo.AutoApplyReferralRewards
+		proposedSettings.OpenCodeGo.ReferralRewardsMaxPerRun = originSettings.OpenCodeGo.ReferralRewardsMaxPerRun
+		proposedSettings.OpenCodeGo.AutoCancelSubscriptionRenewal = originSettings.OpenCodeGo.AutoCancelSubscriptionRenewal
+	}
+	channel.SetOtherSettings(proposedSettings)
 }
 
 func UpdateChannel(c *gin.Context) {
@@ -980,6 +1027,15 @@ func UpdateChannel(c *gin.Context) {
 			"message": err.Error(),
 		})
 		return
+	}
+	if channel.Type != originChannel.Type &&
+		(channel.Type == constant.ChannelTypeOpenCodeGo || originChannel.Type == constant.ChannelTypeOpenCodeGo) {
+		common.ApiError(c, errors.New("OpenCode Go channel type cannot be changed after creation"))
+		return
+	}
+	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		channel.Models = originChannel.Models
+		preserveOpenCodeGoLifecycleSettings(&channel.Channel, originChannel)
 	}
 	originProxy := originChannel.GetSetting().Proxy
 	proxyChanged := false
@@ -1088,7 +1144,17 @@ func UpdateChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		if err := service.ReconcileOpenCodeGoPoolChannel(channel.Id); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if reconciled, reloadErr := model.GetChannelById(channel.Id, true); reloadErr == nil {
+			channel.Channel = *reconciled
+		}
+	} else {
+		model.InitChannelCache()
+	}
 	if proxyChanged {
 		service.InvalidateProxyClient(originProxy)
 	}
@@ -1135,7 +1201,18 @@ func UpdateChannelStatus(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
+	channel, err := model.GetChannelById(id, false)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	changed := model.UpdateChannelStatus(id, "", req.Status, "manual operation")
+	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		if err := service.ReconcileOpenCodeGoPoolChannel(id); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
 	if changed {
 		model.InitChannelCache()
 	}
@@ -1159,8 +1236,19 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 	}
 	changedCount := 0
 	for _, id := range req.Ids {
+		channel, err := model.GetChannelById(id, false)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
 		if model.UpdateChannelStatus(id, "", req.Status, "manual batch operation") {
 			changedCount++
+		}
+		if channel.Type == constant.ChannelTypeOpenCodeGo {
+			if err := service.ReconcileOpenCodeGoPoolChannel(id); err != nil {
+				common.ApiError(c, err)
+				return
+			}
 		}
 	}
 	if changedCount > 0 {
@@ -1436,6 +1524,7 @@ func CopyChannel(c *gin.Context) {
 		clone.Balance = 0
 		clone.UsedQuota = 0
 	}
+	service.PrepareOpenCodeGoPoolContainer(&clone)
 
 	if err := clone.ValidateSettings(); err != nil {
 		common.SysError("failed to validate cloned channel: " + err.Error())
