@@ -177,8 +177,9 @@ func TestAdaptorUsesFixedURLsAndProtocolAuthentication(t *testing.T) {
 	}
 }
 
-func TestAdaptorRoutesChatFamilyFunctionToolsThroughResponses(t *testing.T) {
+func TestAdaptorKeepsClaudeChatFamilyFunctionToolsOnChat(t *testing.T) {
 	info := newAdaptorTestInfo("glm-5.2", false)
+	info.RelayFormat = types.RelayFormatClaude
 	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
 	request.Tools = []map[string]any{
 		{
@@ -195,13 +196,71 @@ func TestAdaptorRoutesChatFamilyFunctionToolsThroughResponses(t *testing.T) {
 
 	converted, err := adaptor.ConvertClaudeRequest(newAdaptorTestContext(), info, request)
 	require.NoError(t, err)
-	require.IsType(t, &dto.OpenAIResponsesRequest{}, converted)
-	assert.Equal(t, ProtocolResponses, adaptor.protocol)
-	assert.Equal(t, types.RelayFormat(types.RelayFormatOpenAIResponses), info.FinalRequestRelayFormat)
+	require.IsType(t, &dto.GeneralOpenAIRequest{}, converted)
+	assert.Equal(t, ProtocolChat, adaptor.protocol)
+	assert.Equal(t, types.RelayFormat(types.RelayFormatOpenAI), info.FinalRequestRelayFormat)
 
 	requestURL, err := adaptor.GetRequestURL(info)
 	require.NoError(t, err)
-	assert.Equal(t, constant.ChannelBaseURLs[constant.ChannelTypeOpenCodeGo]+"/responses", requestURL)
+	assert.Equal(t, constant.ChannelBaseURLs[constant.ChannelTypeOpenCodeGo]+"/chat/completions", requestURL)
+}
+
+func TestAdaptorRoutesOpenAIChatFamilyFunctionToolsThroughResponses(t *testing.T) {
+	info := newAdaptorTestInfo("glm-5.2", false)
+	request := requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest)
+	request.Tools = []dto.ToolCallRequest{
+		{
+			Type: "function",
+			Function: dto.FunctionRequest{
+				Name: "Bash",
+			},
+		},
+	}
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+
+	converted, err := adaptor.ConvertOpenAIRequest(newAdaptorTestContext(), info, request)
+	require.NoError(t, err)
+	require.IsType(t, &dto.OpenAIResponsesRequest{}, converted)
+	assert.Equal(t, ProtocolResponses, adaptor.protocol)
+	assert.Equal(t, types.RelayFormat(types.RelayFormatOpenAIResponses), info.FinalRequestRelayFormat)
+}
+
+func TestAdaptorAddsOpenCodeGoResponsesFunctionCallIDFromClaude(t *testing.T) {
+	info := newAdaptorTestInfo("gpt-5.6-luna", false)
+	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
+	request.Tools = []map[string]any{
+		{"name": "Bash", "input_schema": map[string]any{"type": "object"}},
+	}
+	request.Messages = []dto.ClaudeMessage{
+		{Role: "user", Content: "list files"},
+		{Role: "assistant", Content: []any{
+			map[string]any{
+				"type": "tool_use", "id": "toolu_claude", "name": "Bash", "input": map[string]any{},
+			},
+		}},
+		{Role: "user", Content: []any{map[string]any{
+			"type": "tool_result", "tool_use_id": "toolu_claude", "content": "OK",
+		}}},
+	}
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+
+	converted, err := adaptor.ConvertClaudeRequest(newAdaptorTestContext(), info, request)
+	require.NoError(t, err)
+	responses := converted.(*dto.OpenAIResponsesRequest)
+	var input []map[string]any
+	require.NoError(t, json.Unmarshal(responses.Input, &input))
+
+	var functionCall map[string]any
+	for _, item := range input {
+		if item["type"] == "function_call" {
+			functionCall = item
+		}
+	}
+	require.NotNil(t, functionCall)
+	assert.Equal(t, "toolu_claude", functionCall["call_id"])
+	assert.Equal(t, functionCall["call_id"], functionCall["id"])
 }
 
 func TestAdaptorBuffersStreamingClaudeFunctionToolsUpstream(t *testing.T) {
@@ -225,13 +284,96 @@ func TestAdaptorBuffersStreamingClaudeFunctionToolsUpstream(t *testing.T) {
 
 	converted, err := adaptor.ConvertClaudeRequest(newAdaptorTestContext(), info, request)
 	require.NoError(t, err)
-	responses := converted.(*dto.OpenAIResponsesRequest)
-	require.NotNil(t, responses.Stream)
-	assert.False(t, *responses.Stream)
+	chat := converted.(*dto.GeneralOpenAIRequest)
+	require.NotNil(t, chat.Stream)
+	assert.False(t, *chat.Stream)
 	assert.True(t, adaptor.bufferClaudeToolCall)
 	assert.False(t, adaptor.requestUpstreamStream)
 	assert.Equal(t, 1, adaptor.requestInputItems)
 	assert.Equal(t, 1, adaptor.requestToolCount)
+	assert.Equal(t, ProtocolChat, adaptor.protocol)
+}
+
+func TestAdaptorKeepsClaudeToolOnlyContinuationOnChat(t *testing.T) {
+	info := newAdaptorTestInfo("deepseek-v4-flash", true)
+	info.RelayFormat = types.RelayFormatClaude
+	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
+	request.Tools = []map[string]any{
+		{
+			"name": "Bash",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"command": map[string]any{"type": "string"},
+				},
+				"required": []string{"command"},
+			},
+		},
+	}
+	request.Messages = []dto.ClaudeMessage{
+		{Role: "user", Content: "inspect the repository"},
+		{Role: "assistant", Content: []any{
+			map[string]any{
+				"type": "tool_use", "id": "toolu_missing_reasoning", "name": "Bash",
+				"input": map[string]any{"command": "pwd"},
+			},
+		}},
+		{Role: "user", Content: []any{map[string]any{
+			"type": "tool_result", "tool_use_id": "toolu_missing_reasoning", "content": "/opt/opencode2api",
+		}}},
+	}
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+
+	converted, err := adaptor.ConvertClaudeRequest(newAdaptorTestContext(), info, request)
+	require.NoError(t, err)
+	chat := converted.(*dto.GeneralOpenAIRequest)
+	assert.Equal(t, ProtocolChat, adaptor.protocol)
+	assert.True(t, adaptor.bufferClaudeToolCall)
+	require.Len(t, chat.Messages, 3)
+	assert.Equal(t, "assistant", chat.Messages[1].Role)
+	require.Len(t, chat.Messages[1].ParseToolCalls(), 1)
+	assert.Equal(t, "toolu_missing_reasoning", chat.Messages[1].ParseToolCalls()[0].ID)
+	assert.Empty(t, chat.Messages[1].GetReasoningContent())
+	assert.Equal(t, "tool", chat.Messages[2].Role)
+	assert.Equal(t, "toolu_missing_reasoning", chat.Messages[2].ToolCallId)
+}
+
+func TestAdaptorKeepsOpenAIReasoningToolContinuationOnChat(t *testing.T) {
+	info := newAdaptorTestInfo("deepseek-v4-flash", true)
+	request := requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest)
+	request.Tools = []dto.ToolCallRequest{
+		{
+			Type: "function",
+			Function: dto.FunctionRequest{
+				Name: "Bash",
+			},
+		},
+	}
+	reasoning := "inspect before continuing"
+	assistant := dto.Message{Role: "assistant", ReasoningContent: &reasoning}
+	assistant.SetToolCalls([]dto.ToolCallRequest{{
+		ID: "call_reasoning", Type: "function", Function: dto.FunctionRequest{
+			Name: "Bash", Arguments: `{"command":"pwd"}`,
+		},
+	}})
+	toolName := "Bash"
+	toolResult := dto.Message{Role: "tool", Name: &toolName, ToolCallId: "call_reasoning"}
+	toolResult.SetStringContent("/opt/opencode2api")
+	request.Messages = []dto.Message{assistant, toolResult}
+
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+
+	converted, err := adaptor.ConvertOpenAIRequest(newAdaptorTestContext(), info, request)
+	require.NoError(t, err)
+	chat := converted.(*dto.GeneralOpenAIRequest)
+	assert.Equal(t, ProtocolChat, adaptor.protocol)
+	assert.Equal(t, types.RelayFormat(types.RelayFormatOpenAI), info.FinalRequestRelayFormat)
+	require.Len(t, chat.Messages, 2)
+	assert.Equal(t, reasoning, chat.Messages[0].GetReasoningContent())
+	require.Len(t, chat.Messages[0].ParseToolCalls(), 1)
+	assert.Equal(t, "call_reasoning", chat.Messages[0].ParseToolCalls()[0].ID)
 }
 
 func TestAdaptorKeepsReasoningToolHistoryOnChatPath(t *testing.T) {
@@ -383,25 +525,28 @@ func TestReasoningToolResponseRoundTripsIntoChatContinuation(t *testing.T) {
 
 func TestAdaptorAddsOpenCodeGoResponsesFunctionCallID(t *testing.T) {
 	info := newAdaptorTestInfo("glm-5.2", false)
-	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
-	request.Tools = []map[string]any{
-		{"name": "Bash", "input_schema": map[string]any{"type": "object"}},
+	request := requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest)
+	request.Tools = []dto.ToolCallRequest{
+		{Type: "function", Function: dto.FunctionRequest{Name: "Bash"}},
 	}
-	request.Messages = []dto.ClaudeMessage{
-		{Role: "user", Content: "list files"},
-		{Role: "assistant", Content: []any{
-			map[string]any{
-				"type": "tool_use", "id": "toolu_test", "name": "Bash", "input": map[string]any{},
-			},
-		}},
-		{Role: "user", Content: []any{map[string]any{
-			"type": "tool_result", "tool_use_id": "toolu_test", "content": "OK",
-		}}},
+	assistant := dto.Message{Role: "assistant"}
+	assistant.SetToolCalls([]dto.ToolCallRequest{
+		{ID: "toolu_test", Type: "function", Function: dto.FunctionRequest{Name: "Bash", Arguments: "{}"}},
+	})
+	toolName := "Bash"
+	toolResult := dto.Message{Role: "tool", Name: &toolName, ToolCallId: "toolu_test"}
+	toolResult.SetStringContent("OK")
+	user := dto.Message{Role: "user"}
+	user.SetStringContent("list files")
+	request.Messages = []dto.Message{
+		user,
+		assistant,
+		toolResult,
 	}
 	adaptor := &Adaptor{}
 	adaptor.Init(info)
 
-	converted, err := adaptor.ConvertClaudeRequest(newAdaptorTestContext(), info, request)
+	converted, err := adaptor.ConvertOpenAIRequest(newAdaptorTestContext(), info, request)
 	require.NoError(t, err)
 	responses := converted.(*dto.OpenAIResponsesRequest)
 	var input []map[string]any
