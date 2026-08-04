@@ -41,6 +41,78 @@ func generalOpenAIRequestUsesFunctionTools(request *dto.GeneralOpenAIRequest) bo
 	return false
 }
 
+// requestContainsAssistantReasoning reports whether the request carries prior
+// assistant reasoning that a thinking-mode upstream provider must replay back.
+// Console Go's Responses bridge drops standalone `reasoning` input items and
+// does not preserve assistant reasoning on `assistant` output-history items,
+// so a request that must pass prior reasoning back stays on the model's
+// configured Chat protocol where reasoning_content flows through unchanged on
+// the same assistant message as tool_calls.
+func requestContainsAssistantReasoning(request any) bool {
+	switch typed := request.(type) {
+	case *dto.GeneralOpenAIRequest:
+		return typed != nil && generalOpenAIRequestContainsAssistantReasoning(typed)
+	case dto.GeneralOpenAIRequest:
+		return generalOpenAIRequestContainsAssistantReasoning(&typed)
+	case *dto.ClaudeRequest:
+		return typed != nil && claudeRequestContainsAssistantReasoning(typed)
+	case dto.ClaudeRequest:
+		return claudeRequestContainsAssistantReasoning(&typed)
+	case *dto.OpenAIResponsesRequest:
+		return typed != nil && openAIResponsesRequestContainsReasoning(typed)
+	case dto.OpenAIResponsesRequest:
+		return openAIResponsesRequestContainsReasoning(&typed)
+	default:
+		return false
+	}
+}
+
+func generalOpenAIRequestContainsAssistantReasoning(req *dto.GeneralOpenAIRequest) bool {
+	for _, msg := range req.Messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		if strings.TrimSpace(msg.GetReasoningContent()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func claudeRequestContainsAssistantReasoning(req *dto.ClaudeRequest) bool {
+	for _, msg := range req.Messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		parts, err := msg.ParseContent()
+		if err != nil {
+			continue
+		}
+		for _, part := range parts {
+			if part.Type == "thinking" && part.Thinking != nil && strings.TrimSpace(*part.Thinking) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func openAIResponsesRequestContainsReasoning(req *dto.OpenAIResponsesRequest) bool {
+	if len(req.Input) == 0 {
+		return false
+	}
+	var input []map[string]any
+	if err := common.Unmarshal(req.Input, &input); err != nil {
+		return false
+	}
+	for _, item := range input {
+		if itemType, _ := item["type"].(string); itemType == "reasoning" {
+			return true
+		}
+	}
+	return false
+}
+
 func claudeToolsContainFunction(tools any) bool {
 	if tools == nil {
 		return false

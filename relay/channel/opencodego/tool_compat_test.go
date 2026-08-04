@@ -22,6 +22,54 @@ func TestRequestUsesFunctionToolsDistinguishesHostedWebSearch(t *testing.T) {
 	}}))
 }
 
+func TestRequestContainsAssistantReasoningDetectsHistoryAcrossFormats(t *testing.T) {
+	assert.False(t, requestContainsAssistantReasoning(&dto.ClaudeRequest{}))
+	assert.False(t, requestContainsAssistantReasoning(&dto.GeneralOpenAIRequest{}))
+	assert.False(t, requestContainsAssistantReasoning(&dto.OpenAIResponsesRequest{}))
+
+	thinking := "I should inspect the repository."
+	claude := &dto.ClaudeRequest{Messages: []dto.ClaudeMessage{
+		{Role: "assistant", Content: []any{
+			map[string]any{"type": "thinking", "thinking": thinking},
+			map[string]any{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": map[string]any{}},
+		}},
+	}}
+	assert.True(t, requestContainsAssistantReasoning(claude))
+
+	chatMsg := dto.Message{Role: "assistant"}
+	chatMsg.ReasoningContent = &thinking
+	chatMsg.SetToolCalls([]dto.ToolCallRequest{
+		{ID: "call_1", Type: "function", Function: dto.FunctionRequest{Name: "Bash"}},
+	})
+	chat := &dto.GeneralOpenAIRequest{Messages: []dto.Message{chatMsg}}
+	assert.True(t, requestContainsAssistantReasoning(chat))
+
+	responses := &dto.OpenAIResponsesRequest{Input: json.RawMessage(`[
+		{"type":"reasoning","id":"rs_1","status":"completed","summary":[{"type":"summary_text","text":"x"}]},
+		{"type":"function_call","id":"call_1","call_id":"call_1","name":"Bash","arguments":"{}"}
+	]`)}
+	assert.True(t, requestContainsAssistantReasoning(responses))
+
+	emptyThinking := ""
+	claudeEmpty := &dto.ClaudeRequest{Messages: []dto.ClaudeMessage{
+		{Role: "assistant", Content: []any{
+			map[string]any{"type": "thinking", "thinking": emptyThinking},
+		}},
+	}}
+	assert.False(t, requestContainsAssistantReasoning(claudeEmpty))
+
+	claudeUser := &dto.ClaudeRequest{Messages: []dto.ClaudeMessage{{
+		Role: "user", Content: []any{map[string]any{"type": "thinking", "thinking": thinking}},
+	}}}
+	assert.False(t, requestContainsAssistantReasoning(claudeUser))
+
+	chatUserMessage := dto.Message{Role: "user"}
+	chatUserMessage.ReasoningContent = &thinking
+	assert.False(t, requestContainsAssistantReasoning(&dto.GeneralOpenAIRequest{
+		Messages: []dto.Message{chatUserMessage},
+	}))
+}
+
 func TestPrepareOpenCodeGoResponsesToolHistoryPreservesExistingID(t *testing.T) {
 	request := &dto.OpenAIResponsesRequest{Input: json.RawMessage(`[
 		{"type":"reasoning","summary":[{"type":"summary_text","text":"inspect first"}]},

@@ -325,11 +325,15 @@ type IncompleteDetails struct {
 }
 
 type ResponsesOutput struct {
-	Type      string                   `json:"type"`
-	ID        string                   `json:"id"`
-	Status    string                   `json:"status"`
-	Role      string                   `json:"role"`
-	Content   []ResponsesOutputContent `json:"content"`
+	Type    string                   `json:"type"`
+	ID      string                   `json:"id"`
+	Status  string                   `json:"status"`
+	Role    string                   `json:"role"`
+	Content []ResponsesOutputContent `json:"content"`
+	// Summary is used by the Responses API for reasoning output items. Some
+	// compatible providers use Content for the same payload, so consumers must
+	// accept both representations.
+	Summary   []ResponsesOutputContent `json:"summary,omitempty"`
 	Quality   string                   `json:"quality"`
 	Size      string                   `json:"size"`
 	Result    string                   `json:"result,omitempty"`
