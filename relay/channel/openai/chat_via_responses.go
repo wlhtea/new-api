@@ -78,6 +78,55 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	return usage, nil
 }
 
+// OaiChatToClaudeBufferedStreamHandler mirrors
+// OaiResponsesToClaudeBufferedStreamHandler but consumes a non-streaming
+// OpenAI Chat response. It exists for Chat-family reasoning models that must
+// stay on Chat protocol to preserve assistant reasoning_content across turns
+// (Console Go drops standalone `reasoning` Responses items). The upstream
+// request is non-streaming; this handler emits the complete result as a valid
+// Claude SSE sequence without retrying or selecting another account.
+func OaiChatToClaudeBufferedStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	if resp == nil || resp.Body == nil {
+		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+	defer service.CloseResponseBodyGracefully(resp)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	}
+
+	var chatResp dto.OpenAITextResponse
+	if err := common.Unmarshal(body, &chatResp); err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	if oaiError := chatResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+	}
+
+	result, err := relayconvert.ConvertResponse(c, info, types.RelayFormatClaude, &chatResp)
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	claudeResp, ok := result.Value.(*dto.ClaudeResponse)
+	if !ok || claudeResp == nil {
+		return nil, types.NewOpenAIError(fmt.Errorf("expected Claude response, got %T", result.Value), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+
+	usage := result.Usage
+	if usage == nil || usage.TotalTokens == 0 {
+		text := ""
+		if len(chatResp.Choices) > 0 && chatResp.Choices[0].Message.StringContent() != "" {
+			text = chatResp.Choices[0].Message.StringContent()
+		}
+		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
+	}
+
+	helper.SetEventStreamHeaders(c)
+	emitBufferedClaudeResponse(c, claudeResp)
+	return usage, nil
+}
+
 // OaiResponsesToClaudeBufferedStreamHandler works around Responses providers
 // that omit function arguments only in streaming mode. The upstream request is
 // non-streaming; this handler emits the complete result as a valid Claude SSE

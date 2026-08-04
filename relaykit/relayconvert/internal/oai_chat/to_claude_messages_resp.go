@@ -479,8 +479,16 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info convmeta
 	for _, choice := range openAIResponse.Choices {
 		stopReason = stopReasonOpenAI2Claude(choice.FinishReason)
 		textContent := choice.Message.StringContent()
+		reasoningContent := choice.Message.GetReasoningContent()
 		toolCalls := choice.Message.ParseToolCalls()
-		if textContent != "" || len(toolCalls) == 0 {
+		if strings.TrimSpace(reasoningContent) != "" {
+			claudeContent := dto.ClaudeMediaMessage{
+				Type:     "thinking",
+				Thinking: kitutil.GetPointer(reasoningContent),
+			}
+			contents = append(contents, claudeContent)
+		}
+		if textContent != "" || (len(toolCalls) == 0 && strings.TrimSpace(reasoningContent) == "") {
 			claudeContent := dto.ClaudeMediaMessage{}
 			claudeContent.Type = "text"
 			claudeContent.SetText(textContent)

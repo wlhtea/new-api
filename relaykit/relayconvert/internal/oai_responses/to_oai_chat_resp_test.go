@@ -1,6 +1,7 @@
 package oairesponses
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -75,6 +76,23 @@ func TestResponsesResponseToChatCompletionsPreservesReasoningSummary(t *testing.
 	require.NoError(t, err)
 	assert.Equal(t, "first summary\n\nsecond summary", chat.Choices[0].Message.GetReasoningContent())
 	assert.Equal(t, "final", chat.Choices[0].Message.StringContent())
+}
+
+func TestResponsesResponseToChatCompletionsAcceptsWireSummaryField(t *testing.T) {
+	var resp dto.OpenAIResponsesResponse
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"id":"resp_wire",
+		"model":"gpt-test",
+		"status":"completed",
+		"output":[{
+			"type":"reasoning",
+			"summary":[{"type":"summary_text","text":"wire reasoning"}]
+		}]
+	}`), &resp))
+
+	chat, _, err := ResponsesResponseToChatCompletionsResponse(&resp, "chatcmpl_wire")
+	require.NoError(t, err)
+	assert.Equal(t, "wire reasoning", chat.Choices[0].Message.GetReasoningContent())
 }
 
 func TestResponsesFinishReasonFromIncompleteStatus(t *testing.T) {

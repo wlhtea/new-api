@@ -190,6 +190,9 @@ func TestOaiResponsesToClaudeBufferedStreamHandlerEmitsCompleteToolInput(t *test
 		"model":"glm-test",
 		"status":"completed",
 		"output":[{
+			"type":"reasoning",
+			"summary":[{"type":"summary_text","text":"Selecting Bash"}]
+		},{
 			"type":"function_call",
 			"id":"call_tool",
 			"call_id":"call_tool",
@@ -216,14 +219,62 @@ func TestOaiResponsesToClaudeBufferedStreamHandlerEmitsCompleteToolInput(t *test
 	assert.Contains(t, got, `"type":"input_json_delta"`)
 	assert.Contains(t, got, `\"command\":\"pwd\"`)
 	assert.Contains(t, got, `\"description\":\"Show directory\"`)
+	assert.Contains(t, got, `"type":"thinking"`)
+	assert.Contains(t, got, `"type":"thinking_delta"`)
 	assert.Contains(t, got, `"cache_read_input_tokens":8`)
 	requireOrderedSubstrings(t, got,
 		"event: message_start",
 		"event: content_block_start",
 		"event: content_block_delta",
+		`"type":"thinking_delta"`,
+		`"type":"input_json_delta"`,
 		"event: content_block_stop",
 		"event: message_delta",
 		"event: message_stop",
+	)
+}
+
+func TestOaiChatToClaudeBufferedStreamHandlerPreservesReasoningAndToolInput(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	body := `{
+		"id":"chatcmpl_tool",
+		"model":"glm-test",
+		"choices":[{
+			"index":0,
+			"message":{
+				"role":"assistant",
+				"content":"I will inspect the repository.",
+				"reasoning_content":"Selecting Bash",
+				"tool_calls":[{"id":"call_tool","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"pwd\"}"}}]
+			},
+			"finish_reason":"tool_calls"
+		}],
+		"usage":{"prompt_tokens":12,"completion_tokens":7,"total_tokens":19,"prompt_tokens_details":{"cached_tokens":8}}
+	}`
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+	resp.Header.Set("Content-Type", "application/json")
+	info.RelayFormat = types.RelayFormatClaude
+
+	usage, err := OaiChatToClaudeBufferedStreamHandler(c, info, resp)
+	require.Nil(t, err)
+	require.NotNil(t, usage)
+	assert.Equal(t, 19, usage.TotalTokens)
+
+	got := recorder.Body.String()
+	assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+	assert.Contains(t, got, `"type":"thinking_delta"`)
+	assert.Contains(t, got, `"type":"text_delta"`)
+	assert.Contains(t, got, `"type":"input_json_delta"`)
+	assert.Contains(t, got, `\"command\":\"pwd\"`)
+	requireOrderedSubstrings(t, got,
+		`"type":"thinking_delta"`,
+		`"type":"text_delta"`,
+		`"type":"input_json_delta"`,
+		`"type":"message_delta"`,
+		`"type":"message_stop"`,
 	)
 }
 

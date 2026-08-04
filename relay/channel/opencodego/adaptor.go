@@ -147,14 +147,19 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 		return nil, err
 	}
 	usesFunctionTools := requestUsesFunctionTools(request)
-	if protocol == ProtocolChat && usesFunctionTools {
+	if protocol == ProtocolChat && usesFunctionTools && !requestContainsAssistantReasoning(request) {
 		protocol = ProtocolResponses
 		a.protocol = protocol
 	}
 
 	a.cacheIdentity = cacheIdentityForRequest(c, info, request)
 	a.affinityIdentity = affinityIdentityForRequest(c, request)
-	a.bufferClaudeToolCall = protocol == ProtocolResponses &&
+	// Console Go's streaming Responses result historically omitted complete
+	// function-argument deltas. Buffer any streaming Claude function-tool turn
+	// (Chat-family reasoning continuation or Responses-routed first turn) into
+	// one non-streaming upstream request and synthesize Claude SSE without
+	// retrying or switching accounts.
+	a.bufferClaudeToolCall = (protocol == ProtocolResponses || protocol == ProtocolChat) &&
 		info.IsStream && info.RelayFormat == types.RelayFormatClaude && usesFunctionTools
 	a.captureRequestShape(request)
 	result, err := service.ConvertRequest(c, info, protocol.RelayFormat(), request)
@@ -168,8 +173,12 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	switch converted := result.Value.(type) {
 	case *dto.GeneralOpenAIRequest:
 		converted.Model = info.UpstreamModelName
+		if a.bufferClaudeToolCall {
+			upstreamStream := false
+			converted.Stream = &upstreamStream
+		}
 		a.requestUpstreamStream = converted.Stream != nil && *converted.Stream
-		if info.IsStream {
+		if info.IsStream && a.requestUpstreamStream {
 			converted.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
 		}
 		if strings.EqualFold(info.UpstreamModelName, "kimi-k2.7-code") &&
@@ -295,7 +304,9 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	var responseErr *types.NewAPIError
 	switch protocol {
 	case ProtocolChat:
-		if info.RelayFormat == types.RelayFormatOpenAIResponses {
+		if a.bufferClaudeToolCall {
+			usage, responseErr = openai.OaiChatToClaudeBufferedStreamHandler(c, info, resp)
+		} else if info.RelayFormat == types.RelayFormatOpenAIResponses {
 			if info.IsStream {
 				usage, responseErr = openai.OaiChatToResponsesStreamHandler(c, info, resp)
 			} else {
