@@ -3,6 +3,7 @@ package opencodego
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strconv"
@@ -26,6 +27,7 @@ type normalizedCostUsage struct {
 type responseTransformState struct {
 	model            string
 	protocol         Protocol
+	namespaceTools   map[string]openCodeGoNamespaceTool
 	sawStandardUsage bool
 	fallbackUsage    *normalizedCostUsage
 }
@@ -136,7 +138,55 @@ func (s *responseTransformState) transformJSON(data []byte, stream bool) []byte 
 	if hasStandardUsage(data) {
 		s.sawStandardUsage = true
 	}
+	data = s.restoreOpenCodeGoNamespaceCalls(data)
 	return normalizeResponseModel(data, s.model)
+}
+
+// restoreOpenCodeGoNamespaceCalls reverses the request lowering for native
+// Responses payloads. The provider sees a flat function name, while Codex
+// expects the original child name and namespace on output items. Walking the
+// whole event also covers response.output_item.added/done and completed JSON.
+func (s *responseTransformState) restoreOpenCodeGoNamespaceCalls(data []byte) []byte {
+	if s == nil || len(s.namespaceTools) == 0 || len(data) == 0 {
+		return data
+	}
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return data
+	}
+	changed := restoreOpenCodeGoNamespaceValue(value, s.namespaceTools)
+	if !changed {
+		return data
+	}
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return data
+	}
+	return bytes.TrimSuffix(encoded.Bytes(), []byte("\n"))
+}
+
+func restoreOpenCodeGoNamespaceValue(value any, names map[string]openCodeGoNamespaceTool) bool {
+	changed := false
+	switch typed := value.(type) {
+	case []any:
+		for _, item := range typed {
+			changed = restoreOpenCodeGoNamespaceValue(item, names) || changed
+		}
+	case map[string]any:
+		if strings.TrimSpace(stringValue(typed["type"])) == "function_call" {
+			if entry, ok := names[strings.TrimSpace(stringValue(typed["name"]))]; ok {
+				typed["name"] = entry.Name
+				typed["namespace"] = entry.Namespace
+				changed = true
+			}
+		}
+		for _, child := range typed {
+			changed = restoreOpenCodeGoNamespaceValue(child, names) || changed
+		}
+	}
+	return changed
 }
 
 func isCostExtension(data []byte) bool {

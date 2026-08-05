@@ -56,6 +56,21 @@ func TestResponsesRequestToChatCompletionsRequestInstructionsAndScalarInput(t *t
 	assert.Equal(t, "abc", gjson.GetBytes(got.Metadata, "trace").String())
 }
 
+func TestResponsesRequestToChatCompletionsRequestMapsDeveloperToSystem(t *testing.T) {
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Input: mustRawMessage(t, []map[string]any{
+			{"role": "developer", "content": "developer rules"},
+			{"role": "user", "content": "hello"},
+		}),
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Messages, 2)
+	assert.Equal(t, "system", got.Messages[0].Role)
+	assert.Equal(t, "developer rules", got.Messages[0].StringContent())
+	assert.Equal(t, "user", got.Messages[1].Role)
+}
+
 func TestResponsesRequestToChatCompletionsRequestPreservesQwenThinkingBudget(t *testing.T) {
 	tests := []struct {
 		name   string

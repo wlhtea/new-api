@@ -189,6 +189,13 @@ func responsesInputItemToChatMessages(item map[string]any, messages []dto.Messag
 	if role == "" {
 		role = "user"
 	}
+	// OpenAI Responses permits developer messages, but the OpenCode Go
+	// Chat-compatible upstream rejects that role after Console Go's bridge.
+	// Preserve the instruction semantics with the broadly supported system
+	// role while keeping the original message order and content.
+	if role == "developer" {
+		role = "system"
+	}
 	content, err := responsesInputContentToChatContent(item["content"])
 	if err != nil {
 		return nil, err

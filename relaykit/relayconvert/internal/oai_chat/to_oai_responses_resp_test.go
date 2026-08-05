@@ -132,6 +132,38 @@ func TestChatCompletionsStreamToResponsesEventsAggregatesUsageAndToolArgs(t *tes
 	assert.Equal(t, `"{\"q\":\"x\"}"`, string(events[9].Payload.Response.Output[1].Arguments))
 }
 
+func TestChatCompletionsStreamToResponsesReasoningUsesSummaryPartLifecycle(t *testing.T) {
+	state := NewChatToResponsesStreamState("resp_reasoning", "gpt-test")
+	events := mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Id:      "chat_reasoning",
+		Model:   "gpt-test",
+		Created: 123,
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{
+			Delta: dto.ChatCompletionsStreamResponseChoiceDelta{
+				ReasoningContent: lo.ToPtr("think"),
+			},
+		}},
+	})
+	finishReason := "stop"
+	events = append(events, mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{FinishReason: &finishReason}},
+	})...)
+	events = append(events, FinalizeChatCompletionsStreamToResponses(state)...)
+
+	require.Len(t, events, 8)
+	assert.Equal(t, responsesEventCreated, events[0].Type)
+	assert.Equal(t, responsesEventOutputItemAdded, events[1].Type)
+	assert.Equal(t, responsesEventReasoningSummaryPartAdded, events[2].Type)
+	assert.Equal(t, responsesEventReasoningSummaryDelta, events[3].Type)
+	assert.Equal(t, responsesEventReasoningSummaryDone, events[4].Type)
+	assert.Equal(t, responsesEventReasoningSummaryPartDone, events[5].Type)
+	assert.Equal(t, responsesEventOutputItemDone, events[6].Type)
+	assert.Equal(t, responsesEventCompleted, events[7].Type)
+	assert.Equal(t, "think", events[3].Payload.Delta)
+	require.NotNil(t, events[5].Payload.Part)
+	assert.Equal(t, "think", events[5].Payload.Part.Text)
+}
+
 func mustResponsesEventsFromChatChunk(t *testing.T, state *ChatToResponsesStreamState, chunk *dto.ChatCompletionsStreamResponse) []ChatToResponsesStreamEvent {
 	t.Helper()
 	events, err := ChatCompletionsStreamChunkToResponsesEvents(chunk, state)

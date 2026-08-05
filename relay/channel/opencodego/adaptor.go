@@ -33,6 +33,7 @@ type Adaptor struct {
 	converted             bool
 	workspaceSelected     bool
 	selectedWorkspaceUID  string
+	namespaceTools        map[string]openCodeGoNamespaceTool
 	openai                openai.Adaptor
 	claude                claude.Adaptor
 }
@@ -57,6 +58,7 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	a.converted = false
 	a.workspaceSelected = false
 	a.selectedWorkspaceUID = ""
+	a.namespaceTools = nil
 	if info == nil {
 		return
 	}
@@ -145,6 +147,21 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	protocol, err := a.resolveProtocol(info)
 	if err != nil {
 		return nil, err
+	}
+	a.namespaceTools = nil
+	switch typed := request.(type) {
+	case *dto.OpenAIResponsesRequest:
+		a.namespaceTools, err = prepareOpenCodeGoResponsesTools(typed)
+		if err != nil {
+			return nil, err
+		}
+	case dto.OpenAIResponsesRequest:
+		copy := typed
+		a.namespaceTools, err = prepareOpenCodeGoResponsesTools(&copy)
+		if err != nil {
+			return nil, err
+		}
+		request = &copy
 	}
 	usesFunctionTools := requestUsesFunctionTools(request)
 	// Claude tool turns must stay on Chat for Chat-family models. Console Go's
@@ -293,7 +310,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	if clientModel == "" {
 		clientModel = info.UpstreamModelName
 	}
-	state := &responseTransformState{model: clientModel, protocol: protocol}
+	state := &responseTransformState{model: clientModel, protocol: protocol, namespaceTools: a.namespaceTools}
 	if err := prepareResponseForRelay(resp, state, info.IsStream && !a.bufferClaudeToolCall); err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
 	}
