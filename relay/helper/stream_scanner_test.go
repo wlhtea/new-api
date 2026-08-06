@@ -211,6 +211,37 @@ func TestStreamScannerHandler_DataWithExtraSpaces(t *testing.T) {
 	assert.Equal(t, "{\"trimmed\":true}", got)
 }
 
+func TestStreamScannerHandler_BareDoneSentinel(t *testing.T) {
+	t.Parallel()
+
+	body := "data: {\"payload\":true}\n[DONE]\n"
+	c, resp, info := setupStreamTest(t, strings.NewReader(body))
+
+	var received []string
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		received = append(received, data)
+	})
+
+	require.Equal(t, []string{"{\"payload\":true}"}, received)
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.DoneSentinelObserved())
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+}
+
+func TestStreamScannerHandler_DoesNotAcceptSentinelPrefix(t *testing.T) {
+	t.Parallel()
+
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: [DONE]garbage\n"))
+	var received string
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		received = data
+	})
+
+	assert.Equal(t, "[DONE]garbage", received)
+	require.NotNil(t, info.StreamStatus)
+	assert.False(t, info.StreamStatus.DoneSentinelObserved())
+}
+
 // TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns pins the
 // disconnect contract: when the client goes away, the handler must return
 // promptly (all goroutines joined, so the gin.Context can never leak into a
@@ -412,6 +443,36 @@ func TestStreamScannerHandler_StreamStatus_EOFWithoutDone(t *testing.T) {
 	assert.True(t, info.StreamStatus.IsNormalEnd())
 }
 
+func TestStreamScannerHandler_RequiredProtocolTerminalRejectsDoneSentinelOnly(t *testing.T) {
+	t.Parallel()
+
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: {\"id\":1}\ndata: [DONE]\n"))
+	info.StreamProtocolTerminalRequired = true
+
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	assert.True(t, info.StreamStatus.ProtocolTerminalRequired())
+	assert.False(t, info.StreamStatus.ProtocolTerminalObserved())
+	assert.False(t, info.StreamStatus.IsNormalEnd())
+}
+
+func TestStreamScannerHandler_RequiredProtocolTerminalAcceptsTerminalEvent(t *testing.T) {
+	t.Parallel()
+
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: {\"type\":\"response.completed\"}\ndata: [DONE]\n"))
+	info.StreamProtocolTerminalRequired = true
+
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		info.StreamStatus.MarkProtocolTerminal()
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.ProtocolTerminalObserved())
+	assert.True(t, info.StreamStatus.IsNormalEnd())
+}
+
 func TestStreamScannerHandler_StreamStatus_HandlerStop(t *testing.T) {
 	t.Parallel()
 
@@ -429,6 +490,7 @@ func TestStreamScannerHandler_StreamStatus_HandlerStop(t *testing.T) {
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonHandlerStop, info.StreamStatus.EndReason)
 	assert.True(t, info.StreamStatus.HasErrors())
+	assert.True(t, info.StreamStatus.LocalFailureObserved())
 }
 
 func TestStreamScannerHandler_StreamStatus_HandlerDone(t *testing.T) {

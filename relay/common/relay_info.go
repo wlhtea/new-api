@@ -179,6 +179,11 @@ type RelayInfo struct {
 	FinalRequestRelayFormat types.RelayFormat
 
 	StreamStatus *StreamStatus
+	// StreamProtocolTerminalRequired is set by adaptors whose upstream wire
+	// protocol has an explicit terminal event. StreamScannerHandler copies it
+	// into each fresh StreamStatus so EOF/[DONE] without that event is logged as
+	// incomplete rather than successful.
+	StreamProtocolTerminalRequired bool
 
 	// convOptions caches the converter settings snapshot (see ConvOptions).
 	convOptions *convmeta.Options

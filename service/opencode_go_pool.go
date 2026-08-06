@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,16 +25,31 @@ var ErrOpenCodeGoNoEligibleWorkspace = errors.New("OpenCode Go channel has no el
 
 var ErrOpenCodeGoSelectedCredentialUnavailable = errors.New("selected OpenCode Go workspace credential is unavailable")
 
+var ErrOpenCodeGoStatefulResponsesAffinityRequired = errors.New("stateful OpenCode Go Responses requests require a stable session or prompt cache key")
+
+var ErrOpenCodeGoStatefulResponsesWorkspaceUnavailable = errors.New("the workspace that owns this stateful OpenCode Go Responses session is unavailable")
+
 type OpenCodeGoPoolSelection struct {
-	WorkspaceID  int64
-	WorkspaceUID string
-	APIKey       string
+	WorkspaceID            int64
+	WorkspaceUID           string
+	APIKey                 string
+	CanonicalWorkspaceUID  string
+	CandidateRank          int
+	FailoverActive         bool
+	FailoverLeaseExpiresAt time.Time
+	FailoverAttempt        *OpenCodeGoFailoverAttempt
 }
 
 type openCodeGoPoolCandidate struct {
 	workspaceID      int64
 	workspaceUID     string
+	identityUID      string
 	apiKeyCiphertext string
+}
+
+type openCodeGoRankedCandidate struct {
+	candidate openCodeGoPoolCandidate
+	score     uint64
 }
 
 type openCodeGoPoolSnapshot struct {
@@ -115,6 +131,7 @@ func RebuildOpenCodeGoPoolChannel(channelID int) error {
 			candidate := openCodeGoPoolCandidate{
 				workspaceID:      workspace.ID,
 				workspaceUID:     workspace.UID,
+				identityUID:      identity.UID,
 				apiKeyCiphertext: workspace.APIKeyCiphertext,
 			}
 			added := false
@@ -151,6 +168,14 @@ func SelectOpenCodeGoWorkspace(channelID int, upstreamModel string) (*OpenCodeGo
 }
 
 func SelectOpenCodeGoWorkspaceWithAffinity(channelID int, upstreamModel string, affinityKey string) (*OpenCodeGoPoolSelection, error) {
+	return selectOpenCodeGoWorkspace(channelID, upstreamModel, OpenCodeGoPoolSelectOptions{AffinityKey: affinityKey})
+}
+
+func SelectOpenCodeGoWorkspaceWithFailover(channelID int, upstreamModel string, options OpenCodeGoPoolSelectOptions) (*OpenCodeGoPoolSelection, error) {
+	return selectOpenCodeGoWorkspace(channelID, upstreamModel, options)
+}
+
+func selectOpenCodeGoWorkspace(channelID int, upstreamModel string, options OpenCodeGoPoolSelectOptions) (*OpenCodeGoPoolSelection, error) {
 	value, exists := openCodeGoPoolChannels.Load(channelID)
 	if !exists {
 		return nil, ErrOpenCodeGoNoEligibleWorkspace
@@ -165,12 +190,76 @@ func SelectOpenCodeGoWorkspaceWithAffinity(channelID int, upstreamModel string, 
 		return nil, ErrOpenCodeGoNoEligibleWorkspace
 	}
 	index := 0
-	if strings.TrimSpace(affinityKey) == "" {
+	canonicalWorkspaceUID := candidates[0].workspaceUID
+	var failoverAttempt *OpenCodeGoFailoverAttempt
+	failoverActive := false
+	failoverLeaseExpiresAt := time.Time{}
+	affinityKey := strings.TrimSpace(options.AffinityKey)
+	if affinityKey == "" {
+		if options.Stateful {
+			return nil, ErrOpenCodeGoStatefulResponsesAffinityRequired
+		}
 		cursorValue, _ := state.cursors.LoadOrStore(strings.TrimSpace(upstreamModel), &atomic.Uint64{})
 		cursor := cursorValue.(*atomic.Uint64)
 		index = int((cursor.Add(1) - 1) % uint64(len(candidates)))
-	} else {
+		canonicalWorkspaceUID = candidates[index].workspaceUID
+	} else if !options.Failover.Enabled || strings.TrimSpace(options.Protocol) == "" {
+		// Keep the established O(n) rendezvous scan on the default path. Ranking
+		// every candidate is needed only when failover must retain an ordered
+		// backup; doing it while the opt-in switch is off adds avoidable O(n log n)
+		// work to every healthy affinity request.
 		index = openCodeGoAffinityCandidateIndex(channelID, upstreamModel, affinityKey, candidates)
+		canonicalWorkspaceUID = candidates[index].workspaceUID
+	} else {
+		ranked := openCodeGoRankAffinityCandidates(channelID, upstreamModel, affinityKey, candidates)
+		canonicalWorkspaceUID = ranked[0].candidate.workspaceUID
+		selectedRank := 0
+		now := openCodeGoFailoverNow()
+		selectionResolved := false
+		for resetAttempts := 0; resetAttempts < 3; resetAttempts++ {
+			var leasedWorkspaceMissing bool
+			selectedRank, failoverAttempt, failoverActive, failoverLeaseExpiresAt, leasedWorkspaceMissing = resolveOpenCodeGoFailoverSelection(
+				channelID,
+				upstreamModel,
+				options.Protocol,
+				affinityKey,
+				options.Failover,
+				ranked,
+				now,
+			)
+			if !leasedWorkspaceMissing {
+				selectionResolved = true
+				break
+			}
+			if options.Stateful {
+				return nil, ErrOpenCodeGoStatefulResponsesWorkspaceUnavailable
+			}
+			observation, resetErr := resetOpenCodeGoMissingFailoverLease(failoverAttempt, now)
+			if resetErr != nil {
+				common.SysError(fmt.Sprintf("OpenCode Go missing failover lease reset failed open: channel_id=%d error=%v", channelID, resetErr))
+				break
+			}
+			if observation.Action == OpenCodeGoFailoverActionCleared {
+				failoverAttempt.expectedGeneration = observation.Generation
+				failoverAttempt.observeSuccess = false
+				failoverAttempt.preferredBackupWorkspace = preferredOpenCodeGoFailoverBackupExcluding(ranked, failoverAttempt.excludedWorkspaceUID, failoverAttempt.selectedWorkspaceUID)
+				selectionResolved = true
+				break
+			}
+		}
+		if !selectionResolved {
+			failoverAttempt = nil
+			failoverActive = false
+			failoverLeaseExpiresAt = time.Time{}
+		}
+		if options.Stateful && failoverAttempt != nil {
+			failoverAttempt.suppressFailure = true
+		}
+		index = selectedRank
+		candidates = make([]openCodeGoPoolCandidate, len(ranked))
+		for rankedIndex := range ranked {
+			candidates[rankedIndex] = ranked[rankedIndex].candidate
+		}
 	}
 	candidate := candidates[index]
 	if snapshot.codec == nil {
@@ -186,9 +275,14 @@ func SelectOpenCodeGoWorkspaceWithAffinity(channelID int, upstreamModel string, 
 		return nil, ErrOpenCodeGoSelectedCredentialUnavailable
 	}
 	return &OpenCodeGoPoolSelection{
-		WorkspaceID:  candidate.workspaceID,
-		WorkspaceUID: candidate.workspaceUID,
-		APIKey:       apiKey,
+		WorkspaceID:            candidate.workspaceID,
+		WorkspaceUID:           candidate.workspaceUID,
+		APIKey:                 apiKey,
+		CanonicalWorkspaceUID:  canonicalWorkspaceUID,
+		CandidateRank:          index,
+		FailoverActive:         failoverActive,
+		FailoverLeaseExpiresAt: failoverLeaseExpiresAt,
+		FailoverAttempt:        failoverAttempt,
 	}, nil
 }
 
@@ -207,12 +301,62 @@ func openCodeGoAffinityCandidateIndex(channelID int, upstreamModel string, affin
 			candidate.workspaceUID,
 		)
 		score := binary.BigEndian.Uint64(hash.Sum(nil)[:8])
-		if index == 0 || score > selectedScore || (score == selectedScore && candidate.workspaceUID < candidates[selectedIndex].workspaceUID) {
+		if index == 0 || score > selectedScore ||
+			(score == selectedScore && candidate.workspaceUID < candidates[selectedIndex].workspaceUID) {
 			selectedIndex = index
 			selectedScore = score
 		}
 	}
 	return selectedIndex
+}
+
+func openCodeGoRankAffinityCandidates(channelID int, upstreamModel string, affinityKey string, candidates []openCodeGoPoolCandidate) []openCodeGoRankedCandidate {
+	ranked := make([]openCodeGoRankedCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		hash := hmac.New(sha256.New, []byte(common.CryptoSecret))
+		_, _ = fmt.Fprintf(
+			hash,
+			"%s\x00%d\x00%s\x00%s\x00%s",
+			openCodeGoAffinityDomain,
+			channelID,
+			strings.TrimSpace(upstreamModel),
+			affinityKey,
+			candidate.workspaceUID,
+		)
+		score := binary.BigEndian.Uint64(hash.Sum(nil)[:8])
+		ranked = append(ranked, openCodeGoRankedCandidate{candidate: candidate, score: score})
+	}
+	sort.Slice(ranked, func(left int, right int) bool {
+		if ranked[left].score != ranked[right].score {
+			return ranked[left].score > ranked[right].score
+		}
+		return ranked[left].candidate.workspaceUID < ranked[right].candidate.workspaceUID
+	})
+	return ranked
+}
+
+func preferredOpenCodeGoFailoverBackupExcluding(ranked []openCodeGoRankedCandidate, excludedWorkspaceUID string, primaryWorkspaceUID string) string {
+	primaryIdentity := ""
+	filtered := make([]openCodeGoRankedCandidate, 0, len(ranked))
+	for _, candidate := range ranked {
+		if candidate.candidate.workspaceUID == primaryWorkspaceUID {
+			primaryIdentity = candidate.candidate.identityUID
+			continue
+		}
+		if candidate.candidate.workspaceUID == excludedWorkspaceUID {
+			continue
+		}
+		filtered = append(filtered, candidate)
+	}
+	if len(filtered) == 0 {
+		return ""
+	}
+	for _, candidate := range filtered {
+		if candidate.candidate.identityUID != primaryIdentity {
+			return candidate.candidate.workspaceUID
+		}
+	}
+	return filtered[0].candidate.workspaceUID
 }
 
 func RemoveOpenCodeGoPoolChannel(channelID int) {

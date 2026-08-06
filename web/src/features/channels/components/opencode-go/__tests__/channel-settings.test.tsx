@@ -128,12 +128,23 @@ describe('OpenCode Go channel settings', () => {
     assert.equal(protocolTextarea.disabled, false)
     assert.equal(protocolSelect.disabled, false)
 
-    const lifecycleSwitches = [
+    const switches = [
       ...host.querySelectorAll<HTMLButtonElement>('[role="switch"]'),
     ]
+    const genericFailoverSwitch = switches.find(
+      (control) =>
+        control.getAttribute('aria-label') === 'Generic upstream failover'
+    )
+    const lifecycleSwitches = switches.filter(
+      (control) => control !== genericFailoverSwitch
+    )
     const rewardLimit = host.querySelector<HTMLInputElement>(
       'input[type="number"]'
     )
+    assert.ok(genericFailoverSwitch)
+    assert.equal(genericFailoverSwitch.hasAttribute('disabled'), false)
+    assert.notEqual(genericFailoverSwitch.getAttribute('aria-disabled'), 'true')
+    assert.equal(genericFailoverSwitch.hasAttribute('data-disabled'), false)
     assert.equal(lifecycleSwitches.length, 3)
     assert.equal(
       lifecycleSwitches.every(

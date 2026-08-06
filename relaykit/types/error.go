@@ -18,6 +18,23 @@ type OpenAIError struct {
 	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
+// HasDetails reports whether an upstream error object contains any usable
+// error information. Responses providers are allowed to omit type while
+// returning only a machine-readable code (for example invalid_prompt or
+// server_error), so checking Type alone loses the provider classification.
+func (e *OpenAIError) HasDetails() bool {
+	if e == nil {
+		return false
+	}
+	if strings.TrimSpace(e.Type) != "" || strings.TrimSpace(e.Message) != "" || strings.TrimSpace(e.Param) != "" {
+		return true
+	}
+	if e.Code == nil {
+		return false
+	}
+	return strings.TrimSpace(fmt.Sprint(e.Code)) != ""
+}
+
 type ClaudeError struct {
 	Type    string `json:"type,omitempty"`
 	Message string `json:"message,omitempty"`

@@ -82,6 +82,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 	// 无条件新建 StreamStatus
 	info.StreamStatus = relaycommon.NewStreamStatus()
+	if info.StreamProtocolTerminalRequired {
+		info.StreamStatus.RequireProtocolTerminal()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -153,6 +156,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			defer func() {
 				if r := recover(); r != nil {
 					logger.LogError(c, fmt.Sprintf("ping goroutine panic: %v", r))
+					info.StreamStatus.MarkLocalFailure()
 					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("ping panic: %v", r))
 					stop()
 				}
@@ -177,6 +181,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					}()
 					if err != nil {
 						logger.LogError(c, "ping data error: "+err.Error())
+						info.StreamStatus.MarkLocalFailure()
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPingFail, err)
 						return
 					}
@@ -203,6 +208,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		defer func() {
 			if r := recover(); r != nil {
 				logger.LogError(c, fmt.Sprintf("data handler goroutine panic: %v", r))
+				info.StreamStatus.MarkLocalFailure()
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("handler panic: %v", r))
 			}
 			stop()
@@ -230,6 +236,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			close(dataChan)
 			if r := recover(); r != nil {
 				logger.LogError(c, fmt.Sprintf("scanner goroutine panic: %v", r))
+				info.StreamStatus.MarkLocalFailure()
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("scanner panic: %v", r))
 			}
 			stop()
@@ -248,21 +255,24 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			}
 
 			ticker.Reset(streamingTimeout)
-			data := scanner.Text()
-			logger.LogDebug(c, "stream scanner data: %s", data)
+			rawData := strings.TrimSpace(scanner.Text())
+			logger.LogDebug(c, "stream scanner data: %s", rawData)
 
-			if len(data) < 6 {
+			var data string
+			switch {
+			case strings.HasPrefix(rawData, "data:"):
+				data = strings.TrimSpace(rawData[len("data:"):])
+			case rawData == "[DONE]":
+				// Some gateways emit the sentinel without the SSE `data:`
+				// prefix. Do not slice it as if the prefix were present.
+				data = rawData
+			default:
 				continue
 			}
-			if data[:5] != "data:" && data[:6] != "[DONE]" {
-				continue
-			}
-			data = data[5:]
-			data = strings.TrimSpace(data)
 			if data == "" {
 				continue
 			}
-			if !strings.HasPrefix(data, "[DONE]") {
+			if data != "[DONE]" {
 				info.SetFirstResponseTime()
 				info.ReceivedResponseCount++
 
@@ -274,6 +284,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					return
 				}
 			} else {
+				info.StreamStatus.MarkDoneSentinel()
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				logger.LogDebug(c, "received [DONE], stopping scanner")
 				return

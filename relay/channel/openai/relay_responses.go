@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -16,6 +17,28 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// responsesErrorHasDetails distinguishes an absent Responses error object from
+// the standard code-only shape. Some Responses providers omit error.type while
+// still returning a useful error.code (for example invalid_prompt or
+// server_error), so type alone cannot decide whether classification is safe.
+func responsesErrorHasDetails(oaiErr *types.OpenAIError) bool {
+	return oaiErr != nil && oaiErr.HasDetails()
+}
+
+func markTransientResponsesError(info *relaycommon.RelayInfo, oaiErr *types.OpenAIError, statusCode int) {
+	if info == nil || info.StreamStatus == nil || !responsesErrorHasDetails(oaiErr) {
+		return
+	}
+	if relaycommon.IsTransientProviderStreamError(
+		oaiErr.Type,
+		fmt.Sprintf("%v", oaiErr.Code),
+		oaiErr.Message,
+		statusCode,
+	) {
+		info.StreamStatus.MarkUpstreamFailure()
+	}
+}
 
 func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
@@ -30,7 +53,7 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+	if oaiError := responsesResponse.GetOpenAIError(); responsesErrorHasDetails(oaiError) {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
@@ -84,19 +107,35 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	var responseTextBuilder strings.Builder
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
+	var streamErr *types.NewAPIError
+	strictOpenCodeGo := info != nil && info.ChannelType == constant.ChannelTypeOpenCodeGo
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
-
+		if streamErr != nil {
+			sr.Stop(streamErr)
+			return
+		}
 		// 检查当前数据是否包含 completed 状态和 usage 信息
 		var streamResponse dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
 			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
-			sr.Error(err)
+			if info.StreamStatus != nil {
+				info.StreamStatus.MarkUpstreamFailure()
+			}
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+			sr.Stop(streamErr)
 			return
 		}
-		sendResponsesStreamData(c, streamResponse, data)
+		if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			sr.Stop(streamErr)
+			return
+		}
 		switch streamResponse.Type {
 		case "response.completed", "response.done":
+			if info.StreamStatus != nil {
+				info.StreamStatus.MarkProtocolTerminal()
+			}
 			if streamResponse.Response != nil {
 				if streamResponse.Response.Usage != nil {
 					if streamResponse.Response.Usage.InputTokens != 0 {
@@ -131,7 +170,51 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				imageCounter.Commit(info)
 				imageCommitted = true
 			}
-		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+		case "response.error":
+			if streamResponse.Response != nil {
+				if oaiErr := streamResponse.Response.GetOpenAIError(); responsesErrorHasDetails(oaiErr) {
+					markTransientResponsesError(info, oaiErr, resp.StatusCode)
+					streamErr = types.WithOpenAIError(*oaiErr, resp.StatusCode)
+				} else {
+					streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResponse.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+				}
+			} else {
+				streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResponse.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			}
+			if strictOpenCodeGo {
+				sr.Stop(streamErr)
+				return
+			}
+		case "response.failed":
+			if strictOpenCodeGo {
+				if streamResponse.Response != nil {
+					if oaiErr := streamResponse.Response.GetOpenAIError(); responsesErrorHasDetails(oaiErr) {
+						markTransientResponsesError(info, oaiErr, resp.StatusCode)
+						streamErr = types.WithOpenAIError(*oaiErr, resp.StatusCode)
+					} else {
+						if info.StreamStatus != nil {
+							info.StreamStatus.MarkUpstreamFailure()
+						}
+						streamErr = types.NewOpenAIError(fmt.Errorf("responses stream ended with %s", streamResponse.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+					}
+				} else {
+					if info.StreamStatus != nil {
+						info.StreamStatus.MarkUpstreamFailure()
+					}
+					streamErr = types.NewOpenAIError(fmt.Errorf("responses stream ended with %s", streamResponse.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+				}
+				sr.Stop(streamErr)
+				return
+			}
+		case "response.incomplete", "response.cancelled", "response.canceled":
+			// `incomplete` commonly means a deterministic stop such as
+			// max_output_tokens/content_filter; `cancelled` can be client-driven.
+			// Surface both without rotating the workspace.
+			if strictOpenCodeGo {
+				streamErr = types.NewOpenAIError(fmt.Errorf("responses stream ended with %s", streamResponse.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+				sr.Stop(streamErr)
+				return
+			}
 			if !imageCommitted {
 				imageCounter.Reset()
 				imageCounter.Commit(info)
@@ -157,6 +240,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 		}
 	})
+	if streamErr != nil {
+		return nil, streamErr
+	}
 
 	if usage.CompletionTokens == 0 {
 		// 计算输出文本的 token 数量

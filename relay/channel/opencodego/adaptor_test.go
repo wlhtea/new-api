@@ -133,7 +133,7 @@ func TestAdaptorRequestConversionMatrix(t *testing.T) {
 
 func TestAdaptorUsesFixedURLsAndProtocolAuthentication(t *testing.T) {
 	originalSelector := selectOpenCodeGoWorkspace
-	selectOpenCodeGoWorkspace = func(_ int, _ string, _ string) (*service.OpenCodeGoPoolSelection, error) {
+	selectOpenCodeGoWorkspace = func(_ int, _ string, _ service.OpenCodeGoPoolSelectOptions) (*service.OpenCodeGoPoolSelection, error) {
 		return &service.OpenCodeGoPoolSelection{
 			WorkspaceID:  1,
 			WorkspaceUID: "workspace-test",
@@ -175,6 +175,246 @@ func TestAdaptorUsesFixedURLsAndProtocolAuthentication(t *testing.T) {
 			assert.Equal(t, adaptor.cacheIdentity, header.Get(cacheIdentityHeader))
 		})
 	}
+}
+
+func TestAdaptorPassesFailoverPolicyAndPinsStatefulResponses(t *testing.T) {
+	originalSelector := selectOpenCodeGoWorkspace
+	var captured service.OpenCodeGoPoolSelectOptions
+	selectOpenCodeGoWorkspace = func(_ int, _ string, options service.OpenCodeGoPoolSelectOptions) (*service.OpenCodeGoPoolSelection, error) {
+		captured = options
+		return &service.OpenCodeGoPoolSelection{
+			WorkspaceID:  1,
+			WorkspaceUID: "workspace-test",
+			APIKey:       "test-account-key",
+		}, nil
+	}
+	t.Cleanup(func() { selectOpenCodeGoWorkspace = originalSelector })
+
+	info := newAdaptorTestInfo("gpt-5.6-luna", false)
+	info.RelayFormat = types.RelayFormatOpenAIResponses
+	info.ChannelOtherSettings.OpenCodeGo = &dto.OpenCodeGoConfig{
+		GenericFailoverEnabled:       true,
+		GenericFailoverThreshold:     3,
+		GenericFailoverWindowSeconds: 45,
+		GenericFailoverMaxBackups:    1,
+		GenericFailoverLeaseSeconds:  600,
+	}
+	request := requestForFormat(types.RelayFormatOpenAIResponses).(*dto.OpenAIResponsesRequest)
+	request.PreviousResponseID = "resp_server_state"
+	request.PromptCacheKey = json.RawMessage(`"stable-affinity"`)
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+	_, err := adaptor.ConvertOpenAIResponsesRequest(newAdaptorTestContext(), info, *request)
+	require.NoError(t, err)
+	require.NoError(t, adaptor.SetupRequestHeader(newAdaptorTestContext(), &http.Header{}, info))
+
+	assert.Equal(t, "stable-affinity", captured.AffinityKey)
+	assert.Equal(t, string(ProtocolResponses), captured.Protocol)
+	assert.True(t, captured.Stateful)
+	assert.True(t, captured.Failover.Enabled)
+	assert.Equal(t, 3, captured.Failover.FailureThreshold)
+	assert.Equal(t, 45*time.Second, captured.Failover.FailureWindow)
+	assert.Equal(t, 10*time.Minute, captured.Failover.LeaseDuration)
+}
+
+func TestAdaptorCacheIdentityRemainsStableAcrossPromotedWorkspace(t *testing.T) {
+	originalSelector := selectOpenCodeGoWorkspace
+	selectionCalls := 0
+	selectOpenCodeGoWorkspace = func(_ int, _ string, _ service.OpenCodeGoPoolSelectOptions) (*service.OpenCodeGoPoolSelection, error) {
+		selectionCalls++
+		selection := &service.OpenCodeGoPoolSelection{
+			WorkspaceID:           int64(selectionCalls),
+			WorkspaceUID:          "workspace-primary",
+			CanonicalWorkspaceUID: "workspace-primary",
+			APIKey:                "test-account-key",
+		}
+		if selectionCalls == 2 {
+			selection.WorkspaceUID = "workspace-backup"
+			selection.CandidateRank = 1
+			selection.FailoverActive = true
+			selection.FailoverLeaseExpiresAt = time.Now().Add(30 * time.Minute)
+		}
+		return selection, nil
+	}
+	t.Cleanup(func() { selectOpenCodeGoWorkspace = originalSelector })
+
+	requestOnce := func() (string, string) {
+		info := newAdaptorTestInfo("gpt-5.6-luna", false)
+		info.ChannelId = 42
+		info.RelayFormat = types.RelayFormatOpenAIResponses
+		info.ChannelOtherSettings.OpenCodeGo = &dto.OpenCodeGoConfig{GenericFailoverEnabled: true}
+		request := requestForFormat(types.RelayFormatOpenAIResponses).(*dto.OpenAIResponsesRequest)
+		c := newAdaptorTestContext()
+		c.Request.Header.Set(claudeCodeSessionHeader, "stable-promotion-session")
+		adaptor := &Adaptor{}
+		adaptor.Init(info)
+		_, err := adaptor.ConvertOpenAIResponsesRequest(c, info, *request)
+		require.NoError(t, err)
+		header := http.Header{}
+		require.NoError(t, adaptor.SetupRequestHeader(c, &header, info))
+		return header.Get(cacheIdentityHeader), adaptor.selectedWorkspaceUID
+	}
+
+	primaryCacheIdentity, primaryWorkspace := requestOnce()
+	backupCacheIdentity, backupWorkspace := requestOnce()
+	assert.Equal(t, "workspace-primary", primaryWorkspace)
+	assert.Equal(t, "workspace-backup", backupWorkspace)
+	assert.NotEmpty(t, primaryCacheIdentity)
+	assert.Equal(t, primaryCacheIdentity, backupCacheIdentity)
+	assert.Equal(t, 2, selectionCalls)
+}
+
+func TestRequestUsesStatefulResponsesFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		request dto.OpenAIResponsesRequest
+		want    bool
+	}{
+		{name: "stateless", request: dto.OpenAIResponsesRequest{}, want: false},
+		{name: "previous response", request: dto.OpenAIResponsesRequest{PreviousResponseID: "resp_1"}, want: true},
+		{name: "conversation string", request: dto.OpenAIResponsesRequest{Conversation: json.RawMessage(`"conv_1"`)}, want: true},
+		{name: "conversation object", request: dto.OpenAIResponsesRequest{Conversation: json.RawMessage(`{}`)}, want: true},
+		{name: "context management", request: dto.OpenAIResponsesRequest{ContextManagement: json.RawMessage(`[]`)}, want: true},
+		{name: "explicit null", request: dto.OpenAIResponsesRequest{Conversation: json.RawMessage(`null`)}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, requestUsesStatefulResponses(&test.request))
+		})
+	}
+}
+
+func TestAdaptorStreamCompletenessRequiresProtocolTerminalAndExcludesCancellation(t *testing.T) {
+	adaptor := &Adaptor{
+		requestUpstreamStream: true,
+		failoverAttempt:       &service.OpenCodeGoFailoverAttempt{},
+	}
+	info := newAdaptorTestInfo("gpt-5.6-luna", true)
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	c := newAdaptorTestContext()
+	assert.True(t, adaptor.openCodeGoStreamIncomplete(c, info))
+
+	info.StreamStatus.MarkProtocolTerminal()
+	assert.False(t, adaptor.openCodeGoStreamIncomplete(c, info))
+
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	requestContext, cancel := context.WithCancel(c.Request.Context())
+	c.Request = c.Request.WithContext(requestContext)
+	cancel()
+	assert.False(t, adaptor.openCodeGoStreamIncomplete(c, info))
+}
+
+func TestAdaptorCancellationSkipsFailoverFailureAndSuccessObservations(t *testing.T) {
+	originalFailureObserver := observeOpenCodeGoFailoverFailure
+	originalSuccessObserver := observeOpenCodeGoFailoverSuccess
+	t.Cleanup(func() {
+		observeOpenCodeGoFailoverFailure = originalFailureObserver
+		observeOpenCodeGoFailoverSuccess = originalSuccessObserver
+	})
+
+	failureCalls := 0
+	successCalls := 0
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failureCalls++
+		return service.OpenCodeGoFailoverObservation{}, nil
+	}
+	observeOpenCodeGoFailoverSuccess = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		successCalls++
+		return service.OpenCodeGoFailoverObservation{}, nil
+	}
+
+	c := newAdaptorTestContext()
+	requestContext, cancel := context.WithCancel(c.Request.Context())
+	c.Request = c.Request.WithContext(requestContext)
+	cancel()
+	adaptor := &Adaptor{failoverAttempt: &service.OpenCodeGoFailoverAttempt{}}
+	info := newAdaptorTestInfo("gpt-5.6-luna", true)
+
+	adaptor.recordFailoverFailure(c, info, "upstream_stream_incomplete")
+	adaptor.recordFailoverSuccess(c, info)
+
+	assert.Zero(t, failureCalls)
+	assert.Zero(t, successCalls)
+}
+
+func TestAdaptorLocalStreamEndReasonsDoNotBecomeFailoverEvidence(t *testing.T) {
+	for _, reason := range []relaycommon.StreamEndReason{
+		relaycommon.StreamEndReasonHandlerStop,
+		relaycommon.StreamEndReasonPanic,
+		relaycommon.StreamEndReasonPingFail,
+	} {
+		t.Run(string(reason), func(t *testing.T) {
+			adaptor := &Adaptor{
+				protocol:              ProtocolResponses,
+				requestUpstreamStream: true,
+				failoverAttempt:       &service.OpenCodeGoFailoverAttempt{},
+			}
+			info := newAdaptorTestInfo("gpt-5.6-luna", true)
+			info.StreamStatus = relaycommon.NewStreamStatus()
+			info.StreamStatus.SetEndReason(reason, errors.New("local stream failure"))
+
+			assert.Empty(t, adaptor.openCodeGoStreamFailureReason(newAdaptorTestContext(), info, nil))
+			assert.True(t, adaptor.openCodeGoStreamHasLocalErrors(info))
+		})
+	}
+}
+
+func TestAdaptorPostTerminalLocalFailureDoesNotRecordSuccess(t *testing.T) {
+	adaptor := &Adaptor{
+		protocol:              ProtocolChat,
+		requestUpstreamStream: true,
+		failoverAttempt:       &service.OpenCodeGoFailoverAttempt{},
+	}
+	info := newAdaptorTestInfo("glm-5.2", true)
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.MarkDoneSentinel()
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+	info.StreamStatus.MarkLocalFailure()
+
+	assert.True(t, adaptor.openCodeGoStreamHasLocalErrors(info))
+	assert.Empty(t, adaptor.openCodeGoStreamFailureReason(newAdaptorTestContext(), info, nil))
+}
+
+func TestAdaptorEmptyUpstreamStreamErrorBecomesFailoverEvidence(t *testing.T) {
+	adaptor := &Adaptor{
+		protocol:              ProtocolChat,
+		requestUpstreamStream: true,
+		failoverAttempt:       &service.OpenCodeGoFailoverAttempt{},
+	}
+	responseErr := types.NewOpenAIError(errors.New("empty upstream stream"), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+
+	for _, reason := range []relaycommon.StreamEndReason{
+		relaycommon.StreamEndReasonEOF,
+		relaycommon.StreamEndReasonTimeout,
+		relaycommon.StreamEndReasonScannerErr,
+	} {
+		t.Run(string(reason), func(t *testing.T) {
+			info := newAdaptorTestInfo("glm-5.2", true)
+			info.StreamStatus = relaycommon.NewStreamStatus()
+			info.StreamStatus.SetEndReason(reason, nil)
+
+			assert.Equal(t, "upstream_stream_incomplete", adaptor.openCodeGoStreamFailureReason(newAdaptorTestContext(), info, responseErr))
+		})
+	}
+}
+
+func TestAdaptorResponseErrorWithPayloadOrLocalFailureDoesNotInferIncompleteStream(t *testing.T) {
+	adaptor := &Adaptor{
+		protocol:              ProtocolChat,
+		requestUpstreamStream: true,
+		failoverAttempt:       &service.OpenCodeGoFailoverAttempt{},
+	}
+	responseErr := types.NewOpenAIError(errors.New("relay response error"), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+
+	info := newAdaptorTestInfo("glm-5.2", true)
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
+	info.ReceivedResponseCount = 1
+	assert.Empty(t, adaptor.openCodeGoStreamFailureReason(newAdaptorTestContext(), info, responseErr))
+
+	info.ReceivedResponseCount = 0
+	info.StreamStatus.MarkLocalFailure()
+	assert.Empty(t, adaptor.openCodeGoStreamFailureReason(newAdaptorTestContext(), info, responseErr))
 }
 
 func TestAdaptorKeepsClaudeChatFamilyFunctionToolsOnChat(t *testing.T) {
@@ -625,4 +865,19 @@ func TestAdaptorPersistsTransportFailureAndSkipsCallerCancellation(t *testing.T)
 	_, err = adaptor.DoRequest(c, info, nil)
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Equal(t, 1, observations)
+}
+
+func TestAdaptorDoRequestMakesExactlyOneUpstreamAttempt(t *testing.T) {
+	originalDoRequest := doOpenCodeGoAPIRequest
+	calls := 0
+	doOpenCodeGoAPIRequest = func(_ relaychannel.Adaptor, _ *gin.Context, _ *relaycommon.RelayInfo, _ io.Reader) (*http.Response, error) {
+		calls++
+		return nil, errors.New("temporary upstream failure")
+	}
+	t.Cleanup(func() { doOpenCodeGoAPIRequest = originalDoRequest })
+
+	adaptor := &Adaptor{converted: true}
+	_, err := adaptor.DoRequest(newAdaptorTestContext(), newAdaptorTestInfo("gpt-5.6-luna", false), nil)
+	require.Error(t, err)
+	assert.Equal(t, 1, calls)
 }

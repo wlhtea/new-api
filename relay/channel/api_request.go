@@ -304,13 +304,31 @@ func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]s
 	}
 }
 
+func newUpstreamRequest(c *gin.Context, method string, requestURL string, body io.Reader) (*http.Request, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("downstream request context is unavailable")
+	}
+	return http.NewRequestWithContext(c.Request.Context(), method, requestURL, body)
+}
+
+func downstreamRequestMethod(c *gin.Context) (string, error) {
+	if c == nil || c.Request == nil {
+		return "", errors.New("downstream request context is unavailable")
+	}
+	return c.Request.Method, nil
+}
+
 func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL))
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	method, err := downstreamRequestMethod(c)
+	if err != nil {
+		return nil, fmt.Errorf("get downstream request method failed: %w", err)
+	}
+	req, err := newUpstreamRequest(c, method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
@@ -340,7 +358,11 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL))
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	method, err := downstreamRequestMethod(c)
+	if err != nil {
+		return nil, fmt.Errorf("get downstream request method failed: %w", err)
+	}
+	req, err := newUpstreamRequest(c, method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
@@ -544,7 +566,11 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	method, err := downstreamRequestMethod(c)
+	if err != nil {
+		return nil, fmt.Errorf("get downstream request method failed: %w", err)
+	}
+	req, err := newUpstreamRequest(c, method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}

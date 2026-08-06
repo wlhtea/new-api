@@ -11,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
@@ -33,16 +34,22 @@ type Adaptor struct {
 	converted             bool
 	workspaceSelected     bool
 	selectedWorkspaceUID  string
+	statefulResponses     bool
+	failoverAttempt       *service.OpenCodeGoFailoverAttempt
 	namespaceTools        map[string]openCodeGoNamespaceTool
 	openai                openai.Adaptor
 	claude                claude.Adaptor
 }
 
-var selectOpenCodeGoWorkspace = service.SelectOpenCodeGoWorkspaceWithAffinity
+var selectOpenCodeGoWorkspace = service.SelectOpenCodeGoWorkspaceWithFailover
 
 var doOpenCodeGoAPIRequest = channel.DoApiRequest
 
 var observeOpenCodeGoTransportFailure = service.ObserveOpenCodeGoTransportFailure
+
+var observeOpenCodeGoFailoverFailure = service.ObserveOpenCodeGoFailoverFailure
+
+var observeOpenCodeGoFailoverSuccess = service.ObserveOpenCodeGoFailoverSuccess
 
 var openCodeGoHealthNow = time.Now
 
@@ -58,6 +65,8 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	a.converted = false
 	a.workspaceSelected = false
 	a.selectedWorkspaceUID = ""
+	a.statefulResponses = false
+	a.failoverAttempt = nil
 	a.namespaceTools = nil
 	if info == nil {
 		return
@@ -102,14 +111,36 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 		return err
 	}
 	if !a.workspaceSelected {
-		selection, selectErr := selectOpenCodeGoWorkspace(info.ChannelId, info.UpstreamModelName, a.affinityIdentity)
+		selection, selectErr := selectOpenCodeGoWorkspace(info.ChannelId, info.UpstreamModelName, service.OpenCodeGoPoolSelectOptions{
+			AffinityKey: a.affinityIdentity,
+			Protocol:    string(protocol),
+			Stateful:    a.statefulResponses,
+			Failover:    service.ResolveOpenCodeGoFailoverPolicy(info.ChannelOtherSettings.OpenCodeGo),
+		})
 		if selectErr != nil {
 			return selectErr
 		}
 		info.ApiKey = selection.APIKey
 		a.selectedWorkspaceUID = selection.WorkspaceUID
+		a.failoverAttempt = selection.FailoverAttempt
 		a.workspaceSelected = true
 		common.SetContextKey(c, constant.ContextKeyOpenCodeGoWorkspaceUID, selection.WorkspaceUID)
+		if selection.FailoverActive {
+			leaseRemaining := time.Until(selection.FailoverLeaseExpiresAt).Round(time.Second)
+			if leaseRemaining < 0 {
+				leaseRemaining = 0
+			}
+			logger.LogInfo(c, fmt.Sprintf(
+				"OpenCode Go failover selection: channel_id=%d model=%q protocol=%q rank=%d canonical_ref=%s workspace_ref=%s lease_remaining=%s",
+				info.ChannelId,
+				info.UpstreamModelName,
+				protocol,
+				selection.CandidateRank,
+				hashCacheIdentity("diagnostic-workspace", selection.CanonicalWorkspaceUID),
+				hashCacheIdentity("diagnostic-workspace", selection.WorkspaceUID),
+				leaseRemaining,
+			))
+		}
 	}
 	if strings.TrimSpace(info.ApiKey) == "" {
 		return errors.New("OpenCode Go request has no selected account API key")
@@ -164,6 +195,7 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 		request = &copy
 	}
 	usesFunctionTools := requestUsesFunctionTools(request)
+	a.statefulResponses = requestUsesStatefulResponses(request)
 	// Claude tool turns must stay on Chat for Chat-family models. Console Go's
 	// Responses bridge drops oa-compatible reasoning_content from the first
 	// tool response, so Claude Code cannot replay the provider reasoning on the
@@ -280,9 +312,9 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 			openCodeGoHealthNow(),
 		); observeErr != nil {
 			common.SysError(fmt.Sprintf(
-				"failed to persist OpenCode Go transport health observation: channel_id=%d workspace_uid=%s error=%v",
+				"failed to persist OpenCode Go transport health observation: channel_id=%d workspace_ref=%s error=%v",
 				info.ChannelId,
-				a.selectedWorkspaceUID,
+				hashCacheIdentity("diagnostic-workspace", a.selectedWorkspaceUID),
 				observeErr,
 			))
 		}
@@ -305,6 +337,10 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	if info == nil {
 		return nil, types.NewOpenAIError(errors.New("OpenCode Go relay info is nil"), types.ErrorCodeBadResponse, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
 	}
+	// Responses and Messages have explicit protocol terminal events. Preserve
+	// that requirement through the stream helper so an early EOF cannot be
+	// recorded as a successful request. Chat uses the SSE [DONE] sentinel.
+	info.StreamProtocolTerminalRequired = info.IsStream && protocol != ProtocolChat
 
 	clientModel := info.OriginModelName
 	if clientModel == "" {
@@ -364,10 +400,173 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	default:
 		responseErr = types.NewOpenAIError(fmt.Errorf("unsupported OpenCode Go protocol %q", protocol), types.ErrorCodeBadResponse, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
 	}
+	streamFailureReason := a.openCodeGoStreamFailureReason(c, info, responseErr)
+	if streamFailureReason != "" {
+		a.recordFailoverFailure(c, info, streamFailureReason)
+	}
 	if responseErr != nil {
 		return nil, responseErr
 	}
+	if streamFailureReason == "" && !a.openCodeGoStreamHasLocalErrors(info) {
+		a.recordFailoverSuccess(c, info)
+	}
 	return finalizeResponseUsage(usage, state), nil
+}
+
+func requestUsesStatefulResponses(request any) bool {
+	var responses *dto.OpenAIResponsesRequest
+	switch typed := request.(type) {
+	case *dto.OpenAIResponsesRequest:
+		responses = typed
+	case dto.OpenAIResponsesRequest:
+		copy := typed
+		responses = &copy
+	}
+	if responses == nil {
+		return false
+	}
+	return strings.TrimSpace(responses.PreviousResponseID) != "" ||
+		rawJSONFieldPresent(responses.Conversation) ||
+		rawJSONFieldPresent(responses.ContextManagement)
+}
+
+func rawJSONFieldPresent(raw []byte) bool {
+	value := strings.TrimSpace(string(raw))
+	return value != "" && value != "null"
+}
+
+func (a *Adaptor) openCodeGoStreamIncomplete(c *gin.Context, info *relaycommon.RelayInfo) bool {
+	if a == nil || a.failoverAttempt == nil || !a.requestUpstreamStream || info == nil {
+		return false
+	}
+	if openCodeGoCallerCancelled(c, nil) ||
+		(info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone) {
+		return false
+	}
+	if info.StreamStatus == nil {
+		return true
+	}
+	if a.protocol == ProtocolChat {
+		return !info.StreamStatus.DoneSentinelObserved()
+	}
+	return !info.StreamStatus.ProtocolTerminalObserved()
+}
+
+func (a *Adaptor) openCodeGoStreamFailureReason(c *gin.Context, info *relaycommon.RelayInfo, responseErr *types.NewAPIError) string {
+	if a == nil || a.failoverAttempt == nil || !a.requestUpstreamStream || info == nil ||
+		openCodeGoCallerCancelled(c, responseErr) ||
+		(info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone) {
+		return ""
+	}
+	if info.StreamStatus != nil && info.StreamStatus.UpstreamFailureObserved() {
+		return "upstream_stream_error"
+	}
+	if a.openCodeGoStreamHasLocalErrors(info) {
+		return ""
+	}
+	// A handler error without explicit upstream evidence is a local conversion or
+	// client-write failure. The exception is an upstream stream that ended before
+	// sending even one payload: some protocol handlers return a parse/finalize
+	// error for that empty body, but EOF/timeout/scanner failure is still the
+	// provider-side incomplete-stream evidence that failover is designed for.
+	if responseErr != nil {
+		if info.ReceivedResponseCount == 0 && openCodeGoStreamEndedUpstream(info.StreamStatus) {
+			return "upstream_stream_incomplete"
+		}
+		return ""
+	}
+	if a.openCodeGoStreamIncomplete(c, info) {
+		return "upstream_stream_incomplete"
+	}
+	return ""
+}
+
+func openCodeGoStreamEndedUpstream(status *relaycommon.StreamStatus) bool {
+	if status == nil {
+		return false
+	}
+	switch status.EndReason {
+	case relaycommon.StreamEndReasonEOF,
+		relaycommon.StreamEndReasonTimeout,
+		relaycommon.StreamEndReasonScannerErr:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *Adaptor) openCodeGoStreamHasLocalErrors(info *relaycommon.RelayInfo) bool {
+	if a == nil || info == nil || info.StreamStatus == nil {
+		return false
+	}
+	if info.StreamStatus.UpstreamFailureObserved() {
+		return false
+	}
+	// EndReason uses first-wins semantics. A terminal sentinel can therefore
+	// be recorded before a later ping/handler/write failure; consult the
+	// independent local-failure bit before treating the attempt as successful.
+	if info.StreamStatus.LocalFailureObserved() {
+		return true
+	}
+	switch info.StreamStatus.EndReason {
+	case relaycommon.StreamEndReasonHandlerStop,
+		relaycommon.StreamEndReasonPanic,
+		relaycommon.StreamEndReasonPingFail:
+		return true
+	default:
+		return info.StreamStatus.HasErrors()
+	}
+}
+
+func (a *Adaptor) recordFailoverFailure(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
+	if a == nil || a.failoverAttempt == nil || info == nil || openCodeGoCallerCancelled(c, nil) {
+		return
+	}
+	observation, err := observeOpenCodeGoFailoverFailure(a.failoverAttempt, openCodeGoHealthNow())
+	if err != nil {
+		logger.LogWarn(c, fmt.Sprintf(
+			"OpenCode Go failover state update failed open: channel_id=%d model=%q protocol=%q error=%v",
+			info.ChannelId,
+			info.UpstreamModelName,
+			a.protocol,
+			err,
+		))
+		return
+	}
+	if observation.Action == service.OpenCodeGoFailoverActionNone ||
+		observation.Action == service.OpenCodeGoFailoverActionStale {
+		return
+	}
+	toRef := ""
+	if observation.Action == service.OpenCodeGoFailoverActionPromoted {
+		toRef = hashCacheIdentity("diagnostic-workspace", a.failoverAttempt.PreferredBackupWorkspaceUID())
+	}
+	logger.LogWarn(c, fmt.Sprintf(
+		"OpenCode Go failover observation: channel_id=%d model=%q protocol=%q reason=%s action=%s failure_count=%d from_ref=%s to_ref=%s",
+		info.ChannelId,
+		info.UpstreamModelName,
+		a.protocol,
+		reason,
+		observation.Action,
+		observation.FailureCount,
+		hashCacheIdentity("diagnostic-workspace", a.selectedWorkspaceUID),
+		toRef,
+	))
+}
+
+func (a *Adaptor) recordFailoverSuccess(c *gin.Context, info *relaycommon.RelayInfo) {
+	if a == nil || a.failoverAttempt == nil || info == nil || openCodeGoCallerCancelled(c, nil) {
+		return
+	}
+	if _, err := observeOpenCodeGoFailoverSuccess(a.failoverAttempt, openCodeGoHealthNow()); err != nil {
+		logger.LogWarn(c, fmt.Sprintf(
+			"OpenCode Go failover success update failed open: channel_id=%d model=%q protocol=%q error=%v",
+			info.ChannelId,
+			info.UpstreamModelName,
+			a.protocol,
+			err,
+		))
+	}
 }
 
 func (a *Adaptor) GetModelList() []string {
