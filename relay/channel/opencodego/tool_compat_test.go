@@ -88,3 +88,103 @@ func TestPrepareOpenCodeGoResponsesToolHistoryPreservesExistingID(t *testing.T) 
 	assert.Equal(t, "call_missing", input[2]["id"])
 	assert.Equal(t, "item_existing", input[3]["id"])
 }
+
+func TestPrepareOpenCodeGoResponsesToolsLowersCustomToolHistory(t *testing.T) {
+	request := &dto.OpenAIResponsesRequest{Input: json.RawMessage(`[
+		{
+			"type":"additional_tools",
+			"tools":[{"type":"custom","name":"apply_patch","description":"Apply a patch"}]
+		},
+		{
+			"type":"custom_tool_call",
+			"call_id":"call_patch",
+			"name":"apply_patch",
+			"input":"*** Begin Patch\n*** End Patch",
+			"metadata":{"attempt":1}
+		},
+		{
+			"type":"custom_tool_call_output",
+			"call_id":"call_patch",
+			"output":"Done"
+		},
+		{
+			"type":"function_call",
+			"call_id":"call_lookup",
+			"name":"lookup",
+			"arguments":"{\"q\":\"x\"}"
+		}
+	]`)}
+
+	_, err := prepareOpenCodeGoResponsesTools(request)
+	require.NoError(t, err)
+
+	var tools []map[string]any
+	require.NoError(t, json.Unmarshal(request.Tools, &tools))
+	require.Len(t, tools, 1)
+	assert.Equal(t, "function", tools[0]["type"])
+	assert.Equal(t, "apply_patch", tools[0]["name"])
+
+	var input []map[string]any
+	require.NoError(t, json.Unmarshal(request.Input, &input))
+	require.Len(t, input, 3)
+	assert.NotContains(t, string(request.Input), `"type":"custom`)
+	assert.Equal(t, "function_call", input[0]["type"])
+	assert.Equal(t, "call_patch", input[0]["call_id"])
+	assert.Equal(t, "apply_patch", input[0]["name"])
+	assert.JSONEq(t, `{"input":"*** Begin Patch\n*** End Patch"}`, input[0]["arguments"].(string))
+	assert.Equal(t, float64(1), input[0]["metadata"].(map[string]any)["attempt"])
+	_, hasInput := input[0]["input"]
+	assert.False(t, hasInput)
+
+	assert.Equal(t, "function_call_output", input[1]["type"])
+	assert.Equal(t, "call_patch", input[1]["call_id"])
+	assert.Equal(t, "Done", input[1]["output"])
+	assert.Equal(t, "function_call", input[2]["type"])
+	assert.Equal(t, `{"q":"x"}`, input[2]["arguments"])
+
+	require.NoError(t, prepareOpenCodeGoResponsesToolHistory(request))
+	require.NoError(t, json.Unmarshal(request.Input, &input))
+	assert.Equal(t, "call_patch", input[0]["id"])
+	assert.Equal(t, "call_lookup", input[2]["id"])
+}
+
+func TestPrepareOpenCodeGoResponsesToolsLowersCustomHistoryWithoutDeclarations(t *testing.T) {
+	request := &dto.OpenAIResponsesRequest{Input: json.RawMessage(`[
+		{
+			"type":"custom_tool_call",
+			"call_id":"call_structured",
+			"name":"structured_tool",
+			"input":{"path":"README.md"}
+		},
+		{
+			"type":"custom_tool_call_output",
+			"call_id":"call_structured",
+			"output":{"ok":true}
+		},
+		{
+			"type":"custom_tool_call",
+			"call_id":"call_null",
+			"name":"nullable_tool",
+			"input":null
+		}
+	]`)}
+
+	_, err := prepareOpenCodeGoResponsesTools(request)
+	require.NoError(t, err)
+	assert.Empty(t, request.Tools)
+
+	var input []map[string]any
+	require.NoError(t, json.Unmarshal(request.Input, &input))
+	require.Len(t, input, 3)
+	assert.Equal(t, "function_call", input[0]["type"])
+	assert.JSONEq(t, `{"input":"{\"path\":\"README.md\"}"}`, input[0]["arguments"].(string))
+	assert.Equal(t, "function_call_output", input[1]["type"])
+	assert.Equal(t, map[string]any{"ok": true}, input[1]["output"])
+	assert.Equal(t, "function_call", input[2]["type"])
+	assert.JSONEq(t, `{"input":"null"}`, input[2]["arguments"].(string))
+
+	require.NoError(t, prepareOpenCodeGoResponsesToolHistory(request))
+	require.NoError(t, json.Unmarshal(request.Input, &input))
+	assert.Equal(t, "call_structured", input[0]["id"])
+	assert.Equal(t, "call_null", input[2]["id"])
+}

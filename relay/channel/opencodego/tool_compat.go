@@ -51,7 +51,9 @@ func prepareOpenCodeGoResponsesTools(request *dto.OpenAIResponsesRequest) (map[s
 	// the top-level declaration and remove the metadata item from history.
 	var input []any
 	hasInput := len(request.Input) > 0 && string(request.Input) != "null"
-	if hasInput && common.Unmarshal(request.Input, &input) == nil {
+	inputParsed := hasInput && common.Unmarshal(request.Input, &input) == nil
+	if inputParsed {
+		inputChanged := false
 		filtered := make([]any, 0, len(input))
 		for _, raw := range input {
 			item, ok := raw.(map[string]any)
@@ -66,6 +68,17 @@ func prepareOpenCodeGoResponsesTools(request *dto.OpenAIResponsesRequest) (map[s
 		}
 		if len(filtered) != len(input) {
 			input = filtered
+			inputChanged = true
+		}
+		// Console Go's Chat and Responses bridges only accept function tool
+		// history. Declarations are lowered below; lower their matching history
+		// here before the shared converter can preserve a custom tool call.
+		customHistoryChanged, err := lowerOpenCodeGoResponsesCustomToolHistory(input)
+		if err != nil {
+			return nil, err
+		}
+		inputChanged = inputChanged || customHistoryChanged
+		if inputChanged {
 			encoded, err := common.Marshal(input)
 			if err != nil {
 				return nil, err
@@ -116,18 +129,57 @@ func prepareOpenCodeGoResponsesTools(request *dto.OpenAIResponsesRequest) (map[s
 		request.Tools = json.RawMessage(encoded)
 	}
 
-	if hasInput {
-		if common.Unmarshal(request.Input, &input) == nil {
-			rewriteOpenCodeGoResponsesHistory(input, names)
-			encoded, err := common.Marshal(input)
-			if err != nil {
-				return nil, err
-			}
-			request.Input = json.RawMessage(encoded)
+	if inputParsed {
+		rewriteOpenCodeGoResponsesHistory(input, names)
+		encoded, err := common.Marshal(input)
+		if err != nil {
+			return nil, err
 		}
+		request.Input = json.RawMessage(encoded)
 	}
 	rewriteOpenCodeGoResponsesToolChoice(request, names)
 	return names, nil
+}
+
+// lowerOpenCodeGoResponsesCustomToolHistory maps the custom Responses history
+// form to the function-only representation declared for the OpenCode Go
+// upstream. It deliberately changes only top-level input items.
+func lowerOpenCodeGoResponsesCustomToolHistory(input []any) (bool, error) {
+	changed := false
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(stringValue(item["type"])) {
+		case "custom_tool_call":
+			arguments, err := openCodeGoResponsesCustomToolArguments(item["input"])
+			if err != nil {
+				return false, err
+			}
+			item["type"] = "function_call"
+			item["arguments"] = arguments
+			delete(item, "input")
+			changed = true
+		case "custom_tool_call_output":
+			item["type"] = "function_call_output"
+			changed = true
+		}
+	}
+	return changed, nil
+}
+
+func openCodeGoResponsesCustomToolArguments(input any) (string, error) {
+	text, ok := input.(string)
+	if !ok {
+		encoded, err := common.Marshal(input)
+		if err != nil {
+			return "", err
+		}
+		text = string(encoded)
+	}
+	encoded, err := common.Marshal(map[string]string{"input": text})
+	return string(encoded), err
 }
 
 func responseToolMaps(value any) ([]map[string]any, bool) {
