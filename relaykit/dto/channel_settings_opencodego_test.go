@@ -8,7 +8,12 @@ import (
 
 func TestOpenCodeGoConfigValidate(t *testing.T) {
 	require.NoError(t, (&OpenCodeGoConfig{
-		DefaultProtocol: OpenCodeGoProtocolChat,
+		DefaultProtocol:              OpenCodeGoProtocolChat,
+		GenericFailoverEnabled:       true,
+		GenericFailoverThreshold:     OpenCodeGoGenericFailoverDefaultThreshold,
+		GenericFailoverWindowSeconds: OpenCodeGoGenericFailoverDefaultWindowSeconds,
+		GenericFailoverMaxBackups:    OpenCodeGoGenericFailoverDefaultMaxBackups,
+		GenericFailoverLeaseSeconds:  OpenCodeGoGenericFailoverDefaultLeaseSeconds,
 		ModelProtocols: map[string]string{
 			"future-*": OpenCodeGoProtocolMessages,
 		},
@@ -24,6 +29,11 @@ func TestOpenCodeGoConfigValidate(t *testing.T) {
 		{name: "invalid wildcard", config: OpenCodeGoConfig{ModelProtocols: map[string]string{"future-[": OpenCodeGoProtocolChat}}, match: "invalid"},
 		{name: "invalid protocol", config: OpenCodeGoConfig{ModelProtocols: map[string]string{"future": "auto"}}, match: "invalid"},
 		{name: "normalized duplicate", config: OpenCodeGoConfig{ModelProtocols: map[string]string{"Future-*": OpenCodeGoProtocolChat, " future-* ": OpenCodeGoProtocolMessages}}, match: "duplicate"},
+		{name: "failover threshold too small", config: OpenCodeGoConfig{GenericFailoverThreshold: 1}, match: "generic_failover_threshold"},
+		{name: "failover threshold too large", config: OpenCodeGoConfig{GenericFailoverThreshold: OpenCodeGoGenericFailoverMaxThreshold + 1}, match: "generic_failover_threshold"},
+		{name: "failover window too large", config: OpenCodeGoConfig{GenericFailoverWindowSeconds: OpenCodeGoGenericFailoverMaxWindowSeconds + 1}, match: "generic_failover_window_seconds"},
+		{name: "failover backups exceed MVP", config: OpenCodeGoConfig{GenericFailoverMaxBackups: 2}, match: "generic_failover_max_backups"},
+		{name: "failover lease too large", config: OpenCodeGoConfig{GenericFailoverLeaseSeconds: OpenCodeGoGenericFailoverMaxLeaseSeconds + 1}, match: "generic_failover_lease_seconds"},
 	}
 
 	for _, test := range tests {

@@ -87,10 +87,16 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	var claudeResponse dto.ClaudeResponse
 	err := common.UnmarshalJsonStr(data, &claudeResponse)
 	if err != nil {
+		if info != nil && info.StreamStatus != nil {
+			info.StreamStatus.MarkUpstreamFailure()
+		}
 		common.SysLog("error unmarshalling stream response: " + err.Error())
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
+		if info != nil && info.StreamStatus != nil && relaycommon.IsTransientProviderStreamError(claudeError.Type, "", claudeError.Message, http.StatusOK) {
+			info.StreamStatus.MarkUpstreamFailure()
+		}
 		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
 	}
 	if claudeResponse.StopReason != "" {
@@ -98,6 +104,9 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	}
 	if claudeResponse.Delta != nil && claudeResponse.Delta.StopReason != nil {
 		maybeMarkClaudeRefusal(c, *claudeResponse.Delta.StopReason)
+	}
+	if claudeResponse.Type == "message_stop" && info != nil && info.StreamStatus != nil {
+		info.StreamStatus.MarkProtocolTerminal()
 	}
 	if info.RelayFormat == types.RelayFormatClaude {
 		FormatClaudeResponseInfo(&claudeResponse, nil, claudeInfo)
@@ -115,7 +124,9 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 			}
 		}
 		countClaudeStreamBillableTools(c, info, &claudeResponse)
-		helper.ClaudeChunkData(c, claudeResponse, data)
+		if writeErr := helper.ClaudeChunkData(c, claudeResponse, data); writeErr != nil {
+			return types.NewError(writeErr, types.ErrorCodeBadResponse)
+		}
 	} else if info.RelayFormat == types.RelayFormatOpenAI {
 		response := StreamResponseClaude2OpenAI(&claudeResponse)
 
@@ -128,6 +139,7 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		err = helper.ObjectData(c, response)
 		if err != nil {
 			logger.LogError(c, "send_stream_response_failed: "+err.Error())
+			return types.NewError(err, types.ErrorCodeBadResponse)
 		}
 	}
 	return nil
@@ -150,7 +162,7 @@ func countClaudeStreamBillableTools(c *gin.Context, info *relaycommon.RelayInfo,
 	}
 }
 
-func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
+func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) error {
 	if claudeInfo.Usage.PromptTokens == 0 {
 		//上游出错
 	}
@@ -185,10 +197,12 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 			err := helper.ObjectData(c, response)
 			if err != nil {
 				common.SysLog("send final response failed: " + err.Error())
+				return err
 			}
 		}
-		helper.Done(c)
+		return helper.Done(c)
 	}
+	return nil
 }
 
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
@@ -210,7 +224,12 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		return nil, err
 	}
 
-	HandleStreamFinalResponse(c, info, claudeInfo)
+	if finalErr := HandleStreamFinalResponse(c, info, claudeInfo); finalErr != nil {
+		if info.StreamStatus != nil {
+			info.StreamStatus.MarkLocalFailure()
+		}
+		return nil, types.NewOpenAIError(finalErr, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
 	return claudeInfo.Usage, nil
 }
 

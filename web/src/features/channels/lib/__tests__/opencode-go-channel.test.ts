@@ -105,6 +105,11 @@ describe('OpenCode Go channel configuration', () => {
       models: OPENCODE_GO_MODELS.join(','),
       opencode_go_default_protocol: 'responses',
       opencode_go_model_protocols: '{"GLM-*":"messages","kimi-k3":"chat"}',
+      opencode_go_generic_failover_enabled: true,
+      opencode_go_generic_failover_threshold: 2,
+      opencode_go_generic_failover_window_seconds: 30,
+      opencode_go_generic_failover_max_backups: 1,
+      opencode_go_generic_failover_lease_seconds: 1800,
       opencode_go_auto_enable_china_models: false,
       opencode_go_auto_apply_referral_rewards: true,
       opencode_go_referral_rewards_max_per_run: 0,
@@ -118,6 +123,11 @@ describe('OpenCode Go channel configuration', () => {
         'kimi-k3': 'chat',
       },
       default_protocol: 'responses',
+      generic_failover_enabled: true,
+      generic_failover_threshold: 2,
+      generic_failover_window_seconds: 30,
+      generic_failover_max_backups: 1,
+      generic_failover_lease_seconds: 1800,
       auto_enable_china_models: false,
       auto_apply_referral_rewards: true,
       referral_rewards_max_per_run: 0,
@@ -153,6 +163,11 @@ describe('OpenCode Go channel configuration', () => {
         opencode_go: {
           default_protocol: 'messages',
           model_protocols: { 'glm-*': 'messages' },
+          generic_failover_enabled: true,
+          generic_failover_threshold: 3,
+          generic_failover_window_seconds: 45,
+          generic_failover_max_backups: 1,
+          generic_failover_lease_seconds: 600,
           auto_enable_china_models: true,
           auto_apply_referral_rewards: false,
           referral_rewards_max_per_run: 0,
@@ -165,6 +180,11 @@ describe('OpenCode Go channel configuration', () => {
     assert.equal(defaults.key, '')
     assert.equal(defaults.models, '')
     assert.equal(defaults.opencode_go_default_protocol, 'messages')
+    assert.equal(defaults.opencode_go_generic_failover_enabled, true)
+    assert.equal(defaults.opencode_go_generic_failover_threshold, 3)
+    assert.equal(defaults.opencode_go_generic_failover_window_seconds, 45)
+    assert.equal(defaults.opencode_go_generic_failover_max_backups, 1)
+    assert.equal(defaults.opencode_go_generic_failover_lease_seconds, 600)
     assert.equal(defaults.opencode_go_referral_rewards_max_per_run, 0)
     const protocolOverrides = defaults.opencode_go_model_protocols
     assert.ok(protocolOverrides)
@@ -178,5 +198,28 @@ describe('OpenCode Go channel configuration', () => {
     assert.equal('key' in update, false)
     assert.equal(settings.retained_setting, 'keep-me')
     assert.equal(settings.opencode_go.referral_rewards_max_per_run, 0)
+    assert.equal(settings.opencode_go.generic_failover_enabled, true)
+    assert.equal(settings.opencode_go.generic_failover_threshold, 3)
+    assert.equal(settings.opencode_go.generic_failover_window_seconds, 45)
+    assert.equal(settings.opencode_go.generic_failover_max_backups, 1)
+    assert.equal(settings.opencode_go.generic_failover_lease_seconds, 600)
+  })
+
+  test('rejects failover values outside the bounded first-release policy', () => {
+    for (const invalid of [
+      { opencode_go_generic_failover_threshold: 1 },
+      { opencode_go_generic_failover_window_seconds: 301 },
+      { opencode_go_generic_failover_max_backups: 2 },
+      { opencode_go_generic_failover_lease_seconds: 86401 },
+    ]) {
+      const parsed = channelFormSchema.safeParse({
+        ...CHANNEL_FORM_DEFAULT_VALUES,
+        ...invalid,
+        name: 'OpenCode Go pool',
+        type: CHANNEL_TYPE_OPENCODE_GO,
+        models: '',
+      })
+      assert.equal(parsed.success, false)
+    }
   })
 })

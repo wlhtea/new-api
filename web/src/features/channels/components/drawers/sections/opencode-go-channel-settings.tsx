@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { ArrowRight, ShieldCheck, Waypoints } from 'lucide-react'
+import { ArrowRight, ShieldAlert, ShieldCheck, Waypoints } from 'lucide-react'
 import { useFormContext } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 
@@ -57,6 +57,9 @@ export function OpenCodeGoChannelSettings(
   const form = useFormContext<ChannelFormInput>()
   const lifecyclePolicyDisabled =
     props.disabled || props.lifecyclePolicyReadOnly
+  const genericFailoverEnabled = form.watch(
+    'opencode_go_generic_failover_enabled'
+  )
 
   return (
     <fieldset
@@ -145,6 +148,113 @@ export function OpenCodeGoChannelSettings(
             </FormItem>
           )}
         />
+      </div>
+
+      <div className='flex items-center gap-2'>
+        <ShieldAlert
+          className='text-muted-foreground h-3.5 w-3.5'
+          aria-hidden='true'
+        />
+        <h4 className='text-muted-foreground text-xs font-medium tracking-wide uppercase'>
+          {t('Failure-only workspace affinity')}
+        </h4>
+      </div>
+
+      <div className='divide-border/60 border-border/60 divide-y border-y'>
+        <FormField
+          control={form.control}
+          name='opencode_go_generic_failover_enabled'
+          render={({ field }) => (
+            <FormItem className='flex min-h-16 items-center justify-between gap-4 py-3'>
+              <div className='min-w-0'>
+                <FormLabel>{t('Generic upstream failover')}</FormLabel>
+                <FormDescription>
+                  {t(
+                    'Switches only after repeated 500, 502, 503, or 504 responses'
+                  )}
+                </FormDescription>
+              </div>
+              <FormControl>
+                <Switch
+                  checked={field.value === true}
+                  onCheckedChange={field.onChange}
+                  aria-label={t('Generic upstream failover')}
+                />
+              </FormControl>
+            </FormItem>
+          )}
+        />
+
+        <div className='grid gap-4 py-3 sm:grid-cols-3'>
+          <FormField
+            control={form.control}
+            name='opencode_go_generic_failover_threshold'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Failure threshold')}</FormLabel>
+                <FormControl>
+                  <Input
+                    disabled={!genericFailoverEnabled}
+                    type='number'
+                    min={2}
+                    max={10}
+                    value={field.value}
+                    onChange={(event) =>
+                      field.onChange(event.target.valueAsNumber)
+                    }
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name='opencode_go_generic_failover_window_seconds'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Failure window (seconds)')}</FormLabel>
+                <FormControl>
+                  <Input
+                    disabled={!genericFailoverEnabled}
+                    type='number'
+                    min={1}
+                    max={300}
+                    value={field.value}
+                    onChange={(event) =>
+                      field.onChange(event.target.valueAsNumber)
+                    }
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name='opencode_go_generic_failover_lease_seconds'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Backup lease (seconds)')}</FormLabel>
+                <FormControl>
+                  <Input
+                    disabled={!genericFailoverEnabled}
+                    type='number'
+                    min={1}
+                    max={86400}
+                    value={field.value}
+                    onChange={(event) =>
+                      field.onChange(event.target.valueAsNumber)
+                    }
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </div>
       </div>
 
       <div className='flex flex-wrap items-center justify-between gap-2'>

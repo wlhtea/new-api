@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,6 +10,45 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+func TestNewUpstreamRequestInheritsDownstreamContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+
+	upstreamRequest, err := newUpstreamRequest(c, http.MethodPost, "https://example.com/v1/responses", nil)
+	require.NoError(t, err)
+	require.NoError(t, upstreamRequest.Context().Err())
+
+	cancel()
+	require.ErrorIs(t, upstreamRequest.Context().Err(), context.Canceled)
+}
+
+func TestDownstreamRequestMethodRejectsMissingContext(t *testing.T) {
+	for name, ctx := range map[string]*gin.Context{
+		"nil context": nil,
+		"nil request": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			method, err := downstreamRequestMethod(ctx)
+			require.Error(t, err)
+			require.Empty(t, method)
+		})
+	}
+}
+
+func TestDownstreamRequestMethodReturnsMethod(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	method, err := downstreamRequestMethod(c)
+	require.NoError(t, err)
+	require.Equal(t, http.MethodPost, method)
+}
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 	t.Parallel()

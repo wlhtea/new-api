@@ -1,11 +1,13 @@
 package opencodego
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -13,6 +15,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -112,6 +115,26 @@ func responseTestContext(client types.RelayFormat) (*gin.Context, *httptest.Resp
 	return c, recorder
 }
 
+type panicFlushResponseWriter struct {
+	gin.ResponseWriter
+}
+
+func (w *panicFlushResponseWriter) Flush() {
+	panic("local response flush failed")
+}
+
+type failAfterDoneResponseWriter struct {
+	gin.ResponseWriter
+	recorder *httptest.ResponseRecorder
+}
+
+func (w *failAfterDoneResponseWriter) Flush() {
+	if w.recorder != nil && strings.Contains(w.recorder.Body.String(), "data: [DONE]") {
+		panic("local post-terminal flush failed")
+	}
+	w.ResponseWriter.Flush()
+}
+
 func TestAdaptorResponseCompatibilityMatrix(t *testing.T) {
 	oldMode := gin.Mode()
 	gin.SetMode(gin.TestMode)
@@ -166,10 +189,414 @@ func TestAdaptorResponseCompatibilityMatrix(t *testing.T) {
 					assert.NotContains(t, output, "vendor/")
 					assert.NotContains(t, output, "inference-cost")
 					assert.NotContains(t, output, `"cost":"0"`)
+					if stream {
+						require.NotNil(t, info.StreamStatus)
+						if protocol == ProtocolChat {
+							assert.True(t, info.StreamStatus.DoneSentinelObserved())
+						} else {
+							assert.True(t, info.StreamStatus.ProtocolTerminalObserved())
+						}
+					}
 				})
 			}
 		}
 	}
+}
+
+func TestAdaptorStreamTerminalEventsWithoutDoneSentinel(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	for _, test := range []struct {
+		protocol Protocol
+		client   types.RelayFormat
+		want     bool
+	}{
+		{protocol: ProtocolChat, client: types.RelayFormatOpenAI, want: false},
+		{protocol: ProtocolMessages, client: types.RelayFormatClaude, want: true},
+		{protocol: ProtocolResponses, client: types.RelayFormatOpenAIResponses, want: true},
+	} {
+		t.Run(string(test.protocol), func(t *testing.T) {
+			info := responseTestInfo(test.protocol, test.client, true)
+			c, _ := responseTestContext(test.client)
+			body := strings.Replace(responseFixture(test.protocol, true), "data: [DONE]\n", "", 1)
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+			_, apiErr := adaptor.DoResponse(c, resp, info)
+			require.Nil(t, apiErr)
+			require.NotNil(t, info.StreamStatus)
+			assert.Equal(t, test.want, info.StreamStatus.ProtocolTerminalObserved())
+		})
+	}
+}
+
+func TestAdaptorRecordsIncompleteStreamAndSuccessSeparately(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	originalFailureObserver := observeOpenCodeGoFailoverFailure
+	originalSuccessObserver := observeOpenCodeGoFailoverSuccess
+	originalNow := openCodeGoHealthNow
+	t.Cleanup(func() {
+		observeOpenCodeGoFailoverFailure = originalFailureObserver
+		observeOpenCodeGoFailoverSuccess = originalSuccessObserver
+		openCodeGoHealthNow = originalNow
+	})
+	fixedNow := time.Unix(1_900_000_000, 0)
+	openCodeGoHealthNow = func() time.Time { return fixedNow }
+	failures := 0
+	successes := 0
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, observedAt time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failures++
+		assert.Equal(t, fixedNow, observedAt)
+		return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionSuspect}, nil
+	}
+	observeOpenCodeGoFailoverSuccess = func(_ *service.OpenCodeGoFailoverAttempt, observedAt time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		successes++
+		assert.Equal(t, fixedNow, observedAt)
+		return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionCleared}, nil
+	}
+
+	run := func(body string) {
+		info := responseTestInfo(ProtocolChat, types.RelayFormatOpenAI, true)
+		c, _ := responseTestContext(types.RelayFormatOpenAI)
+		adaptor := &Adaptor{}
+		adaptor.Init(info)
+		adaptor.requestUpstreamStream = true
+		adaptor.failoverAttempt = &service.OpenCodeGoFailoverAttempt{}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}
+		_, apiErr := adaptor.DoResponse(c, resp, info)
+		require.Nil(t, apiErr)
+	}
+
+	run(strings.Replace(responseFixture(ProtocolChat, true), "data: [DONE]\n", "", 1))
+	assert.Equal(t, 1, failures)
+	assert.Equal(t, 0, successes)
+	run(responseFixture(ProtocolChat, true))
+	assert.Equal(t, 1, failures)
+	assert.Equal(t, 1, successes)
+}
+
+func TestAdaptorDoneSentinelDoesNotCompleteMessagesOrResponses(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	originalFailureObserver := observeOpenCodeGoFailoverFailure
+	originalSuccessObserver := observeOpenCodeGoFailoverSuccess
+	t.Cleanup(func() {
+		observeOpenCodeGoFailoverFailure = originalFailureObserver
+		observeOpenCodeGoFailoverSuccess = originalSuccessObserver
+	})
+
+	failures := 0
+	successes := 0
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failures++
+		return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionSuspect}, nil
+	}
+	observeOpenCodeGoFailoverSuccess = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		successes++
+		return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionCleared}, nil
+	}
+
+	tests := []struct {
+		protocol Protocol
+		client   types.RelayFormat
+		event    string
+	}{
+		{protocol: ProtocolMessages, client: types.RelayFormatClaude, event: `"type":"message_stop"`},
+		{protocol: ProtocolResponses, client: types.RelayFormatOpenAIResponses, event: `"type":"response.completed"`},
+	}
+	for _, test := range tests {
+		t.Run(string(test.protocol), func(t *testing.T) {
+			lines := strings.Split(responseFixture(test.protocol, true), "\n")
+			filtered := lines[:0]
+			for _, line := range lines {
+				if !strings.Contains(line, test.event) {
+					filtered = append(filtered, line)
+				}
+			}
+			info := responseTestInfo(test.protocol, test.client, true)
+			c, _ := responseTestContext(test.client)
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+			adaptor.requestUpstreamStream = true
+			adaptor.failoverAttempt = &service.OpenCodeGoFailoverAttempt{}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(strings.Join(filtered, "\n"))),
+			}
+
+			_, apiErr := adaptor.DoResponse(c, resp, info)
+
+			require.Nil(t, apiErr)
+			require.NotNil(t, info.StreamStatus)
+			assert.True(t, info.StreamStatus.DoneSentinelObserved())
+			assert.False(t, info.StreamStatus.ProtocolTerminalObserved())
+		})
+	}
+	assert.Equal(t, len(tests), failures)
+	assert.Zero(t, successes)
+}
+
+func TestAdaptorTruncatedStreamJSONRecordsOneUpstreamFailure(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	originalFailureObserver := observeOpenCodeGoFailoverFailure
+	originalSuccessObserver := observeOpenCodeGoFailoverSuccess
+	t.Cleanup(func() {
+		observeOpenCodeGoFailoverFailure = originalFailureObserver
+		observeOpenCodeGoFailoverSuccess = originalSuccessObserver
+	})
+
+	failures := 0
+	successes := 0
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failures++
+		return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionSuspect}, nil
+	}
+	observeOpenCodeGoFailoverSuccess = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		successes++
+		return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionCleared}, nil
+	}
+
+	tests := []struct {
+		name     string
+		protocol Protocol
+		client   types.RelayFormat
+		body     string
+	}{
+		{name: "chat to responses", protocol: ProtocolChat, client: types.RelayFormatOpenAIResponses, body: `data: {"id":"chat_truncated"` + "\n"},
+		{name: "messages to responses", protocol: ProtocolMessages, client: types.RelayFormatOpenAIResponses, body: `data: {"type":"message_start"` + "\n"},
+		{name: "native responses", protocol: ProtocolResponses, client: types.RelayFormatOpenAIResponses, body: `data: {"type":"response.output_text.delta"` + "\n"},
+		{name: "responses to chat", protocol: ProtocolResponses, client: types.RelayFormatOpenAI, body: `data: {"type":"response.output_text.delta"` + "\n"},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			info := responseTestInfo(test.protocol, test.client, true)
+			c, _ := responseTestContext(test.client)
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+			adaptor.requestUpstreamStream = true
+			adaptor.failoverAttempt = &service.OpenCodeGoFailoverAttempt{}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(test.body)),
+			}
+
+			_, apiErr := adaptor.DoResponse(c, resp, info)
+
+			require.NotNil(t, apiErr)
+			require.NotNil(t, info.StreamStatus)
+			assert.True(t, info.StreamStatus.UpstreamFailureObserved())
+			assert.Equal(t, index+1, failures)
+			assert.Zero(t, successes)
+		})
+	}
+}
+
+func TestAdaptorLocalStreamWriteFailureDoesNotTriggerFailover(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	originalFailureObserver := observeOpenCodeGoFailoverFailure
+	originalSuccessObserver := observeOpenCodeGoFailoverSuccess
+	t.Cleanup(func() {
+		observeOpenCodeGoFailoverFailure = originalFailureObserver
+		observeOpenCodeGoFailoverSuccess = originalSuccessObserver
+	})
+
+	failures := 0
+	successes := 0
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failures++
+		return service.OpenCodeGoFailoverObservation{}, nil
+	}
+	observeOpenCodeGoFailoverSuccess = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		successes++
+		return service.OpenCodeGoFailoverObservation{}, nil
+	}
+
+	info := responseTestInfo(ProtocolResponses, types.RelayFormatOpenAI, true)
+	c, _ := responseTestContext(types.RelayFormatOpenAI)
+	c.Writer = &panicFlushResponseWriter{ResponseWriter: c.Writer}
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+	adaptor.requestUpstreamStream = true
+	adaptor.failoverAttempt = &service.OpenCodeGoFailoverAttempt{}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(responseFixture(ProtocolResponses, true))),
+	}
+
+	_, apiErr := adaptor.DoResponse(c, resp, info)
+
+	require.NotNil(t, apiErr)
+	require.NotNil(t, info.StreamStatus)
+	assert.False(t, info.StreamStatus.UpstreamFailureObserved())
+	assert.Zero(t, failures)
+	assert.Zero(t, successes)
+}
+
+func TestAdaptorPostTerminalDoneWriteFailureSuppressesSuccess(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	originalFailureObserver := observeOpenCodeGoFailoverFailure
+	originalSuccessObserver := observeOpenCodeGoFailoverSuccess
+	t.Cleanup(func() {
+		observeOpenCodeGoFailoverFailure = originalFailureObserver
+		observeOpenCodeGoFailoverSuccess = originalSuccessObserver
+	})
+	failures := 0
+	successes := 0
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failures++
+		return service.OpenCodeGoFailoverObservation{}, nil
+	}
+	observeOpenCodeGoFailoverSuccess = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		successes++
+		return service.OpenCodeGoFailoverObservation{}, nil
+	}
+
+	info := responseTestInfo(ProtocolResponses, types.RelayFormatOpenAI, true)
+	c, recorder := responseTestContext(types.RelayFormatOpenAI)
+	c.Writer = &failAfterDoneResponseWriter{ResponseWriter: c.Writer, recorder: recorder}
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+	adaptor.requestUpstreamStream = true
+	adaptor.failoverAttempt = &service.OpenCodeGoFailoverAttempt{}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(responseFixture(ProtocolResponses, true))),
+	}
+
+	_, apiErr := adaptor.DoResponse(c, resp, info)
+
+	require.NotNil(t, apiErr)
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.ProtocolTerminalObserved())
+	assert.True(t, info.StreamStatus.LocalFailureObserved())
+	assert.Zero(t, failures)
+	assert.Zero(t, successes)
+}
+
+func TestAdaptorChatStructuredErrorProvenance(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	originalFailureObserver := observeOpenCodeGoFailoverFailure
+	originalSuccessObserver := observeOpenCodeGoFailoverSuccess
+	t.Cleanup(func() {
+		observeOpenCodeGoFailoverFailure = originalFailureObserver
+		observeOpenCodeGoFailoverSuccess = originalSuccessObserver
+	})
+
+	for _, test := range []struct {
+		name       string
+		errorType  string
+		message    string
+		status     int
+		wantHealth bool
+	}{
+		{name: "deterministic request error", errorType: "invalid_request_error", message: "invalid tool schema", status: http.StatusOK, wantHealth: false},
+		{name: "deterministic request wrapped in 5xx", errorType: "invalid_request_error", message: "invalid tool schema", status: http.StatusInternalServerError, wantHealth: false},
+		{name: "transient overload error", errorType: "overloaded_error", message: "try again later", status: http.StatusOK, wantHealth: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			failures := 0
+			successes := 0
+			observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+				failures++
+				return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionSuspect}, nil
+			}
+			observeOpenCodeGoFailoverSuccess = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+				successes++
+				return service.OpenCodeGoFailoverObservation{}, nil
+			}
+
+			info := responseTestInfo(ProtocolChat, types.RelayFormatOpenAI, true)
+			c, _ := responseTestContext(types.RelayFormatOpenAI)
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+			adaptor.requestUpstreamStream = true
+			adaptor.failoverAttempt = &service.OpenCodeGoFailoverAttempt{}
+			body := fmt.Sprintf("data: {\"error\":{\"type\":%q,\"message\":%q}}\ndata: [DONE]\n", test.errorType, test.message)
+			resp := &http.Response{
+				StatusCode: test.status,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}
+
+			_, apiErr := adaptor.DoResponse(c, resp, info)
+			require.NotNil(t, apiErr)
+			if test.wantHealth {
+				assert.Equal(t, 1, failures)
+			} else {
+				assert.Zero(t, failures)
+			}
+			assert.Zero(t, successes)
+		})
+	}
+}
+
+func TestAdaptorMessagesStructuredErrorUsesUpstreamStatus(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	originalFailureObserver := observeOpenCodeGoFailoverFailure
+	originalSuccessObserver := observeOpenCodeGoFailoverSuccess
+	t.Cleanup(func() {
+		observeOpenCodeGoFailoverFailure = originalFailureObserver
+		observeOpenCodeGoFailoverSuccess = originalSuccessObserver
+	})
+
+	failures := 0
+	successes := 0
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failures++
+		return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionSuspect}, nil
+	}
+	observeOpenCodeGoFailoverSuccess = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		successes++
+		return service.OpenCodeGoFailoverObservation{}, nil
+	}
+
+	info := responseTestInfo(ProtocolMessages, types.RelayFormatOpenAIResponses, true)
+	c, _ := responseTestContext(types.RelayFormatOpenAIResponses)
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+	adaptor.requestUpstreamStream = true
+	adaptor.failoverAttempt = &service.OpenCodeGoFailoverAttempt{}
+	resp := &http.Response{
+		StatusCode: http.StatusInternalServerError,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+			`data: {"type":"error","error":{"type":"upstream_error","message":"opaque provider failure"}}`,
+			`data: [DONE]`,
+			``,
+		}, "\n"))),
+	}
+
+	_, apiErr := adaptor.DoResponse(c, resp, info)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, 1, failures, "the actual upstream status must participate in stream-error classification")
+	assert.Zero(t, successes)
 }
 
 func TestChatCostExtensionBecomesUsageFallback(t *testing.T) {

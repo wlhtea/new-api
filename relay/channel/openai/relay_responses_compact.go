@@ -24,7 +24,7 @@ func OaiResponsesCompactionHandler(c *gin.Context, resp *http.Response) (*dto.Us
 	if err := common.Unmarshal(responseBody, &compactResp); err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	if oaiError := compactResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+	if oaiError := compactResp.GetOpenAIError(); responsesErrorHasDetails(oaiError) {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 

@@ -360,6 +360,151 @@ func TestOaiChatToResponsesStreamHandlerConvertsSSEOrderAndUsage(t *testing.T) {
 	)
 }
 
+func TestOaiResponsesStreamHandlerCodeOnlyDeterministicFailureDoesNotMarkFailover(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\",\"message\":\"prompt is invalid\"}}}\ndata: [DONE]\n"
+	c, _, resp, info := newResponsesChatTestContext(t, body, true)
+	info.ChannelType = constant.ChannelTypeOpenCodeGo
+	info.RelayFormat = types.RelayFormatOpenAIResponses
+	info.StreamProtocolTerminalRequired = true
+
+	_, err := OaiResponsesStreamHandler(c, info, resp)
+	require.Error(t, err)
+	require.NotNil(t, info.StreamStatus)
+	assert.False(t, info.StreamStatus.UpstreamFailureObserved())
+	assert.True(t, info.StreamStatus.LocalFailureObserved())
+}
+
+func TestOaiResponsesStreamHandlerCodeOnlyTransientFailureMarksFailover(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"try again\"}}}\ndata: [DONE]\n"
+	c, _, resp, info := newResponsesChatTestContext(t, body, true)
+	info.ChannelType = constant.ChannelTypeOpenCodeGo
+	info.RelayFormat = types.RelayFormatOpenAIResponses
+	info.StreamProtocolTerminalRequired = true
+
+	_, err := OaiResponsesStreamHandler(c, info, resp)
+	require.Error(t, err)
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.UpstreamFailureObserved())
+}
+
+func TestOaiResponsesStreamHandlerCodeOnlyResponseErrorMarksFailover(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := "data: {\"type\":\"response.error\",\"response\":{\"error\":{\"code\":\"server_error\"}}}\ndata: [DONE]\n"
+	c, _, resp, info := newResponsesChatTestContext(t, body, true)
+	info.ChannelType = constant.ChannelTypeOpenCodeGo
+	info.RelayFormat = types.RelayFormatOpenAIResponses
+	info.StreamProtocolTerminalRequired = true
+
+	_, err := OaiResponsesStreamHandler(c, info, resp)
+	require.Error(t, err)
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.UpstreamFailureObserved())
+}
+
+func TestOaiResponsesStreamHandlerEOFWithoutTerminalIsNotNormal(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\",\"model\":\"gpt-test\"}}\ndata: [DONE]\n"
+	c, _, resp, info := newResponsesChatTestContext(t, body, true)
+	info.ChannelType = constant.ChannelTypeOpenCodeGo
+	info.RelayFormat = types.RelayFormatOpenAIResponses
+	info.StreamProtocolTerminalRequired = true
+
+	_, err := OaiResponsesStreamHandler(c, info, resp)
+	assert.Nil(t, err)
+	require.NotNil(t, info.StreamStatus)
+	assert.False(t, info.StreamStatus.ProtocolTerminalObserved())
+	assert.False(t, info.StreamStatus.IsNormalEnd())
+}
+
+func TestOaiResponsesToChatStreamHandlerIncompleteIsNormalForNonOpenCodeGo(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test","created_at":1710000000}}`,
+		`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		`data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+
+	// A max_output_tokens cutoff is a legitimate terminal state for non-OpenCode
+	// Go channels: it must finish with finish_reason "length", not an error.
+	usage, err := OaiResponsesToChatStreamHandler(c, info, resp)
+	require.Nil(t, err)
+	require.NotNil(t, usage)
+	assert.Equal(t, 5, usage.TotalTokens)
+
+	got := recorder.Body.String()
+	require.Contains(t, got, `"finish_reason":"length"`)
+	require.Contains(t, got, `data: [DONE]`)
+}
+
+func TestOaiResponsesToChatStreamHandlerIncompleteErrorsForOpenCodeGo(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test","created_at":1710000000}}`,
+		`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		`data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	c, _, resp, info := newResponsesChatTestContext(t, body, true)
+	info.ChannelType = constant.ChannelTypeOpenCodeGo
+
+	// OpenCode Go surfaces incomplete/cancelled as an error without rotating the
+	// workspace: no transient upstream-failure failover evidence is recorded.
+	_, err := OaiResponsesToChatStreamHandler(c, info, resp)
+	require.Error(t, err)
+	require.NotNil(t, info.StreamStatus)
+	assert.False(t, info.StreamStatus.UpstreamFailureObserved())
+}
+
 func requireOrderedSubstrings(t *testing.T, s string, parts ...string) {
 	t.Helper()
 

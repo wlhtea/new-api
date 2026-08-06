@@ -175,6 +175,76 @@ func TestStreamStatus_Summary(t *testing.T) {
 	assert.Contains(t, summary2, "soft_errors=2")
 }
 
+func TestStreamStatusProtocolTerminal(t *testing.T) {
+	status := NewStreamStatus()
+	assert.False(t, status.ProtocolTerminalObserved())
+	status.MarkProtocolTerminal()
+	assert.True(t, status.ProtocolTerminalObserved())
+
+	var nilStatus *StreamStatus
+	nilStatus.MarkProtocolTerminal()
+	assert.False(t, nilStatus.ProtocolTerminalObserved())
+}
+
+func TestStreamStatusProtocolTerminalRequiredRejectsEOFWithoutTerminal(t *testing.T) {
+	status := NewStreamStatus()
+	status.RequireProtocolTerminal()
+	status.SetEndReason(StreamEndReasonEOF, nil)
+
+	assert.True(t, status.ProtocolTerminalRequired())
+	assert.False(t, status.ProtocolTerminalObserved())
+	assert.False(t, status.IsNormalEnd())
+
+	status.MarkProtocolTerminal()
+	assert.True(t, status.IsNormalEnd())
+}
+
+func TestStreamStatusLocalFailureMakesCompletedStreamNonNormal(t *testing.T) {
+	status := NewStreamStatus()
+	status.MarkProtocolTerminal()
+	status.SetEndReason(StreamEndReasonDone, nil)
+	status.MarkLocalFailure()
+
+	assert.False(t, status.IsNormalEnd())
+}
+
+func TestStreamStatusLocalFailureSurvivesTerminalMarker(t *testing.T) {
+	status := NewStreamStatus()
+	status.MarkDoneSentinel()
+	status.SetEndReason(StreamEndReasonDone, nil)
+	status.MarkLocalFailure()
+
+	assert.True(t, status.DoneSentinelObserved())
+	assert.Equal(t, StreamEndReasonDone, status.EndReason)
+	assert.True(t, status.LocalFailureObserved(), "a later local failure must not be hidden by first-wins EndReason")
+
+	var nilStatus *StreamStatus
+	nilStatus.MarkLocalFailure()
+	assert.False(t, nilStatus.LocalFailureObserved())
+}
+
+func TestIsTransientProviderStreamError(t *testing.T) {
+	t.Parallel()
+	assert.True(t, IsTransientProviderStreamError("overloaded_error", "", "", 200))
+	assert.True(t, IsTransientProviderStreamError("", "", "temporary upstream timeout", 200))
+	assert.True(t, IsTransientProviderStreamError("", "", "", 503))
+	assert.True(t, IsTransientProviderStreamError("overloaded_error", "", "", 400), "an explicit transient type wins over a client status")
+	assert.False(t, IsTransientProviderStreamError("invalid_request_error", "", "", 503), "a deterministic type must not become generic failover evidence")
+	assert.False(t, IsTransientProviderStreamError("authentication_error", "", "", 500), "authentication evidence must not become generic failover evidence")
+	assert.False(t, IsTransientProviderStreamError("AuthError", "", "credential rejected", 500), "OpenCode Go auth evidence must not become generic failover evidence")
+	assert.False(t, IsTransientProviderStreamError("ModelError", "", "model is unavailable", 500), "OpenCode Go model evidence must not become generic failover evidence")
+	assert.False(t, IsTransientProviderStreamError("MonthlyLimitError", "", "", 500), "OpenCode Go quota evidence must not become generic failover evidence")
+	assert.True(t, IsTransientProviderStreamError("FreeUsageLimitError", "", "", 200), "OpenCode Go RPM evidence remains transient")
+	assert.False(t, IsTransientProviderStreamError("invalid_request_error", "invalid_request", "bad tool schema", 400))
+	assert.False(t, IsTransientProviderStreamError("authentication_error", "", "invalid credential", 401))
+	assert.False(t, IsTransientProviderStreamError("", "invalid_prompt", "", 500), "Responses code-only prompt errors are deterministic")
+	assert.False(t, IsTransientProviderStreamError("", "input_too_long", "", 500), "Responses code-only length errors are deterministic")
+	assert.True(t, IsTransientProviderStreamError("", "server_error", "", 200), "Responses code-only server errors are transient")
+	assert.True(t, IsTransientProviderStreamError("", "rate_limit_exceeded", "", 200), "Responses code-only rate-limit errors are transient")
+	assert.False(t, IsTransientProviderStreamError("", "", "", 501), "non-generic 5xx statuses are not generic failover evidence")
+	assert.False(t, IsTransientProviderStreamError("", "", "", 505), "non-generic 5xx statuses are not generic failover evidence")
+}
+
 func TestStreamStatus_Summary_NilSafe(t *testing.T) {
 	t.Parallel()
 	var s *StreamStatus

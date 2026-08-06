@@ -101,14 +101,23 @@ func messagesToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInf
 		}
 		var claudeResponse dto.ClaudeResponse
 		if err := common.UnmarshalJsonStr(data, &claudeResponse); err != nil {
+			if info.StreamStatus != nil {
+				info.StreamStatus.MarkUpstreamFailure()
+			}
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 			sr.Stop(streamErr)
 			return
 		}
 		if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
+			if info.StreamStatus != nil && relaycommon.IsTransientProviderStreamError(claudeError.Type, "", claudeError.Message, resp.StatusCode) {
+				info.StreamStatus.MarkUpstreamFailure()
+			}
 			streamErr = types.WithClaudeError(*claudeError, http.StatusInternalServerError)
 			sr.Stop(streamErr)
 			return
+		}
+		if claudeResponse.Type == "message_stop" && info.StreamStatus != nil {
+			info.StreamStatus.MarkProtocolTerminal()
 		}
 		relayconvert.FormatClaudeResponseInfo(&claudeResponse, nil, claudeInfo)
 		if claudeResponse.Type == "message_delta" {
@@ -141,10 +150,16 @@ func messagesToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInf
 	}
 	finalResults, err := relayconvert.FinalizeStreamResponse(c, info, state)
 	if err != nil {
+		if info.StreamStatus != nil {
+			info.StreamStatus.MarkLocalFailure()
+		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	for _, result := range finalResults {
 		if !sendResult(result) {
+			if info.StreamStatus != nil {
+				info.StreamStatus.MarkLocalFailure()
+			}
 			return nil, streamErr
 		}
 	}

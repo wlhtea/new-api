@@ -2,6 +2,7 @@ package opencodego
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type errorReadCloser struct {
+	err error
+}
+
+func (r errorReadCloser) Read([]byte) (int, error) {
+	return 0, r.err
+}
+
+func (errorReadCloser) Close() error {
+	return nil
+}
 
 func TestHandleNon2xxResponseLogsOnlyPrivacySafeRequestShape(t *testing.T) {
 	originalWriter := gin.DefaultErrorWriter
@@ -163,4 +176,162 @@ func TestHandleNon2xxResponsePersistsSelectedWorkspaceObservation(t *testing.T) 
 	_, observation := adaptor.HandleNon2xxResponse(newAdaptorTestContext(), resp, info)
 	require.NotNil(t, observation)
 	assert.Equal(t, 1, calls)
+}
+
+func TestHandleNon2xxResponseCountsOnlyGenericFailoverStatuses(t *testing.T) {
+	originalProviderObserver := observeOpenCodeGoProviderFailure
+	originalFailoverObserver := observeOpenCodeGoFailoverFailure
+	originalNow := openCodeGoHealthNow
+	t.Cleanup(func() {
+		observeOpenCodeGoProviderFailure = originalProviderObserver
+		observeOpenCodeGoFailoverFailure = originalFailoverObserver
+		openCodeGoHealthNow = originalNow
+	})
+
+	fixedNow := time.Unix(1_900_000_000, 0)
+	openCodeGoHealthNow = func() time.Time { return fixedNow }
+	observeOpenCodeGoProviderFailure = func(_ int, _ string, _ string, _ service.OpenCodeGoProviderFailure, _ time.Time) (bool, error) {
+		return false, nil
+	}
+	failoverCalls := 0
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, observedAt time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failoverCalls++
+		assert.Equal(t, fixedNow, observedAt)
+		return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionSuspect, FailureCount: 1}, nil
+	}
+
+	adaptor := &Adaptor{
+		protocol:             ProtocolResponses,
+		workspaceSelected:    true,
+		selectedWorkspaceUID: "workspace-provider",
+		failoverAttempt:      &service.OpenCodeGoFailoverAttempt{},
+	}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "kimi-k3"}}
+	for _, test := range []struct {
+		status int
+		body   string
+		want   int
+	}{
+		{status: http.StatusInternalServerError, body: `{"type":"upstream_error","message":"temporary"}`, want: 1},
+		{status: http.StatusUnprocessableEntity, body: `{"type":"invalid_request_error","message":"bad input"}`, want: 1},
+		{status: http.StatusInternalServerError, body: `{"type":"AuthError","message":"credential rejected"}`, want: 1},
+		{status: http.StatusGatewayTimeout, body: `{"type":"upstream_error","message":"temporary"}`, want: 2},
+	} {
+		resp := &http.Response{
+			StatusCode: test.status,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(test.body)),
+		}
+		apiErr, observation := adaptor.HandleNon2xxResponse(newAdaptorTestContext(), resp, info)
+		require.NotNil(t, apiErr)
+		require.NotNil(t, observation)
+		assert.True(t, types.IsSkipRetryError(apiErr))
+		assert.Equal(t, test.want, failoverCalls)
+	}
+}
+
+func TestHandleNon2xxResponseReadFailureStillClassifiesKnownStatus(t *testing.T) {
+	originalProviderObserver := observeOpenCodeGoProviderFailure
+	originalFailoverObserver := observeOpenCodeGoFailoverFailure
+	t.Cleanup(func() {
+		observeOpenCodeGoProviderFailure = originalProviderObserver
+		observeOpenCodeGoFailoverFailure = originalFailoverObserver
+	})
+
+	providerStatuses := make([]int, 0, 3)
+	observeOpenCodeGoProviderFailure = func(_ int, _ string, _ string, failure service.OpenCodeGoProviderFailure, _ time.Time) (bool, error) {
+		providerStatuses = append(providerStatuses, failure.StatusCode)
+		return false, nil
+	}
+	failoverCalls := 0
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failoverCalls++
+		return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionSuspect}, nil
+	}
+
+	adaptor := &Adaptor{
+		protocol:             ProtocolResponses,
+		workspaceSelected:    true,
+		selectedWorkspaceUID: "workspace-provider",
+		failoverAttempt:      &service.OpenCodeGoFailoverAttempt{},
+	}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "kimi-k3"}}
+	for index, test := range []struct {
+		status       int
+		wantFailover int
+	}{
+		{status: http.StatusServiceUnavailable, wantFailover: 1},
+		{status: http.StatusUnauthorized, wantFailover: 1},
+		{status: http.StatusTooManyRequests, wantFailover: 1},
+	} {
+		resp := &http.Response{
+			StatusCode: test.status,
+			Header:     http.Header{},
+			Body:       errorReadCloser{err: io.ErrUnexpectedEOF},
+		}
+
+		apiErr, observation := adaptor.HandleNon2xxResponse(newAdaptorTestContext(), resp, info)
+
+		require.NotNil(t, apiErr)
+		require.NotNil(t, observation)
+		assert.Equal(t, test.status, apiErr.StatusCode)
+		assert.Equal(t, test.status, observation.StatusCode)
+		assert.Equal(t, string(types.ErrorCodeReadResponseBodyFailed), observation.ErrorCode)
+		assert.True(t, types.IsSkipRetryError(apiErr))
+		assert.Equal(t, index+1, len(providerStatuses))
+		assert.Equal(t, test.status, providerStatuses[index])
+		assert.Equal(t, test.wantFailover, failoverCalls)
+	}
+}
+
+func TestHandleNon2xxResponseCancellationDoesNotMutateHealthOrFailover(t *testing.T) {
+	originalProviderObserver := observeOpenCodeGoProviderFailure
+	originalFailoverObserver := observeOpenCodeGoFailoverFailure
+	t.Cleanup(func() {
+		observeOpenCodeGoProviderFailure = originalProviderObserver
+		observeOpenCodeGoFailoverFailure = originalFailoverObserver
+	})
+
+	providerCalls := 0
+	failoverCalls := 0
+	observeOpenCodeGoProviderFailure = func(_ int, _ string, _ string, _ service.OpenCodeGoProviderFailure, _ time.Time) (bool, error) {
+		providerCalls++
+		return false, nil
+	}
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failoverCalls++
+		return service.OpenCodeGoFailoverObservation{}, nil
+	}
+
+	adaptor := &Adaptor{
+		protocol:             ProtocolResponses,
+		workspaceSelected:    true,
+		selectedWorkspaceUID: "workspace-provider",
+		failoverAttempt:      &service.OpenCodeGoFailoverAttempt{},
+	}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "kimi-k3"}}
+
+	c := newAdaptorTestContext()
+	requestContext, cancel := context.WithCancel(c.Request.Context())
+	c.Request = c.Request.WithContext(requestContext)
+	cancel()
+	apiErr, observation := adaptor.HandleNon2xxResponse(c, &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"type":"upstream_error"}`)),
+	}, info)
+	require.NotNil(t, apiErr)
+	require.NotNil(t, observation)
+
+	activeContext := newAdaptorTestContext()
+	apiErr, observation = adaptor.HandleNon2xxResponse(activeContext, &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     http.Header{},
+		Body:       errorReadCloser{err: context.Canceled},
+	}, info)
+	require.NotNil(t, apiErr)
+	require.NotNil(t, observation)
+
+	assert.Zero(t, providerCalls)
+	assert.Zero(t, failoverCalls)
 }

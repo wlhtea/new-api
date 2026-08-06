@@ -27,6 +27,13 @@ func (r *StreamResult) Error(err error) {
 
 // Stop records a fatal error and marks the stream to stop after this chunk.
 func (r *StreamResult) Stop(err error) {
+	if r == nil || r.status == nil {
+		return
+	}
+	// A handler stop is local relay evidence unless the handler has also
+	// explicitly marked the payload as an upstream failure. Keep this flag
+	// independent of EndReason because a prior [DONE] can win first-wins.
+	r.status.MarkLocalFailure()
 	if err != nil {
 		r.status.RecordError(err.Error())
 	}

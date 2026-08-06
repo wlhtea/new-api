@@ -93,11 +93,24 @@ const (
 	OpenCodeGoProtocolChat      = "chat"
 	OpenCodeGoProtocolMessages  = "messages"
 	OpenCodeGoProtocolResponses = "responses"
+
+	OpenCodeGoGenericFailoverDefaultThreshold     = 2
+	OpenCodeGoGenericFailoverDefaultWindowSeconds = 30
+	OpenCodeGoGenericFailoverDefaultMaxBackups    = 1
+	OpenCodeGoGenericFailoverDefaultLeaseSeconds  = 30 * 60
+	OpenCodeGoGenericFailoverMaxThreshold         = 10
+	OpenCodeGoGenericFailoverMaxWindowSeconds     = 5 * 60
+	OpenCodeGoGenericFailoverMaxLeaseSeconds      = 24 * 60 * 60
 )
 
 type OpenCodeGoConfig struct {
 	ModelProtocols                map[string]string `json:"model_protocols,omitempty"`
 	DefaultProtocol               string            `json:"default_protocol,omitempty"`
+	GenericFailoverEnabled        bool              `json:"generic_failover_enabled,omitempty"`
+	GenericFailoverThreshold      int               `json:"generic_failover_threshold,omitempty"`
+	GenericFailoverWindowSeconds  int               `json:"generic_failover_window_seconds,omitempty"`
+	GenericFailoverMaxBackups     int               `json:"generic_failover_max_backups,omitempty"`
+	GenericFailoverLeaseSeconds   int               `json:"generic_failover_lease_seconds,omitempty"`
 	AutoEnableChinaModels         *bool             `json:"auto_enable_china_models,omitempty"`
 	AutoApplyReferralRewards      *bool             `json:"auto_apply_referral_rewards,omitempty"`
 	ReferralRewardsMaxPerRun      *int              `json:"referral_rewards_max_per_run,omitempty"`
@@ -116,6 +129,38 @@ func (c *OpenCodeGoConfig) Validate() error {
 	if c.ReferralRewardsMaxPerRun != nil &&
 		(*c.ReferralRewardsMaxPerRun < 0 || *c.ReferralRewardsMaxPerRun > 20) {
 		return fmt.Errorf("OpenCode Go referral_rewards_max_per_run must be between 0 and 20")
+	}
+	if c.GenericFailoverThreshold != 0 &&
+		(c.GenericFailoverThreshold < OpenCodeGoGenericFailoverDefaultThreshold ||
+			c.GenericFailoverThreshold > OpenCodeGoGenericFailoverMaxThreshold) {
+		return fmt.Errorf(
+			"OpenCode Go generic_failover_threshold must be between %d and %d",
+			OpenCodeGoGenericFailoverDefaultThreshold,
+			OpenCodeGoGenericFailoverMaxThreshold,
+		)
+	}
+	if c.GenericFailoverWindowSeconds != 0 &&
+		(c.GenericFailoverWindowSeconds < 1 ||
+			c.GenericFailoverWindowSeconds > OpenCodeGoGenericFailoverMaxWindowSeconds) {
+		return fmt.Errorf(
+			"OpenCode Go generic_failover_window_seconds must be between 1 and %d",
+			OpenCodeGoGenericFailoverMaxWindowSeconds,
+		)
+	}
+	if c.GenericFailoverMaxBackups != 0 &&
+		c.GenericFailoverMaxBackups != OpenCodeGoGenericFailoverDefaultMaxBackups {
+		return fmt.Errorf(
+			"OpenCode Go generic_failover_max_backups must be %d in this release",
+			OpenCodeGoGenericFailoverDefaultMaxBackups,
+		)
+	}
+	if c.GenericFailoverLeaseSeconds != 0 &&
+		(c.GenericFailoverLeaseSeconds < 1 ||
+			c.GenericFailoverLeaseSeconds > OpenCodeGoGenericFailoverMaxLeaseSeconds) {
+		return fmt.Errorf(
+			"OpenCode Go generic_failover_lease_seconds must be between 1 and %d",
+			OpenCodeGoGenericFailoverMaxLeaseSeconds,
+		)
 	}
 	seenPatterns := make(map[string]struct{}, len(c.ModelProtocols))
 	for pattern, protocol := range c.ModelProtocols {

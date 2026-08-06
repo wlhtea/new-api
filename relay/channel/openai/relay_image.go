@@ -45,7 +45,7 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 
-	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+	if oaiError := usageResp.GetOpenAIError(); responsesErrorHasDetails(oaiError) {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
@@ -246,7 +246,7 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	if err := common.Unmarshal(responseBody, &usageResp); err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+	if oaiError := usageResp.GetOpenAIError(); responsesErrorHasDetails(oaiError) {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 	normalizeOpenAIUsage(&usageResp.Usage)

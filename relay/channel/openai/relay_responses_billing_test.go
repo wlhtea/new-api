@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -264,4 +265,54 @@ func TestOaiResponsesStreamHandlerDoesNotCountPartialImageEvent(t *testing.T) {
 	)
 
 	assert.Equal(t, 0, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
+}
+
+func TestOaiResponsesStreamHandlerClassifiesCodeOnlyErrors(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	tests := []struct {
+		name      string
+		eventType string
+		code      string
+		upstream  bool
+	}{
+		{name: "failed deterministic", eventType: "response.failed", code: "invalid_prompt", upstream: false},
+		{name: "failed transient", eventType: "response.failed", code: "server_error", upstream: true},
+		{name: "error deterministic", eventType: "response.error", code: "input_too_long", upstream: false},
+		{name: "error transient", eventType: "response.error", code: "rate_limit_exceeded", upstream: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := `data: {"type":"` + tt.eventType + `","response":{"error":{"code":"` + tt.code + `","message":"provider rejected request"}}}` + "\n\n"
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			c.Set(common.RequestIdKey, "responses-code-only-error-test")
+			info := &relaycommon.RelayInfo{
+				DisablePing: true,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType:       constant.ChannelTypeOpenCodeGo,
+					UpstreamModelName: "gpt-test",
+				},
+			}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			}
+
+			_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+			require.NotNil(t, apiErr)
+			assert.Equal(t, types.ErrorCode(tt.code), apiErr.GetErrorCode())
+			require.NotNil(t, info.StreamStatus)
+			assert.Equal(t, tt.upstream, info.StreamStatus.UpstreamFailureObserved())
+		})
+	}
 }

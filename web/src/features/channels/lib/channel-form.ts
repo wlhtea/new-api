@@ -300,6 +300,31 @@ export const channelFormSchema = z
           return false
         }
       }, 'OpenCode Go model protocols must be a JSON object using chat, messages, or responses'),
+    opencode_go_generic_failover_enabled: z.boolean().optional(),
+    opencode_go_generic_failover_threshold: z
+      .number()
+      .int()
+      .min(2)
+      .max(10)
+      .default(2),
+    opencode_go_generic_failover_window_seconds: z
+      .number()
+      .int()
+      .min(1)
+      .max(300)
+      .default(30),
+    opencode_go_generic_failover_max_backups: z
+      .number()
+      .int()
+      .min(1)
+      .max(1)
+      .default(1),
+    opencode_go_generic_failover_lease_seconds: z
+      .number()
+      .int()
+      .min(1)
+      .max(86400)
+      .default(1800),
     opencode_go_auto_enable_china_models: z.boolean().optional(),
     opencode_go_auto_apply_referral_rewards: z.boolean().optional(),
     opencode_go_referral_rewards_max_per_run: z
@@ -487,6 +512,11 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   upstream_model_update_ignored_models: '',
   opencode_go_default_protocol: '',
   opencode_go_model_protocols: '',
+  opencode_go_generic_failover_enabled: false,
+  opencode_go_generic_failover_threshold: 2,
+  opencode_go_generic_failover_window_seconds: 30,
+  opencode_go_generic_failover_max_backups: 1,
+  opencode_go_generic_failover_lease_seconds: 1800,
   opencode_go_auto_enable_china_models: true,
   opencode_go_auto_apply_referral_rewards: true,
   opencode_go_referral_rewards_max_per_run: 3,
@@ -557,6 +587,11 @@ export function transformChannelToFormDefaults(
   let upstreamModelUpdateIgnoredModels = ''
   let openCodeGoDefaultProtocol: '' | 'chat' | 'messages' | 'responses' = ''
   let openCodeGoModelProtocols = ''
+  let openCodeGoGenericFailoverEnabled = false
+  let openCodeGoGenericFailoverThreshold = 2
+  let openCodeGoGenericFailoverWindowSeconds = 30
+  let openCodeGoGenericFailoverMaxBackups = 1
+  let openCodeGoGenericFailoverLeaseSeconds = 1800
   let openCodeGoAutoEnableChinaModels = true
   let openCodeGoAutoApplyReferralRewards = true
   let openCodeGoReferralRewardsMaxPerRun = 3
@@ -603,6 +638,35 @@ export function transformChannelToFormDefaults(
         openCodeGoModelProtocols = stringifyOpenCodeGoProtocolOverrides(
           openCodeGo.model_protocols
         )
+        openCodeGoGenericFailoverEnabled =
+          openCodeGo.generic_failover_enabled === true
+        if (
+          Number.isInteger(openCodeGo.generic_failover_threshold) &&
+          openCodeGo.generic_failover_threshold >= 2 &&
+          openCodeGo.generic_failover_threshold <= 10
+        ) {
+          openCodeGoGenericFailoverThreshold =
+            openCodeGo.generic_failover_threshold
+        }
+        if (
+          Number.isInteger(openCodeGo.generic_failover_window_seconds) &&
+          openCodeGo.generic_failover_window_seconds >= 1 &&
+          openCodeGo.generic_failover_window_seconds <= 300
+        ) {
+          openCodeGoGenericFailoverWindowSeconds =
+            openCodeGo.generic_failover_window_seconds
+        }
+        if (openCodeGo.generic_failover_max_backups === 1) {
+          openCodeGoGenericFailoverMaxBackups = 1
+        }
+        if (
+          Number.isInteger(openCodeGo.generic_failover_lease_seconds) &&
+          openCodeGo.generic_failover_lease_seconds >= 1 &&
+          openCodeGo.generic_failover_lease_seconds <= 86400
+        ) {
+          openCodeGoGenericFailoverLeaseSeconds =
+            openCodeGo.generic_failover_lease_seconds
+        }
         openCodeGoAutoEnableChinaModels =
           typeof openCodeGo.auto_enable_china_models === 'boolean'
             ? openCodeGo.auto_enable_china_models
@@ -677,6 +741,14 @@ export function transformChannelToFormDefaults(
     upstream_model_update_ignored_models: upstreamModelUpdateIgnoredModels,
     opencode_go_default_protocol: openCodeGoDefaultProtocol,
     opencode_go_model_protocols: openCodeGoModelProtocols,
+    opencode_go_generic_failover_enabled: openCodeGoGenericFailoverEnabled,
+    opencode_go_generic_failover_threshold: openCodeGoGenericFailoverThreshold,
+    opencode_go_generic_failover_window_seconds:
+      openCodeGoGenericFailoverWindowSeconds,
+    opencode_go_generic_failover_max_backups:
+      openCodeGoGenericFailoverMaxBackups,
+    opencode_go_generic_failover_lease_seconds:
+      openCodeGoGenericFailoverLeaseSeconds,
     opencode_go_auto_enable_china_models: openCodeGoAutoEnableChinaModels,
     opencode_go_auto_apply_referral_rewards: openCodeGoAutoApplyReferralRewards,
     opencode_go_referral_rewards_max_per_run:
@@ -855,6 +927,16 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
       formData.opencode_go_model_protocols
     )
     openCodeGo.default_protocol = formData.opencode_go_default_protocol || ''
+    openCodeGo.generic_failover_enabled =
+      formData.opencode_go_generic_failover_enabled === true
+    openCodeGo.generic_failover_threshold =
+      formData.opencode_go_generic_failover_threshold
+    openCodeGo.generic_failover_window_seconds =
+      formData.opencode_go_generic_failover_window_seconds
+    openCodeGo.generic_failover_max_backups =
+      formData.opencode_go_generic_failover_max_backups
+    openCodeGo.generic_failover_lease_seconds =
+      formData.opencode_go_generic_failover_lease_seconds
     openCodeGo.auto_enable_china_models =
       formData.opencode_go_auto_enable_china_models !== false
     openCodeGo.auto_apply_referral_rewards =

@@ -4,12 +4,363 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
+
+// openCodeGoNamespaceTool is the reversible identity for a function that was
+// declared under a Codex Responses namespace. OpenCode Go only accepts flat
+// Responses function tools, so the mapping is carried by the adaptor until the
+// provider response is converted back to the client format.
+type openCodeGoNamespaceTool struct {
+	Namespace string
+	Name      string
+}
+
+const openCodeGoResponsesToolNameLimit = 64
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
+}
+
+// prepareOpenCodeGoResponsesTools lowers Codex-only Responses tool shapes to
+// the strict function-only schema accepted by the OpenCode Go Responses route.
+// It mutates request in place and returns only names that need restoration on
+// the response path.
+func prepareOpenCodeGoResponsesTools(request *dto.OpenAIResponsesRequest) (map[string]openCodeGoNamespaceTool, error) {
+	if request == nil {
+		return nil, nil
+	}
+
+	var tools []map[string]any
+	hasTools := false
+	if len(request.Tools) > 0 && string(request.Tools) != "null" {
+		if err := common.Unmarshal(request.Tools, &tools); err != nil {
+			return nil, fmt.Errorf("invalid OpenCode Go Responses tools: %w", err)
+		}
+		hasTools = true
+	}
+
+	// Codex Desktop can put declarations in an additional_tools input item.
+	// OpenCode Go's input schema does not define that item, so lift its tools to
+	// the top-level declaration and remove the metadata item from history.
+	var input []any
+	hasInput := len(request.Input) > 0 && string(request.Input) != "null"
+	if hasInput && common.Unmarshal(request.Input, &input) == nil {
+		filtered := make([]any, 0, len(input))
+		for _, raw := range input {
+			item, ok := raw.(map[string]any)
+			if !ok || strings.TrimSpace(stringValue(item["type"])) != "additional_tools" {
+				filtered = append(filtered, raw)
+				continue
+			}
+			if extra, ok := responseToolMaps(item["tools"]); ok {
+				tools = append(tools, extra...)
+				hasTools = true
+			}
+		}
+		if len(filtered) != len(input) {
+			input = filtered
+			encoded, err := common.Marshal(input)
+			if err != nil {
+				return nil, err
+			}
+			request.Input = json.RawMessage(encoded)
+		}
+	}
+
+	if !hasTools {
+		return nil, nil
+	}
+
+	// Detect collisions before lowering. A flat name cannot identify two
+	// different namespace children or a top-level function unambiguously.
+	topLevel := make(map[string]struct{})
+	for _, tool := range tools {
+		typ := strings.ToLower(strings.TrimSpace(stringValue(tool["type"])))
+		if typ == "function" || typ == "custom" {
+			if name := strings.TrimSpace(stringValue(tool["name"])); name != "" {
+				topLevel[name] = struct{}{}
+			}
+		}
+	}
+	names := make(map[string]openCodeGoNamespaceTool)
+	for _, tool := range tools {
+		if strings.ToLower(strings.TrimSpace(stringValue(tool["type"]))) != "namespace" {
+			continue
+		}
+		if err := collectOpenCodeGoNamespaceTools(tool, "", topLevel, names); err != nil {
+			return nil, err
+		}
+	}
+
+	lowered := make([]map[string]any, 0, len(tools))
+	seen := make(map[string]struct{})
+	for _, tool := range tools {
+		if err := appendOpenCodeGoResponsesTool(&lowered, seen, tool, "", topLevel, names); err != nil {
+			return nil, err
+		}
+	}
+	if len(lowered) == 0 {
+		request.Tools = nil
+	} else {
+		encoded, err := common.Marshal(lowered)
+		if err != nil {
+			return nil, err
+		}
+		request.Tools = json.RawMessage(encoded)
+	}
+
+	if hasInput {
+		if common.Unmarshal(request.Input, &input) == nil {
+			rewriteOpenCodeGoResponsesHistory(input, names)
+			encoded, err := common.Marshal(input)
+			if err != nil {
+				return nil, err
+			}
+			request.Input = json.RawMessage(encoded)
+		}
+	}
+	rewriteOpenCodeGoResponsesToolChoice(request, names)
+	return names, nil
+}
+
+func responseToolMaps(value any) ([]map[string]any, bool) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if typed, ok := item.(map[string]any); ok {
+			result = append(result, typed)
+		}
+	}
+	return result, true
+}
+
+func responseToolChildren(tool map[string]any) []map[string]any {
+	children, ok := responseToolMaps(tool["tools"])
+	if ok {
+		return children
+	}
+	children, _ = responseToolMaps(tool["children"])
+	return children
+}
+
+func qualifyOpenCodeGoNamespaceToolName(namespace, child string) string {
+	namespace = strings.TrimSpace(namespace)
+	child = strings.TrimSpace(child)
+	if namespace == "" || child == "" || strings.HasPrefix(child, "mcp__") || strings.HasPrefix(child, namespace) {
+		return child
+	}
+	full := namespace + "__" + child
+	if len(full) <= openCodeGoResponsesToolNameLimit {
+		return full
+	}
+	// Responses function names are limited to 64 characters. Keep a readable
+	// prefix and a deterministic suffix so response restoration remains stable.
+	digest := sha256.Sum256([]byte(full))
+	suffix := "__" + hex.EncodeToString(digest[:4])
+	return full[:openCodeGoResponsesToolNameLimit-len(suffix)] + suffix
+}
+
+func collectOpenCodeGoNamespaceTools(tool map[string]any, parent string, topLevel map[string]struct{}, names map[string]openCodeGoNamespaceTool) error {
+	namespace := strings.TrimSpace(stringValue(tool["name"]))
+	if parent != "" {
+		namespace = qualifyOpenCodeGoNamespaceToolName(parent, namespace)
+	}
+	if namespace == "" {
+		return nil
+	}
+	for _, child := range responseToolChildren(tool) {
+		typ := strings.ToLower(strings.TrimSpace(stringValue(child["type"])))
+		name := strings.TrimSpace(stringValue(child["name"]))
+		switch typ {
+		case "function":
+			if name == "" {
+				continue
+			}
+			flat := qualifyOpenCodeGoNamespaceToolName(namespace, name)
+			if _, exists := topLevel[flat]; exists {
+				return fmt.Errorf("OpenCode Go namespace tool %q/%q conflicts with top-level tool %q", namespace, name, flat)
+			}
+			entry := openCodeGoNamespaceTool{Namespace: namespace, Name: name}
+			if previous, exists := names[flat]; exists && previous != entry {
+				return fmt.Errorf("OpenCode Go namespace tools %q/%q and %q/%q both flatten to %q", previous.Namespace, previous.Name, namespace, name, flat)
+			}
+			names[flat] = entry
+		case "namespace":
+			if err := collectOpenCodeGoNamespaceTools(child, namespace, topLevel, names); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func appendOpenCodeGoResponsesTool(out *[]map[string]any, seen map[string]struct{}, tool map[string]any, parent string, topLevel map[string]struct{}, names map[string]openCodeGoNamespaceTool) error {
+	typ := strings.ToLower(strings.TrimSpace(stringValue(tool["type"])))
+	switch typ {
+	case "namespace":
+		namespace := strings.TrimSpace(stringValue(tool["name"]))
+		if parent != "" {
+			namespace = qualifyOpenCodeGoNamespaceToolName(parent, namespace)
+		}
+		for _, child := range responseToolChildren(tool) {
+			childType := strings.ToLower(strings.TrimSpace(stringValue(child["type"])))
+			if childType == "namespace" {
+				if err := appendOpenCodeGoResponsesTool(out, seen, child, namespace, topLevel, names); err != nil {
+					return err
+				}
+				continue
+			}
+			if childType != "function" {
+				continue
+			}
+			name := strings.TrimSpace(stringValue(child["name"]))
+			if name == "" {
+				continue
+			}
+			flat := qualifyOpenCodeGoNamespaceToolName(namespace, name)
+			if _, exists := seen[flat]; exists {
+				continue
+			}
+			seen[flat] = struct{}{}
+			*out = append(*out, openCodeGoResponsesFunctionTool(child, flat))
+		}
+	case "function":
+		name := strings.TrimSpace(stringValue(tool["name"]))
+		if name == "" {
+			return nil
+		}
+		if _, exists := seen[name]; exists {
+			return nil
+		}
+		seen[name] = struct{}{}
+		*out = append(*out, openCodeGoResponsesFunctionTool(tool, name))
+	case "custom":
+		// OpenCode Go does not implement Responses custom tools. A function
+		// wrapper keeps Codex command tools usable without sending an unknown
+		// tool type to the strict upstream schema.
+		name := strings.TrimSpace(stringValue(tool["name"]))
+		if name == "" {
+			return nil
+		}
+		if _, exists := seen[name]; exists {
+			return nil
+		}
+		seen[name] = struct{}{}
+		*out = append(*out, openCodeGoResponsesCustomTool(name, stringValue(tool["description"])))
+	default:
+		// Hosted/server tools (web_search, image generation, tool search, and
+		// unknown extensions) are intentionally omitted: OpenCode Go cannot
+		// execute them and forwarding them causes a 400 unknown-tool-type error.
+	}
+	return nil
+}
+
+func openCodeGoResponsesFunctionTool(tool map[string]any, name string) map[string]any {
+	parameters := tool["parameters"]
+	if parameters == nil {
+		parameters = tool["parametersJsonSchema"]
+	}
+	if parameters == nil {
+		parameters = tool["input_schema"]
+	}
+	if parameters == nil {
+		parameters = map[string]any{"type": "object"}
+	}
+	result := map[string]any{
+		"type":        "function",
+		"name":        name,
+		"description": stringValue(tool["description"]),
+		"parameters":  parameters,
+	}
+	if strict, ok := tool["strict"].(bool); ok {
+		result["strict"] = strict
+	}
+	return result
+}
+
+func openCodeGoResponsesCustomTool(name, description string) map[string]any {
+	return map[string]any{
+		"type":        "function",
+		"name":        name,
+		"description": description,
+		"parameters": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"input": map[string]any{"type": "string"}},
+			"required":   []string{"input"},
+		},
+	}
+}
+
+func rewriteOpenCodeGoResponsesHistory(value any, names map[string]openCodeGoNamespaceTool) {
+	switch typed := value.(type) {
+	case []any:
+		for _, item := range typed {
+			rewriteOpenCodeGoResponsesHistory(item, names)
+		}
+	case map[string]any:
+		if strings.TrimSpace(stringValue(typed["type"])) == "function_call" {
+			name := strings.TrimSpace(stringValue(typed["name"]))
+			namespace := strings.TrimSpace(stringValue(typed["namespace"]))
+			if namespace != "" {
+				flat := qualifyOpenCodeGoNamespaceToolName(namespace, name)
+				if _, exists := names[flat]; exists || flat != "" {
+					typed["name"] = flat
+					delete(typed, "namespace")
+				}
+			}
+		}
+		for _, child := range typed {
+			rewriteOpenCodeGoResponsesHistory(child, names)
+		}
+	}
+}
+
+func rewriteOpenCodeGoResponsesToolChoice(request *dto.OpenAIResponsesRequest, names map[string]openCodeGoNamespaceTool) {
+	if request == nil || len(request.ToolChoice) == 0 || string(request.ToolChoice) == "null" {
+		return
+	}
+	var choice any
+	if common.Unmarshal(request.ToolChoice, &choice) != nil {
+		return
+	}
+	if object, ok := choice.(map[string]any); ok {
+		typ := strings.ToLower(strings.TrimSpace(stringValue(object["type"])))
+		namespace := strings.TrimSpace(stringValue(object["namespace"]))
+		name := strings.TrimSpace(stringValue(object["name"]))
+		if name == "" {
+			if nested, ok := object["function"].(map[string]any); ok {
+				name = strings.TrimSpace(stringValue(nested["name"]))
+			}
+		}
+		switch {
+		case namespace != "":
+			flat := qualifyOpenCodeGoNamespaceToolName(namespace, name)
+			if _, exists := names[flat]; exists {
+				request.ToolChoice, _ = common.Marshal(map[string]any{"type": "function", "name": flat})
+				return
+			}
+			request.ToolChoice = json.RawMessage(`"auto"`)
+		case typ == "namespace" || strings.HasPrefix(typ, "web_search") || typ == "tool_search":
+			request.ToolChoice = json.RawMessage(`"auto"`)
+		case typ == "custom" && name != "":
+			request.ToolChoice, _ = common.Marshal(map[string]any{"type": "function", "name": name})
+		case typ == "function" && name != "":
+			request.ToolChoice, _ = common.Marshal(map[string]any{"type": "function", "name": name})
+		default:
+			request.ToolChoice = json.RawMessage(`"auto"`)
+		}
+	}
+}
 
 func requestUsesFunctionTools(request any) bool {
 	switch typed := request.(type) {
