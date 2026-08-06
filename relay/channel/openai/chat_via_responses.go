@@ -131,9 +131,7 @@ func OaiChatToClaudeBufferedStreamHandler(c *gin.Context, info *relaycommon.Rela
 		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
-	if info.StreamStatus != nil {
-		info.StreamStatus.MarkProtocolTerminal()
-	}
+	markBufferedStreamNormal(info)
 	return usage, nil
 }
 
@@ -181,9 +179,7 @@ func OaiResponsesToClaudeBufferedStreamHandler(c *gin.Context, info *relaycommon
 		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
-	if info.StreamStatus != nil {
-		info.StreamStatus.MarkProtocolTerminal()
-	}
+	markBufferedStreamNormal(info)
 	return usage, nil
 }
 
@@ -197,6 +193,19 @@ func ensureBufferedStreamStatus(info *relaycommon.RelayInfo) {
 	if info.StreamProtocolTerminalRequired {
 		info.StreamStatus.RequireProtocolTerminal()
 	}
+}
+
+// markBufferedStreamNormal records a successful synthesized buffered stream.
+// Buffered handlers never pass through StreamScannerHandler, so EndReason is
+// never set on their StreamStatus; without it IsNormalEnd() reports a
+// successful request as an error in the admin log even though the relay
+// completed and emitted its terminal event.
+func markBufferedStreamNormal(info *relaycommon.RelayInfo) {
+	if info == nil || info.StreamStatus == nil {
+		return
+	}
+	info.StreamStatus.MarkProtocolTerminal()
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 }
 
 func emitBufferedClaudeResponse(c *gin.Context, response *dto.ClaudeResponse) error {
@@ -352,9 +361,7 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 		accumulator.ProcessEvent(&streamResp)
 		switch streamResp.Type {
 		case "response.completed", "response.done":
-			if info.StreamStatus != nil {
-				info.StreamStatus.MarkProtocolTerminal()
-			}
+			markBufferedStreamNormal(info)
 			finalResponse = streamResp.Response
 		case "response.incomplete":
 			if strictOpenCodeGo {

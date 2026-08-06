@@ -211,6 +211,8 @@ func TestOaiResponsesToClaudeBufferedStreamHandlerEmitsCompleteToolInput(t *test
 	assert.Equal(t, 19, usage.TotalTokens)
 	require.NotNil(t, usage.InputTokensDetails)
 	assert.Equal(t, 8, usage.InputTokensDetails.CachedTokens)
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.IsNormalEnd())
 
 	got := recorder.Body.String()
 	assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
@@ -262,6 +264,11 @@ func TestOaiChatToClaudeBufferedStreamHandlerPreservesReasoningAndToolInput(t *t
 	require.Nil(t, err)
 	require.NotNil(t, usage)
 	assert.Equal(t, 19, usage.TotalTokens)
+
+	// A synthesized buffered stream is a successful normal end, not an error.
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.IsNormalEnd())
+	assert.True(t, info.StreamStatus.ProtocolTerminalObserved())
 
 	got := recorder.Body.String()
 	assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
