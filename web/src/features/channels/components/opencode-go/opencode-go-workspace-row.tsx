@@ -128,10 +128,11 @@ export function OpenCodeGoWorkspaceRow(props: OpenCodeGoWorkspaceRowProps) {
   const refreshBusy = props.busyKey === `workspace:${workspace.uid}:refresh`
   const toggleBusy = props.busyKey === `workspace:${workspace.uid}:toggle`
   const riskBusy = props.busyKey === `workspace:${workspace.uid}:risk`
+  const bulkDisabled = workspace.effective_state === 'bulk_disabled'
   let toggleIcon = <Power className='text-success size-4' />
   if (toggleBusy) {
     toggleIcon = <Loader2 className='size-4 animate-spin' />
-  } else if (workspace.manual_enabled) {
+  } else if (workspace.manual_enabled && !bulkDisabled) {
     toggleIcon = <PowerOff className='text-destructive size-4' />
   }
 
@@ -257,10 +258,15 @@ export function OpenCodeGoWorkspaceRow(props: OpenCodeGoWorkspaceRowProps) {
                   variant='ghost'
                   disabled={!props.canOperate || toggleBusy}
                   onClick={() =>
-                    props.onToggle(workspace.uid, !workspace.manual_enabled)
+                    props.onToggle(
+                      workspace.uid,
+                      bulkDisabled ? true : !workspace.manual_enabled
+                    )
                   }
                   aria-label={
-                    workspace.manual_enabled ? t('Disable') : t('Enable')
+                    workspace.manual_enabled && !bulkDisabled
+                      ? t('Disable')
+                      : t('Enable')
                   }
                 />
               }
@@ -268,7 +274,9 @@ export function OpenCodeGoWorkspaceRow(props: OpenCodeGoWorkspaceRowProps) {
               {toggleIcon}
             </TooltipTrigger>
             <TooltipContent>
-              {workspace.manual_enabled ? t('Disable') : t('Enable')}
+              {workspace.manual_enabled && !bulkDisabled
+                ? t('Disable')
+                : t('Enable')}
             </TooltipContent>
           </Tooltip>
 
@@ -388,6 +396,15 @@ export function OpenCodeGoWorkspaceRow(props: OpenCodeGoWorkspaceRowProps) {
       </div>
 
       <div className='mt-4 grid min-w-0 gap-x-6 gap-y-2 text-xs sm:grid-cols-2 xl:grid-cols-4'>
+        <div>
+          <span className='text-muted-foreground'>{t('Current requests')}</span>
+          <p
+            className='mt-0.5 tabular-nums'
+            title={t('Concurrent requests currently served by this workspace')}
+          >
+            {workspace.inflight ?? 0}
+          </p>
+        </div>
         <div>
           <span className='text-muted-foreground'>{t('Last synced')}</span>
           <p

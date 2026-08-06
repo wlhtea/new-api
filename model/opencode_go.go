@@ -24,6 +24,7 @@ const (
 	OpenCodeGoStateMembershipExpired = "membership_expired"
 	OpenCodeGoStateQuotaExhausted    = "quota_exhausted"
 	OpenCodeGoStateRiskBlocked       = "risk_blocked"
+	OpenCodeGoStateBulkDisabled      = "bulk_disabled"
 	OpenCodeGoStateCooldown          = "cooldown"
 
 	OpenCodeGoQuotaSnapshotPending  = "pending"
@@ -112,6 +113,9 @@ type OpenCodeGoWorkspace struct {
 	ReferralRewardAppliedAt  int64                      `json:"referral_reward_applied_at" gorm:"bigint"`
 	RiskDetectedAt           int64                      `json:"risk_detected_at" gorm:"bigint;index"`
 	RiskLastCheckedAt        int64                      `json:"risk_last_checked_at" gorm:"bigint"`
+	// BulkFailureDetectedAt marks a workspace auto-disabled by repeated
+	// persistent provider failures (401/403), awaiting manual verification.
+	BulkFailureDetectedAt    int64                      `json:"-" gorm:"bigint;index"`
 	LastSyncedAt             int64                      `json:"last_synced_at" gorm:"bigint;index"`
 	LastError                string                     `json:"last_error" gorm:"type:varchar(512)"`
 	CreatedAt                int64                      `json:"created_at" gorm:"bigint;index"`

@@ -1,11 +1,13 @@
 package service
 
 import (
+	"net/http"
 	"sync"
 	"testing"
 	"time"
 
 	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -182,4 +184,115 @@ func TestOpenCodeGoLoadAwareDoesNotOverrideFailoverLease(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, leased.FailoverActive)
 	assert.Equal(t, backup, leased.WorkspaceUID)
+}
+
+func TestOpenCodeGoBulkFailureAutoDisablesWorkspace(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	first := createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "one", "workspace-one", "wrk_ALPHA1", []string{"model-a"})
+	createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "two", "workspace-two", "wrk_BETA2", []string{"model-a"})
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+
+	now := time.Unix(2_000_000_000, 0)
+	for range openCodeGoBulkFailureThreshold {
+		disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, http.StatusForbidden, "region blocked", now)
+		require.NoError(t, err)
+		if disabled {
+			break
+		}
+		now = now.Add(time.Minute)
+	}
+
+	workspace, err := model.GetOpenCodeGoWorkspace(channel.Id, first.UID)
+	require.NoError(t, err)
+	require.Equal(t, model.OpenCodeGoStateBulkDisabled, workspace.EffectiveState)
+	require.Greater(t, workspace.BulkFailureDetectedAt, int64(0))
+
+	// The auto-disabled workspace is removed from the pool snapshot.
+	selection, err := SelectOpenCodeGoWorkspace(channel.Id, "model-a")
+	require.NoError(t, err)
+	require.NotEqual(t, first.UID, selection.WorkspaceUID)
+}
+
+func TestOpenCodeGoBulkFailureIgnoresTransientAndQuotaStatuses(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	first := createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "one", "workspace-one", "wrk_ALPHA1", []string{"model-a"})
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+
+	now := time.Unix(2_000_000_000, 0)
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable} {
+		disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, status, "transient", now)
+		require.NoError(t, err)
+		require.False(t, disabled, "status %d must not auto-disable", status)
+		now = now.Add(time.Minute)
+	}
+	workspace, err := model.GetOpenCodeGoWorkspace(channel.Id, first.UID)
+	require.NoError(t, err)
+	require.Equal(t, model.OpenCodeGoStateEligible, workspace.EffectiveState)
+	require.Zero(t, workspace.BulkFailureDetectedAt)
+}
+
+func TestOpenCodeGoBulkFailureWindowResetsStaleCount(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	first := createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "one", "workspace-one", "wrk_ALPHA1", []string{"model-a"})
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+
+	now := time.Unix(2_000_000_000, 0)
+	// Two failures, then a long gap resets the window before the threshold is met.
+	for range openCodeGoBulkFailureThreshold - 1 {
+		_, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, http.StatusForbidden, "region blocked", now)
+		require.NoError(t, err)
+		now = now.Add(time.Minute)
+	}
+	now = now.Add(openCodeGoBulkFailureWindow + time.Minute)
+	disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, http.StatusForbidden, "region blocked", now)
+	require.NoError(t, err)
+	require.False(t, disabled)
+	workspace, err := model.GetOpenCodeGoWorkspace(channel.Id, first.UID)
+	require.NoError(t, err)
+	require.Zero(t, workspace.BulkFailureDetectedAt)
+}
+
+func TestOpenCodeGoBulkDisabledRecoversOnlyByManualEnable(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	first := createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "one", "workspace-one", "wrk_ALPHA1", []string{"model-a"})
+	createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "two", "workspace-two", "wrk_BETA2", []string{"model-a"})
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+
+	now := time.Unix(2_000_000_000, 0)
+	for range openCodeGoBulkFailureThreshold - 1 {
+		_, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, http.StatusForbidden, "region blocked", now)
+		require.NoError(t, err)
+		now = now.Add(time.Minute)
+	}
+	disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, http.StatusForbidden, "region blocked", now)
+	require.NoError(t, err)
+	require.True(t, disabled)
+
+	// Manual re-enable (human verification) clears the bulk-disable evidence.
+	pool := &OpenCodeGoAccountPoolService{now: func() time.Time { return now.Add(time.Hour) }}
+	require.NoError(t, pool.SetWorkspaceEnabled(channel.Id, first.UID, true))
+
+	workspace, err := model.GetOpenCodeGoWorkspace(channel.Id, first.UID)
+	require.NoError(t, err)
+	require.Zero(t, workspace.BulkFailureDetectedAt)
+	require.Equal(t, model.OpenCodeGoStateEligible, workspace.EffectiveState)
+}
+
+func TestOpenCodeGoPoolViewExposesInflight(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	first := createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "one", "workspace-one", "wrk_ALPHA1", []string{"model-a"})
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+
+	AcquireOpenCodeGoWorkspaceInFlight(channel.Id, first.UID)
+	AcquireOpenCodeGoWorkspaceInFlight(channel.Id, first.UID)
+	t.Cleanup(func() {
+		ReleaseOpenCodeGoWorkspaceInFlight(channel.Id, first.UID)
+		ReleaseOpenCodeGoWorkspaceInFlight(channel.Id, first.UID)
+	})
+
+	view, err := GetOpenCodeGoPoolView(channel.Id)
+	require.NoError(t, err)
+	require.Len(t, view.Identities, 1)
+	require.Len(t, view.Identities[0].Workspaces, 1)
+	assert.Equal(t, int64(2), view.Identities[0].Workspaces[0].Inflight)
 }

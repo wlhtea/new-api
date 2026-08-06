@@ -36,6 +36,7 @@ export const OPENCODE_GO_WORKSPACE_STATE_LABELS: Record<string, string> = {
   membership_expired: 'Membership inactive',
   quota_exhausted: 'Quota exhausted',
   risk_blocked: 'Risk blocked',
+  bulk_disabled: 'Bulk failures (awaiting verification)',
   cooldown: 'Cooling down',
 }
 
@@ -65,7 +66,12 @@ export function openCodeGoIdentityBadgeVariant(status: string): BadgeVariant {
 
 export function openCodeGoWorkspaceBadgeVariant(state: string): BadgeVariant {
   if (state === 'eligible') return 'default'
-  if (state === 'risk_blocked' || state === 'auth_error') return 'destructive'
+  if (
+    state === 'risk_blocked' ||
+    state === 'auth_error' ||
+    state === 'bulk_disabled'
+  )
+    return 'destructive'
   if (state === 'quota_exhausted' || state === 'cooldown') return 'warning'
   if (state === 'manual_disabled') return 'secondary'
   return 'outline'

@@ -96,12 +96,13 @@ func TestOpenCodeGoPoolViewConvertsHealthObservationNanosecondsToSeconds(t *test
 		},
 	}
 
-	view := openCodeGoWorkspaceToView(workspace)
+	view := openCodeGoWorkspaceToView(7, workspace)
 
 	require.Equal(t, observedAt.Unix(), view.HealthObservedAt)
 	require.Len(t, view.Models, 1)
 	require.Equal(t, observedAt.Add(time.Second).Unix(), view.Models[0].HealthObservedAt)
 	require.LessOrEqual(t, view.HealthObservedAt, int64(9_007_199_254_740_991))
+	require.Equal(t, int64(0), view.Inflight)
 	require.Zero(t, openCodeGoHealthObservedAtForView(0))
 }
 

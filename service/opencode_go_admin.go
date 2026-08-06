@@ -78,6 +78,7 @@ type OpenCodeGoWorkspaceView struct {
 	ReferralRewardAppliedAt  int64                          `json:"referral_reward_applied_at"`
 	RiskDetectedAt           int64                          `json:"risk_detected_at"`
 	RiskLastCheckedAt        int64                          `json:"risk_last_checked_at"`
+	Inflight                 int64                          `json:"inflight"`
 	LastSyncedAt             int64                          `json:"last_synced_at"`
 	LastError                string                         `json:"last_error"`
 	CreatedAt                int64                          `json:"created_at"`
@@ -161,7 +162,7 @@ func GetOpenCodeGoPoolView(channelID int) (*OpenCodeGoPoolView, error) {
 			Workspaces:    make([]OpenCodeGoWorkspaceView, 0, len(identity.Workspaces)),
 		}
 		for _, workspace := range identity.Workspaces {
-			identityView.Workspaces = append(identityView.Workspaces, openCodeGoWorkspaceToView(workspace))
+			identityView.Workspaces = append(identityView.Workspaces, openCodeGoWorkspaceToView(channelID, workspace))
 		}
 		view.Identities = append(view.Identities, identityView)
 	}
@@ -181,7 +182,7 @@ func GetOpenCodeGoPoolView(channelID int) (*OpenCodeGoPoolView, error) {
 	return view, nil
 }
 
-func openCodeGoWorkspaceToView(workspace model.OpenCodeGoWorkspace) OpenCodeGoWorkspaceView {
+func openCodeGoWorkspaceToView(channelID int, workspace model.OpenCodeGoWorkspace) OpenCodeGoWorkspaceView {
 	view := OpenCodeGoWorkspaceView{
 		UID:                      workspace.UID,
 		Name:                     workspace.Name,
@@ -216,6 +217,7 @@ func openCodeGoWorkspaceToView(workspace model.OpenCodeGoWorkspace) OpenCodeGoWo
 		ReferralRewardAppliedAt:  workspace.ReferralRewardAppliedAt,
 		RiskDetectedAt:           workspace.RiskDetectedAt,
 		RiskLastCheckedAt:        workspace.RiskLastCheckedAt,
+		Inflight:                 OpenCodeGoWorkspaceInFlight(channelID, workspace.UID),
 		LastSyncedAt:             workspace.LastSyncedAt,
 		LastError:                sanitizeOpenCodeGoStoredMessage(workspace.LastError),
 		CreatedAt:                workspace.CreatedAt,
@@ -382,6 +384,7 @@ func (service *OpenCodeGoAccountPoolService) SetWorkspaceEnabled(channelID int, 
 				"health_observed_at": reduced.HealthObservedAt,
 				"quota_recovery_at":  reduced.QuotaRecoveryAt,
 				"cooldown_until":     reduced.CooldownUntil,
+				"bulk_failure_detected_at": reduced.BulkFailureDetectedAt,
 				"updated_at":         common.GetTimestamp(),
 			})
 		if result.Error != nil {

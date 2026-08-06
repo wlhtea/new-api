@@ -113,6 +113,7 @@ function workspace(
     referral_reward_applied_at: 0,
     risk_detected_at: 0,
     risk_last_checked_at: 1_900_000_000,
+    inflight: 0,
     last_synced_at: 1_900_000_000,
     last_error: '',
     created_at: 1_800_000_000,
