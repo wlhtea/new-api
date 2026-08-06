@@ -52,6 +52,7 @@ type OpenCodeGoPoolSelectOptions struct {
 	Protocol    string
 	Stateful    bool
 	Failover    OpenCodeGoFailoverPolicy
+	LoadAware   bool
 }
 
 type OpenCodeGoFailoverAttempt struct {

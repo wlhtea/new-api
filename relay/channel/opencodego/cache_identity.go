@@ -25,7 +25,7 @@ const (
 )
 
 func cacheIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) string {
-	if identity := affinityIdentityForRequest(c, request); identity != "" {
+	if identity := affinityIdentityForRequest(c, info, request); identity != "" {
 		return identity
 	}
 	if source, value := requestCacheIdentity(request); value != "" {
@@ -45,7 +45,12 @@ func cacheIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, reques
 	return hashCacheIdentity("fallback", seed)
 }
 
-func affinityIdentityForRequest(c *gin.Context, request any) string {
+// affinityIdentityForRequest resolves the workspace-affinity key for a
+// request. Session markers keep priority; when none is present and the channel
+// opted into token fallback, the caller token identity is used so stateless
+// traffic (for example load tests) stays on a stable workspace instead of
+// round-robining and losing its cache on every request.
+func affinityIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) string {
 	if c != nil && c.Request != nil {
 		if value := strings.TrimSpace(c.Request.Header.Get(claudeCodeSessionHeader)); value != "" {
 			return hashCacheIdentity("claude-code-session", value)
@@ -61,6 +66,10 @@ func affinityIdentityForRequest(c *gin.Context, request any) string {
 	}
 	if source, value := requestCacheIdentity(request); value != "" && source != "messages" {
 		return canonicalCacheIdentity(source, value)
+	}
+	if info != nil && info.ChannelMeta != nil && info.ChannelOtherSettings.OpenCodeGo != nil &&
+		info.ChannelOtherSettings.OpenCodeGo.AffinityFallback == "token" && info.TokenId > 0 {
+		return hashCacheIdentity("token-fallback", strconv.Itoa(info.TokenId))
 	}
 	return ""
 }

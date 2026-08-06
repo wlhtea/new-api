@@ -135,8 +135,13 @@ describe('OpenCode Go channel settings', () => {
       (control) =>
         control.getAttribute('aria-label') === 'Generic upstream failover'
     )
+    const loadAwareSwitch = switches.find(
+      (control) =>
+        control.getAttribute('aria-label') === 'Balance traffic by account load'
+    )
     const lifecycleSwitches = switches.filter(
-      (control) => control !== genericFailoverSwitch
+      (control) =>
+        control !== genericFailoverSwitch && control !== loadAwareSwitch
     )
     const rewardLimit = host.querySelector<HTMLInputElement>(
       'input[type="number"]'
@@ -145,6 +150,10 @@ describe('OpenCode Go channel settings', () => {
     assert.equal(genericFailoverSwitch.hasAttribute('disabled'), false)
     assert.notEqual(genericFailoverSwitch.getAttribute('aria-disabled'), 'true')
     assert.equal(genericFailoverSwitch.hasAttribute('data-disabled'), false)
+    assert.ok(loadAwareSwitch)
+    assert.equal(loadAwareSwitch.hasAttribute('disabled'), false)
+    assert.notEqual(loadAwareSwitch.getAttribute('aria-disabled'), 'true')
+    assert.equal(loadAwareSwitch.hasAttribute('data-disabled'), false)
     assert.equal(lifecycleSwitches.length, 3)
     assert.equal(
       lifecycleSwitches.every(

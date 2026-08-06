@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { ArrowRight, ShieldAlert, ShieldCheck, Waypoints } from 'lucide-react'
+import { ArrowRight, Gauge, ShieldAlert, ShieldCheck, Waypoints } from 'lucide-react'
 import { useFormContext } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 
@@ -255,6 +255,77 @@ export function OpenCodeGoChannelSettings(
             )}
           />
         </div>
+      </div>
+
+      <div className='flex items-center gap-2'>
+        <Gauge
+          className='text-muted-foreground h-3.5 w-3.5'
+          aria-hidden='true'
+        />
+        <h4 className='text-muted-foreground text-xs font-medium tracking-wide uppercase'>
+          {t('Load-aware scheduling')}
+        </h4>
+      </div>
+
+      <div className='divide-border/60 border-border/60 divide-y border-y'>
+        <FormField
+          control={form.control}
+          name='opencode_go_load_aware_enabled'
+          render={({ field }) => (
+            <FormItem className='flex min-h-16 items-center justify-between gap-4 py-3'>
+              <div className='min-w-0'>
+                <FormLabel>{t('Balance traffic by account load')}</FormLabel>
+                <FormDescription>
+                  {t(
+                    'Routes steady-state requests toward less-busy accounts and keeps an explicit failover lease in charge on errors'
+                  )}
+                </FormDescription>
+              </div>
+              <FormControl>
+                <Switch
+                  checked={field.value === true}
+                  onCheckedChange={field.onChange}
+                  aria-label={t('Balance traffic by account load')}
+                />
+              </FormControl>
+            </FormItem>
+          )}
+        />
+
+        <FormField
+          control={form.control}
+          name='opencode_go_affinity_fallback'
+          render={({ field }) => (
+            <FormItem className='flex min-h-16 items-center justify-between gap-4 py-3'>
+              <div className='min-w-0'>
+                <FormLabel>{t('Affinity fallback')}</FormLabel>
+                <FormDescription>
+                  {t(
+                    'Keep requests that carry no session marker on a stable account'
+                  )}
+                </FormDescription>
+              </div>
+              <FormControl>
+                <Select
+                  value={field.value}
+                  onValueChange={(value) => field.onChange(value)}
+                >
+                  <SelectTrigger className='w-40'>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value='none'>{t('Disabled')}</SelectItem>
+                      <SelectItem value='token'>
+                        {t('By request API key')}
+                      </SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </FormControl>
+            </FormItem>
+          )}
+        />
       </div>
 
       <div className='flex flex-wrap items-center justify-between gap-2'>
