@@ -464,6 +464,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 	streamErr := (*types.NewAPIError)(nil)
+	strictOpenCodeGo := info != nil && info.ChannelType == constant.ChannelTypeOpenCodeGo
 
 	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo == nil {
 		info.ClaudeConvertInfo = &relaycommon.ClaudeConvertInfo{LastMessagesType: relaycommon.LastMessageTypeNone}
@@ -567,9 +568,15 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 		if streamResp.Type == "response.incomplete" || streamResp.Type == "response.cancelled" || streamResp.Type == "response.canceled" {
-			streamErr = types.NewOpenAIError(fmt.Errorf("responses stream ended with %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
-			sr.Stop(streamErr)
-			return
+			if strictOpenCodeGo {
+				// `incomplete` commonly means a deterministic stop such as
+				// max_output_tokens/content_filter; `cancelled` can be client-driven.
+				// Surface both as failover evidence without rotating the workspace.
+				// Other channels must keep converting them as normal terminal events.
+				streamErr = types.NewOpenAIError(fmt.Errorf("responses stream ended with %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+				sr.Stop(streamErr)
+				return
+			}
 		}
 		if (streamResp.Type == "response.completed" || streamResp.Type == "response.done") && info.StreamStatus != nil {
 			info.StreamStatus.MarkProtocolTerminal()

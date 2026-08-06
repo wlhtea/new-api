@@ -446,6 +446,65 @@ func TestOaiResponsesStreamHandlerEOFWithoutTerminalIsNotNormal(t *testing.T) {
 	assert.False(t, info.StreamStatus.IsNormalEnd())
 }
 
+func TestOaiResponsesToChatStreamHandlerIncompleteIsNormalForNonOpenCodeGo(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test","created_at":1710000000}}`,
+		`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		`data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+
+	// A max_output_tokens cutoff is a legitimate terminal state for non-OpenCode
+	// Go channels: it must finish with finish_reason "length", not an error.
+	usage, err := OaiResponsesToChatStreamHandler(c, info, resp)
+	require.Nil(t, err)
+	require.NotNil(t, usage)
+	assert.Equal(t, 5, usage.TotalTokens)
+
+	got := recorder.Body.String()
+	require.Contains(t, got, `"finish_reason":"length"`)
+	require.Contains(t, got, `data: [DONE]`)
+}
+
+func TestOaiResponsesToChatStreamHandlerIncompleteErrorsForOpenCodeGo(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test","created_at":1710000000}}`,
+		`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		`data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	c, _, resp, info := newResponsesChatTestContext(t, body, true)
+	info.ChannelType = constant.ChannelTypeOpenCodeGo
+
+	// OpenCode Go surfaces incomplete/cancelled as an error without rotating the
+	// workspace: no transient upstream-failure failover evidence is recorded.
+	_, err := OaiResponsesToChatStreamHandler(c, info, resp)
+	require.Error(t, err)
+	require.NotNil(t, info.StreamStatus)
+	assert.False(t, info.StreamStatus.UpstreamFailureObserved())
+}
+
 func requireOrderedSubstrings(t *testing.T, s string, parts ...string) {
 	t.Helper()
 
