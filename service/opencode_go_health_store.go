@@ -155,6 +155,7 @@ func openCodeGoWorkspaceHealthUpdates(workspace model.OpenCodeGoWorkspace) map[s
 		"quota_recovery_at":     workspace.QuotaRecoveryAt,
 		"risk_detected_at":      workspace.RiskDetectedAt,
 		"risk_last_checked_at":  workspace.RiskLastCheckedAt,
+		"bulk_failure_detected_at": workspace.BulkFailureDetectedAt,
 		"last_error":            workspace.LastError,
 		"updated_at":            common.GetTimestamp(),
 	}

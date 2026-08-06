@@ -151,6 +151,29 @@ func (a *Adaptor) persistProviderFailure(c *gin.Context, info *relaycommon.Relay
 			err,
 		))
 	}
+	// Repeated persistent failures (401/403) auto-disable the workspace pending
+	// manual verification, separate from model-level cooldowns.
+	if disabled, bulkErr := service.ObserveOpenCodeGoBulkProviderFailure(
+		info.ChannelId,
+		a.selectedWorkspaceUID,
+		observation.StatusCode,
+		observation.Message,
+		observedAt,
+	); bulkErr != nil {
+		common.SysError(fmt.Sprintf(
+			"failed to persist OpenCode Go bulk failure observation: channel_id=%d workspace_ref=%s error=%v",
+			info.ChannelId,
+			hashCacheIdentity("diagnostic-workspace", a.selectedWorkspaceUID),
+			bulkErr,
+		))
+	} else if disabled {
+		logger.LogWarn(c, fmt.Sprintf(
+			"OpenCode Go workspace auto-disabled after repeated provider failures: channel_id=%d workspace_ref=%s status=%d",
+			info.ChannelId,
+			hashCacheIdentity("diagnostic-workspace", a.selectedWorkspaceUID),
+			observation.StatusCode,
+		))
+	}
 	if !authoritative && service.IsOpenCodeGoGenericFailoverStatus(observation.StatusCode) {
 		a.recordFailoverFailure(c, info, fmt.Sprintf("http_%d", observation.StatusCode))
 	}

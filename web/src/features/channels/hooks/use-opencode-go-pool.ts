@@ -23,6 +23,8 @@ import { toast } from 'sonner'
 
 import {
   applyOpenCodeGoReferralReward,
+  batchCancelOpenCodeGoSubscriptionRenewal,
+  batchOpenCodeGoChinaModels,
   cancelOpenCodeGoSubscriptionRenewal,
   deleteOpenCodeGoIdentity,
   deleteOpenCodeGoNonMemberWorkspaces,
@@ -393,6 +395,38 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
     )
   }
 
+  const batchSetChinaModels = async (enabled: boolean) => {
+    await startSensitiveAction(
+      'batch-china-models',
+      () => batchOpenCodeGoChinaModels(channelId, enabled),
+      (result) => {
+        storePool(result.pool)
+        toast.success(
+          t('China models: {{succeeded}} updated, {{skipped}} skipped', {
+            succeeded: result.summary.succeeded,
+            skipped: result.summary.skipped,
+          })
+        )
+      }
+    )
+  }
+
+  const batchCancelRenewal = async () => {
+    await startSensitiveAction(
+      'batch-cancel-renewal',
+      () => batchCancelOpenCodeGoSubscriptionRenewal(channelId),
+      (result) => {
+        storePool(result.pool)
+        toast.success(
+          t('Renewals cancelled: {{succeeded}} updated, {{skipped}} skipped', {
+            succeeded: result.summary.succeeded,
+            skipped: result.summary.skipped,
+          })
+        )
+      }
+    )
+  }
+
   return {
     poolQuery,
     ordinaryMutation,
@@ -414,5 +448,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
     enableChinaModels,
     applyReferralReward,
     cancelRenewal,
+    batchSetChinaModels,
+    batchCancelRenewal,
   }
 }

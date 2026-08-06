@@ -19,6 +19,7 @@ import (
 type fakeOpenCodeGoLifecycleBackend struct {
 	mutex               sync.Mutex
 	page                *OpenCodeGoConsolePage
+	pages               map[string]*OpenCodeGoConsolePage
 	fetchWorkspaceCalls int
 	discoverCalls       int
 	enableCalls         int
@@ -41,6 +42,9 @@ func (fake *fakeOpenCodeGoLifecycleBackend) FetchWorkspacePage(
 	fake.mutex.Lock()
 	defer fake.mutex.Unlock()
 	fake.fetchWorkspaceCalls++
+	if page, ok := fake.pages[workspaceID]; ok {
+		return cloneOpenCodeGoLifecyclePage(page), nil
+	}
 	if fake.page == nil || fake.page.WorkspaceID != workspaceID {
 		return nil, errors.New("synthetic workspace page is unavailable")
 	}
@@ -80,7 +84,7 @@ func (fake *fakeOpenCodeGoLifecycleBackend) FetchModels(_ context.Context, _ str
 func (fake *fakeOpenCodeGoLifecycleBackend) EnableChinaModels(
 	_ context.Context,
 	_ string,
-	_ *OpenCodeGoConsolePage,
+	page *OpenCodeGoConsolePage,
 ) error {
 	fake.mutex.Lock()
 	defer fake.mutex.Unlock()
@@ -90,7 +94,32 @@ func (fake *fakeOpenCodeGoLifecycleBackend) EnableChinaModels(
 	}
 	if fake.enableChangesState {
 		enabled := true
+		if fake.page != nil {
+			fake.page.ChinaModelsEnabled = &enabled
+		}
+		if fake.pages != nil && page != nil {
+			fake.pages[page.WorkspaceID] = &OpenCodeGoConsolePage{WorkspaceID: page.WorkspaceID, ChinaModelsEnabled: &enabled}
+		}
+	}
+	return nil
+}
+
+func (fake *fakeOpenCodeGoLifecycleBackend) DisableChinaModels(
+	_ context.Context,
+	_ string,
+	page *OpenCodeGoConsolePage,
+) error {
+	fake.mutex.Lock()
+	defer fake.mutex.Unlock()
+	if fake.enableErr != nil {
+		return fake.enableErr
+	}
+	enabled := false
+	if fake.page != nil {
 		fake.page.ChinaModelsEnabled = &enabled
+	}
+	if fake.pages != nil && page != nil {
+		fake.pages[page.WorkspaceID] = &OpenCodeGoConsolePage{WorkspaceID: page.WorkspaceID, ChinaModelsEnabled: &enabled}
 	}
 	return nil
 }

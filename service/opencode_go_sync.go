@@ -21,6 +21,10 @@ import (
 
 const openCodeGoMaxImportCookies = 100
 
+// openCodeGoImportAutomationTimeout bounds the background lifecycle
+// automation started right after an identity import.
+const openCodeGoImportAutomationTimeout = 5 * time.Minute
+
 var (
 	openCodeGoIdentityOperationLocks sync.Map
 	openCodeGoSecretPattern          = regexp.MustCompile(`(?i)sk-[a-z0-9._-]+`)
@@ -108,6 +112,7 @@ func (service *OpenCodeGoAccountPoolService) ImportAuthCookies(
 	lines := strings.Split(strings.ReplaceAll(input, "\r\n", "\n"), "\n")
 	results := make([]OpenCodeGoImportResult, 0, len(lines))
 	seen := make(map[string]struct{})
+	importedIdentityUIDs := make([]string, 0, len(lines))
 	nonEmptyCount := 0
 	for index, line := range lines {
 		if strings.TrimSpace(line) == "" {
@@ -157,13 +162,50 @@ func (service *OpenCodeGoAccountPoolService) ImportAuthCookies(
 			result.Status = "imported"
 			result.IdentityUID = identityUID
 			result.WorkspaceCount = workspaceCount
+			importedIdentityUIDs = append(importedIdentityUIDs, identityUID)
 		}
 		results = append(results, result)
 	}
 	if nonEmptyCount == 0 {
 		return nil, errors.New("at least one OpenCode Go auth Cookie is required")
 	}
+	// Newly imported identities should pick up the channel's lifecycle policy
+	// (China-deployed models, renewal cancellation, referral rewards) right
+	// away instead of waiting for the periodic refresh. Best-effort and
+	// asynchronous: failures are recorded as operations and do not fail the
+	// import. Only runs when the global automation master switch is enabled.
+	if len(importedIdentityUIDs) > 0 {
+		runOpenCodeGoImportAutomations(context.Background(), channelID, importedIdentityUIDs)
+	}
 	return results, nil
+}
+
+// runOpenCodeGoImportAutomations applies the channel lifecycle policy to
+// freshly imported identities in the background. It is bounded by a timeout
+// and never returns an error to the caller.
+func runOpenCodeGoImportAutomations(ctx context.Context, channelID int, identityUIDs []string) {
+	runCtx, cancel := context.WithTimeout(ctx, openCodeGoImportAutomationTimeout)
+	defer cancel()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				common.SysError(fmt.Sprintf("OpenCode Go import automation panic recovered: %v", r))
+			}
+		}()
+		lifecycle, err := NewConfiguredOpenCodeGoLifecycleService()
+		if err != nil {
+			common.SysError(fmt.Sprintf("failed to start OpenCode Go import automation: %v", err))
+			return
+		}
+		for _, identityUID := range identityUIDs {
+			if err := runCtx.Err(); err != nil {
+				return
+			}
+			if _, err := lifecycle.RunIdentityAutomations(runCtx, channelID, identityUID, "import"); err != nil {
+				common.SysError(fmt.Sprintf("OpenCode Go import automation failed for identity %s: %v", identityUID, err))
+			}
+		}
+	}()
 }
 
 func (service *OpenCodeGoAccountPoolService) importOneIdentity(

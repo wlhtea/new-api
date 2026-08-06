@@ -27,6 +27,10 @@ const (
 	OpenCodeGoObservationTransientFailure      OpenCodeGoHealthObservationKind = "transient_failure"
 	OpenCodeGoObservationModelProbeSucceeded   OpenCodeGoHealthObservationKind = "model_probe_succeeded"
 	OpenCodeGoObservationCooldownExpired       OpenCodeGoHealthObservationKind = "cooldown_expired"
+	// OpenCodeGoObservationBulkFailure marks a workspace auto-disabled by
+	// repeated persistent provider failures (for example bulk 401/403),
+	// awaiting manual verification before it can be re-enabled.
+	OpenCodeGoObservationBulkFailure           OpenCodeGoHealthObservationKind = "bulk_failure"
 )
 
 type OpenCodeGoHealthObservation struct {
@@ -62,11 +66,16 @@ func ReduceOpenCodeGoWorkspaceHealth(
 		candidate.StateReason = firstNonEmptyOpenCodeGoMessage(reason, "workspace is manually disabled")
 		candidate.CooldownUntil = 0
 	case OpenCodeGoObservationManualEnabled:
-		if current.ManualEnabled && current.EffectiveState != model.OpenCodeGoStateManualDisabled {
+		if current.ManualEnabled &&
+			current.EffectiveState != model.OpenCodeGoStateManualDisabled &&
+			current.EffectiveState != model.OpenCodeGoStateBulkDisabled {
 			return current, false, nil
 		}
 		candidate = current
 		candidate.ManualEnabled = true
+		// A human re-enabled this workspace after verification; clear any
+		// auto-disable evidence so a later refresh can restore eligibility.
+		candidate.BulkFailureDetectedAt = 0
 		candidate.EffectiveState, candidate.StateReason, candidate.QuotaRecoveryAt = deriveOpenCodeGoWorkspaceHealth(
 			candidate,
 			windows,
@@ -169,6 +178,14 @@ func ReduceOpenCodeGoWorkspaceHealth(
 		}
 		candidate = current
 		candidate.RiskLastCheckedAt = observation.ObservedAt.Unix()
+	case OpenCodeGoObservationBulkFailure:
+		if current.EffectiveState == model.OpenCodeGoStateManualDisabled {
+			return current, false, nil
+		}
+		candidate = current
+		candidate.BulkFailureDetectedAt = observation.ObservedAt.Unix()
+		candidate.EffectiveState = model.OpenCodeGoStateBulkDisabled
+		candidate.StateReason = firstNonEmptyOpenCodeGoMessage(reason, "auto-disabled awaiting manual verification after repeated provider failures")
 	default:
 		return current, false, errors.New("unsupported workspace-scoped OpenCode Go health observation")
 	}
@@ -261,6 +278,9 @@ func deriveOpenCodeGoWorkspaceHealth(
 	if workspace.RiskDetectedAt > 0 {
 		return model.OpenCodeGoStateRiskBlocked, firstNonEmptyOpenCodeGoMessage(workspace.LastError, "request blocked by upstream provider"), workspace.QuotaRecoveryAt
 	}
+	if workspace.BulkFailureDetectedAt > 0 {
+		return model.OpenCodeGoStateBulkDisabled, firstNonEmptyOpenCodeGoMessage(workspace.LastError, "auto-disabled awaiting manual verification after repeated provider failures"), workspace.QuotaRecoveryAt
+	}
 	if workspace.MembershipStatus == model.OpenCodeGoMembershipInactive {
 		return model.OpenCodeGoStateMembershipExpired, "OpenCode Go membership is inactive", workspace.QuotaRecoveryAt
 	}
@@ -310,6 +330,8 @@ func openCodeGoWorkspaceStatePriority(state string) int {
 		return 100
 	case model.OpenCodeGoStateRiskBlocked:
 		return 90
+	case model.OpenCodeGoStateBulkDisabled:
+		return 85
 	case model.OpenCodeGoStateAuthError:
 		return 80
 	case model.OpenCodeGoStateKeyError:
@@ -335,6 +357,8 @@ func openCodeGoWorkspaceObservationPriority(kind string) int {
 		return 100
 	case OpenCodeGoObservationRiskBlocked:
 		return 90
+	case OpenCodeGoObservationBulkFailure:
+		return 85
 	case OpenCodeGoObservationAuthenticationFailure:
 		return 80
 	case OpenCodeGoObservationCredentialFailure:

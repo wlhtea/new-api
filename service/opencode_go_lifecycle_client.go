@@ -35,6 +35,7 @@ type OpenCodeGoSubscriptionCancellation struct {
 
 type openCodeGoLifecycleMutator interface {
 	EnableChinaModels(ctx context.Context, authCookie string, page *OpenCodeGoConsolePage) error
+	DisableChinaModels(ctx context.Context, authCookie string, page *OpenCodeGoConsolePage) error
 	ApplyReferralReward(ctx context.Context, authCookie string, page *OpenCodeGoConsolePage, rewardID string) error
 	CancelSubscriptionRenewal(ctx context.Context, authCookie string, page *OpenCodeGoConsolePage) (OpenCodeGoSubscriptionCancellation, error)
 }
@@ -119,6 +120,54 @@ func (client *OpenCodeGoLifecycleClient) EnableChinaModels(
 	body := url.Values{
 		"workspaceID":       []string{page.WorkspaceID},
 		"useChinaProviders": []string{"false"},
+	}.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, actionURL.String(), strings.NewReader(body))
+	if err != nil {
+		return errors.New("OpenCode Go China-model request could not be created")
+	}
+	client.setConsoleMutationHeaders(request, cookieHeader, page.WorkspaceID)
+	request.Header.Set("Accept", "text/html,application/xhtml+xml")
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", openCodeGoURLOrigin(client.console.consoleBase))
+	response, err := client.console.manualClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("OpenCode Go China-model action failed: %w", err)
+	}
+	defer response.Body.Close()
+	if (!responseSuccessOrRedirect(response.StatusCode)) || response.Header.Get("X-Error") != "" {
+		return fmt.Errorf("OpenCode Go China-model action returned status %d", response.StatusCode)
+	}
+	return nil
+}
+
+func (client *OpenCodeGoLifecycleClient) DisableChinaModels(
+	ctx context.Context,
+	authCookie string,
+	page *OpenCodeGoConsolePage,
+) error {
+	if page == nil || !openCodeGoWorkspaceIDPattern.MatchString(page.WorkspaceID) {
+		return errors.New("OpenCode Go China-model action target is invalid")
+	}
+	if page.ChinaModelsEnabled == nil {
+		return errors.New("OpenCode Go China-model state is not authoritative")
+	}
+	if !*page.ChinaModelsEnabled {
+		return nil
+	}
+	if !openCodeGoServerActionIDPattern.MatchString(page.ChinaModelsServerID) {
+		return errors.New("OpenCode Go China-model action could not be resolved")
+	}
+	cookieHeader, err := BuildOpenCodeGoCookieHeader(authCookie)
+	if err != nil {
+		return err
+	}
+	actionURL := client.console.consoleBase.ResolveReference(&url.URL{Path: "/_server"})
+	query := actionURL.Query()
+	query.Set("id", page.ChinaModelsServerID)
+	actionURL.RawQuery = query.Encode()
+	body := url.Values{
+		"workspaceID":       []string{page.WorkspaceID},
+		"useChinaProviders": []string{"true"},
 	}.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, actionURL.String(), strings.NewReader(body))
 	if err != nil {

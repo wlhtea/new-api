@@ -18,7 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import {
   AlertCircle,
+  Ban,
   Filter,
+  Globe2,
   History,
   Loader2,
   RefreshCw,
@@ -117,6 +119,8 @@ type ConfirmationAction =
       kind: OpenCodeGoWorkspaceSensitiveAction
       workspace: OpenCodeGoWorkspace
     }
+  | { kind: 'batch-china'; enabled: boolean }
+  | { kind: 'batch-cancel-renewals' }
   | { kind: 'policy-cancellation'; values: OpenCodeGoPolicyFormValues }
 
 function poolErrorMessage(error: unknown, fallback: string): string {
@@ -259,6 +263,12 @@ export function OpenCodeGoPoolDrawer(props: OpenCodeGoPoolDrawerProps) {
       case 'delete-workspace':
         void pool.deleteWorkspace(action.workspace.uid)
         return
+      case 'batch-china':
+        void pool.batchSetChinaModels(action.enabled)
+        return
+      case 'batch-cancel-renewals':
+        void pool.batchCancelRenewal()
+        return
       case 'policy-cancellation':
         void pool.updatePolicy(action.values)
     }
@@ -320,6 +330,22 @@ export function OpenCodeGoPoolDrawer(props: OpenCodeGoPoolDrawerProps) {
           { name: confirmation.workspace.name || confirmation.workspace.uid }
         )
         confirmationDestructive = true
+        break
+      case 'batch-china':
+        confirmationTitle = confirmation.enabled
+          ? t('Enable China-deployed models for all eligible workspaces')
+          : t('Disable China-deployed models for all eligible workspaces')
+        confirmationDescription = t(
+          'This changes the upstream China-provider setting for every eligible workspace in this channel.'
+        )
+        break
+      case 'batch-cancel-renewals':
+        confirmationTitle = t('Cancel subscription renewal for all eligible workspaces')
+        confirmationDescription = t(
+          'Eligible active memberships will stop auto-renewing while access remains active until each current period ends. Type CANCEL RENEWAL to continue.'
+        )
+        confirmationDestructive = true
+        confirmationRequiresText = true
         break
       case 'policy-cancellation':
         confirmationTitle = t('Enable automatic renewal cancellation')
@@ -663,6 +689,66 @@ export function OpenCodeGoPoolDrawer(props: OpenCodeGoPoolDrawerProps) {
                   >
                     <Trash2 className='size-4' />
                     {t('Delete non-members')}
+                  </Button>
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='outline'
+                    disabled={
+                      !canSensitiveWrite ||
+                      !view?.identities.length ||
+                      busyKey === 'batch-china-models'
+                    }
+                    onClick={() =>
+                      setConfirmation({ kind: 'batch-china', enabled: true })
+                    }
+                  >
+                    {busyKey === 'batch-china-models' ? (
+                      <Loader2 className='size-4 animate-spin' />
+                    ) : (
+                      <Globe2 className='size-4' />
+                    )}
+                    {t('Enable China models (all)')}
+                  </Button>
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='outline'
+                    disabled={
+                      !canSensitiveWrite ||
+                      !view?.identities.length ||
+                      busyKey === 'batch-china-models'
+                    }
+                    onClick={() =>
+                      setConfirmation({ kind: 'batch-china', enabled: false })
+                    }
+                  >
+                    {busyKey === 'batch-china-models' ? (
+                      <Loader2 className='size-4 animate-spin' />
+                    ) : (
+                      <Ban className='size-4' />
+                    )}
+                    {t('Disable China models (all)')}
+                  </Button>
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='outline'
+                    disabled={
+                      !canSensitiveWrite ||
+                      !view?.identities.length ||
+                      busyKey === 'batch-cancel-renewal'
+                    }
+                    onClick={() =>
+                      setConfirmation({ kind: 'batch-cancel-renewals' })
+                    }
+                  >
+                    {busyKey === 'batch-cancel-renewal' ? (
+                      <Loader2 className='size-4 animate-spin' />
+                    ) : (
+                      <Ban className='size-4' />
+                    )}
+                    {t('Cancel renewals (all)')}
                   </Button>
                 </div>
 

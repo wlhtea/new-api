@@ -3,6 +3,18 @@
     "360": "360",
     "1000": "1000",
     "10000": "10000",
+    "Bulk failures (awaiting verification)": "批量故障（等待人工驗證）",
+    "Cancel renewals (all)": "取消全部續費",
+    "Cancel subscription renewal for all eligible workspaces": "為所有符合條件的帳號取消訂閱續費",
+    "China models: {{succeeded}} updated, {{skipped}} skipped": "中國模型：{{succeeded}} 個已更新，{{skipped}} 個略過",
+    "Concurrent requests currently served by this workspace": "該工作區目前正在處理的並發請求數",
+    "Current requests": "目前請求數",
+    "Disable China models (all)": "關閉全部中國模型",
+    "Disable China-deployed models for all eligible workspaces": "為所有符合條件的帳號關閉中國部署模型",
+    "Eligible active memberships will stop auto-renewing while access remains active until each current period ends. Type CANCEL RENEWAL to continue.": "符合條件的有效會員將停止自動續費，目前週期結束前存取保持有效。請輸入 CANCEL RENEWAL 繼續。",
+    "Enable China models (all)": "開啟全部中國模型",
+    "Enable China-deployed models for all eligible workspaces": "為所有符合條件的帳號開啟中國部署模型",
+    "This changes the upstream China-provider setting for every eligible workspace in this channel.": "這將更改本通道所有符合條件的帳號的上游中國區提供商設定。",
     "_copy": "_複製",
     "，": "，",
     ", and": "，和",
@@ -5436,6 +5448,7 @@
     "{{count}} stale": "{{count}} 個已過期",
     "{{count}} workspaces": "{{count}} 個工作區",
     "{{processed}} of {{total}}": "已處理 {{processed}} / {{total}}",
+    "Renewals cancelled: {{succeeded}} updated, {{skipped}} skipped": "續費已取消：{{succeeded}} 個已更新，{{skipped}} 個略過",
     "{{success}} succeeded / {{failed}} failed": "{{success}} 個成功 / {{failed}} 個失敗"
   }
 }

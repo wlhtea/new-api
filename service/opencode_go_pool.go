@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -33,6 +34,12 @@ const (
 	// openCodeGoWeightQuotaEpsilon floors quotaFactor so a near-exhausted but
 	// still eligible workspace is deprioritized rather than eliminated.
 	openCodeGoWeightQuotaEpsilon = 0.05
+	// openCodeGoBulkFailureThreshold is the number of persistent provider
+	// failures (401/403) within the window that auto-disable a workspace,
+	// awaiting manual verification.
+	openCodeGoBulkFailureThreshold = 3
+	// openCodeGoBulkFailureWindow bounds the persistent-failure counting window.
+	openCodeGoBulkFailureWindow = 5 * time.Minute
 )
 
 var ErrOpenCodeGoNoEligibleWorkspace = errors.New("OpenCode Go channel has no eligible workspace for the requested model")
@@ -82,6 +89,16 @@ type openCodeGoPoolChannelState struct {
 	// per-node in-memory counter (same class as cursors), intentionally not
 	// cleared on snapshot rebuild: requests span reconcile boundaries.
 	inflight sync.Map
+	// bulkFailures tracks per-workspace persistent provider failure counts
+	// used by the bulk-disable rule. In-memory like inflight; a restart simply
+	// re-accumulates evidence from new failures.
+	bulkFailures sync.Map
+}
+
+type openCodeGoBulkFailureCounter struct {
+	mu         sync.Mutex
+	count      int
+	windowAtMS int64
 }
 
 var openCodeGoPoolChannels sync.Map
@@ -457,6 +474,54 @@ func OpenCodeGoWorkspaceInFlight(channelID int, workspaceUID string) int64 {
 		return counterValue.(*atomic.Int64).Load()
 	}
 	return 0
+}
+
+// ObserveOpenCodeGoBulkProviderFailure counts persistent per-workspace provider
+// failures (HTTP 401/403: credential, region, or auth - not transient 5xx and
+// not quota, which have their own flow). When a workspace accumulates the
+// threshold within the window, it is auto-disabled as a workspace-level
+// `bulk_failure` health observation and removed from the pool, awaiting manual
+// verification (re-enable or delete).
+func ObserveOpenCodeGoBulkProviderFailure(channelID int, workspaceUID string, statusCode int, reason string, observedAt time.Time) (bool, error) {
+	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
+		return false, nil
+	}
+	workspaceUID = strings.TrimSpace(workspaceUID)
+	if channelID <= 0 || workspaceUID == "" || observedAt.IsZero() {
+		return false, errors.New("OpenCode Go bulk failure observation target is invalid")
+	}
+	state := openCodeGoPoolStateForChannel(channelID)
+	counterValue, _ := state.bulkFailures.LoadOrStore(workspaceUID, &openCodeGoBulkFailureCounter{})
+	counter := counterValue.(*openCodeGoBulkFailureCounter)
+
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	nowMS := observedAt.UnixMilli()
+	if counter.windowAtMS == 0 || nowMS-counter.windowAtMS > openCodeGoBulkFailureWindow.Milliseconds() {
+		counter.windowAtMS = nowMS
+		counter.count = 0
+	}
+	counter.count++
+	if counter.count < openCodeGoBulkFailureThreshold {
+		return false, nil
+	}
+	counter.count = 0
+	counter.windowAtMS = 0
+	return applyOpenCodeGoClassifiedFailure(
+		channelID,
+		workspaceUID,
+		"",
+		OpenCodeGoClassifiedFailure{
+			Scope: OpenCodeGoHealthScopeWorkspace,
+			Observation: OpenCodeGoHealthObservation{
+				Kind:       OpenCodeGoObservationBulkFailure,
+				ObservedAt: observedAt,
+				Reason:     reason,
+				ErrorCode:  "bulk_provider_failure",
+			},
+		},
+		ReconcileOpenCodeGoPoolChannel,
+	)
 }
 
 // openCodeGoQuotaFactor derives a candidate's remaining-quota fraction (min

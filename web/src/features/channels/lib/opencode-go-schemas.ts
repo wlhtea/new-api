@@ -88,6 +88,7 @@ export const openCodeGoWorkspaceSchema = z.object({
   referral_reward_applied_at: unixTimestampSchema,
   risk_detected_at: unixTimestampSchema,
   risk_last_checked_at: unixTimestampSchema,
+  inflight: z.number().int().nonnegative().optional(),
   last_synced_at: unixTimestampSchema,
   last_error: z.string(),
   created_at: unixTimestampSchema,
