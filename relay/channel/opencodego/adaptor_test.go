@@ -131,6 +131,63 @@ func TestAdaptorRequestConversionMatrix(t *testing.T) {
 	}
 }
 
+func TestAdaptorLowersCustomResponsesHistoryBeforeProtocolConversion(t *testing.T) {
+	tests := []struct {
+		model    string
+		protocol Protocol
+	}{
+		{model: "glm-5.2", protocol: ProtocolChat},
+		{model: "gpt-5.6-luna", protocol: ProtocolResponses},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.protocol), func(t *testing.T) {
+			request := dto.OpenAIResponsesRequest{
+				Model: "public-model",
+				Tools: json.RawMessage(`[{
+					"type":"custom","name":"apply_patch","description":"Apply a patch"
+				}]`),
+				Input: json.RawMessage(`[
+					{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch"},
+					{"type":"custom_tool_call_output","call_id":"call_patch","output":"Done"}
+				]`),
+			}
+			info := newAdaptorTestInfo(tt.model, false)
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+
+			converted, err := adaptor.ConvertOpenAIResponsesRequest(newAdaptorTestContext(), info, request)
+			require.NoError(t, err)
+			assert.Equal(t, tt.protocol, adaptor.protocol)
+
+			switch value := converted.(type) {
+			case *dto.GeneralOpenAIRequest:
+				require.Len(t, value.Tools, 1)
+				assert.Equal(t, "function", value.Tools[0].Type)
+				require.Len(t, value.Messages, 2)
+				calls := value.Messages[0].ParseToolCalls()
+				require.Len(t, calls, 1)
+				assert.Equal(t, "function", calls[0].Type)
+				assert.Equal(t, "apply_patch", calls[0].Function.Name)
+				assert.JSONEq(t, `{"input":"*** Begin Patch"}`, calls[0].Function.Arguments)
+				assert.Equal(t, "tool", value.Messages[1].Role)
+				assert.Equal(t, "call_patch", value.Messages[1].ToolCallId)
+				assert.Equal(t, "Done", value.Messages[1].StringContent())
+			case *dto.OpenAIResponsesRequest:
+				var input []map[string]any
+				require.NoError(t, json.Unmarshal(value.Input, &input))
+				require.Len(t, input, 2)
+				assert.Equal(t, "function_call", input[0]["type"])
+				assert.Equal(t, "call_patch", input[0]["id"])
+				assert.JSONEq(t, `{"input":"*** Begin Patch"}`, input[0]["arguments"].(string))
+				assert.Equal(t, "function_call_output", input[1]["type"])
+			default:
+				t.Fatalf("unexpected converted request type %T", converted)
+			}
+		})
+	}
+}
+
 func TestAdaptorUsesFixedURLsAndProtocolAuthentication(t *testing.T) {
 	originalSelector := selectOpenCodeGoWorkspace
 	selectOpenCodeGoWorkspace = func(_ int, _ string, _ service.OpenCodeGoPoolSelectOptions) (*service.OpenCodeGoPoolSelection, error) {
