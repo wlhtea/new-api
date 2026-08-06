@@ -21,8 +21,6 @@ import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
-import { useSecureVerification } from '@/features/auth/secure-verification'
-
 import {
   applyOpenCodeGoReferralReward,
   cancelOpenCodeGoSubscriptionRenewal,
@@ -83,7 +81,6 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   const [bulkResults, setBulkResults] = useState<OpenCodeGoBulkResult[]>([])
   const [sensitiveBusyKey, setSensitiveBusyKey] = useState<string | null>(null)
   const handledTaskIdRef = useRef('')
-  const verification = useSecureVerification()
 
   const poolQuery = useQuery({
     queryKey: openCodeGoPoolQueryKeys.pool(channelId),
@@ -253,33 +250,17 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
 
   const startSensitiveAction = async <T>(
     busyKey: string,
-    title: string,
-    description: string,
-    action: (proofToken: string) => Promise<T>,
+    action: () => Promise<T>,
     onSuccess: (result: T) => void
   ) => {
+    setSensitiveBusyKey(busyKey)
     try {
-      await verification.startVerification(
-        async (proofToken) => {
-          if (!proofToken) throw new Error(t('Security proof is required'))
-          setSensitiveBusyKey(busyKey)
-          try {
-            const result = await action(proofToken)
-            onSuccess(result)
-            return result
-          } finally {
-            setSensitiveBusyKey(null)
-          }
-        },
-        {
-          scope: 'channel.opencode_go.pool.write',
-          preferredMethod: 'passkey',
-          title,
-          description,
-        }
-      )
+      const result = await action()
+      onSuccess(result)
     } catch (error) {
       toast.error(errorMessage(error, t('OpenCode Go operation failed')))
+    } finally {
+      setSensitiveBusyKey(null)
     }
   }
 
@@ -289,9 +270,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   }) => {
     await startSensitiveAction(
       'sensitive:import',
-      t('Verify account import'),
-      t('Confirm your identity before importing OpenCode Go accounts.'),
-      (proofToken) => importOpenCodeGoIdentities(channelId, input, proofToken),
+      () => importOpenCodeGoIdentities(channelId, input),
       (result) => {
         storePool(result.pool)
         setBulkResults(
@@ -312,15 +291,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   ) => {
     await startSensitiveAction(
       `identity:${identityUid}:cookie`,
-      t('Verify Cookie replacement'),
-      t('Confirm your identity before replacing this account Cookie.'),
-      (proofToken) =>
-        replaceOpenCodeGoIdentityCookie(
-          channelId,
-          identityUid,
-          authCookie,
-          proofToken
-        ),
+      () => replaceOpenCodeGoIdentityCookie(channelId, identityUid, authCookie),
       (pool) => {
         storePool(pool)
         toast.success(t('Account Cookie replaced'))
@@ -331,12 +302,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   const deleteIdentity = async (identityUid: string) => {
     await startSensitiveAction(
       `identity:${identityUid}:delete`,
-      t('Verify account deletion'),
-      t(
-        'Confirm your identity before deleting this account and its workspaces.'
-      ),
-      (proofToken) =>
-        deleteOpenCodeGoIdentity(channelId, identityUid, proofToken),
+      () => deleteOpenCodeGoIdentity(channelId, identityUid),
       (pool) => {
         storePool(pool)
         toast.success(t('Account deleted'))
@@ -347,10 +313,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   const deleteWorkspace = async (workspaceUid: string) => {
     await startSensitiveAction(
       `workspace:${workspaceUid}:delete`,
-      t('Verify workspace deletion'),
-      t('Confirm your identity before deleting this workspace.'),
-      (proofToken) =>
-        deleteOpenCodeGoWorkspace(channelId, workspaceUid, proofToken),
+      () => deleteOpenCodeGoWorkspace(channelId, workspaceUid),
       (pool) => {
         storePool(pool)
         toast.success(t('Workspace deleted'))
@@ -361,10 +324,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   const deleteNonMembers = async () => {
     await startSensitiveAction(
       'sensitive:delete-non-members',
-      t('Verify non-member cleanup'),
-      t('Confirm your identity before deleting all non-member workspaces.'),
-      (proofToken) =>
-        deleteOpenCodeGoNonMemberWorkspaces(channelId, proofToken),
+      () => deleteOpenCodeGoNonMemberWorkspaces(channelId),
       (result) => {
         storePool(result.pool)
         toast.success(
@@ -381,10 +341,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   ) => {
     await startSensitiveAction(
       'sensitive:policy',
-      t('Verify lifecycle policy update'),
-      t('Confirm your identity before changing lifecycle automation.'),
-      (proofToken) =>
-        updateOpenCodeGoLifecyclePolicy(channelId, policy, proofToken),
+      () => updateOpenCodeGoLifecyclePolicy(channelId, policy),
       (updatedPolicy) => {
         queryClient.setQueryData<OpenCodeGoPool>(
           openCodeGoPoolQueryKeys.pool(channelId),
@@ -402,10 +359,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   const enableChinaModels = async (workspaceUid: string) => {
     await startSensitiveAction(
       `workspace:${workspaceUid}:china-models`,
-      t('Verify China-model change'),
-      t('Confirm your identity before changing the upstream workspace.'),
-      (proofToken) =>
-        enableOpenCodeGoChinaModels(channelId, workspaceUid, proofToken),
+      () => enableOpenCodeGoChinaModels(channelId, workspaceUid),
       (result) => {
         storePool(result.pool)
         toast.success(t('China-deployed models enabled'))
@@ -416,10 +370,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   const applyReferralReward = async (workspaceUid: string) => {
     await startSensitiveAction(
       `workspace:${workspaceUid}:referral`,
-      t('Verify referral reward use'),
-      t('Confirm your identity before applying one available referral reward.'),
-      (proofToken) =>
-        applyOpenCodeGoReferralReward(channelId, workspaceUid, proofToken),
+      () => applyOpenCodeGoReferralReward(channelId, workspaceUid),
       (result) => {
         storePool(result.pool)
         toast.success(
@@ -434,14 +385,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   const cancelRenewal = async (workspaceUid: string) => {
     await startSensitiveAction(
       `workspace:${workspaceUid}:cancel-renewal`,
-      t('Verify renewal cancellation'),
-      t('Confirm your identity before cancelling subscription renewal.'),
-      (proofToken) =>
-        cancelOpenCodeGoSubscriptionRenewal(
-          channelId,
-          workspaceUid,
-          proofToken
-        ),
+      () => cancelOpenCodeGoSubscriptionRenewal(channelId, workspaceUid),
       (result) => {
         storePool(result.pool)
         toast.success(t('Subscription renewal cancelled'))
@@ -460,7 +404,6 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
     activeTask,
     taskQuery,
     bulkResults,
-    verification,
     runOrdinaryAction: ordinaryMutation.mutate,
     importIdentities,
     replaceIdentityCookie,

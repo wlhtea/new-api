@@ -120,7 +120,6 @@ var channelPermissionRoutes = []permissionRoute{
 		middlewares: []gin.HandlerFunc{
 			middleware.CriticalRateLimit(),
 			middleware.DisableCache(),
-			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
 		},
 		handler: controller.UpdateOpenCodeGoLifecyclePolicy,
 	},
@@ -131,7 +130,6 @@ var channelPermissionRoutes = []permissionRoute{
 		middlewares: []gin.HandlerFunc{
 			middleware.CriticalRateLimit(),
 			middleware.DisableCache(),
-			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
 		},
 		handler: controller.EnableOpenCodeGoChinaModels,
 	},
@@ -142,7 +140,6 @@ var channelPermissionRoutes = []permissionRoute{
 		middlewares: []gin.HandlerFunc{
 			middleware.CriticalRateLimit(),
 			middleware.DisableCache(),
-			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
 		},
 		handler: controller.ApplyOpenCodeGoReferralReward,
 	},
@@ -153,7 +150,6 @@ var channelPermissionRoutes = []permissionRoute{
 		middlewares: []gin.HandlerFunc{
 			middleware.CriticalRateLimit(),
 			middleware.DisableCache(),
-			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
 		},
 		handler: controller.CancelOpenCodeGoSubscriptionRenewal,
 	},
@@ -164,7 +160,6 @@ var channelPermissionRoutes = []permissionRoute{
 		middlewares: []gin.HandlerFunc{
 			middleware.CriticalRateLimit(),
 			middleware.DisableCache(),
-			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
 		},
 		handler: controller.ImportOpenCodeGoIdentities,
 	},
@@ -175,7 +170,6 @@ var channelPermissionRoutes = []permissionRoute{
 		middlewares: []gin.HandlerFunc{
 			middleware.CriticalRateLimit(),
 			middleware.DisableCache(),
-			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
 		},
 		handler: controller.ReplaceOpenCodeGoIdentityCookie,
 	},
@@ -185,7 +179,6 @@ var channelPermissionRoutes = []permissionRoute{
 		permission: authz.ChannelSensitiveWrite,
 		middlewares: []gin.HandlerFunc{
 			middleware.DisableCache(),
-			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
 		},
 		handler: controller.DeleteOpenCodeGoIdentity,
 	},
@@ -195,7 +188,6 @@ var channelPermissionRoutes = []permissionRoute{
 		permission: authz.ChannelSensitiveWrite,
 		middlewares: []gin.HandlerFunc{
 			middleware.DisableCache(),
-			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
 		},
 		handler: controller.DeleteOpenCodeGoNonMemberWorkspaces,
 	},
@@ -205,7 +197,6 @@ var channelPermissionRoutes = []permissionRoute{
 		permission: authz.ChannelSensitiveWrite,
 		middlewares: []gin.HandlerFunc{
 			middleware.DisableCache(),
-			middleware.SecurityProofRequired(controller.SecurityProofScopeOpenCodeGoPoolWrite, []string{"2fa", "passkey"}),
 		},
 		handler: controller.DeleteOpenCodeGoWorkspace,
 	},

@@ -16,8 +16,6 @@ import (
 const (
 	secureVerificationMethod2FA     = "2fa"
 	secureVerificationMethodPasskey = "passkey"
-
-	SecurityProofScopeOpenCodeGoPoolWrite = "channel.opencode_go.pool.write"
 )
 
 type UniversalVerifyRequest struct {
@@ -84,8 +82,7 @@ func isAllowedSecurityProofScope(scope string) bool {
 	switch scope {
 	case securityProofScopeChannelKeyRead,
 		securityProofScopePasskeyRegister,
-		securityProofScopePasskeyDelete,
-		SecurityProofScopeOpenCodeGoPoolWrite:
+		securityProofScopePasskeyDelete:
 		return true
 	default:
 		return false

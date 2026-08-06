@@ -2,13 +2,10 @@ package router
 
 import (
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"testing"
 
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/controller"
-	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -54,70 +51,6 @@ func TestOpenCodeGoPoolRoutesUseScopedChannelPermissions(t *testing.T) {
 	assertChannelRoutePermission(t, http.MethodDelete, "/:id/opencode-go/workspaces/:workspace_uid", authz.ChannelSensitiveWrite, controller.DeleteOpenCodeGoWorkspace)
 }
 
-func TestOpenCodeGoSensitiveRouteRequiresDedicatedSecurityProofScope(t *testing.T) {
-	var proofMiddleware gin.HandlerFunc
-	for _, route := range channelPermissionRoutes {
-		if route.method == http.MethodPost && route.path == "/:id/opencode-go/identities/import" {
-			require.NotEmpty(t, route.middlewares)
-			proofMiddleware = route.middlewares[len(route.middlewares)-1]
-			break
-		}
-	}
-	require.NotNil(t, proofMiddleware)
-
-	previousSecret := common.SessionSecret
-	common.SessionSecret = "router-security-proof-test-secret"
-	t.Cleanup(func() { common.SessionSecret = previousSecret })
-	identity := service.AuthIdentity{
-		UserID:          42,
-		SessionID:       "session-opencode-go",
-		UserAuthVersion: 3,
-		SessionVersion:  2,
-	}
-	wrongScopeProof, _, err := service.IssueSecurityProof(identity, "2fa", []string{"channel.key.read"})
-	require.NoError(t, err)
-	correctProof, _, err := service.IssueSecurityProof(
-		identity,
-		"2fa",
-		[]string{controller.SecurityProofScopeOpenCodeGoPoolWrite},
-	)
-	require.NoError(t, err)
-
-	run := func(proof string) (int, string, bool) {
-		t.Helper()
-		reached := false
-		engine := gin.New()
-		engine.POST("/test",
-			func(c *gin.Context) {
-				c.Set("id", identity.UserID)
-				c.Set("session_id", identity.SessionID)
-				c.Set("auth_version", identity.UserAuthVersion)
-				c.Set("session_version", identity.SessionVersion)
-				c.Next()
-			},
-			proofMiddleware,
-			func(c *gin.Context) {
-				reached = c.GetBool("secure_verified")
-				c.Status(http.StatusNoContent)
-			},
-		)
-		request := httptest.NewRequest(http.MethodPost, "/test", nil)
-		request.Header.Set("X-Security-Proof", proof)
-		response := httptest.NewRecorder()
-		engine.ServeHTTP(response, request)
-		return response.Code, response.Body.String(), reached
-	}
-
-	status, body, reached := run(wrongScopeProof)
-	assert.Equal(t, http.StatusForbidden, status)
-	assert.Contains(t, body, "SECURITY_PROOF_SCOPE_MISMATCH")
-	assert.False(t, reached)
-
-	status, _, reached = run(correctProof)
-	assert.Equal(t, http.StatusNoContent, status)
-	assert.True(t, reached)
-}
-
 func TestOpenCodeGoLifecycleWriteRoutesUseCriticalScopedMiddleware(t *testing.T) {
 	paths := []struct {
 		method string
@@ -136,7 +69,7 @@ func TestOpenCodeGoLifecycleWriteRoutesUseCriticalScopedMiddleware(t *testing.T)
 			}
 			found = true
 			require.Equal(t, authz.ChannelSensitiveWrite, route.permission)
-			require.Len(t, route.middlewares, 3)
+			require.Len(t, route.middlewares, 2)
 			break
 		}
 		require.True(t, found, "route %s %s not found", expected.method, expected.path)

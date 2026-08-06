@@ -71,7 +71,6 @@ import {
 } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { SecureVerificationDialog } from '@/features/auth/secure-verification'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
@@ -205,7 +204,6 @@ export function OpenCodeGoPoolDrawer(props: OpenCodeGoPoolDrawerProps) {
   const handleOpenChange = (open: boolean) => {
     props.onOpenChange(open)
     if (!open) {
-      pool.verification.cancel()
       setImportOpen(false)
       setLabelIdentity(null)
       setCookieIdentity(null)
@@ -832,25 +830,6 @@ export function OpenCodeGoPoolDrawer(props: OpenCodeGoPoolDrawerProps) {
           />
         )}
       </ConfirmDialog>
-
-      <SecureVerificationDialog
-        open={pool.verification.open}
-        onOpenChange={(open) => {
-          if (!open) pool.verification.cancel()
-        }}
-        methods={pool.verification.methods}
-        state={pool.verification.state}
-        onVerify={async (method, code) => {
-          try {
-            await pool.verification.executeVerification(method, code)
-          } catch {
-            // The verification hook already displays the request error.
-          }
-        }}
-        onCancel={pool.verification.cancel}
-        onCodeChange={pool.verification.setCode}
-        onMethodChange={pool.verification.switchMethod}
-      />
     </>
   )
 }

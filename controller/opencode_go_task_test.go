@@ -31,7 +31,6 @@ func TestOpenCodeGoRefreshHandlerConfigurationIsBoundedAndRequiresStableCrypto(t
 	require.True(t, ok)
 	assert.True(t, payload.Scheduled)
 	assert.Equal(t, service.OpenCodeGoMaxRefreshConcurrency, payload.Concurrency)
-	assert.True(t, isAllowedSecurityProofScope(SecurityProofScopeOpenCodeGoPoolWrite))
 }
 
 func TestOpenCodeGoRiskRecheckConfigurationIsBounded(t *testing.T) {

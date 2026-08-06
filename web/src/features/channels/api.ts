@@ -98,12 +98,6 @@ const openCodeGoCancellationMutationSchema = z.object({
   pool: openCodeGoPoolSchema,
 })
 
-function openCodeGoActionConfig(proofToken?: string): ApiRequestConfig {
-  return channelActionConfig({
-    headers: proofToken ? { 'X-Security-Proof': proofToken } : undefined,
-  })
-}
-
 function requireOpenCodeGoData<T>(
   schema: z.ZodType<T>,
   payload: unknown,
@@ -735,13 +729,12 @@ export async function getOpenCodeGoPool(
 
 export async function importOpenCodeGoIdentities(
   channelId: number,
-  input: { label: string; authCookies: string },
-  proofToken?: string
+  input: { label: string; authCookies: string }
 ) {
   const res = await api.post(
     `/api/channel/${channelId}/opencode-go/identities/import`,
     { label: input.label, auth_cookies: input.authCookies },
-    openCodeGoActionConfig(proofToken)
+    channelActionConfig()
   )
   return requireOpenCodeGoData(
     openCodeGoImportMutationSchema,
@@ -787,13 +780,12 @@ export async function setOpenCodeGoIdentityEnabled(
 export async function replaceOpenCodeGoIdentityCookie(
   channelId: number,
   identityUid: string,
-  authCookie: string,
-  proofToken?: string
+  authCookie: string
 ): Promise<OpenCodeGoPool> {
   const res = await api.put(
     `/api/channel/${channelId}/opencode-go/identities/${encodeURIComponent(identityUid)}/cookie`,
     { auth_cookie: authCookie },
-    openCodeGoActionConfig(proofToken)
+    channelActionConfig()
   )
   return requireOpenCodeGoData(
     openCodeGoPoolSchema,
@@ -820,12 +812,11 @@ export async function refreshOpenCodeGoIdentity(
 
 export async function deleteOpenCodeGoIdentity(
   channelId: number,
-  identityUid: string,
-  proofToken?: string
+  identityUid: string
 ): Promise<OpenCodeGoPool> {
   const res = await api.delete(
     `/api/channel/${channelId}/opencode-go/identities/${encodeURIComponent(identityUid)}`,
-    openCodeGoActionConfig(proofToken)
+    channelActionConfig()
   )
   return requireOpenCodeGoData(
     openCodeGoPoolSchema,
@@ -885,12 +876,11 @@ export async function recheckOpenCodeGoWorkspaceRisk(
 
 export async function deleteOpenCodeGoWorkspace(
   channelId: number,
-  workspaceUid: string,
-  proofToken?: string
+  workspaceUid: string
 ): Promise<OpenCodeGoPool> {
   const res = await api.delete(
     `/api/channel/${channelId}/opencode-go/workspaces/${encodeURIComponent(workspaceUid)}`,
-    openCodeGoActionConfig(proofToken)
+    channelActionConfig()
   )
   return requireOpenCodeGoData(
     openCodeGoPoolSchema,
@@ -900,12 +890,11 @@ export async function deleteOpenCodeGoWorkspace(
 }
 
 export async function deleteOpenCodeGoNonMemberWorkspaces(
-  channelId: number,
-  proofToken?: string
+  channelId: number
 ) {
   const res = await api.delete(
     `/api/channel/${channelId}/opencode-go/workspaces/non-members`,
-    openCodeGoActionConfig(proofToken)
+    channelActionConfig()
   )
   return requireOpenCodeGoData(
     openCodeGoDeleteNonMembersSchema,
@@ -959,13 +948,12 @@ export async function getOpenCodeGoTask(
 
 export async function updateOpenCodeGoLifecyclePolicy(
   channelId: number,
-  policy: Omit<OpenCodeGoLifecyclePolicy, 'automation_enabled'>,
-  proofToken?: string
+  policy: Omit<OpenCodeGoLifecyclePolicy, 'automation_enabled'>
 ): Promise<OpenCodeGoLifecyclePolicy> {
   const res = await api.put(
     `/api/channel/${channelId}/opencode-go/lifecycle-policy`,
     policy,
-    openCodeGoActionConfig(proofToken)
+    channelActionConfig()
   )
   return requireOpenCodeGoData(
     openCodeGoLifecyclePolicySchema,
@@ -976,13 +964,12 @@ export async function updateOpenCodeGoLifecyclePolicy(
 
 export async function enableOpenCodeGoChinaModels(
   channelId: number,
-  workspaceUid: string,
-  proofToken?: string
+  workspaceUid: string
 ) {
   const res = await api.post(
     `/api/channel/${channelId}/opencode-go/workspaces/${encodeURIComponent(workspaceUid)}/china-models/enable`,
     undefined,
-    openCodeGoActionConfig(proofToken)
+    channelActionConfig()
   )
   return requireOpenCodeGoData(
     openCodeGoChinaModelsMutationSchema,
@@ -993,13 +980,12 @@ export async function enableOpenCodeGoChinaModels(
 
 export async function applyOpenCodeGoReferralReward(
   channelId: number,
-  workspaceUid: string,
-  proofToken?: string
+  workspaceUid: string
 ) {
   const res = await api.post(
     `/api/channel/${channelId}/opencode-go/workspaces/${encodeURIComponent(workspaceUid)}/referral-rewards/apply`,
     undefined,
-    openCodeGoActionConfig(proofToken)
+    channelActionConfig()
   )
   return requireOpenCodeGoData(
     openCodeGoReferralMutationSchema,
@@ -1010,13 +996,12 @@ export async function applyOpenCodeGoReferralReward(
 
 export async function cancelOpenCodeGoSubscriptionRenewal(
   channelId: number,
-  workspaceUid: string,
-  proofToken?: string
+  workspaceUid: string
 ) {
   const res = await api.post(
     `/api/channel/${channelId}/opencode-go/workspaces/${encodeURIComponent(workspaceUid)}/subscription/cancel-renewal`,
     { confirmation: 'CANCEL RENEWAL' },
-    openCodeGoActionConfig(proofToken)
+    channelActionConfig()
   )
   return requireOpenCodeGoData(
     openCodeGoCancellationMutationSchema,
