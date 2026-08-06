@@ -76,13 +76,13 @@ func TestClaudeCodeSessionIdentityDrivesCacheAndAffinity(t *testing.T) {
 	require.NoError(t, err)
 	request := &dto.ClaudeRequest{Metadata: metadata}
 
-	identity := affinityIdentityForRequest(c, request)
+	identity := affinityIdentityForRequest(c, info, request)
 	assert.Equal(t, identity, cacheIdentityForRequest(c, info, request))
 	assert.True(t, strings.HasPrefix(identity, cacheIdentityPrefix))
 	assert.NotContains(t, identity, "claude-session-raw")
 
 	c.Request.Header.Del(claudeCodeSessionHeader)
-	metadataIdentity := affinityIdentityForRequest(c, request)
+	metadataIdentity := affinityIdentityForRequest(c, info, request)
 	assert.NotEmpty(t, metadataIdentity)
 	assert.NotEqual(t, identity, metadataIdentity)
 	assert.NotContains(t, metadataIdentity, "metadata-session")
@@ -93,6 +93,43 @@ func TestAffinityIdentityIsEmptyWithoutSessionMarker(t *testing.T) {
 	require.NoError(t, err)
 	request := &dto.ClaudeRequest{Metadata: metadata}
 
-	assert.Empty(t, affinityIdentityForRequest(newCacheIdentityContext(""), request))
+	assert.Empty(t, affinityIdentityForRequest(newCacheIdentityContext(""), nil, request))
 	assert.NotEmpty(t, cacheIdentityForRequest(newCacheIdentityContext(""), nil, request))
+}
+
+func TestAffinityIdentityTokenFallbackIsOptInAndStable(t *testing.T) {
+	metadata, err := json.Marshal(dto.ClaudeMetadata{UserId: "plain-customer-id"})
+	require.NoError(t, err)
+	request := &dto.ClaudeRequest{Metadata: metadata}
+
+	noFallback := &relaycommon.RelayInfo{OriginModelName: "model", UserId: 7, TokenId: 42}
+	assert.Empty(t, affinityIdentityForRequest(newCacheIdentityContext(""), noFallback, request))
+
+	fallback := &relaycommon.RelayInfo{
+		OriginModelName: "model",
+		UserId:          7,
+		TokenId:         42,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelOtherSettings: dto.ChannelOtherSettings{
+				OpenCodeGo: &dto.OpenCodeGoConfig{AffinityFallback: "token"},
+			},
+		},
+	}
+	tokenIdentity := affinityIdentityForRequest(newCacheIdentityContext(""), fallback, request)
+	require.NotEmpty(t, tokenIdentity)
+	assert.True(t, strings.HasPrefix(tokenIdentity, cacheIdentityPrefix))
+	assert.NotContains(t, tokenIdentity, "42")
+	// Stable for the same token, distinct from a different token.
+	otherToken := &relaycommon.RelayInfo{
+		OriginModelName: "model",
+		UserId:          7,
+		TokenId:         43,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelOtherSettings: dto.ChannelOtherSettings{
+				OpenCodeGo: &dto.OpenCodeGoConfig{AffinityFallback: "token"},
+			},
+		},
+	}
+	assert.Equal(t, tokenIdentity, affinityIdentityForRequest(newCacheIdentityContext(""), fallback, request))
+	assert.NotEqual(t, tokenIdentity, affinityIdentityForRequest(newCacheIdentityContext(""), otherToken, request))
 }

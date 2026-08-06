@@ -325,6 +325,8 @@ export const channelFormSchema = z
       .min(1)
       .max(86400)
       .default(1800),
+    opencode_go_affinity_fallback: z.enum(['', 'none', 'token']).default(''),
+    opencode_go_load_aware_enabled: z.boolean().optional(),
     opencode_go_auto_enable_china_models: z.boolean().optional(),
     opencode_go_auto_apply_referral_rewards: z.boolean().optional(),
     opencode_go_referral_rewards_max_per_run: z
@@ -517,6 +519,8 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   opencode_go_generic_failover_window_seconds: 30,
   opencode_go_generic_failover_max_backups: 1,
   opencode_go_generic_failover_lease_seconds: 1800,
+  opencode_go_affinity_fallback: '',
+  opencode_go_load_aware_enabled: false,
   opencode_go_auto_enable_china_models: true,
   opencode_go_auto_apply_referral_rewards: true,
   opencode_go_referral_rewards_max_per_run: 3,
@@ -592,6 +596,8 @@ export function transformChannelToFormDefaults(
   let openCodeGoGenericFailoverWindowSeconds = 30
   let openCodeGoGenericFailoverMaxBackups = 1
   let openCodeGoGenericFailoverLeaseSeconds = 1800
+  let openCodeGoAffinityFallback: '' | 'none' | 'token' = ''
+  let openCodeGoLoadAwareEnabled = false
   let openCodeGoAutoEnableChinaModels = true
   let openCodeGoAutoApplyReferralRewards = true
   let openCodeGoReferralRewardsMaxPerRun = 3
@@ -667,6 +673,13 @@ export function transformChannelToFormDefaults(
           openCodeGoGenericFailoverLeaseSeconds =
             openCodeGo.generic_failover_lease_seconds
         }
+        if (
+          openCodeGo.affinity_fallback === 'none' ||
+          openCodeGo.affinity_fallback === 'token'
+        ) {
+          openCodeGoAffinityFallback = openCodeGo.affinity_fallback
+        }
+        openCodeGoLoadAwareEnabled = openCodeGo.load_aware_enabled === true
         openCodeGoAutoEnableChinaModels =
           typeof openCodeGo.auto_enable_china_models === 'boolean'
             ? openCodeGo.auto_enable_china_models
@@ -749,6 +762,8 @@ export function transformChannelToFormDefaults(
       openCodeGoGenericFailoverMaxBackups,
     opencode_go_generic_failover_lease_seconds:
       openCodeGoGenericFailoverLeaseSeconds,
+    opencode_go_affinity_fallback: openCodeGoAffinityFallback,
+    opencode_go_load_aware_enabled: openCodeGoLoadAwareEnabled,
     opencode_go_auto_enable_china_models: openCodeGoAutoEnableChinaModels,
     opencode_go_auto_apply_referral_rewards: openCodeGoAutoApplyReferralRewards,
     opencode_go_referral_rewards_max_per_run:
@@ -937,6 +952,9 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
       formData.opencode_go_generic_failover_max_backups
     openCodeGo.generic_failover_lease_seconds =
       formData.opencode_go_generic_failover_lease_seconds
+    openCodeGo.affinity_fallback = formData.opencode_go_affinity_fallback || ''
+    openCodeGo.load_aware_enabled =
+      formData.opencode_go_load_aware_enabled === true
     openCodeGo.auto_enable_china_models =
       formData.opencode_go_auto_enable_china_models !== false
     openCodeGo.auto_apply_referral_rewards =

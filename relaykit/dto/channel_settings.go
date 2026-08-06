@@ -111,6 +111,8 @@ type OpenCodeGoConfig struct {
 	GenericFailoverWindowSeconds  int               `json:"generic_failover_window_seconds,omitempty"`
 	GenericFailoverMaxBackups     int               `json:"generic_failover_max_backups,omitempty"`
 	GenericFailoverLeaseSeconds   int               `json:"generic_failover_lease_seconds,omitempty"`
+	AffinityFallback              string            `json:"affinity_fallback,omitempty"`
+	LoadAwareEnabled              bool              `json:"load_aware_enabled,omitempty"`
 	AutoEnableChinaModels         *bool             `json:"auto_enable_china_models,omitempty"`
 	AutoApplyReferralRewards      *bool             `json:"auto_apply_referral_rewards,omitempty"`
 	ReferralRewardsMaxPerRun      *int              `json:"referral_rewards_max_per_run,omitempty"`
@@ -125,6 +127,9 @@ func (c *OpenCodeGoConfig) Validate() error {
 		if err := validateOpenCodeGoProtocol(c.DefaultProtocol); err != nil {
 			return fmt.Errorf("invalid OpenCode Go default protocol: %w", err)
 		}
+	}
+	if c.AffinityFallback != "" && c.AffinityFallback != "none" && c.AffinityFallback != "token" {
+		return fmt.Errorf("OpenCode Go affinity_fallback must be \"none\" or \"token\"")
 	}
 	if c.ReferralRewardsMaxPerRun != nil &&
 		(*c.ReferralRewardsMaxPerRun < 0 || *c.ReferralRewardsMaxPerRun > 20) {

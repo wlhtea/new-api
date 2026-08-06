@@ -14,6 +14,8 @@ func TestOpenCodeGoConfigValidate(t *testing.T) {
 		GenericFailoverWindowSeconds: OpenCodeGoGenericFailoverDefaultWindowSeconds,
 		GenericFailoverMaxBackups:    OpenCodeGoGenericFailoverDefaultMaxBackups,
 		GenericFailoverLeaseSeconds:  OpenCodeGoGenericFailoverDefaultLeaseSeconds,
+		AffinityFallback:             "token",
+		LoadAwareEnabled:             true,
 		ModelProtocols: map[string]string{
 			"future-*": OpenCodeGoProtocolMessages,
 		},
@@ -34,7 +36,9 @@ func TestOpenCodeGoConfigValidate(t *testing.T) {
 		{name: "failover window too large", config: OpenCodeGoConfig{GenericFailoverWindowSeconds: OpenCodeGoGenericFailoverMaxWindowSeconds + 1}, match: "generic_failover_window_seconds"},
 		{name: "failover backups exceed MVP", config: OpenCodeGoConfig{GenericFailoverMaxBackups: 2}, match: "generic_failover_max_backups"},
 		{name: "failover lease too large", config: OpenCodeGoConfig{GenericFailoverLeaseSeconds: OpenCodeGoGenericFailoverMaxLeaseSeconds + 1}, match: "generic_failover_lease_seconds"},
+		{name: "affinity fallback unknown", config: OpenCodeGoConfig{AffinityFallback: "apikey"}, match: "affinity_fallback"},
 	}
+	require.NoError(t, (&OpenCodeGoConfig{AffinityFallback: "none"}).Validate())
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

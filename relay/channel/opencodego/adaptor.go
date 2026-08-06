@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -37,6 +38,8 @@ type Adaptor struct {
 	statefulResponses     bool
 	failoverAttempt       *service.OpenCodeGoFailoverAttempt
 	namespaceTools        map[string]openCodeGoNamespaceTool
+	releaseOnce           sync.Once
+	releaseInFlightFn     func()
 	openai                openai.Adaptor
 	claude                claude.Adaptor
 }
@@ -67,12 +70,34 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	a.selectedWorkspaceUID = ""
 	a.statefulResponses = false
 	a.failoverAttempt = nil
+	a.releaseOnce = sync.Once{}
+	a.releaseInFlightFn = nil
 	a.namespaceTools = nil
 	if info == nil {
 		return
 	}
 	a.openai.Init(info)
 	a.claude.Init(info)
+}
+
+// acquireInFlight registers the per-workspace in-flight slot for this request
+// after a workspace is selected. It must be balanced by exactly one
+// releaseInFlight call; releaseOnce guards the three terminal paths.
+func (a *Adaptor) acquireInFlight(channelID int, workspaceUID string) {
+	if channelID <= 0 || strings.TrimSpace(workspaceUID) == "" {
+		return
+	}
+	service.AcquireOpenCodeGoWorkspaceInFlight(channelID, workspaceUID)
+	a.releaseInFlightFn = func() {
+		service.ReleaseOpenCodeGoWorkspaceInFlight(channelID, workspaceUID)
+	}
+}
+
+func (a *Adaptor) releaseInFlight() {
+	if a == nil || a.releaseInFlightFn == nil {
+		return
+	}
+	a.releaseOnce.Do(a.releaseInFlightFn)
 }
 
 func (a *Adaptor) resolveProtocol(info *relaycommon.RelayInfo) (Protocol, error) {
@@ -111,11 +136,14 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 		return err
 	}
 	if !a.workspaceSelected {
+		loadAware := info != nil && info.ChannelOtherSettings.OpenCodeGo != nil &&
+			info.ChannelOtherSettings.OpenCodeGo.LoadAwareEnabled
 		selection, selectErr := selectOpenCodeGoWorkspace(info.ChannelId, info.UpstreamModelName, service.OpenCodeGoPoolSelectOptions{
 			AffinityKey: a.affinityIdentity,
 			Protocol:    string(protocol),
 			Stateful:    a.statefulResponses,
 			Failover:    service.ResolveOpenCodeGoFailoverPolicy(info.ChannelOtherSettings.OpenCodeGo),
+			LoadAware:   loadAware,
 		})
 		if selectErr != nil {
 			return selectErr
@@ -124,6 +152,7 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 		a.selectedWorkspaceUID = selection.WorkspaceUID
 		a.failoverAttempt = selection.FailoverAttempt
 		a.workspaceSelected = true
+		a.acquireInFlight(info.ChannelId, selection.WorkspaceUID)
 		common.SetContextKey(c, constant.ContextKeyOpenCodeGoWorkspaceUID, selection.WorkspaceUID)
 		if selection.FailoverActive {
 			leaseRemaining := time.Until(selection.FailoverLeaseExpiresAt).Round(time.Second)
@@ -208,7 +237,7 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	}
 
 	a.cacheIdentity = cacheIdentityForRequest(c, info, request)
-	a.affinityIdentity = affinityIdentityForRequest(c, request)
+	a.affinityIdentity = affinityIdentityForRequest(c, info, request)
 	// Console Go can omit complete function-argument deltas from streaming tool
 	// results. Buffer any streaming Claude function-tool turn, whether its model
 	// uses Chat or Responses, into one non-streaming upstream request and
@@ -302,21 +331,24 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 		return nil, errors.New("OpenCode Go does not allow pass-through request bodies")
 	}
 	response, err := doOpenCodeGoAPIRequest(a, c, info, requestBody)
-	if err != nil && a.workspaceSelected && !openCodeGoCallerCancelled(c, err) && info != nil {
-		reason := sanitizeErrorMessage(err.Error())
-		if _, observeErr := observeOpenCodeGoTransportFailure(
-			info.ChannelId,
-			a.selectedWorkspaceUID,
-			info.UpstreamModelName,
-			reason,
-			openCodeGoHealthNow(),
-		); observeErr != nil {
-			common.SysError(fmt.Sprintf(
-				"failed to persist OpenCode Go transport health observation: channel_id=%d workspace_ref=%s error=%v",
+	if err != nil {
+		a.releaseInFlight()
+		if a.workspaceSelected && !openCodeGoCallerCancelled(c, err) && info != nil {
+			reason := sanitizeErrorMessage(err.Error())
+			if _, observeErr := observeOpenCodeGoTransportFailure(
 				info.ChannelId,
-				hashCacheIdentity("diagnostic-workspace", a.selectedWorkspaceUID),
-				observeErr,
-			))
+				a.selectedWorkspaceUID,
+				info.UpstreamModelName,
+				reason,
+				openCodeGoHealthNow(),
+			); observeErr != nil {
+				common.SysError(fmt.Sprintf(
+					"failed to persist OpenCode Go transport health observation: channel_id=%d workspace_ref=%s error=%v",
+					info.ChannelId,
+					hashCacheIdentity("diagnostic-workspace", a.selectedWorkspaceUID),
+					observeErr,
+				))
+			}
 		}
 	}
 	return response, err
@@ -337,6 +369,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	if info == nil {
 		return nil, types.NewOpenAIError(errors.New("OpenCode Go relay info is nil"), types.ErrorCodeBadResponse, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
 	}
+	defer a.releaseInFlight()
 	// Responses and Messages have explicit protocol terminal events. Preserve
 	// that requirement through the stream helper so an early EOF cannot be
 	// recorded as a successful request. Chat uses the SSE [DONE] sentinel.

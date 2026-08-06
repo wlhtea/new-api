@@ -28,6 +28,7 @@ func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info
 		err := types.NewOpenAIError(errors.New("OpenCode Go returned no response"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 		return err, &channel.Non2xxResponseObservation{Provider: ChannelName, StatusCode: http.StatusBadGateway, ErrorCode: string(types.ErrorCodeBadResponseStatusCode)}
 	}
+	defer a.releaseInFlight()
 	defer service.CloseResponseBodyGracefully(resp)
 
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes+1))

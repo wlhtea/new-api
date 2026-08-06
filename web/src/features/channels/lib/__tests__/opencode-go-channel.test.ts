@@ -110,6 +110,8 @@ describe('OpenCode Go channel configuration', () => {
       opencode_go_generic_failover_window_seconds: 30,
       opencode_go_generic_failover_max_backups: 1,
       opencode_go_generic_failover_lease_seconds: 1800,
+      opencode_go_affinity_fallback: 'token',
+      opencode_go_load_aware_enabled: true,
       opencode_go_auto_enable_china_models: false,
       opencode_go_auto_apply_referral_rewards: true,
       opencode_go_referral_rewards_max_per_run: 0,
@@ -128,6 +130,8 @@ describe('OpenCode Go channel configuration', () => {
       generic_failover_window_seconds: 30,
       generic_failover_max_backups: 1,
       generic_failover_lease_seconds: 1800,
+      affinity_fallback: 'token',
+      load_aware_enabled: true,
       auto_enable_china_models: false,
       auto_apply_referral_rewards: true,
       referral_rewards_max_per_run: 0,
@@ -168,6 +172,8 @@ describe('OpenCode Go channel configuration', () => {
           generic_failover_window_seconds: 45,
           generic_failover_max_backups: 1,
           generic_failover_lease_seconds: 600,
+          affinity_fallback: 'token',
+          load_aware_enabled: true,
           auto_enable_china_models: true,
           auto_apply_referral_rewards: false,
           referral_rewards_max_per_run: 0,
@@ -185,6 +191,8 @@ describe('OpenCode Go channel configuration', () => {
     assert.equal(defaults.opencode_go_generic_failover_window_seconds, 45)
     assert.equal(defaults.opencode_go_generic_failover_max_backups, 1)
     assert.equal(defaults.opencode_go_generic_failover_lease_seconds, 600)
+    assert.equal(defaults.opencode_go_affinity_fallback, 'token')
+    assert.equal(defaults.opencode_go_load_aware_enabled, true)
     assert.equal(defaults.opencode_go_referral_rewards_max_per_run, 0)
     const protocolOverrides = defaults.opencode_go_model_protocols
     assert.ok(protocolOverrides)
@@ -211,6 +219,7 @@ describe('OpenCode Go channel configuration', () => {
       { opencode_go_generic_failover_window_seconds: 301 },
       { opencode_go_generic_failover_max_backups: 2 },
       { opencode_go_generic_failover_lease_seconds: 86401 },
+      { opencode_go_affinity_fallback: 'apikey' },
     ]) {
       const parsed = channelFormSchema.safeParse({
         ...CHANNEL_FORM_DEFAULT_VALUES,
