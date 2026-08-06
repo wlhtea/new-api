@@ -4,8 +4,17 @@
     "1000": "1000",
     "10000": "10000",
     "Bulk failures (awaiting verification)": "Bulk failures (awaiting verification)",
+    "Cancel renewals (all)": "Cancel renewals (all)",
+    "Cancel subscription renewal for all eligible workspaces": "Cancel subscription renewal for all eligible workspaces",
+    "China models: {{succeeded}} updated, {{skipped}} skipped": "China models: {{succeeded}} updated, {{skipped}} skipped",
     "Concurrent requests currently served by this workspace": "Concurrent requests currently served by this workspace",
     "Current requests": "Current requests",
+    "Disable China models (all)": "Disable China models (all)",
+    "Disable China-deployed models for all eligible workspaces": "Disable China-deployed models for all eligible workspaces",
+    "Eligible active memberships will stop auto-renewing while access remains active until each current period ends. Type CANCEL RENEWAL to continue.": "Eligible active memberships will stop auto-renewing while access remains active until each current period ends. Type CANCEL RENEWAL to continue.",
+    "Enable China models (all)": "Enable China models (all)",
+    "Enable China-deployed models for all eligible workspaces": "Enable China-deployed models for all eligible workspaces",
+    "This changes the upstream China-provider setting for every eligible workspace in this channel.": "This changes the upstream China-provider setting for every eligible workspace in this channel.",
     "_copy": "_copy",
     "，": ", ",
     ", and": ", and",
@@ -5439,6 +5448,7 @@
     "{{count}} stale": "{{count}} stale",
     "{{count}} workspaces": "{{count}} workspaces",
     "{{processed}} of {{total}}": "{{processed}} of {{total}}",
+    "Renewals cancelled: {{succeeded}} updated, {{skipped}} skipped": "Renewals cancelled: {{succeeded}} updated, {{skipped}} skipped",
     "{{success}} succeeded / {{failed}} failed": "{{success}} succeeded / {{failed}} failed"
   }
 }

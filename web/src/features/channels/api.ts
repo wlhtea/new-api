@@ -1009,3 +1009,58 @@ export async function cancelOpenCodeGoSubscriptionRenewal(
     'Failed to cancel OpenCode Go subscription renewal'
   )
 }
+
+const openCodeGoBatchSummarySchema = z.object({
+  attempted: z.number().int().nonnegative(),
+  succeeded: z.number().int().nonnegative(),
+  skipped: z.number().int().nonnegative(),
+  failed: z.number().int().nonnegative(),
+  results: z.array(
+    z.object({
+      workspace_uid: z.string(),
+      status: z.string(),
+      message: z.string().optional(),
+    })
+  ),
+})
+
+const openCodeGoBatchChinaModelsSchema = z.object({
+  summary: openCodeGoBatchSummarySchema,
+  pool: openCodeGoPoolSchema,
+})
+
+const openCodeGoBatchCancelSchema = z.object({
+  summary: openCodeGoBatchSummarySchema,
+  pool: openCodeGoPoolSchema,
+})
+
+export async function batchOpenCodeGoChinaModels(
+  channelId: number,
+  enabled: boolean
+) {
+  const res = await api.post(
+    `/api/channel/${channelId}/opencode-go/workspaces/batch-china-models`,
+    { enabled },
+    channelActionConfig()
+  )
+  return requireOpenCodeGoData(
+    openCodeGoBatchChinaModelsSchema,
+    res.data,
+    'Failed to batch-update China-deployed models'
+  )
+}
+
+export async function batchCancelOpenCodeGoSubscriptionRenewal(
+  channelId: number
+) {
+  const res = await api.post(
+    `/api/channel/${channelId}/opencode-go/workspaces/batch-cancel-renewal`,
+    { confirmation: 'CANCEL RENEWAL' },
+    channelActionConfig()
+  )
+  return requireOpenCodeGoData(
+    openCodeGoBatchCancelSchema,
+    res.data,
+    'Failed to batch-cancel OpenCode Go subscription renewal'
+  )
+}

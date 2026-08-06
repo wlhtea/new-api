@@ -4,8 +4,17 @@
     "1000": "1000",
     "10000": "10000",
     "Bulk failures (awaiting verification)": "Échecs répétés (en attente de vérification)",
+    "Cancel renewals (all)": "Annuler tous les renouvellements",
+    "Cancel subscription renewal for all eligible workspaces": "Annuler le renouvellement d'abonnement pour tous les espaces éligibles",
+    "China models: {{succeeded}} updated, {{skipped}} skipped": "Modèles Chine : {{succeeded}} mis à jour, {{skipped}} ignorés",
     "Concurrent requests currently served by this workspace": "Requêtes simultanées actuellement servies par cet espace de travail",
     "Current requests": "Requêtes en cours",
+    "Disable China models (all)": "Désactiver les modèles Chine (tous)",
+    "Disable China-deployed models for all eligible workspaces": "Désactiver les modèles hébergés en Chine pour tous les espaces éligibles",
+    "Eligible active memberships will stop auto-renewing while access remains active until each current period ends. Type CANCEL RENEWAL to continue.": "Les adhésions actives éligibles cesseront de se renouveler automatiquement. Saisissez CANCEL RENEWAL pour continuer.",
+    "Enable China models (all)": "Activer les modèles Chine (tous)",
+    "Enable China-deployed models for all eligible workspaces": "Activer les modèles hébergés en Chine pour tous les espaces éligibles",
+    "This changes the upstream China-provider setting for every eligible workspace in this channel.": "Cela modifie le paramètre de fournisseur Chine pour chaque espace éligible de ce canal.",
     "_copy": "_copie",
     "，": ", ",
     ", and": ", et",
@@ -5439,6 +5448,7 @@
     "{{count}} stale": "{{count}} obsolètes",
     "{{count}} workspaces": "{{count}} espaces de travail",
     "{{processed}} of {{total}}": "{{processed}} sur {{total}}",
+    "Renewals cancelled: {{succeeded}} updated, {{skipped}} skipped": "Renouvellements annulés : {{succeeded}} mis à jour, {{skipped}} ignorés",
     "{{success}} succeeded / {{failed}} failed": "{{success}} réussis / {{failed}} échoués"
   }
 }

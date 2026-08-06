@@ -261,6 +261,67 @@ func (service *OpenCodeGoLifecycleService) EnableChinaModels(
 	return operation, nil
 }
 
+func (service *OpenCodeGoLifecycleService) DisableChinaModels(
+	ctx context.Context,
+	channelID int,
+	workspaceUID string,
+	source string,
+) (*model.OpenCodeGoOperation, error) {
+	if err := service.validate(); err != nil {
+		return nil, err
+	}
+	target, unlock, err := service.lockTarget(channelID, workspaceUID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	startedAt := service.now()
+	operation, err := startOpenCodeGoOperation(
+		channelID,
+		*target.workspace,
+		OpenCodeGoOperationDisableChinaModels,
+		source,
+		startedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	page, err := service.reader.FetchWorkspacePage(ctx, target.authCookie, target.workspace.UpstreamWorkspaceID)
+	if err != nil {
+		return operation, service.failOperation(operation, err)
+	}
+	if page.ChinaModelsEnabled == nil {
+		err = errors.New("OpenCode Go China-model state is not authoritative")
+		return operation, service.failOperation(operation, err)
+	}
+	if !*page.ChinaModelsEnabled {
+		if err := service.persistChinaModelVerification(channelID, workspaceUID, false, nil); err != nil {
+			return operation, service.failOperation(operation, err)
+		}
+		return operation, finishOpenCodeGoOperation(operation, OpenCodeGoOperationStatusSucceeded, "China-deployed models already disabled", nil, service.now())
+	}
+	if err := service.mutator.DisableChinaModels(ctx, target.authCookie, page); err != nil {
+		_ = service.persistChinaModelVerification(channelID, workspaceUID, true, err)
+		return operation, service.failOperation(operation, err)
+	}
+	verified, err := service.reader.FetchWorkspacePage(ctx, target.authCookie, target.workspace.UpstreamWorkspaceID)
+	if err == nil && verified.ChinaModelsEnabled != nil && *verified.ChinaModelsEnabled {
+		err = errors.New("OpenCode Go China-model action could not be verified")
+	}
+	if err != nil {
+		_ = service.persistChinaModelVerification(channelID, workspaceUID, true, err)
+		return operation, service.failOperation(operation, err)
+	}
+	if err := service.persistChinaModelVerification(channelID, workspaceUID, false, nil); err != nil {
+		return operation, service.failOperation(operation, err)
+	}
+	if err := finishOpenCodeGoOperation(operation, OpenCodeGoOperationStatusSucceeded, "China-deployed models disabled and verified", nil, service.now()); err != nil {
+		return operation, err
+	}
+	return operation, nil
+}
+
 func (service *OpenCodeGoLifecycleService) ApplyReferralRewards(
 	ctx context.Context,
 	channelID int,
@@ -467,7 +528,7 @@ func (service *OpenCodeGoLifecycleService) RunIdentityAutomations(
 		if workspace == nil || !workspace.ManualEnabled || workspace.EffectiveState == model.OpenCodeGoStateRiskBlocked || workspace.EffectiveState == model.OpenCodeGoStateAuthError {
 			continue
 		}
-		if policy.AutoEnableChinaModels && workspace.ChinaModelsEnabled != nil && !*workspace.ChinaModelsEnabled {
+		if policy.AutoEnableChinaModels && (workspace.ChinaModelsEnabled == nil || !*workspace.ChinaModelsEnabled) {
 			_, actionErr := service.EnableChinaModels(ctx, channelID, workspaceUID, source)
 			summary.append(workspaceUID, OpenCodeGoOperationEnableChinaModels, actionErr)
 		}

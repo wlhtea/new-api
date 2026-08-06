@@ -4,8 +4,17 @@
     "1000": "1000",
     "10000": "10000",
     "Bulk failures (awaiting verification)": "Lỗi hàng loạt (chờ xác minh thủ công)",
+    "Cancel renewals (all)": "Hủy tất cả gia hạn",
+    "Cancel subscription renewal for all eligible workspaces": "Hủy gia hạn đăng ký cho mọi không gian đủ điều kiện",
+    "China models: {{succeeded}} updated, {{skipped}} skipped": "Mô hình Trung Quốc: {{succeeded}} đã cập nhật, {{skipped}} bỏ qua",
     "Concurrent requests currently served by this workspace": "Số yêu cầu đồng thời đang được xử lý bởi không gian làm việc này",
     "Current requests": "Yêu cầu hiện tại",
+    "Disable China models (all)": "Tắt mô hình Trung Quốc (tất cả)",
+    "Disable China-deployed models for all eligible workspaces": "Tắt mô hình triển khai tại Trung Quốc cho mọi không gian đủ điều kiện",
+    "Eligible active memberships will stop auto-renewing while access remains active until each current period ends. Type CANCEL RENEWAL to continue.": "Các tư cách thành viên đủ điều kiện sẽ ngừng tự gia hạn. Nhập CANCEL RENEWAL để tiếp tục.",
+    "Enable China models (all)": "Bật mô hình Trung Quốc (tất cả)",
+    "Enable China-deployed models for all eligible workspaces": "Bật mô hình triển khai tại Trung Quốc cho mọi không gian đủ điều kiện",
+    "This changes the upstream China-provider setting for every eligible workspace in this channel.": "Thao tác này thay đổi cài đặt nhà cung cấp Trung Quốc cho mọi không gian đủ điều kiện trong kênh.",
     "_copy": "_bản sao",
     "，": ", ",
     ", and": ", và",
@@ -5439,6 +5448,7 @@
     "{{count}} stale": "{{count}} đã cũ",
     "{{count}} workspaces": "{{count}} không gian làm việc",
     "{{processed}} of {{total}}": "{{processed}} trên {{total}}",
+    "Renewals cancelled: {{succeeded}} updated, {{skipped}} skipped": "Đã hủy gia hạn: {{succeeded}} đã cập nhật, {{skipped}} bỏ qua",
     "{{success}} succeeded / {{failed}} failed": "{{success}} thành công / {{failed}} thất bại"
   }
 }

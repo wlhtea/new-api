@@ -47,6 +47,14 @@ type openCodeGoCancelRenewalRequest struct {
 	Confirmation string `json:"confirmation"`
 }
 
+type openCodeGoBatchChinaModelsRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+type openCodeGoBatchCancelRenewalRequest struct {
+	Confirmation string `json:"confirmation"`
+}
+
 func GetOpenCodeGoPool(c *gin.Context) {
 	channelID, ok := openCodeGoChannelID(c)
 	if !ok {
@@ -194,6 +202,77 @@ func CancelOpenCodeGoSubscriptionRenewal(c *gin.Context) {
 		"current_period_end": result.CurrentPeriodEnd,
 	})
 	common.ApiSuccess(c, gin.H{"operation": operation, "cancellation": result, "pool": view})
+}
+
+func BatchOpenCodeGoChinaModels(c *gin.Context) {
+	channelID, ok := openCodeGoChannelID(c)
+	if !ok {
+		return
+	}
+	request := openCodeGoBatchChinaModelsRequest{}
+	if err := decodeOpenCodeGoAdminJSON(c, &request, openCodeGoAdminBodyLimit); err != nil {
+		common.ApiError(c, errors.New("invalid OpenCode Go batch China-model request"))
+		return
+	}
+	lifecycle, err := service.NewConfiguredOpenCodeGoLifecycleService()
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	summary, err := lifecycle.BatchSetChinaModels(c.Request.Context(), channelID, nil, request.Enabled, "batch")
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	view, err := service.GetOpenCodeGoPoolView(channelID)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	recordManageAudit(c, "channel.opencode_go_china_models_batch", map[string]interface{}{
+		"id":        channelID,
+		"enabled":   request.Enabled,
+		"attempted": summary.Attempted,
+		"succeeded": summary.Succeeded,
+		"failed":    summary.Failed,
+		"skipped":   summary.Skipped,
+	})
+	common.ApiSuccess(c, gin.H{"summary": summary, "pool": view})
+}
+
+func BatchCancelOpenCodeGoSubscriptionRenewal(c *gin.Context) {
+	channelID, ok := openCodeGoChannelID(c)
+	if !ok {
+		return
+	}
+	request := openCodeGoBatchCancelRenewalRequest{}
+	if err := decodeOpenCodeGoAdminJSON(c, &request, openCodeGoAdminBodyLimit); err != nil || strings.TrimSpace(request.Confirmation) != openCodeGoCancelRenewalConfirmation {
+		common.ApiError(c, fmt.Errorf("confirmation must be %q", openCodeGoCancelRenewalConfirmation))
+		return
+	}
+	lifecycle, err := service.NewConfiguredOpenCodeGoLifecycleService()
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	summary, err := lifecycle.BatchCancelSubscriptionRenewal(c.Request.Context(), channelID, nil, "batch")
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	view, err := service.GetOpenCodeGoPoolView(channelID)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	recordManageAudit(c, "channel.opencode_go_renewal_cancel_batch", map[string]interface{}{
+		"id":        channelID,
+		"attempted": summary.Attempted,
+		"succeeded": summary.Succeeded,
+		"failed":    summary.Failed,
+		"skipped":   summary.Skipped,
+	})
+	common.ApiSuccess(c, gin.H{"summary": summary, "pool": view})
 }
 
 func ImportOpenCodeGoIdentities(c *gin.Context) {

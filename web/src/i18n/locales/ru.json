@@ -4,8 +4,17 @@
     "1000": "1000",
     "10000": "10000",
     "Bulk failures (awaiting verification)": "Массовые сбои (ожидается ручная проверка)",
+    "Cancel renewals (all)": "Отменить все продления",
+    "Cancel subscription renewal for all eligible workspaces": "Отменить продление подписки для всех подходящих пространств",
+    "China models: {{succeeded}} updated, {{skipped}} skipped": "Модели Китая: обновлено {{succeeded}}, пропущено {{skipped}}",
     "Concurrent requests currently served by this workspace": "Параллельные запросы, обслуживаемые этим рабочим пространством",
     "Current requests": "Текущие запросы",
+    "Disable China models (all)": "Отключить модели Китая (все)",
+    "Disable China-deployed models for all eligible workspaces": "Отключить модели, размещённые в Китае, для всех подходящих пространств",
+    "Eligible active memberships will stop auto-renewing while access remains active until each current period ends. Type CANCEL RENEWAL to continue.": "Подходящие активные подписки перестанут продлеваться автоматически. Введите CANCEL RENEWAL, чтобы продолжить.",
+    "Enable China models (all)": "Включить модели Китая (все)",
+    "Enable China-deployed models for all eligible workspaces": "Включить модели, размещённые в Китае, для всех подходящих пространств",
+    "This changes the upstream China-provider setting for every eligible workspace in this channel.": "Это изменит настройку китайского провайдера для каждого подходящего пространства канала.",
     "_copy": "_копировать",
     "，": ", ",
     ", and": ", и",
@@ -5439,6 +5448,7 @@
     "{{count}} stale": "Устарело: {{count}}",
     "{{count}} workspaces": "Рабочих областей: {{count}}",
     "{{processed}} of {{total}}": "{{processed}} из {{total}}",
+    "Renewals cancelled: {{succeeded}} updated, {{skipped}} skipped": "Продления отменены: обновлено {{succeeded}}, пропущено {{skipped}}",
     "{{success}} succeeded / {{failed}} failed": "Успешно: {{success}} / ошибок: {{failed}}"
   }
 }

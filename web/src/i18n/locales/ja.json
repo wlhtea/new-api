@@ -4,8 +4,17 @@
     "1000": "1000",
     "10000": "10000",
     "Bulk failures (awaiting verification)": "大量失敗（手動確認待ち）",
+    "Cancel renewals (all)": "すべての更新をキャンセル",
+    "Cancel subscription renewal for all eligible workspaces": "対象となるすべてのワークスペースでサブスクリプション更新をキャンセル",
+    "China models: {{succeeded}} updated, {{skipped}} skipped": "中国モデル: {{succeeded}} 更新、{{skipped}} スキップ",
     "Concurrent requests currently served by this workspace": "このワークスペースが現在処理中の並行リクエスト数",
     "Current requests": "現在のリクエスト数",
+    "Disable China models (all)": "中国モデルをすべて無効化",
+    "Disable China-deployed models for all eligible workspaces": "対象となるすべてのワークスペースで中国デプロイモデルを無効化",
+    "Eligible active memberships will stop auto-renewing while access remains active until each current period ends. Type CANCEL RENEWAL to continue.": "対象の有効なメンバーシップは自動更新を停止します。続けるには CANCEL RENEWAL と入力してください。",
+    "Enable China models (all)": "中国モデルをすべて有効化",
+    "Enable China-deployed models for all eligible workspaces": "対象となるすべてのワークスペースで中国デプロイモデルを有効化",
+    "This changes the upstream China-provider setting for every eligible workspace in this channel.": "このチャンネルの対象ワークスペースすべての中国プロバイダー設定を変更します。",
     "_copy": "_copy",
     "，": "、",
     ", and": "、および",
@@ -5439,6 +5448,7 @@
     "{{count}} stale": "古いデータ {{count}} 件",
     "{{count}} workspaces": "{{count}} ワークスペース",
     "{{processed}} of {{total}}": "{{total}} 件中 {{processed}} 件",
+    "Renewals cancelled: {{succeeded}} updated, {{skipped}} skipped": "更新キャンセル: {{succeeded}} 更新、{{skipped}} スキップ",
     "{{success}} succeeded / {{failed}} failed": "成功 {{success}} / 失敗 {{failed}}"
   }
 }

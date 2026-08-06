@@ -155,6 +155,26 @@ var channelPermissionRoutes = []permissionRoute{
 	},
 	{
 		method:     http.MethodPost,
+		path:       "/:id/opencode-go/workspaces/batch-china-models",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.CriticalRateLimit(),
+			middleware.DisableCache(),
+		},
+		handler: controller.BatchOpenCodeGoChinaModels,
+	},
+	{
+		method:     http.MethodPost,
+		path:       "/:id/opencode-go/workspaces/batch-cancel-renewal",
+		permission: authz.ChannelSensitiveWrite,
+		middlewares: []gin.HandlerFunc{
+			middleware.CriticalRateLimit(),
+			middleware.DisableCache(),
+		},
+		handler: controller.BatchCancelOpenCodeGoSubscriptionRenewal,
+	},
+	{
+		method:     http.MethodPost,
 		path:       "/:id/opencode-go/identities/import",
 		permission: authz.ChannelSensitiveWrite,
 		middlewares: []gin.HandlerFunc{

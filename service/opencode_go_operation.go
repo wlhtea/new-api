@@ -17,6 +17,7 @@ const (
 
 	OpenCodeGoOperationRiskRecheck        = "risk_recheck"
 	OpenCodeGoOperationEnableChinaModels  = "enable_china_models"
+	OpenCodeGoOperationDisableChinaModels = "disable_china_models"
 	OpenCodeGoOperationApplyReferral      = "apply_referral_reward"
 	OpenCodeGoOperationCancelSubscription = "cancel_subscription_renewal"
 )
