@@ -25,7 +25,7 @@ const (
 )
 
 func cacheIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) string {
-	if identity := affinityIdentityForRequest(c, info, request); identity != "" {
+	if identity, _ := affinityIdentityForRequest(c, info, request); identity != "" {
 		return identity
 	}
 	if source, value := requestCacheIdentity(request); value != "" {
@@ -45,33 +45,43 @@ func cacheIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, reques
 	return hashCacheIdentity("fallback", seed)
 }
 
-// affinityIdentityForRequest resolves the workspace-affinity key for a
-// request. Session markers keep priority; when none is present and the channel
-// opted into token fallback, the caller token identity is used so stateless
-// traffic (for example load tests) stays on a stable workspace instead of
-// round-robining and losing its cache on every request.
-func affinityIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) string {
+// Affinity source labels recorded in the consume log (admin_info) so each
+// request shows which workspace-affinity path selected the account.
+const (
+	AffinitySourceToken             = "token"
+	AffinitySourceClaudeCodeSession = "claude-code-session"
+	AffinitySourceClaudeMetadata    = "claude-metadata-session"
+	AffinitySourceOpenCodeSession   = "opencode-session"
+	AffinitySourcePromptCacheKey    = "prompt_cache_key"
+)
+
+// affinityIdentityForRequest resolves the workspace-affinity key and its source
+// for a request. Session markers keep priority; when none is present and the
+// channel opted into token fallback, the caller token identity is used so
+// stateless traffic (for example load tests) stays on a stable workspace
+// instead of round-robining and losing its cache on every request.
+func affinityIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (string, string) {
 	if c != nil && c.Request != nil {
 		if value := strings.TrimSpace(c.Request.Header.Get(claudeCodeSessionHeader)); value != "" {
-			return hashCacheIdentity("claude-code-session", value)
+			return hashCacheIdentity("claude-code-session", value), AffinitySourceClaudeCodeSession
 		}
 	}
 	if sessionID := requestClaudeSessionID(request); sessionID != "" {
-		return hashCacheIdentity("claude-metadata-session", sessionID)
+		return hashCacheIdentity("claude-metadata-session", sessionID), AffinitySourceClaudeMetadata
 	}
 	if c != nil && c.Request != nil {
 		if value := c.Request.Header.Get(cacheIdentityHeader); value != "" {
-			return canonicalCacheIdentity("header", value)
+			return canonicalCacheIdentity("header", value), AffinitySourceOpenCodeSession
 		}
 	}
 	if source, value := requestCacheIdentity(request); value != "" && source != "messages" {
-		return canonicalCacheIdentity(source, value)
+		return canonicalCacheIdentity(source, value), AffinitySourcePromptCacheKey
 	}
 	if info != nil && info.ChannelMeta != nil && info.ChannelOtherSettings.OpenCodeGo != nil &&
 		info.ChannelOtherSettings.OpenCodeGo.AffinityFallback == "token" && info.TokenId > 0 {
-		return hashCacheIdentity("token-fallback", strconv.Itoa(info.TokenId))
+		return hashCacheIdentity("token-fallback", strconv.Itoa(info.TokenId)), AffinitySourceToken
 	}
-	return ""
+	return "", ""
 }
 
 func requestClaudeSessionID(request any) string {

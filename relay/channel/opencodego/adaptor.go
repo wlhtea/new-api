@@ -28,6 +28,7 @@ type Adaptor struct {
 	protocolErr           error
 	cacheIdentity         string
 	affinityIdentity      string
+	affinitySource        string
 	bufferClaudeToolCall  bool
 	requestInputItems     int
 	requestToolCount      int
@@ -61,6 +62,7 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	a.protocolErr = nil
 	a.cacheIdentity = ""
 	a.affinityIdentity = ""
+	a.affinitySource = ""
 	a.bufferClaudeToolCall = false
 	a.requestInputItems = 0
 	a.requestToolCount = 0
@@ -136,6 +138,15 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 		return err
 	}
 	if !a.workspaceSelected {
+		// convertRequest normally resolves the affinity identity before this
+		// point; for relay modes that skip conversion, resolve it here from the
+		// incoming request so workspace selection and the consume-log attribution
+		// always agree.
+		if a.affinityIdentity == "" && a.affinitySource == "" {
+			a.affinityIdentity, a.affinitySource = affinityIdentityForRequest(c, info, nil)
+		}
+		common.SetContextKey(c, constant.ContextKeyOpenCodeGoAffinitySource, a.affinitySource)
+		common.SetContextKey(c, constant.ContextKeyOpenCodeGoAffinityKey, a.affinityIdentity)
 		loadAware := info != nil && info.ChannelOtherSettings.OpenCodeGo != nil &&
 			info.ChannelOtherSettings.OpenCodeGo.LoadAwareEnabled
 		selection, selectErr := selectOpenCodeGoWorkspace(info.ChannelId, info.UpstreamModelName, service.OpenCodeGoPoolSelectOptions{
@@ -237,7 +248,7 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	}
 
 	a.cacheIdentity = cacheIdentityForRequest(c, info, request)
-	a.affinityIdentity = affinityIdentityForRequest(c, info, request)
+	a.affinityIdentity, a.affinitySource = affinityIdentityForRequest(c, info, request)
 	// Console Go can omit complete function-argument deltas from streaming tool
 	// results. Buffer any streaming Claude function-tool turn, whether its model
 	// uses Chat or Responses, into one non-streaming upstream request and

@@ -39,6 +39,8 @@ const (
 	ContextKeyChannelMultiKeyIndex     ContextKey = "channel_multi_key_index"
 	ContextKeyChannelKey               ContextKey = "channel_key"
 	ContextKeyOpenCodeGoWorkspaceUID   ContextKey = "opencode_go_workspace_uid"
+	ContextKeyOpenCodeGoAffinitySource ContextKey = "opencode_go_affinity_source"
+	ContextKeyOpenCodeGoAffinityKey    ContextKey = "opencode_go_affinity_key"
 
 	ContextKeyAutoGroup           ContextKey = "auto_group"
 	ContextKeyAutoGroupIndex      ContextKey = "auto_group_index"

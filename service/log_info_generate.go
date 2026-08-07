@@ -124,8 +124,19 @@ func appendOpenCodeGoWorkspaceAdminInfo(ctx *gin.Context, adminInfo map[string]i
 		return
 	}
 	workspaceUID := common.GetContextKeyString(ctx, constant.ContextKeyOpenCodeGoWorkspaceUID)
-	if workspaceUID != "" {
-		adminInfo["opencode_go_workspace_uid"] = workspaceUID
+	if workspaceUID == "" {
+		return
+	}
+	adminInfo["opencode_go_workspace_uid"] = workspaceUID
+	// Round-robin selection (no session marker, no token fallback) is reported
+	// explicitly as "none" so admin logs distinguish it from a missing marker.
+	affinitySource := common.GetContextKeyString(ctx, constant.ContextKeyOpenCodeGoAffinitySource)
+	if affinitySource == "" {
+		affinitySource = "none"
+	}
+	adminInfo["opencode_go_affinity_source"] = affinitySource
+	if affinityKey := common.GetContextKeyString(ctx, constant.ContextKeyOpenCodeGoAffinityKey); affinityKey != "" {
+		adminInfo["opencode_go_affinity_key"] = affinityKey
 	}
 }
 

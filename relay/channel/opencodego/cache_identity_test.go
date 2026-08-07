@@ -76,16 +76,18 @@ func TestClaudeCodeSessionIdentityDrivesCacheAndAffinity(t *testing.T) {
 	require.NoError(t, err)
 	request := &dto.ClaudeRequest{Metadata: metadata}
 
-	identity := affinityIdentityForRequest(c, info, request)
+	identity, source := affinityIdentityForRequest(c, info, request)
 	assert.Equal(t, identity, cacheIdentityForRequest(c, info, request))
 	assert.True(t, strings.HasPrefix(identity, cacheIdentityPrefix))
 	assert.NotContains(t, identity, "claude-session-raw")
+	assert.Equal(t, AffinitySourceClaudeCodeSession, source)
 
 	c.Request.Header.Del(claudeCodeSessionHeader)
-	metadataIdentity := affinityIdentityForRequest(c, info, request)
+	metadataIdentity, metadataSource := affinityIdentityForRequest(c, info, request)
 	assert.NotEmpty(t, metadataIdentity)
 	assert.NotEqual(t, identity, metadataIdentity)
 	assert.NotContains(t, metadataIdentity, "metadata-session")
+	assert.Equal(t, AffinitySourceClaudeMetadata, metadataSource)
 }
 
 func TestAffinityIdentityIsEmptyWithoutSessionMarker(t *testing.T) {
@@ -93,7 +95,9 @@ func TestAffinityIdentityIsEmptyWithoutSessionMarker(t *testing.T) {
 	require.NoError(t, err)
 	request := &dto.ClaudeRequest{Metadata: metadata}
 
-	assert.Empty(t, affinityIdentityForRequest(newCacheIdentityContext(""), nil, request))
+	identity, source := affinityIdentityForRequest(newCacheIdentityContext(""), nil, request)
+	assert.Empty(t, identity)
+	assert.Empty(t, source)
 	assert.NotEmpty(t, cacheIdentityForRequest(newCacheIdentityContext(""), nil, request))
 }
 
@@ -103,7 +107,9 @@ func TestAffinityIdentityTokenFallbackIsOptInAndStable(t *testing.T) {
 	request := &dto.ClaudeRequest{Metadata: metadata}
 
 	noFallback := &relaycommon.RelayInfo{OriginModelName: "model", UserId: 7, TokenId: 42}
-	assert.Empty(t, affinityIdentityForRequest(newCacheIdentityContext(""), noFallback, request))
+	identity, source := affinityIdentityForRequest(newCacheIdentityContext(""), noFallback, request)
+	assert.Empty(t, identity)
+	assert.Empty(t, source)
 
 	fallback := &relaycommon.RelayInfo{
 		OriginModelName: "model",
@@ -115,10 +121,11 @@ func TestAffinityIdentityTokenFallbackIsOptInAndStable(t *testing.T) {
 			},
 		},
 	}
-	tokenIdentity := affinityIdentityForRequest(newCacheIdentityContext(""), fallback, request)
+	tokenIdentity, tokenSource := affinityIdentityForRequest(newCacheIdentityContext(""), fallback, request)
 	require.NotEmpty(t, tokenIdentity)
 	assert.True(t, strings.HasPrefix(tokenIdentity, cacheIdentityPrefix))
 	assert.NotContains(t, tokenIdentity, "42")
+	assert.Equal(t, AffinitySourceToken, tokenSource)
 	// Stable for the same token, distinct from a different token.
 	otherToken := &relaycommon.RelayInfo{
 		OriginModelName: "model",
@@ -130,6 +137,8 @@ func TestAffinityIdentityTokenFallbackIsOptInAndStable(t *testing.T) {
 			},
 		},
 	}
-	assert.Equal(t, tokenIdentity, affinityIdentityForRequest(newCacheIdentityContext(""), fallback, request))
-	assert.NotEqual(t, tokenIdentity, affinityIdentityForRequest(newCacheIdentityContext(""), otherToken, request))
+	sameTokenIdentity, _ := affinityIdentityForRequest(newCacheIdentityContext(""), fallback, request)
+	otherTokenIdentity, _ := affinityIdentityForRequest(newCacheIdentityContext(""), otherToken, request)
+	assert.Equal(t, tokenIdentity, sameTokenIdentity)
+	assert.NotEqual(t, tokenIdentity, otherTokenIdentity)
 }
