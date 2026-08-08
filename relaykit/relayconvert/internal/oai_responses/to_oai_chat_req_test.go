@@ -316,3 +316,172 @@ func mustRawMessage(t *testing.T, value any) []byte {
 	require.NoError(t, err)
 	return raw
 }
+
+func TestResponsesRequestToChatCompletionsRequestReasoningItem(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []map[string]any
+		want  []struct {
+			role          string
+			content       string
+			reasoning     string
+			reasoningSet  bool
+			toolCallNames []string
+		}
+	}{
+		{
+			name: "standard summary shape attaches to following assistant message",
+			input: []map[string]any{
+				{"role": "user", "content": "hi"},
+				{"type": "reasoning", "id": "rs_1", "status": "completed", "summary": []map[string]any{{"type": "summary_text", "text": "I think about X"}}},
+				{"role": "assistant", "content": []map[string]any{{"type": "output_text", "text": "answer"}}},
+			},
+			want: []struct {
+				role          string
+				content       string
+				reasoning     string
+				reasoningSet  bool
+				toolCallNames []string
+			}{
+				{role: "user", content: "hi"},
+				{role: "assistant", content: "answer", reasoning: "I think about X", reasoningSet: true},
+			},
+		},
+		{
+			name: "compatible content shape attaches reasoning",
+			input: []map[string]any{
+				{"type": "reasoning", "id": "rs_1", "status": "completed", "content": []map[string]any{{"type": "summary_text", "text": "Deep thought"}}},
+				{"role": "assistant", "content": []map[string]any{{"type": "output_text", "text": "answer"}}},
+			},
+			want: []struct {
+				role          string
+				content       string
+				reasoning     string
+				reasoningSet  bool
+				toolCallNames []string
+			}{
+				{role: "assistant", content: "answer", reasoning: "Deep thought", reasoningSet: true},
+			},
+		},
+		{
+			name: "reasoning before function_call merges into assistant turn",
+			input: []map[string]any{
+				{"role": "user", "content": "hi"},
+				{"type": "reasoning", "summary": []map[string]any{{"type": "summary_text", "text": "I will call"}}},
+				{"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": `{"q":"x"}`},
+				{"type": "function_call_output", "call_id": "call_1", "output": `{"ok":true}`},
+			},
+			want: []struct {
+				role          string
+				content       string
+				reasoning     string
+				reasoningSet  bool
+				toolCallNames []string
+			}{
+				{role: "user", content: "hi"},
+				{role: "assistant", reasoning: "I will call", reasoningSet: true, toolCallNames: []string{"lookup"}},
+				{role: "tool", content: `{"ok":true}`},
+			},
+		},
+		{
+			name: "reasoning after assistant message attaches on tool result boundary",
+			input: []map[string]any{
+				{"role": "user", "content": "hi"},
+				{"role": "assistant", "content": []map[string]any{{"type": "output_text", "text": "done"}}},
+				{"type": "reasoning", "summary": []map[string]any{{"type": "summary_text", "text": "retro thought"}}},
+				{"type": "function_call_output", "call_id": "call_1", "output": "result"},
+			},
+			want: []struct {
+				role          string
+				content       string
+				reasoning     string
+				reasoningSet  bool
+				toolCallNames []string
+			}{
+				{role: "user", content: "hi"},
+				{role: "assistant", content: "done", reasoning: "retro thought", reasoningSet: true},
+				{role: "tool", content: "result"},
+			},
+		},
+		{
+			name: "unclaimed reasoning at end becomes standalone assistant message",
+			input: []map[string]any{
+				{"role": "user", "content": "hi"},
+				{"type": "reasoning", "summary": []map[string]any{{"type": "summary_text", "text": "orphan thought"}}},
+			},
+			want: []struct {
+				role          string
+				content       string
+				reasoning     string
+				reasoningSet  bool
+				toolCallNames []string
+			}{
+				{role: "user", content: "hi"},
+				{role: "assistant", reasoning: "orphan thought", reasoningSet: true},
+			},
+		},
+		{
+			name: "empty summary text still sets reasoning_content field",
+			input: []map[string]any{
+				{"type": "reasoning", "summary": []map[string]any{{"type": "summary_text", "text": ""}}},
+				{"role": "assistant", "content": []map[string]any{{"type": "output_text", "text": "answer"}}},
+			},
+			want: []struct {
+				role          string
+				content       string
+				reasoning     string
+				reasoningSet  bool
+				toolCallNames []string
+			}{
+				{role: "assistant", content: "answer", reasoningSet: true},
+			},
+		},
+		{
+			name: "multiple reasoning items concatenate",
+			input: []map[string]any{
+				{"type": "reasoning", "summary": []map[string]any{{"type": "summary_text", "text": "first"}}},
+				{"type": "reasoning", "summary": []map[string]any{{"type": "summary_text", "text": "second"}}},
+				{"role": "assistant", "content": []map[string]any{{"type": "output_text", "text": "answer"}}},
+			},
+			want: []struct {
+				role          string
+				content       string
+				reasoning     string
+				reasoningSet  bool
+				toolCallNames []string
+			}{
+				{role: "assistant", content: "answer", reasoning: "first\n\nsecond", reasoningSet: true},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+				Model: "deepseek-test",
+				Input: mustRawMessage(t, tt.input),
+			})
+			require.NoError(t, err)
+			require.Len(t, got.Messages, len(tt.want))
+			for i, want := range tt.want {
+				msg := got.Messages[i]
+				assert.Equal(t, want.role, msg.Role, "message %d role", i)
+				assert.Equal(t, want.content, msg.StringContent(), "message %d content", i)
+				if want.reasoningSet {
+					require.NotNil(t, msg.ReasoningContent, "message %d reasoning_content must be set", i)
+					assert.Equal(t, want.reasoning, *msg.ReasoningContent, "message %d reasoning_content", i)
+				} else {
+					assert.Nil(t, msg.ReasoningContent, "message %d reasoning_content must be unset", i)
+				}
+				names := make([]string, 0, len(want.toolCallNames))
+				for _, tc := range msg.ParseToolCalls() {
+					names = append(names, tc.Function.Name)
+				}
+				if len(names) == 0 {
+					names = nil
+				}
+				assert.Equal(t, want.toolCallNames, names, "message %d tool calls", i)
+			}
+		})
+	}
+}

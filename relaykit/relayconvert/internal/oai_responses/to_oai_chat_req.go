@@ -122,67 +122,108 @@ func ValidateRequestChatUnsupportedFields(req *dto.OpenAIResponsesRequest) error
 	return validateResponsesRequestChatUnsupportedFields(req)
 }
 
-func responsesRequestMessagesToChat(req *dto.OpenAIResponsesRequest) ([]dto.Message, error) {
-	messages := make([]dto.Message, 0)
-	if rawJSONPresent(req.Instructions) {
-		instructions, err := responsesJSONString(req.Instructions)
-		if err != nil {
-			return nil, fmt.Errorf("invalid instructions: %w", err)
-		}
-		if strings.TrimSpace(instructions) != "" {
-			messages = append(messages, dto.Message{Role: "system", Content: instructions})
-		}
-	}
-
-	if !rawJSONPresent(req.Input) {
-		return messages, nil
-	}
-
-	switch kitutil.GetJsonType(req.Input) {
-	case "string":
-		input, err := responsesJSONString(req.Input)
-		if err != nil {
-			return nil, fmt.Errorf("invalid input string: %w", err)
-		}
-		messages = append(messages, dto.Message{Role: "user", Content: input})
-		return messages, nil
-	case "array":
-		var items []map[string]any
-		if err := kitutil.Unmarshal(req.Input, &items); err != nil {
-			return nil, fmt.Errorf("invalid input array: %w", err)
-		}
-		for _, item := range items {
-			nextMessages, err := responsesInputItemToChatMessages(item, messages)
-			if err != nil {
-				return nil, err
-			}
-			messages = nextMessages
-		}
-		return messages, nil
-	default:
-		return nil, fmt.Errorf("unsupported responses input type %q", kitutil.GetJsonType(req.Input))
-	}
+// responsesChatContext accumulates Chat messages while converting a Responses
+// input array. A Responses `reasoning` item carries prior assistant reasoning
+// (in `summary[]` or the compatible `content[]` representation) but no role or
+// content of its own; thinking-mode upstream providers such as DeepSeek require
+// that reasoning to be passed back as `reasoning_content` on the assistant
+// message of the same turn. The item is therefore buffered and attached to the
+// assistant message that follows it (OpenAI emits reasoning before the
+// message/function_call of its turn).
+type responsesChatContext struct {
+	messages         []dto.Message
+	pendingReasoning string
+	reasoningSeen    bool
 }
 
-func responsesInputItemToChatMessages(item map[string]any, messages []dto.Message) ([]dto.Message, error) {
+// applyReasoning moves the buffered reasoning onto msg as `reasoning_content`.
+// It sets the field even when the extracted text is empty: a thinking-mode
+// provider may return empty reasoning_content that still must be passed back on
+// subsequent requests. The buffer is cleared once attached; a message that
+// already carries reasoning_content is left untouched.
+func (c *responsesChatContext) applyReasoning(msg *dto.Message) {
+	if msg == nil || !c.reasoningSeen || msg.ReasoningContent != nil {
+		return
+	}
+	reasoning := c.pendingReasoning
+	msg.ReasoningContent = &reasoning
+	c.reasoningSeen = false
+	c.pendingReasoning = ""
+}
+
+// flushPendingReasoning attaches buffered reasoning to the last assistant
+// message (for orderings where the reasoning item follows its assistant turn,
+// e.g. the repo's own Responses representation). If no assistant message is
+// available, the reasoning is preserved as a standalone assistant message
+// rather than dropped. Empty reasoning with no assistant message to attach to
+// is simply discarded.
+func (c *responsesChatContext) flushPendingReasoning() {
+	if !c.reasoningSeen {
+		return
+	}
+	if len(c.messages) > 0 {
+		last := &c.messages[len(c.messages)-1]
+		if last.Role == "assistant" && last.ReasoningContent == nil {
+			c.applyReasoning(last)
+			return
+		}
+	}
+	if c.pendingReasoning != "" {
+		c.messages = append(c.messages, dto.Message{Role: "assistant"})
+		c.applyReasoning(&c.messages[len(c.messages)-1])
+		return
+	}
+	c.reasoningSeen = false
+	c.pendingReasoning = ""
+}
+
+// appendToolCall merges a Responses function_call/custom_tool_call item into the
+// current assistant message, creating one if needed, and attaches any buffered
+// reasoning to it first.
+func (c *responsesChatContext) appendToolCall(toolCall dto.ToolCallRequest) {
+	if len(c.messages) == 0 || c.messages[len(c.messages)-1].Role != "assistant" {
+		c.messages = append(c.messages, dto.Message{Role: "assistant"})
+	}
+	idx := len(c.messages) - 1
+	c.applyReasoning(&c.messages[idx])
+	toolCalls := c.messages[idx].ParseToolCalls()
+	toolCalls = append(toolCalls, toolCall)
+	toolCallsRaw, _ := kitutil.Marshal(toolCalls)
+	c.messages[idx].ToolCalls = toolCallsRaw
+}
+
+func (c *responsesChatContext) appendItem(item map[string]any) error {
 	itemType := strings.TrimSpace(kitutil.Interface2String(item["type"]))
 	switch itemType {
+	case "reasoning":
+		c.reasoningSeen = true
+		text := responsesReasoningItemText(item)
+		if c.pendingReasoning == "" {
+			c.pendingReasoning = text
+		} else if text != "" {
+			c.pendingReasoning += "\n\n" + text
+		}
+		return nil
 	case responsesInputTypeFunctionCall:
 		toolCall, err := responsesFunctionCallItemToChatToolCall(item)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		return appendToolCallToLastAssistant(messages, toolCall), nil
+		c.appendToolCall(toolCall)
+		return nil
 	case responsesInputTypeCustomToolCall:
 		toolCall, err := responsesCustomToolCallItemToChatToolCall(item)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		return appendToolCallToLastAssistant(messages, toolCall), nil
+		c.appendToolCall(toolCall)
+		return nil
 	case responsesInputTypeFunctionCallOutput:
+		c.flushPendingReasoning()
 		callID := strings.TrimSpace(kitutil.Interface2String(item["call_id"]))
 		content := responseToolOutputToChatContent(item["output"])
-		return append(messages, dto.Message{Role: "tool", ToolCallId: callID, Content: content}), nil
+		c.messages = append(c.messages, dto.Message{Role: "tool", ToolCallId: callID, Content: content})
+		return nil
 	}
 
 	role := strings.TrimSpace(kitutil.Interface2String(item["role"]))
@@ -198,9 +239,86 @@ func responsesInputItemToChatMessages(item map[string]any, messages []dto.Messag
 	}
 	content, err := responsesInputContentToChatContent(item["content"])
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return append(messages, dto.Message{Role: role, Content: content}), nil
+	if role == "assistant" {
+		msg := dto.Message{Role: "assistant", Content: content}
+		c.applyReasoning(&msg)
+		c.messages = append(c.messages, msg)
+		return nil
+	}
+	c.flushPendingReasoning()
+	c.messages = append(c.messages, dto.Message{Role: role, Content: content})
+	return nil
+}
+
+// responsesReasoningItemText extracts the reasoning text from a Responses
+// `reasoning` input item, accepting both the standard `summary[]` shape
+// (summary_text.text) and the compatible `content[]` shape. It mirrors the
+// response-side normalization in ExtractReasoningTextFromResponses.
+func responsesReasoningItemText(item map[string]any) string {
+	for _, key := range []string{"summary", "content"} {
+		if text := responsesReasoningPartsText(item[key]); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func responsesReasoningPartsText(raw any) string {
+	parts, ok := raw.([]any)
+	if !ok {
+		return ""
+	}
+	var sb strings.Builder
+	for _, item := range parts {
+		part, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		sb.WriteString(kitutil.Interface2String(part["text"]))
+	}
+	return sb.String()
+}
+
+func responsesRequestMessagesToChat(req *dto.OpenAIResponsesRequest) ([]dto.Message, error) {
+	ctx := &responsesChatContext{}
+	if rawJSONPresent(req.Instructions) {
+		instructions, err := responsesJSONString(req.Instructions)
+		if err != nil {
+			return nil, fmt.Errorf("invalid instructions: %w", err)
+		}
+		if strings.TrimSpace(instructions) != "" {
+			ctx.messages = append(ctx.messages, dto.Message{Role: "system", Content: instructions})
+		}
+	}
+
+	if !rawJSONPresent(req.Input) {
+		return ctx.messages, nil
+	}
+
+	switch kitutil.GetJsonType(req.Input) {
+	case "string":
+		input, err := responsesJSONString(req.Input)
+		if err != nil {
+			return nil, fmt.Errorf("invalid input string: %w", err)
+		}
+		return append(ctx.messages, dto.Message{Role: "user", Content: input}), nil
+	case "array":
+		var items []map[string]any
+		if err := kitutil.Unmarshal(req.Input, &items); err != nil {
+			return nil, fmt.Errorf("invalid input array: %w", err)
+		}
+		for _, item := range items {
+			if err := ctx.appendItem(item); err != nil {
+				return nil, err
+			}
+		}
+		ctx.flushPendingReasoning()
+		return ctx.messages, nil
+	default:
+		return nil, fmt.Errorf("unsupported responses input type %q", kitutil.GetJsonType(req.Input))
+	}
 }
 
 func responsesInputContentToChatContent(content any) (any, error) {
@@ -311,19 +429,6 @@ func responsesCustomToolCallItemToChatToolCall(item map[string]any) (dto.ToolCal
 			Arguments: responsesArgumentsString(item["input"]),
 		},
 	}, nil
-}
-
-func appendToolCallToLastAssistant(messages []dto.Message, toolCall dto.ToolCallRequest) []dto.Message {
-	if len(messages) == 0 || messages[len(messages)-1].Role != "assistant" {
-		messages = append(messages, dto.Message{Role: "assistant"})
-	}
-
-	idx := len(messages) - 1
-	toolCalls := messages[idx].ParseToolCalls()
-	toolCalls = append(toolCalls, toolCall)
-	toolCallsRaw, _ := kitutil.Marshal(toolCalls)
-	messages[idx].ToolCalls = toolCallsRaw
-	return messages
 }
 
 func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, error) {
