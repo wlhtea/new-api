@@ -266,6 +266,77 @@ func TestOpenCodeGoLifecycleAutomationMasterSwitchDefaultsOff(t *testing.T) {
 	assert.Zero(t, fake.cancelCalls)
 }
 
+func TestOpenCodeGoLifecycleAutomationMasterSwitchOptionOverridesEnv(t *testing.T) {
+	// A DB-backed option must take precedence over the deployment env value.
+	snapshot := snapshotOpenCodeGoLifecycleAutomationOption(t)
+	t.Cleanup(func() { restoreOpenCodeGoLifecycleAutomationOption(t, snapshot) })
+	common.OptionMapRWMutex.Lock()
+	common.OptionMap["OpenCodeGoLifecycleAutomationEnabled"] = "true"
+	common.OptionMapRWMutex.Unlock()
+	t.Setenv("OPENCODE_GO_LIFECYCLE_AUTOMATION_ENABLED", "false")
+	assert.True(t, openCodeGoLifecycleAutomationEnabled())
+}
+
+func TestOpenCodeGoLifecycleAutomationMasterSwitchEnvFallbackWithoutOption(t *testing.T) {
+	// Without a DB option the env value must be honored unchanged.
+	snapshot := snapshotOpenCodeGoLifecycleAutomationOption(t)
+	t.Cleanup(func() { restoreOpenCodeGoLifecycleAutomationOption(t, snapshot) })
+	common.OptionMapRWMutex.Lock()
+	if common.OptionMap == nil {
+		common.OptionMap = map[string]string{}
+	}
+	delete(common.OptionMap, "OpenCodeGoLifecycleAutomationEnabled")
+	common.OptionMapRWMutex.Unlock()
+	t.Setenv("OPENCODE_GO_LIFECYCLE_AUTOMATION_ENABLED", "true")
+	assert.True(t, openCodeGoLifecycleAutomationEnabled())
+}
+
+func TestOpenCodeGoLifecycleAutomationMasterSwitchMalformedOptionFallsBackToEnv(t *testing.T) {
+	// An unparseable DB value must fall back to the env default rather than
+	// silently disabling automation.
+	snapshot := snapshotOpenCodeGoLifecycleAutomationOption(t)
+	t.Cleanup(func() { restoreOpenCodeGoLifecycleAutomationOption(t, snapshot) })
+	common.OptionMapRWMutex.Lock()
+	common.OptionMap["OpenCodeGoLifecycleAutomationEnabled"] = "not-a-bool"
+	common.OptionMapRWMutex.Unlock()
+	t.Setenv("OPENCODE_GO_LIFECYCLE_AUTOMATION_ENABLED", "true")
+	assert.True(t, openCodeGoLifecycleAutomationEnabled())
+}
+
+// openCodeGoLifecycleAutomationOptionSnapshot captures the previous value of
+// the master-switch option (if any) so a test can restore it afterwards.
+type openCodeGoLifecycleAutomationOptionSnapshot struct {
+	value string
+	had   bool
+}
+
+// snapshotOpenCodeGoLifecycleAutomationOption ensures common.OptionMap is
+// non-nil (it may be nil in the test binary since InitOptionMap only runs in
+// main) and records the previous option value.
+func snapshotOpenCodeGoLifecycleAutomationOption(t *testing.T) openCodeGoLifecycleAutomationOptionSnapshot {
+	t.Helper()
+	common.OptionMapRWMutex.Lock()
+	defer common.OptionMapRWMutex.Unlock()
+	if common.OptionMap == nil {
+		common.OptionMap = map[string]string{}
+	}
+	previous, had := common.OptionMap["OpenCodeGoLifecycleAutomationEnabled"]
+	return openCodeGoLifecycleAutomationOptionSnapshot{value: previous, had: had}
+}
+
+// restoreOpenCodeGoLifecycleAutomationOption puts the captured option value
+// back, removing it if it was absent before the test.
+func restoreOpenCodeGoLifecycleAutomationOption(t *testing.T, snapshot openCodeGoLifecycleAutomationOptionSnapshot) {
+	t.Helper()
+	common.OptionMapRWMutex.Lock()
+	defer common.OptionMapRWMutex.Unlock()
+	if snapshot.had {
+		common.OptionMap["OpenCodeGoLifecycleAutomationEnabled"] = snapshot.value
+	} else {
+		delete(common.OptionMap, "OpenCodeGoLifecycleAutomationEnabled")
+	}
+}
+
 func TestOpenCodeGoLifecyclePolicyDefaultsAndUpdatePreserveProtocolSettings(t *testing.T) {
 	db, channel, _ := setupOpenCodeGoPoolTestDB(t)
 	t.Setenv("OPENCODE_GO_LIFECYCLE_AUTOMATION_ENABLED", "false")

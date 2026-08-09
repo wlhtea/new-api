@@ -889,9 +889,7 @@ export async function deleteOpenCodeGoWorkspace(
   )
 }
 
-export async function deleteOpenCodeGoNonMemberWorkspaces(
-  channelId: number
-) {
+export async function deleteOpenCodeGoNonMemberWorkspaces(channelId: number) {
   const res = await api.delete(
     `/api/channel/${channelId}/opencode-go/workspaces/non-members`,
     channelActionConfig()
@@ -960,6 +958,25 @@ export async function updateOpenCodeGoLifecyclePolicy(
     res.data,
     'Failed to update OpenCode Go lifecycle policy'
   )
+}
+
+const openCodeGoOptionUpdateSchema = z.object({
+  success: z.boolean(),
+  message: z.string(),
+})
+
+export async function updateOpenCodeGoLifecycleAutomation(
+  enabled: boolean
+): Promise<void> {
+  const res = await api.put(
+    '/api/option/',
+    { key: 'OpenCodeGoLifecycleAutomationEnabled', value: enabled },
+    channelActionConfig()
+  )
+  const response = openCodeGoOptionUpdateSchema.parse(res.data)
+  if (!response.success) {
+    throw new Error(response.message || 'Failed to update lifecycle automation')
+  }
 }
 
 export async function enableOpenCodeGoChinaModels(

@@ -42,6 +42,7 @@ import {
   setOpenCodeGoIdentityEnabled,
   setOpenCodeGoWorkspaceEnabled,
   updateOpenCodeGoIdentityLabel,
+  updateOpenCodeGoLifecycleAutomation,
   updateOpenCodeGoLifecyclePolicy,
 } from '../api'
 import { channelsQueryKeys } from '../lib/channel-actions'
@@ -427,6 +428,27 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
     )
   }
 
+  const toggleAutomation = async (enabled: boolean) => {
+    await startSensitiveAction(
+      'sensitive:automation',
+      () => updateOpenCodeGoLifecycleAutomation(enabled),
+      () => {
+        queryClient.invalidateQueries({
+          queryKey: openCodeGoPoolQueryKeys.pool(channelId),
+        })
+        queryClient.invalidateQueries({ queryKey: channelsQueryKeys.lists() })
+        queryClient.invalidateQueries({
+          queryKey: channelsQueryKeys.detail(channelId),
+        })
+        toast.success(
+          enabled
+            ? t('Global lifecycle automation enabled')
+            : t('Global lifecycle automation disabled')
+        )
+      }
+    )
+  }
+
   return {
     poolQuery,
     ordinaryMutation,
@@ -445,6 +467,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
     deleteWorkspace,
     deleteNonMembers,
     updatePolicy,
+    toggleAutomation,
     enableChinaModels,
     applyReferralReward,
     cancelRenewal,

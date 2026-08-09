@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -569,6 +570,17 @@ func (client *OpenCodeGoLifecycleClient) doStripeRequest(
 }
 
 func openCodeGoLifecycleAutomationEnabled() bool {
+	// A DB-backed option (settable from the admin UI) takes precedence over the
+	// deployment env default. The env var remains the bootstrap/fallback value
+	// so existing deployments keep working without a DB row.
+	common.OptionMapRWMutex.RLock()
+	raw, ok := common.OptionMap["OpenCodeGoLifecycleAutomationEnabled"]
+	common.OptionMapRWMutex.RUnlock()
+	if ok {
+		if enabled, err := strconv.ParseBool(raw); err == nil {
+			return enabled
+		}
+	}
 	return common.GetEnvOrDefaultBool("OPENCODE_GO_LIFECYCLE_AUTOMATION_ENABLED", false)
 }
 

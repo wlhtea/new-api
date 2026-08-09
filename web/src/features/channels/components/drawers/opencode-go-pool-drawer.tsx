@@ -78,6 +78,7 @@ import {
   ADMIN_PERMISSION_RESOURCES,
   hasPermission,
 } from '@/lib/admin-permissions'
+import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { useOpenCodeGoPool } from '../../hooks/use-opencode-go-pool'
@@ -340,7 +341,9 @@ export function OpenCodeGoPoolDrawer(props: OpenCodeGoPoolDrawerProps) {
         )
         break
       case 'batch-cancel-renewals':
-        confirmationTitle = t('Cancel subscription renewal for all eligible workspaces')
+        confirmationTitle = t(
+          'Cancel subscription renewal for all eligible workspaces'
+        )
         confirmationDescription = t(
           'Eligible active memberships will stop auto-renewing while access remains active until each current period ends. Type CANCEL RENEWAL to continue.'
         )
@@ -539,6 +542,9 @@ export function OpenCodeGoPoolDrawer(props: OpenCodeGoPoolDrawerProps) {
         disabled={!canSensitiveWrite}
         isSubmitting={pool.sensitiveBusyKey === 'sensitive:policy'}
         onSubmit={submitPolicy}
+        canToggleAutomation={currentUser?.role === ROLE.SUPER_ADMIN}
+        automationBusy={pool.sensitiveBusyKey === 'sensitive:automation'}
+        onToggleAutomation={(enabled) => void pool.toggleAutomation(enabled)}
       />
     )
   }

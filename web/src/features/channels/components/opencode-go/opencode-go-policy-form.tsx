@@ -54,6 +54,9 @@ type OpenCodeGoPolicyFormProps = {
   disabled: boolean
   isSubmitting: boolean
   onSubmit: (values: OpenCodeGoPolicyFormValues) => void
+  canToggleAutomation?: boolean
+  automationBusy?: boolean
+  onToggleAutomation?: (enabled: boolean) => void
 }
 
 export function OpenCodeGoPolicyForm(props: OpenCodeGoPolicyFormProps) {
@@ -109,6 +112,34 @@ export function OpenCodeGoPolicyForm(props: OpenCodeGoPolicyFormProps) {
               {t('Saved channel policies will not run automatically')}
             </AlertDescription>
           </Alert>
+        )}
+
+        {props.onToggleAutomation && (
+          <div className='divide-border/60 border-border/60 flex min-h-18 items-center justify-between gap-4 border-y py-3'>
+            <div className='min-w-0'>
+              <div className='text-sm font-medium'>
+                {t('Global lifecycle automation')}
+              </div>
+              <div className='text-muted-foreground text-xs'>
+                {props.canToggleAutomation
+                  ? t(
+                      'Controls whether lifecycle automation runs for all OpenCode Go channels'
+                    )
+                  : t('Only root can change this setting')}
+              </div>
+            </div>
+            <Switch
+              checked={props.policy.automation_enabled}
+              disabled={
+                !props.canToggleAutomation ||
+                props.disabled ||
+                props.isSubmitting ||
+                props.automationBusy
+              }
+              onCheckedChange={props.onToggleAutomation}
+              aria-label={t('Global lifecycle automation')}
+            />
+          </div>
         )}
 
         <fieldset
