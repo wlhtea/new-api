@@ -58,7 +58,7 @@ describe('usage log affinity display', () => {
     )
   })
 
-  test('prefers public fields and falls back to nested admin fields', () => {
+  test('prefers legacy top-level fields and falls back to nested admin fields', () => {
     assert.deepEqual(
       resolveUsageLogAffinity({
         opencode_go_affinity_source: 'token',

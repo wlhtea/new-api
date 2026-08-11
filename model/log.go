@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/types"
 
@@ -114,55 +113,17 @@ func assignDisplayLogIds(logs []*Log, startIdx int) {
 	}
 }
 
-const (
-	openCodeGoAffinitySourceField = "opencode_go_affinity_source"
-	openCodeGoWorkspaceUIDField   = "opencode_go_workspace_uid"
-	openCodeGoWorkspaceUIDMaxLen  = 64
-)
-
-func isPublicOpenCodeGoAffinitySource(source string) bool {
-	switch source {
-	case constant.OpenCodeGoAffinitySourceToken,
-		constant.OpenCodeGoAffinitySourceClaudeCodeSession,
-		constant.OpenCodeGoAffinitySourceClaudeMetadataSession,
-		constant.OpenCodeGoAffinitySourceOpenCodeSession,
-		constant.OpenCodeGoAffinitySourcePromptCacheKey,
-		constant.OpenCodeGoAffinitySourceNone:
-		return true
-	default:
-		return false
-	}
-}
-
-func projectOpenCodeGoUserLogFields(otherMap map[string]interface{}) {
-	// Only values copied from the validated admin payload are public. Clearing
-	// pre-existing top-level values keeps this projection as the trust boundary.
-	delete(otherMap, openCodeGoAffinitySourceField)
-	delete(otherMap, openCodeGoWorkspaceUIDField)
-
-	adminInfo, ok := otherMap["admin_info"].(map[string]interface{})
-	if !ok || adminInfo == nil {
-		return
-	}
-	if source, ok := adminInfo[openCodeGoAffinitySourceField].(string); ok && isPublicOpenCodeGoAffinitySource(source) {
-		otherMap[openCodeGoAffinitySourceField] = source
-	}
-	if workspaceUID, ok := adminInfo[openCodeGoWorkspaceUIDField].(string); ok {
-		workspaceUID = strings.TrimSpace(workspaceUID)
-		if workspaceUID != "" && len(workspaceUID) <= openCodeGoWorkspaceUIDMaxLen {
-			otherMap[openCodeGoWorkspaceUIDField] = workspaceUID
-		}
-	}
-}
-
 func formatUserLogs(logs []*Log, startIdx int) {
 	for i := range logs {
 		logs[i].ChannelName = ""
 		var otherMap map[string]interface{}
 		otherMap, _ = common.StrToMap(logs[i].Other)
 		if otherMap != nil {
-			projectOpenCodeGoUserLogFields(otherMap)
-			// Remove admin-only debug fields.
+			// Affinity routing diagnostics are admin-only. Clear historical or
+			// malformed top-level copies before removing the stored admin payload.
+			delete(otherMap, "opencode_go_affinity_source")
+			delete(otherMap, "opencode_go_workspace_uid")
+			delete(otherMap, "opencode_go_affinity_key")
 			delete(otherMap, "admin_info")
 			// Remove operation-audit details (operator/route info), admin-only.
 			delete(otherMap, "audit_info")

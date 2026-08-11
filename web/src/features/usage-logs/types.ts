@@ -178,8 +178,8 @@ export interface LogOtherData {
   user_agent?: string
   request_path?: string
   request_conversion?: string[]
-  // Public-safe projection for the log owner. The affinity key remains nested
-  // in admin_info on the backend and is never included here.
+  // Legacy top-level compatibility fields. Ordinary-user APIs strip them and
+  // only administrator views render affinity diagnostics.
   opencode_go_affinity_source?: string
   opencode_go_workspace_uid?: string
   ws?: boolean

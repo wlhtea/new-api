@@ -79,8 +79,8 @@ const { usageLogSchema } = await import('../../data/schema')
 const { useCommonLogsColumns } = await import('../columns/common-logs-columns')
 const { UsageLogsMobileList } = await import('../usage-logs-mobile-card')
 
-function AffinityViews({ log }: { log: UsageLog }) {
-  const columns = useCommonLogsColumns(false)
+function AdminAffinityViews({ log }: { log: UsageLog }) {
+  const columns = useCommonLogsColumns(true)
   const affinityColumn = columns.find((column) => column.id === 'affinity')
   assert.ok(affinityColumn)
 
@@ -117,6 +117,27 @@ function AffinityViews({ log }: { log: UsageLog }) {
   )
 }
 
+function UserAffinityView({ log }: { log: UsageLog }) {
+  const columns = useCommonLogsColumns(false)
+  assert.equal(
+    columns.find((column) => column.id === 'affinity'),
+    undefined
+  )
+
+  const mobileColumns: ColumnDef<UsageLog>[] = [{ accessorKey: 'created_at' }]
+  const mobileTable = useReactTable({
+    columns: mobileColumns,
+    data: [log],
+    getCoreRowModel: getCoreRowModel(),
+  })
+
+  return (
+    <div data-view='user-mobile'>
+      <UsageLogsMobileList table={mobileTable} logCategory='common' />
+    </div>
+  )
+}
+
 const reactTestGlobals = globalThis as typeof globalThis & {
   IS_REACT_ACT_ENVIRONMENT?: boolean
 }
@@ -127,7 +148,7 @@ describe('usage log affinity display', () => {
     domWindow.close()
   })
 
-  test('shows one compact fingerprint and workspace marker in desktop and mobile views', async () => {
+  test('shows one compact fingerprint and workspace marker in admin desktop and mobile views', async () => {
     const container = document.createElement('div')
     document.body.append(container)
     const root = createRoot(container)
@@ -139,15 +160,17 @@ describe('usage log affinity display', () => {
       type: 2,
       content: '',
       other: JSON.stringify({
-        opencode_go_affinity_source: 'claude-code-session',
-        opencode_go_workspace_uid: workspaceUid,
+        admin_info: {
+          opencode_go_affinity_source: 'claude-code-session',
+          opencode_go_workspace_uid: workspaceUid,
+        },
       }),
     })
 
     await act(async () => {
       root.render(
         <I18nextProvider i18n={i18n}>
-          <AffinityViews log={log} />
+          <AdminAffinityViews log={log} />
         </I18nextProvider>
       )
     })
@@ -178,6 +201,46 @@ describe('usage log affinity display', () => {
       ).length,
       1
     )
+
+    await act(async () => root.unmount())
+    container.remove()
+  })
+
+  test('hides affinity columns and mobile fields from ordinary users even when payload data exists', async () => {
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    const workspaceUid = '4f7c9a10-6b7e-4e26-91b4-a71687fb4c01'
+    const log = usageLogSchema.parse({
+      id: 1,
+      user_id: 1,
+      created_at: 1,
+      type: 2,
+      content: '',
+      other: JSON.stringify({
+        opencode_go_affinity_source: 'claude-code-session',
+        opencode_go_workspace_uid: workspaceUid,
+        admin_info: {
+          opencode_go_affinity_source: 'claude-code-session',
+          opencode_go_workspace_uid: workspaceUid,
+        },
+      }),
+    })
+
+    await act(async () => {
+      root.render(
+        <I18nextProvider i18n={i18n}>
+          <UserAffinityView log={log} />
+        </I18nextProvider>
+      )
+    })
+
+    const mobileView = container.querySelector('[data-view="user-mobile"]')
+    assert.ok(mobileView)
+    assert.equal(mobileView.querySelector('[data-affinity-method]'), null)
+    assert.doesNotMatch(mobileView.textContent ?? '', /Request fingerprint/)
+    assert.doesNotMatch(mobileView.textContent ?? '', /4f7c9a10/)
+    assert.doesNotMatch(mobileView.textContent ?? '', new RegExp(workspaceUid))
 
     await act(async () => root.unmount())
     container.remove()

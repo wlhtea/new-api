@@ -318,9 +318,11 @@ function CommonLogsCard<TData>({
   const modelCell = cells.get('model_name')
   const quotaCell = cells.get('quota')
   const rowData = cells.get('created_at')?.row.original as UsageLog | undefined
-  const affinity = rowData
-    ? resolveUsageLogAffinity(parseLogOther(rowData.other))
-    : null
+  const affinityCell = cells.get('affinity')
+  const affinity =
+    affinityCell && rowData
+      ? resolveUsageLogAffinity(parseLogOther(rowData.other))
+      : null
 
   return (
     <div className='space-y-2.5'>
@@ -354,7 +356,7 @@ function CommonLogsCard<TData>({
         />
         {affinity && (
           <SummaryField
-            cell={cells.get('affinity')}
+            cell={affinityCell}
             valueClassName='[&_[data-affinity-method]]:max-w-none'
           />
         )}
