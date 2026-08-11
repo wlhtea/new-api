@@ -2357,8 +2357,6 @@
     "Keep requests that carry no session marker on a stable account": "Giữ các yêu cầu không có dấu hiệu phiên trên một tài khoản ổn định",
     "Load-aware scheduling": "Lập lịch theo tải",
     "Routes steady-state requests toward less-busy accounts and keeps an explicit failover lease in charge on errors": "Định tuyến các yêu cầu ổn định tới tài khoản ít tải hơn và để hợp đồng chuyển đổi dự phòng rõ ràng tiếp quản khi có lỗi",
-    "Total Input Tokens": "Tổng token đầu vào",
-    "Uncached Input Tokens": "Token đầu vào không lưu đệm",
     "Inset": "Khung trong",
     "Inspect requests, errors, and billing details": "Kiểm tra yêu cầu, lỗi và chi tiết thanh toán",
     "Inspect user prompts": "Kiểm tra lời nhắc của người dùng",

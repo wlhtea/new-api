@@ -2357,8 +2357,6 @@
     "Keep requests that carry no session marker on a stable account": "Conserver les requêtes sans marqueur de session sur un compte stable",
     "Load-aware scheduling": "Planification sensible à la charge",
     "Routes steady-state requests toward less-busy accounts and keeps an explicit failover lease in charge on errors": "Route les requêtes stables vers les comptes moins chargés et laisse le bail de basculement explicite prendre le relais en cas d'erreur",
-    "Total Input Tokens": "Total des tokens d'entrée",
-    "Uncached Input Tokens": "Tokens d'entrée hors cache",
     "Inset": "Encastré",
     "Inspect requests, errors, and billing details": "Inspecter les requêtes, les erreurs et les détails de facturation",
     "Inspect user prompts": "Inspecter les invites utilisateur",

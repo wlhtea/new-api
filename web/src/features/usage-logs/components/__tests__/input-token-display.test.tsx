@@ -61,10 +61,10 @@ await i18n.use(initReactI18next).init({
     en: {
       translation: {
         'Token Breakdown': 'Token Breakdown',
-        'Uncached Input Tokens': 'Uncached Input Tokens',
-        'Total Input Tokens': 'Total Input Tokens',
+        'Input Tokens': 'Input Tokens',
         'Output Tokens': 'Output Tokens',
         'Cache Read': 'Cache Read',
+        'Cache Write': 'Cache Write',
         'Cache Write (5m)': 'Cache Write (5m)',
         'Cache Write (1h)': 'Cache Write (1h)',
         Cache: 'Cache',
@@ -107,145 +107,161 @@ const reactTestGlobals = globalThis as typeof globalThis & {
 }
 reactTestGlobals.IS_REACT_ACT_ENVIRONMENT = true
 
+async function renderTokenViews(
+  log: UsageLog,
+  other: import('../../types').LogOtherData
+) {
+  const container = document.createElement('div')
+  document.body.append(container)
+  const root = createRoot(container)
+
+  await act(async () => {
+    root.render(
+      <I18nextProvider i18n={i18n}>
+        <div data-view='desktop'>
+          <DesktopTokenCell log={log} />
+        </div>
+        <div data-view='mobile'>
+          <MobileTokenCard log={log} />
+        </div>
+        <div data-view='details'>
+          <TokenBreakdown log={log} other={other} />
+        </div>
+      </I18nextProvider>
+    )
+  })
+
+  return {
+    textFor(view: 'desktop' | 'mobile' | 'details') {
+      return (
+        container.querySelector(`[data-view="${view}"]`)?.textContent ?? ''
+      )
+        .replaceAll(/\s+/g, ' ')
+        .trim()
+    },
+    async cleanup() {
+      await act(async () => root.unmount())
+      container.remove()
+    },
+  }
+}
+
+function createLog(
+  id: number,
+  promptTokens: number,
+  completionTokens: number,
+  other: import('../../types').LogOtherData
+): UsageLog {
+  return usageLogSchema.parse({
+    id,
+    user_id: 1,
+    created_at: 1,
+    type: 2,
+    content: '',
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    other: JSON.stringify(other),
+  })
+}
+
 describe('usage log input token display', () => {
   after(() => {
     domWindow.close()
   })
 
-  test('labels uncached and cache-read input without exposing total input', async () => {
-    const container = document.createElement('div')
-    document.body.append(container)
-    const root = createRoot(container)
-    const log = usageLogSchema.parse({
-      id: 1,
-      user_id: 1,
-      created_at: 1,
-      type: 2,
-      content: '',
-      prompt_tokens: 30_289,
-      completion_tokens: 55,
-    })
+  test('renders OpenAI top-level usage across all views', async () => {
+    const other = {
+      input_tokens_total: 210,
+      cache_tokens: 80,
+      cache_creation_tokens: 30,
+    }
+    const view = await renderTokenViews(createLog(1, 210, 40, other), other)
 
-    await act(async () => {
-      root.render(
-        <I18nextProvider i18n={i18n}>
-          <TokenBreakdown
-            log={log}
-            other={{ input_tokens_total: 30_289, cache_tokens: 29_952 }}
-          />
-        </I18nextProvider>
-      )
-    })
+    for (const name of ['desktop', 'mobile'] as const) {
+      const text = view.textFor(name)
+      assert.match(text, /210 \/ 40/)
+      assert.match(text, /Cache↓ 80/)
+      assert.match(text, /↑ 30/)
+      assert.doesNotMatch(text, /\b130\b/)
+    }
 
-    const text = (container.textContent ?? '').replaceAll(/\s+/g, ' ')
-    assert.match(text, /Uncached Input Tokens\s*337/)
-    assert.doesNotMatch(text, /Total Input Tokens/)
-    assert.doesNotMatch(text, /30,289/)
-    assert.match(text, /Cache Read\s*29,952/)
-    assert.match(text, /Output Tokens\s*55/)
+    const detailsText = view.textFor('details')
+    assert.match(detailsText, /Input Tokens\s*210/)
+    assert.match(detailsText, /Output Tokens\s*40/)
+    assert.match(detailsText, /Cache Read\s*80/)
+    assert.match(detailsText, /Cache Write\s*30/)
+    assert.doesNotMatch(detailsText, /\b130\b/)
 
-    await act(async () => root.unmount())
-    container.remove()
+    await view.cleanup()
   })
 
-  test('does not subtract cache or claim a total without explicit total input', async () => {
-    const container = document.createElement('div')
-    document.body.append(container)
-    const root = createRoot(container)
-    const log = usageLogSchema.parse({
-      id: 2,
-      user_id: 1,
-      created_at: 1,
-      type: 2,
-      content: '',
-      prompt_tokens: 900,
-      completion_tokens: 55,
-    })
-
-    await act(async () => {
-      root.render(
-        <I18nextProvider i18n={i18n}>
-          <TokenBreakdown log={log} other={{ cache_tokens: 256 }} />
-        </I18nextProvider>
-      )
-    })
-
-    const text = (container.textContent ?? '').replaceAll(/\s+/g, ' ')
-    assert.match(text, /Uncached Input Tokens\s*900/)
-    assert.match(text, /Cache Read\s*256/)
-    assert.doesNotMatch(text, /Total Input Tokens/)
-    assert.doesNotMatch(text, /644/)
-
-    await act(async () => root.unmount())
-    container.remove()
-  })
-
-  test('hides Messages total while rendering cache and output across views', async () => {
-    const container = document.createElement('div')
-    document.body.append(container)
-    const root = createRoot(container)
+  test('renders Claude Messages native input across all views', async () => {
     const other = {
       input_tokens_total: 210,
       cache_tokens: 80,
       cache_creation_tokens_5m: 20,
       cache_creation_tokens_1h: 10,
     }
-    const log = usageLogSchema.parse({
-      id: 3,
-      user_id: 1,
-      created_at: 1,
-      type: 2,
-      content: '',
-      prompt_tokens: 100,
-      completion_tokens: 40,
-      other: JSON.stringify(other),
-    })
+    const view = await renderTokenViews(createLog(2, 100, 40, other), other)
 
-    await act(async () => {
-      root.render(
-        <I18nextProvider i18n={i18n}>
-          <div data-view='desktop'>
-            <DesktopTokenCell log={log} />
-          </div>
-          <div data-view='mobile'>
-            <MobileTokenCard log={log} />
-          </div>
-          <div data-view='details'>
-            <TokenBreakdown log={log} other={other} />
-          </div>
-        </I18nextProvider>
-      )
-    })
+    for (const name of ['desktop', 'mobile'] as const) {
+      const text = view.textFor(name)
+      assert.match(text, /100 \/ 40/)
+      assert.match(text, /Cache↓ 80/)
+      assert.match(text, /↑ 30/)
+      assert.doesNotMatch(text, /\b130\b/)
+      assert.doesNotMatch(text, /\b210\b/)
+    }
 
-    const textFor = (view: string) =>
-      (container.querySelector(`[data-view="${view}"]`)?.textContent ?? '')
-        .replaceAll(/\s+/g, ' ')
-        .trim()
-
-    const desktopText = textFor('desktop')
-    assert.match(desktopText, /130 \/ 40/)
-    assert.doesNotMatch(desktopText, /Total Input Tokens/)
-    assert.doesNotMatch(desktopText, /\b210\b/)
-    assert.match(desktopText, /Cache↓ 80/)
-    assert.match(desktopText, /↑ 30/)
-
-    const mobileText = textFor('mobile')
-    assert.match(mobileText, /130 \/ 40/)
-    assert.doesNotMatch(mobileText, /Total Input Tokens/)
-    assert.doesNotMatch(mobileText, /\b210\b/)
-    assert.match(mobileText, /Cache↓ 80/)
-    assert.match(mobileText, /↑ 30/)
-
-    const detailsText = textFor('details')
-    assert.match(detailsText, /Uncached Input Tokens\s*130/)
-    assert.doesNotMatch(detailsText, /Total Input Tokens/)
+    const detailsText = view.textFor('details')
+    assert.match(detailsText, /Input Tokens\s*100/)
     assert.doesNotMatch(detailsText, /\b210\b/)
+    assert.doesNotMatch(detailsText, /\b130\b/)
     assert.match(detailsText, /Output Tokens\s*40/)
     assert.match(detailsText, /Cache Read\s*80/)
     assert.match(detailsText, /Cache Write \(5m\)\s*20/)
     assert.match(detailsText, /Cache Write \(1h\)\s*10/)
 
-    await act(async () => root.unmount())
-    container.remove()
+    await view.cleanup()
+  })
+
+  test('keeps legacy prompt input when no normalized total exists', async () => {
+    const other = { cache_tokens: 256 }
+    const view = await renderTokenViews(createLog(3, 900, 55, other), other)
+
+    for (const name of ['desktop', 'mobile'] as const) {
+      const text = view.textFor(name)
+      assert.match(text, /900 \/ 55/)
+      assert.match(text, /Cache↓ 256/)
+      assert.doesNotMatch(text, /\b644\b/)
+    }
+
+    const detailsText = view.textFor('details')
+    assert.match(detailsText, /Input Tokens\s*900/)
+    assert.match(detailsText, /Output Tokens\s*55/)
+    assert.match(detailsText, /Cache Read\s*256/)
+    assert.doesNotMatch(detailsText, /\b644\b/)
+
+    await view.cleanup()
+  })
+
+  test('keeps no-cache values and zero-value placeholders unchanged', async () => {
+    const noCacheView = await renderTokenViews(createLog(4, 12, 3, {}), {})
+
+    assert.match(noCacheView.textFor('desktop'), /12 \/ 3/)
+    assert.match(noCacheView.textFor('mobile'), /12 \/ 3/)
+    assert.match(noCacheView.textFor('details'), /Input Tokens\s*12/)
+    assert.match(noCacheView.textFor('details'), /Output Tokens\s*3/)
+    assert.doesNotMatch(noCacheView.textFor('details'), /Cache/)
+
+    await noCacheView.cleanup()
+
+    const zeroView = await renderTokenViews(createLog(5, 0, 0, {}), {})
+
+    assert.equal(zeroView.textFor('desktop'), '-')
+    assert.match(zeroView.textFor('mobile'), /-/)
+    assert.equal(zeroView.textFor('details'), '')
+
+    await zeroView.cleanup()
   })
 })

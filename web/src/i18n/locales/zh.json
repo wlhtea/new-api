@@ -2357,8 +2357,6 @@
     "Keep requests that carry no session marker on a stable account": "让不带会话标记的请求保持在稳定的账号",
     "Load-aware scheduling": "负载感知调度",
     "Routes steady-state requests toward less-busy accounts and keeps an explicit failover lease in charge on errors": "稳态请求优先分配给较空闲的账号；出错时仍由明确的故障切换租约接管",
-    "Total Input Tokens": "总输入 Token",
-    "Uncached Input Tokens": "未缓存输入 Token",
     "Inset": "内嵌",
     "Inspect requests, errors, and billing details": "查看请求、错误和计费详情",
     "Inspect user prompts": "检查用户提示",

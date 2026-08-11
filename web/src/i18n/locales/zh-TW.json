@@ -2357,8 +2357,6 @@
     "Keep requests that carry no session marker on a stable account": "讓不帶工作階段標記的請求保持在穩定的帳號",
     "Load-aware scheduling": "負載感知排程",
     "Routes steady-state requests toward less-busy accounts and keeps an explicit failover lease in charge on errors": "穩定流量優先分配給較空閒的帳號；出錯時仍由明確的故障切換租約接管",
-    "Total Input Tokens": "總輸入 Token",
-    "Uncached Input Tokens": "未快取輸入 Token",
     "Inset": "內嵌",
     "Inspect requests, errors, and billing details": "查看請求、錯誤和收費詳情",
     "Inspect user prompts": "檢查用戶提示",

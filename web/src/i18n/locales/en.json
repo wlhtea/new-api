@@ -2357,8 +2357,6 @@
     "Keep requests that carry no session marker on a stable account": "Keep requests that carry no session marker on a stable account",
     "Load-aware scheduling": "Load-aware scheduling",
     "Routes steady-state requests toward less-busy accounts and keeps an explicit failover lease in charge on errors": "Routes steady-state requests toward less-busy accounts and keeps an explicit failover lease in charge on errors",
-    "Total Input Tokens": "Total Input Tokens",
-    "Uncached Input Tokens": "Uncached Input Tokens",
     "Inset": "Inset",
     "Inspect requests, errors, and billing details": "Inspect requests, errors, and billing details",
     "Inspect user prompts": "Inspect user prompts",

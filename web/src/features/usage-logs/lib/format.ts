@@ -96,36 +96,6 @@ function isPositiveFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
 }
 
-export interface InputTokenBreakdown {
-  totalInputTokens: number
-  uncachedInputTokens: number
-  cacheReadTokens: number
-  hasExplicitTotal: boolean
-}
-
-export function getInputTokenBreakdown(
-  promptTokens: number,
-  other: LogOtherData | null | undefined
-): InputTokenBreakdown {
-  const fallbackTotal = Math.max(promptTokens || 0, 0)
-  const explicitTotal = other?.input_tokens_total
-  const hasExplicitTotal =
-    typeof explicitTotal === 'number' &&
-    Number.isFinite(explicitTotal) &&
-    explicitTotal >= 0
-  const totalInputTokens = hasExplicitTotal ? explicitTotal : fallbackTotal
-  const cacheReadTokens = Math.max(other?.cache_tokens || 0, 0)
-
-  return {
-    totalInputTokens,
-    uncachedInputTokens: hasExplicitTotal
-      ? Math.max(totalInputTokens - cacheReadTokens, 0)
-      : fallbackTotal,
-    cacheReadTokens,
-    hasExplicitTotal,
-  }
-}
-
 function hasLegacySearchSurcharge(
   enabled: boolean | undefined,
   count: number | undefined,
