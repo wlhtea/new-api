@@ -1409,7 +1409,7 @@ func invalidateTaskBillingTokenCache(tokenKey string) {
 	if tokenKey == "" || !common.RedisEnabled {
 		return
 	}
-	if err := cacheDeleteToken(tokenKey); err != nil {
+	if err := invalidateTokenCacheForMutation(tokenKey); err != nil {
 		common.SysLog("failed to invalidate durable task token cache: " + err.Error())
 	}
 }
