@@ -166,7 +166,15 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 	if claudeInfo.Usage.PromptTokens == 0 {
 		//上游出错
 	}
-	if claudeInfo.Usage.CompletionTokens == 0 || !claudeInfo.Done {
+	cacheOnlyUsage := claudeInfo.Done &&
+		claudeInfo.ResponseText.Len() == 0 &&
+		claudeInfo.Usage.PromptTokens == 0 &&
+		claudeInfo.Usage.CompletionTokens == 0 &&
+		(claudeInfo.Usage.PromptTokensDetails.CachedTokens > 0 ||
+			claudeInfo.Usage.PromptTokensDetails.CacheCreationTokensTotal() > 0 ||
+			claudeInfo.Usage.ClaudeCacheCreation5mTokens > 0 ||
+			claudeInfo.Usage.ClaudeCacheCreation1hTokens > 0)
+	if !cacheOnlyUsage && (claudeInfo.Usage.CompletionTokens == 0 || !claudeInfo.Done) {
 		if common.DebugEnabled {
 			common.SysLog("claude response usage is not complete, maybe upstream error")
 		}

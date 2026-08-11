@@ -770,6 +770,164 @@ func TestBuildTieredTokenParams_Claude_WithCache(t *testing.T) {
 	}
 }
 
+func TestBuildTieredTokenParamsRepresentativeUsageVector(t *testing.T) {
+	expr := `tier("base", p + c * 2 + cr * 0.25 + cc * 2 + cc1h * 3)`
+	usedVars := billingexpr.UsedVars(expr)
+	tests := []struct {
+		name             string
+		usage            *dto.Usage
+		anthropic        bool
+		wantWeightedCost float64
+		wantParams       billingexpr.TokenParams
+	}{
+		{
+			name: "openai",
+			usage: &dto.Usage{
+				PromptTokens:     210,
+				CompletionTokens: 40,
+				InputTokens:      210,
+				PromptTokensDetails: dto.InputTokenDetails{
+					CachedTokens:     80,
+					CacheWriteTokens: 30,
+				},
+			},
+			wantWeightedCost: 260,
+			wantParams: billingexpr.TokenParams{
+				P: 100, C: 40, Len: 210, CR: 80, CC: 30,
+			},
+		},
+		{
+			name: "anthropic",
+			usage: effectiveBillingUsage(&dto.Usage{BillingUsage: dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
+				InputTokens:              100,
+				CacheReadInputTokens:     80,
+				CacheCreationInputTokens: 30,
+				OutputTokens:             40,
+				CacheCreation: &dto.ClaudeCacheCreationUsage{
+					Ephemeral5mInputTokens: 20,
+					Ephemeral1hInputTokens: 10,
+				},
+			})}),
+			anthropic:        true,
+			wantWeightedCost: 270,
+			wantParams: billingexpr.TokenParams{
+				P: 100, C: 40, Len: 210, CR: 80, CC: 20, CC1h: 10,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.usage.CompletionTokenDetails.ReasoningTokens = 15
+			params := BuildTieredTokenParams(tt.usage, tt.anthropic, usedVars)
+			cost, _, err := billingexpr.RunExpr(expr, params)
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantParams.P, params.P)
+			assert.Equal(t, tt.wantParams.C, params.C)
+			assert.Equal(t, tt.wantParams.Len, params.Len)
+			assert.Equal(t, tt.wantParams.CR, params.CR)
+			assert.Equal(t, tt.wantParams.CC, params.CC)
+			assert.Equal(t, tt.wantParams.CC1h, params.CC1h)
+			assert.Equal(t, tt.wantWeightedCost, cost)
+		})
+	}
+}
+
+func TestBuildTieredTokenParamsAnthropicCacheCreationFallback(t *testing.T) {
+	usedVars := map[string]bool{"cc": true, "cc1h": true}
+	tests := []struct {
+		name      string
+		aggregate int
+		split5m   int
+		split1h   int
+		wantCC    float64
+		wantCC1h  float64
+		wantLen   float64
+	}{
+		{name: "unsplit aggregate", aggregate: 30, wantCC: 30, wantLen: 210},
+		{name: "split fallback", split5m: 20, split1h: 10, wantCC: 20, wantCC1h: 10, wantLen: 210},
+		{name: "aggregate generic remainder", aggregate: 50, split5m: 20, split1h: 10, wantCC: 40, wantCC1h: 10, wantLen: 230},
+		{name: "incomplete aggregate uses splits", aggregate: 20, split5m: 20, split1h: 10, wantCC: 20, wantCC1h: 10, wantLen: 210},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			usage := &dto.Usage{
+				PromptTokens:     100,
+				CompletionTokens: 40,
+				InputTokens:      999,
+				UsageSemantic:    dto.BillingUsageSemanticAnthropic,
+				PromptTokensDetails: dto.InputTokenDetails{
+					CachedTokens:         80,
+					CachedCreationTokens: tt.aggregate,
+				},
+				ClaudeCacheCreation5mTokens: tt.split5m,
+				ClaudeCacheCreation1hTokens: tt.split1h,
+			}
+
+			params := BuildTieredTokenParams(usage, true, usedVars)
+
+			assert.Equal(t, tt.wantCC, params.CC)
+			assert.Equal(t, tt.wantCC1h, params.CC1h)
+			assert.Equal(t, tt.wantLen, params.Len)
+		})
+	}
+}
+
+func TestBuildTieredTokenParamsCacheOnlyAndInputTokensIndependence(t *testing.T) {
+	usage := &dto.Usage{
+		InputTokens:   110,
+		UsageSemantic: dto.BillingUsageSemanticAnthropic,
+		PromptTokensDetails: dto.InputTokenDetails{
+			CachedTokens:         80,
+			CachedCreationTokens: 30,
+		},
+		ClaudeCacheCreation5mTokens: 20,
+		ClaudeCacheCreation1hTokens: 10,
+	}
+	expr := `tier("base", p + c * 2 + cr * 0.25 + cc * 2 + cc1h * 3)`
+	usedVars := billingexpr.UsedVars(expr)
+	want := BuildTieredTokenParams(usage, true, usedVars)
+	cost, _, err := billingexpr.RunExpr(expr, want)
+	require.NoError(t, err)
+
+	usage.InputTokens = 999
+	got := BuildTieredTokenParams(usage, true, usedVars)
+
+	assert.Equal(t, billingexpr.TokenParams{Len: 110, CR: 80, CC: 20, CC1h: 10}, want)
+	assert.Equal(t, 90.0, cost)
+	assert.Equal(t, want, got)
+}
+
+func TestTryTieredSettleBillsAnthropicCacheOnlyUsage(t *testing.T) {
+	usage := &dto.Usage{
+		UsageSemantic: dto.BillingUsageSemanticAnthropic,
+		PromptTokensDetails: dto.InputTokenDetails{
+			CachedTokens:         80,
+			CachedCreationTokens: 30,
+		},
+		ClaudeCacheCreation5mTokens: 20,
+		ClaudeCacheCreation1hTokens: 10,
+	}
+	expr := `tier("base", p + c * 2 + cr * 0.25 + cc * 2 + cc1h * 3)`
+	relayInfo := &relaycommon.RelayInfo{TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+		BillingMode:  "tiered_expr",
+		ExprString:   expr,
+		ExprHash:     billingexpr.ExprHashString(expr),
+		GroupRatio:   1,
+		QuotaPerUnit: 1_000_000,
+	}}
+	params := BuildTieredTokenParams(usage, true, billingexpr.UsedVars(expr))
+
+	ok, quota, result := TryTieredSettle(relayInfo, params)
+
+	require.True(t, ok)
+	require.NotNil(t, result)
+	require.Equal(t, 90, quota)
+	require.Equal(t, 90.0, result.ActualQuotaBeforeGroup)
+}
+
 func TestBuildTieredTokenParams_GPT_AudioOutput(t *testing.T) {
 	usage := &dto.Usage{
 		PromptTokens:     1000,

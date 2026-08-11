@@ -225,9 +225,9 @@ type Usage struct {
 	CompletionTokens     int           `json:"completion_tokens"`
 	TotalTokens          int           `json:"total_tokens"`
 	PromptCacheHitTokens int           `json:"prompt_cache_hit_tokens,omitempty"`
-	UsageSemantic        string        `json:"usage_semantic,omitempty"`
-	UsageSource          string        `json:"usage_source,omitempty"`
-	BillingUsage         *BillingUsage `json:"billing_usage,omitempty"`
+	UsageSemantic        string        `json:"-"`
+	UsageSource          string        `json:"-"`
+	BillingUsage         *BillingUsage `json:"-"`
 
 	PromptTokensDetails    InputTokenDetails  `json:"prompt_tokens_details"`
 	CompletionTokenDetails OutputTokenDetails `json:"completion_tokens_details"`
@@ -313,6 +313,77 @@ type OpenAIResponsesResponse struct {
 	Usage              *Usage             `json:"usage"`
 	User               json.RawMessage    `json:"user"`
 	Metadata           json.RawMessage    `json:"metadata"`
+}
+
+type responsesUsageWire struct {
+	Usage
+	CanonicalOutputDetails *OutputTokenDetails `json:"completion_tokens_details"`
+	ResponsesOutputDetails *OutputTokenDetails `json:"output_tokens_details"`
+}
+
+func decodeResponsesUsage(data []byte) (*Usage, error) {
+	var decoded *responsesUsageWire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, err
+	}
+	if decoded == nil {
+		return nil, nil
+	}
+	if decoded.CanonicalOutputDetails != nil {
+		decoded.CompletionTokenDetails = *decoded.CanonicalOutputDetails
+	} else if decoded.ResponsesOutputDetails != nil {
+		decoded.CompletionTokenDetails = *decoded.ResponsesOutputDetails
+	}
+	return &decoded.Usage, nil
+}
+
+// UnmarshalJSON accepts the Responses API's output_tokens_details wire name
+// while keeping CompletionTokenDetails as the canonical internal field. This
+// belongs on the Responses envelope rather than Usage: Usage is anonymously
+// embedded by Chat and Images DTOs, where a method would be promoted and would
+// intercept decoding of their entire response object.
+func (o *OpenAIResponsesResponse) UnmarshalJSON(data []byte) error {
+	type responseAlias OpenAIResponsesResponse
+	decoded := struct {
+		*responseAlias
+		Usage json.RawMessage `json:"usage"`
+	}{
+		responseAlias: (*responseAlias)(o),
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Usage == nil {
+		return nil
+	}
+	usage, err := decodeResponsesUsage(decoded.Usage)
+	if err != nil {
+		return err
+	}
+	o.Usage = usage
+	return nil
+}
+
+func (o *OpenAIResponsesCompactionResponse) UnmarshalJSON(data []byte) error {
+	type responseAlias OpenAIResponsesCompactionResponse
+	decoded := struct {
+		*responseAlias
+		Usage json.RawMessage `json:"usage"`
+	}{
+		responseAlias: (*responseAlias)(o),
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Usage == nil {
+		return nil
+	}
+	usage, err := decodeResponsesUsage(decoded.Usage)
+	if err != nil {
+		return err
+	}
+	o.Usage = usage
+	return nil
 }
 
 // GetOpenAIError 从动态错误类型中提取OpenAIError结构

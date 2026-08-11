@@ -73,18 +73,50 @@ type textQuotaSummary struct {
 // surcharge (e.g. /v1/alpha/search returns no usage but bills one web_search
 // call), so token count alone is not sufficient to decide.
 func (s *textQuotaSummary) hasBillableUsage() bool {
-	return s.TotalTokens > 0 || !s.ToolCallSurchargeQuota.IsZero()
+	return s.TotalTokens > 0 ||
+		s.CacheTokens > 0 ||
+		reliableCacheCreationTokens(s.CacheCreationTokens, s.CacheCreationTokens5m, s.CacheCreationTokens1h) > 0 ||
+		!s.ToolCallSurchargeQuota.IsZero()
 }
 
 func cacheWriteTokensTotal(summary textQuotaSummary) int {
-	if summary.CacheCreationTokens5m > 0 || summary.CacheCreationTokens1h > 0 {
-		splitCacheWriteTokens := summary.CacheCreationTokens5m + summary.CacheCreationTokens1h
-		if summary.CacheCreationTokens > splitCacheWriteTokens {
-			return summary.CacheCreationTokens
-		}
-		return splitCacheWriteTokens
+	return reliableCacheCreationTokens(
+		summary.CacheCreationTokens,
+		summary.CacheCreationTokens5m,
+		summary.CacheCreationTokens1h,
+	)
+}
+
+func hasTrustedEffectiveBillingUsageSource(usage *dto.Usage) bool {
+	if usage == nil || usage.BillingUsage == nil {
+		return false
 	}
-	return summary.CacheCreationTokens
+	billingUsage := usage.BillingUsage
+	if billingUsage.Estimated {
+		return false
+	}
+	source := strings.TrimSpace(billingUsage.Source)
+	if !strings.EqualFold(strings.TrimSpace(usage.UsageSource), source) {
+		return false
+	}
+	switch {
+	case strings.EqualFold(source, dto.BillingUsageSourceOAIChat),
+		strings.EqualFold(source, dto.BillingUsageSourceOAIResponses):
+		return billingUsage.OpenAIUsage != nil &&
+			strings.EqualFold(usage.UsageSemantic, dto.BillingUsageSemanticOpenAI)
+	case strings.EqualFold(source, dto.BillingUsageSourceClaudeMessages):
+		return billingUsage.ClaudeUsage != nil &&
+			strings.EqualFold(usage.UsageSemantic, dto.BillingUsageSemanticAnthropic)
+	default:
+		return false
+	}
+}
+
+func appendInputTokensTotalForLog(other map[string]interface{}, effectiveUsage *dto.Usage) {
+	if other == nil || !hasTrustedEffectiveBillingUsageSource(effectiveUsage) || effectiveUsage.InputTokens < 0 {
+		return
+	}
+	other["input_tokens_total"] = effectiveUsage.InputTokens
 }
 
 func isLegacyClaudeDerivedOpenAIUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) bool {
@@ -510,13 +542,10 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		// to cache_creation_tokens.
 		other["cache_write_tokens"] = cacheWriteTokens
 	}
-	if relayInfo.GetFinalRequestRelayFormat() != types.RelayFormatClaude && billingUsage != nil && billingUsage.UsageSource != "" && billingUsage.InputTokens > 0 {
-		// input_tokens_total: explicit normalized total input used by the usage log UI.
-		// Only write this field when upstream/current conversion has already provided a
-		// reliable total input value and tagged the usage source. Do not infer it from
-		// prompt/cache fields here, otherwise old upstream payloads may be double-counted.
-		other["input_tokens_total"] = billingUsage.InputTokens
-	}
+	// input_tokens_total is only emitted from a tagged, normalized usage snapshot.
+	// This includes Messages usage and a trusted zero, while legacy untagged usage
+	// remains unchanged so the UI cannot accidentally subtract cache twice.
+	appendInputTokensTotalForLog(other, billingUsage)
 	if tieredBillingApplied {
 		InjectTieredBillingInfo(other, relayInfo, tieredResult)
 	}

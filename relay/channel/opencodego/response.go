@@ -25,11 +25,15 @@ type normalizedCostUsage struct {
 }
 
 type responseTransformState struct {
-	model            string
-	protocol         Protocol
-	namespaceTools   map[string]openCodeGoNamespaceTool
-	sawStandardUsage bool
-	fallbackUsage    *normalizedCostUsage
+	model                    string
+	protocol                 Protocol
+	namespaceTools           map[string]openCodeGoNamespaceTool
+	sawStandardUsage         bool
+	sawPositiveStandardUsage bool
+	sawStandardInputField    bool
+	sawFallbackInputField    bool
+	standardUsageCategories  responseUsageCategoryPresence
+	fallbackUsage            *normalizedCostUsage
 }
 
 func prepareResponseForRelay(resp *http.Response, state *responseTransformState, stream bool) error {
@@ -134,9 +138,18 @@ func (s *responseTransformState) transformJSON(data []byte, stream bool) []byte 
 		if stream {
 			return nil
 		}
+		data = sanitizeNonstreamCostExtension(data)
+		if data == nil {
+			return nil
+		}
 	}
+	data = stripPrivateCostFields(data)
 	if hasStandardUsage(data) {
 		s.sawStandardUsage = true
+		if hasPositiveStandardUsage(data) {
+			s.sawPositiveStandardUsage = true
+		}
+		s.capturePositiveStandardUsageCategories(data)
 	}
 	data = s.restoreOpenCodeGoNamespaceCalls(data)
 	return normalizeResponseModel(data, s.model)
@@ -198,17 +211,136 @@ func isCostExtension(data []byte) bool {
 }
 
 func hasStandardUsage(data []byte) bool {
-	paths := []string{
-		"usage.prompt_tokens",
-		"usage.input_tokens",
-		"usage.output_tokens",
-		"message.usage.input_tokens",
-		"message.usage.output_tokens",
-		"response.usage.input_tokens",
-		"response.usage.output_tokens",
-	}
+	paths := []string{"usage", "message.usage", "response.usage"}
 	for _, path := range paths {
-		if gjson.GetBytes(data, path).Exists() {
+		if usage := gjson.GetBytes(data, path); usage.Exists() && usage.IsObject() {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPositiveStandardUsage(data []byte) bool {
+	usagePaths := []string{"usage", "message.usage", "response.usage"}
+	tokenPaths := []string{
+		"prompt_tokens", "input_tokens", "completion_tokens", "output_tokens", "prompt_cache_hit_tokens",
+		"cache_read_input_tokens", "cache_creation_input_tokens",
+		"prompt_tokens_details.cached_tokens", "prompt_tokens_details.cached_creation_tokens", "prompt_tokens_details.cache_write_tokens",
+		"input_tokens_details.cached_tokens", "input_tokens_details.cached_creation_tokens", "input_tokens_details.cache_write_tokens",
+		"completion_tokens_details.reasoning_tokens", "output_tokens_details.reasoning_tokens",
+		"prompt_tokens_details.text_tokens", "prompt_tokens_details.audio_tokens", "prompt_tokens_details.image_tokens",
+		"input_tokens_details.text_tokens", "input_tokens_details.audio_tokens", "input_tokens_details.image_tokens",
+		"completion_tokens_details.text_tokens", "completion_tokens_details.audio_tokens", "completion_tokens_details.image_tokens",
+		"output_tokens_details.text_tokens", "output_tokens_details.audio_tokens", "output_tokens_details.image_tokens",
+		"cache_creation.ephemeral_5m_input_tokens", "cache_creation.ephemeral_1h_input_tokens",
+		"claude_cache_creation_5_m_tokens", "claude_cache_creation_1_h_tokens",
+	}
+	for _, usagePath := range usagePaths {
+		for _, tokenPath := range tokenPaths {
+			value := gjson.GetBytes(data, usagePath+"."+tokenPath)
+			if value.Type == gjson.Number && value.Float() > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sanitizeNonstreamCostExtension(data []byte) []byte {
+	hasPublicResponse := gjson.GetBytes(data, "choices").Exists() ||
+		gjson.GetBytes(data, "content").Exists() ||
+		gjson.GetBytes(data, "output").Exists() ||
+		strings.EqualFold(gjson.GetBytes(data, "object").String(), "response")
+	if !hasPublicResponse {
+		return nil
+	}
+	return stripPrivateCostFields(data)
+}
+
+func stripPrivateCostFields(data []byte) []byte {
+	for _, path := range []string{"cost", "normalizedUsage", "x-opencode-type"} {
+		updated, err := sjson.DeleteBytes(data, path)
+		if err == nil {
+			data = updated
+		}
+	}
+	return data
+}
+
+type responseUsageCategoryPresence struct {
+	input        bool
+	output       bool
+	cacheRead    bool
+	cacheWrite   bool
+	cacheWrite5m bool
+	cacheWrite1h bool
+	reasoning    bool
+	inputText    bool
+	inputAudio   bool
+	inputImage   bool
+	outputText   bool
+	outputAudio  bool
+	outputImage  bool
+}
+
+func (s *responseTransformState) capturePositiveStandardUsageCategories(data []byte) {
+	if s == nil {
+		return
+	}
+	usagePaths := []string{"usage"}
+	switch s.protocol {
+	case ProtocolMessages:
+		usagePaths = append(usagePaths, "message.usage")
+	case ProtocolResponses:
+		usagePaths = append(usagePaths, "response.usage")
+	}
+	for _, usagePath := range usagePaths {
+		s.sawStandardInputField = s.sawStandardInputField || hasNonNegativeTokenField(data, usagePath,
+			"prompt_tokens", "input_tokens")
+		s.standardUsageCategories.input = s.standardUsageCategories.input || hasPositiveTokenField(data, usagePath,
+			"prompt_tokens", "input_tokens")
+		s.standardUsageCategories.output = s.standardUsageCategories.output || hasPositiveTokenField(data, usagePath,
+			"completion_tokens", "output_tokens")
+		s.standardUsageCategories.cacheRead = s.standardUsageCategories.cacheRead || hasPositiveTokenField(data, usagePath,
+			"prompt_cache_hit_tokens", "cache_read_input_tokens", "prompt_tokens_details.cached_tokens", "input_tokens_details.cached_tokens")
+		s.standardUsageCategories.cacheWrite = s.standardUsageCategories.cacheWrite || hasPositiveTokenField(data, usagePath,
+			"cache_creation_input_tokens", "prompt_tokens_details.cached_creation_tokens", "prompt_tokens_details.cache_write_tokens",
+			"input_tokens_details.cached_creation_tokens", "input_tokens_details.cache_write_tokens")
+		s.standardUsageCategories.cacheWrite5m = s.standardUsageCategories.cacheWrite5m || hasPositiveTokenField(data, usagePath,
+			"cache_creation.ephemeral_5m_input_tokens", "claude_cache_creation_5_m_tokens")
+		s.standardUsageCategories.cacheWrite1h = s.standardUsageCategories.cacheWrite1h || hasPositiveTokenField(data, usagePath,
+			"cache_creation.ephemeral_1h_input_tokens", "claude_cache_creation_1_h_tokens")
+		s.standardUsageCategories.reasoning = s.standardUsageCategories.reasoning || hasPositiveTokenField(data, usagePath,
+			"completion_tokens_details.reasoning_tokens", "output_tokens_details.reasoning_tokens")
+		s.standardUsageCategories.inputText = s.standardUsageCategories.inputText || hasPositiveTokenField(data, usagePath,
+			"prompt_tokens_details.text_tokens", "input_tokens_details.text_tokens")
+		s.standardUsageCategories.inputAudio = s.standardUsageCategories.inputAudio || hasPositiveTokenField(data, usagePath,
+			"prompt_tokens_details.audio_tokens", "input_tokens_details.audio_tokens")
+		s.standardUsageCategories.inputImage = s.standardUsageCategories.inputImage || hasPositiveTokenField(data, usagePath,
+			"prompt_tokens_details.image_tokens", "input_tokens_details.image_tokens")
+		s.standardUsageCategories.outputText = s.standardUsageCategories.outputText || hasPositiveTokenField(data, usagePath,
+			"completion_tokens_details.text_tokens", "output_tokens_details.text_tokens")
+		s.standardUsageCategories.outputAudio = s.standardUsageCategories.outputAudio || hasPositiveTokenField(data, usagePath,
+			"completion_tokens_details.audio_tokens", "output_tokens_details.audio_tokens")
+		s.standardUsageCategories.outputImage = s.standardUsageCategories.outputImage || hasPositiveTokenField(data, usagePath,
+			"completion_tokens_details.image_tokens", "output_tokens_details.image_tokens")
+	}
+}
+
+func hasNonNegativeTokenField(data []byte, usagePath string, fields ...string) bool {
+	for _, field := range fields {
+		value := gjson.GetBytes(data, usagePath+"."+field)
+		if value.Type == gjson.Number && value.Float() >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPositiveTokenField(data []byte, usagePath string, fields ...string) bool {
+	for _, field := range fields {
+		value := gjson.GetBytes(data, usagePath+"."+field)
+		if value.Type == gjson.Number && value.Int() > 0 {
 			return true
 		}
 	}
@@ -236,15 +368,22 @@ func (s *responseTransformState) captureFallbackUsage(data []byte) {
 	if !raw.Exists() || !raw.IsObject() {
 		return
 	}
+	inputField := raw.Get("inputTokens")
+	hasInputField := inputField.Type == gjson.Number && inputField.Float() >= 0
 	var usage normalizedCostUsage
 	if err := common.Unmarshal([]byte(raw.Raw), &usage); err != nil {
 		return
 	}
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.CacheReadTokens == 0 &&
+	if usage.InputTokens < 0 || usage.OutputTokens < 0 || usage.ReasoningTokens < 0 || usage.CacheReadTokens < 0 ||
+		usage.CacheWrite5mTokens < 0 || usage.CacheWrite1hTokens < 0 {
+		return
+	}
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.ReasoningTokens == 0 && usage.CacheReadTokens == 0 &&
 		usage.CacheWrite5mTokens == 0 && usage.CacheWrite1hTokens == 0 {
 		return
 	}
 	s.fallbackUsage = &usage
+	s.sawFallbackInputField = hasInputField
 }
 
 func (s *responseTransformState) standardChatUsageFrame() []byte {
@@ -276,39 +415,443 @@ func (u *normalizedCostUsage) toUsage(protocol Protocol) *dto.Usage {
 	if u == nil {
 		return nil
 	}
-	cacheWrite := u.CacheWrite5mTokens + u.CacheWrite1hTokens
-	totalInput := u.InputTokens + u.CacheReadTokens + cacheWrite
-	usage := &dto.Usage{
-		PromptTokens:                totalInput,
-		CompletionTokens:            u.OutputTokens,
-		TotalTokens:                 totalInput + u.OutputTokens,
-		InputTokens:                 totalInput,
-		OutputTokens:                u.OutputTokens,
-		UsageSource:                 "opencode_go_inference_cost",
-		ClaudeCacheCreation5mTokens: u.CacheWrite5mTokens,
-		ClaudeCacheCreation1hTokens: u.CacheWrite1hTokens,
+	return finalizeUsageSnapshot(protocol, responseUsageSnapshotFromCost(protocol, u), nil)
+}
+
+func finalizeResponseUsage(usage any, state *responseTransformState) any {
+	parsed, _ := usage.(*dto.Usage)
+	protocol := ProtocolChat
+	if state != nil {
+		protocol = state.protocol
 	}
-	usage.PromptTokensDetails.CachedTokens = u.CacheReadTokens
-	usage.PromptTokensDetails.CachedCreationTokens = cacheWrite
-	usage.PromptTokensDetails.CacheWriteTokens = cacheWrite
-	usage.CompletionTokenDetails.ReasoningTokens = u.ReasoningTokens
-	usage.PromptCacheHitTokens = u.CacheReadTokens
+
+	var fallback *responseUsageSnapshot
+	if state != nil && state.fallbackUsage != nil {
+		candidate := responseUsageSnapshotFromCost(protocol, state.fallbackUsage)
+		fallback = &candidate
+	}
+	var parsedSnapshot *responseUsageSnapshot
+	if parsed != nil {
+		allowOuterInput := state == nil || state.standardUsageCategories.input
+		parsedSnapshot = responseUsageSnapshotFromStandard(protocol, parsed, allowOuterInput)
+	}
+	var standard *responseUsageSnapshot
+	if parsedSnapshot != nil && (state == nil || state.sawStandardUsage) {
+		candidate := *parsedSnapshot
+		if state != nil {
+			retainPositiveStandardUsageCategories(&candidate, state.standardUsageCategories)
+		}
+		standard = &candidate
+	}
+
+	reconciled := mergeResponseUsageSnapshots(standard, fallback)
+	estimated := state == nil && parsed != nil && parsed.BillingUsage != nil && parsed.BillingUsage.Estimated
+	if state != nil && parsedSnapshot != nil && responseUsageSnapshotNeedsLocalFallback(reconciled, *parsedSnapshot) {
+		fillResponseUsageDetailGaps(&reconciled, parsedSnapshot, true)
+		estimated = true
+	}
+	result := finalizeUsageSnapshot(protocol, reconciled, parsed)
+	if result.BillingUsage != nil {
+		if state != nil && !state.sawStandardInputField && !state.sawFallbackInputField {
+			estimated = true
+		}
+		result.BillingUsage.Estimated = estimated
+	}
+	return result
+}
+
+// responseUsageSnapshotNeedsLocalFallback distinguishes handler-generated token
+// estimates from provider usage. Scalar cache/reasoning fields own their detail
+// aliases, so only independent modality details participate in this check.
+func responseUsageSnapshotNeedsLocalFallback(target responseUsageSnapshot, local responseUsageSnapshot) bool {
+	return target.input == 0 && local.input > 0 ||
+		target.output == 0 && local.output > 0 ||
+		target.cacheRead == 0 && local.cacheRead > 0 ||
+		target.cacheWrite == 0 && local.cacheWrite > 0 ||
+		target.cacheWrite5m == 0 && local.cacheWrite5m > 0 ||
+		target.cacheWrite1h == 0 && local.cacheWrite1h > 0 ||
+		target.reasoning == 0 && local.reasoning > 0 ||
+		target.inputDetails.TextTokens == 0 && local.inputDetails.TextTokens > 0 ||
+		target.inputDetails.AudioTokens == 0 && local.inputDetails.AudioTokens > 0 ||
+		target.inputDetails.ImageTokens == 0 && local.inputDetails.ImageTokens > 0 ||
+		target.outputDetails.TextTokens == 0 && local.outputDetails.TextTokens > 0 ||
+		target.outputDetails.AudioTokens == 0 && local.outputDetails.AudioTokens > 0 ||
+		target.outputDetails.ImageTokens == 0 && local.outputDetails.ImageTokens > 0
+}
+
+func retainPositiveStandardUsageCategories(snapshot *responseUsageSnapshot, presence responseUsageCategoryPresence) {
+	if snapshot == nil {
+		return
+	}
+	if !presence.input {
+		snapshot.input = 0
+	}
+	if !presence.output {
+		snapshot.output = 0
+	}
+	if !presence.cacheRead {
+		snapshot.cacheRead = 0
+		snapshot.inputDetails.CachedTokens = 0
+	}
+	if !presence.cacheWrite {
+		snapshot.cacheWrite = 0
+		snapshot.inputDetails.CachedCreationTokens = 0
+		snapshot.inputDetails.CacheWriteTokens = 0
+	}
+	if !presence.cacheWrite5m {
+		snapshot.cacheWrite5m = 0
+	}
+	if !presence.cacheWrite1h {
+		snapshot.cacheWrite1h = 0
+	}
+	if !presence.reasoning {
+		snapshot.reasoning = 0
+		snapshot.outputDetails.ReasoningTokens = 0
+	}
+	if !presence.inputText {
+		snapshot.inputDetails.TextTokens = 0
+	}
+	if !presence.inputAudio {
+		snapshot.inputDetails.AudioTokens = 0
+	}
+	if !presence.inputImage {
+		snapshot.inputDetails.ImageTokens = 0
+	}
+	if !presence.outputText {
+		snapshot.outputDetails.TextTokens = 0
+	}
+	if !presence.outputAudio {
+		snapshot.outputDetails.AudioTokens = 0
+	}
+	if !presence.outputImage {
+		snapshot.outputDetails.ImageTokens = 0
+	}
+}
+
+type responseUsageSnapshot struct {
+	input         int
+	output        int
+	cacheRead     int
+	cacheWrite    int
+	cacheWrite5m  int
+	cacheWrite1h  int
+	reasoning     int
+	inputDetails  dto.InputTokenDetails
+	outputDetails dto.OutputTokenDetails
+	usageSource   string
+}
+
+func responseUsageSnapshotFromCost(protocol Protocol, usage *normalizedCostUsage) responseUsageSnapshot {
+	if usage == nil {
+		return responseUsageSnapshot{}
+	}
+	cacheWrite5m := nonNegativeTokens(usage.CacheWrite5mTokens)
+	cacheWrite1h := nonNegativeTokens(usage.CacheWrite1hTokens)
+	cacheWrite := cacheWrite5m + cacheWrite1h
+	input := nonNegativeTokens(usage.InputTokens)
+	if protocol != ProtocolMessages {
+		input += nonNegativeTokens(usage.CacheReadTokens) + cacheWrite
+	}
+	return responseUsageSnapshot{
+		input:        input,
+		output:       nonNegativeTokens(usage.OutputTokens),
+		cacheRead:    nonNegativeTokens(usage.CacheReadTokens),
+		cacheWrite:   cacheWrite,
+		cacheWrite5m: cacheWrite5m,
+		cacheWrite1h: cacheWrite1h,
+		reasoning:    nonNegativeTokens(usage.ReasoningTokens),
+		usageSource:  "opencode_go_inference_cost",
+	}
+}
+
+func responseUsageSnapshotFromStandard(protocol Protocol, parsed *dto.Usage, allowOuterInput bool) *responseUsageSnapshot {
+	if parsed == nil {
+		return nil
+	}
+	if snapshot := responseUsageSnapshotFromNativeBilling(protocol, parsed); snapshot != nil {
+		outer := responseUsageSnapshotFromOpenAIUsage(protocol, parsed)
+		if allowOuterInput && snapshot.input == 0 && protocol == ProtocolMessages &&
+			strings.EqualFold(parsed.UsageSemantic, dto.BillingUsageSemanticOpenAI) {
+			cacheRead := maxTokens(snapshot.cacheRead, outer.cacheRead)
+			cacheWrite := maxTokens(snapshot.cacheWrite, outer.cacheWrite)
+			outer.input = nonNegativeTokens(outer.input - cacheRead - cacheWrite)
+		}
+		fillResponseUsageDetailGaps(snapshot, &outer, allowOuterInput)
+		return snapshot
+	}
+	snapshot := responseUsageSnapshotFromOpenAIUsage(protocol, parsed)
+	return &snapshot
+}
+
+func responseUsageSnapshotFromNativeBilling(protocol Protocol, parsed *dto.Usage) *responseUsageSnapshot {
+	billing := parsed.BillingUsage
+	if billing == nil {
+		return nil
+	}
+	switch protocol {
+	case ProtocolMessages:
+		if billing.Source != dto.BillingUsageSourceClaudeMessages || billing.ClaudeUsage == nil {
+			return nil
+		}
+		usage := billing.ClaudeUsage
+		cacheWrite5m := nonNegativeTokens(usage.ClaudeCacheCreation5mTokens)
+		cacheWrite1h := nonNegativeTokens(usage.ClaudeCacheCreation1hTokens)
+		if usage.CacheCreation != nil {
+			if value := nonNegativeTokens(usage.CacheCreation.Ephemeral5mInputTokens); value > 0 {
+				cacheWrite5m = value
+			}
+			if value := nonNegativeTokens(usage.CacheCreation.Ephemeral1hInputTokens); value > 0 {
+				cacheWrite1h = value
+			}
+		}
+		cacheWrite := maxTokens(nonNegativeTokens(usage.CacheCreationInputTokens), cacheWrite5m+cacheWrite1h)
+		return &responseUsageSnapshot{
+			input:        nonNegativeTokens(usage.InputTokens),
+			output:       nonNegativeTokens(usage.OutputTokens),
+			cacheRead:    nonNegativeTokens(usage.CacheReadInputTokens),
+			cacheWrite:   cacheWrite,
+			cacheWrite5m: cacheWrite5m,
+			cacheWrite1h: cacheWrite1h,
+			usageSource:  parsed.UsageSource,
+		}
+	case ProtocolResponses:
+		if billing.Source != dto.BillingUsageSourceOAIResponses || billing.OpenAIUsage == nil {
+			return nil
+		}
+		snapshot := responseUsageSnapshotFromOpenAIUsage(protocol, billing.OpenAIUsage)
+		return &snapshot
+	default:
+		if billing.Source != dto.BillingUsageSourceOAIChat || billing.OpenAIUsage == nil {
+			return nil
+		}
+		snapshot := responseUsageSnapshotFromOpenAIUsage(protocol, billing.OpenAIUsage)
+		return &snapshot
+	}
+}
+
+func responseUsageSnapshotFromOpenAIUsage(protocol Protocol, usage *dto.Usage) responseUsageSnapshot {
+	if usage == nil {
+		return responseUsageSnapshot{}
+	}
+	inputDetails := canonicalInputTokenDetails(protocol, usage)
+	outputDetails := usage.CompletionTokenDetails
+	input := usage.PromptTokens
+	if protocol == ProtocolResponses {
+		input = usage.InputTokens
+		if input == 0 {
+			input = usage.PromptTokens
+		}
+	} else if input == 0 {
+		input = usage.InputTokens
+	}
+	output := usage.CompletionTokens
+	if protocol == ProtocolResponses {
+		output = usage.OutputTokens
+		if output == 0 {
+			output = usage.CompletionTokens
+		}
+	} else if output == 0 {
+		output = usage.OutputTokens
+	}
+	cacheWrite5m := nonNegativeTokens(usage.ClaudeCacheCreation5mTokens)
+	cacheWrite1h := nonNegativeTokens(usage.ClaudeCacheCreation1hTokens)
+	cacheWrite := maxTokens(inputDetails.CacheCreationTokensTotal(), cacheWrite5m+cacheWrite1h)
+	return responseUsageSnapshot{
+		input:         nonNegativeTokens(input),
+		output:        nonNegativeTokens(output),
+		cacheRead:     nonNegativeTokens(inputDetails.CachedTokens),
+		cacheWrite:    cacheWrite,
+		cacheWrite5m:  cacheWrite5m,
+		cacheWrite1h:  cacheWrite1h,
+		reasoning:     nonNegativeTokens(outputDetails.ReasoningTokens),
+		inputDetails:  normalizeInputTokenDetails(inputDetails),
+		outputDetails: normalizeOutputTokenDetails(outputDetails),
+		usageSource:   usage.UsageSource,
+	}
+}
+
+func canonicalInputTokenDetails(protocol Protocol, usage *dto.Usage) dto.InputTokenDetails {
+	details := normalizeInputTokenDetails(usage.PromptTokensDetails)
+	if details.CachedTokens == 0 {
+		details.CachedTokens = nonNegativeTokens(usage.PromptCacheHitTokens)
+	}
+	if usage.InputTokensDetails == nil {
+		return details
+	}
+	inputDetails := normalizeInputTokenDetails(*usage.InputTokensDetails)
+	if protocol == ProtocolResponses {
+		fillInputTokenDetailGaps(&inputDetails, details)
+		return inputDetails
+	}
+	fillInputTokenDetailGaps(&details, inputDetails)
+	return details
+}
+
+func fillResponseUsageDetailGaps(target *responseUsageSnapshot, fallback *responseUsageSnapshot, allowInput bool) {
+	if target == nil || fallback == nil {
+		return
+	}
+	if allowInput && target.input == 0 {
+		target.input = fallback.input
+	}
+	if target.output == 0 {
+		target.output = fallback.output
+	}
+	if target.cacheRead == 0 {
+		target.cacheRead = fallback.cacheRead
+	}
+	if target.cacheWrite == 0 {
+		target.cacheWrite = fallback.cacheWrite
+	}
+	if target.cacheWrite5m == 0 {
+		target.cacheWrite5m = fallback.cacheWrite5m
+	}
+	if target.cacheWrite1h == 0 {
+		target.cacheWrite1h = fallback.cacheWrite1h
+	}
+	fillInputTokenDetailGaps(&target.inputDetails, fallback.inputDetails)
+	fillOutputTokenDetailGaps(&target.outputDetails, fallback.outputDetails)
+	if target.reasoning == 0 {
+		target.reasoning = fallback.reasoning
+	}
+	if target.usageSource == "" {
+		target.usageSource = fallback.usageSource
+	}
+}
+
+func fillInputTokenDetailGaps(target *dto.InputTokenDetails, fallback dto.InputTokenDetails) {
+	if target.CachedTokens == 0 {
+		target.CachedTokens = fallback.CachedTokens
+	}
+	if target.CachedCreationTokens == 0 {
+		target.CachedCreationTokens = fallback.CachedCreationTokens
+	}
+	if target.CacheWriteTokens == 0 {
+		target.CacheWriteTokens = fallback.CacheWriteTokens
+	}
+	if target.TextTokens == 0 {
+		target.TextTokens = fallback.TextTokens
+	}
+	if target.AudioTokens == 0 {
+		target.AudioTokens = fallback.AudioTokens
+	}
+	if target.ImageTokens == 0 {
+		target.ImageTokens = fallback.ImageTokens
+	}
+}
+
+func fillOutputTokenDetailGaps(target *dto.OutputTokenDetails, fallback dto.OutputTokenDetails) {
+	if target.ReasoningTokens == 0 {
+		target.ReasoningTokens = fallback.ReasoningTokens
+	}
+	if target.TextTokens == 0 {
+		target.TextTokens = fallback.TextTokens
+	}
+	if target.AudioTokens == 0 {
+		target.AudioTokens = fallback.AudioTokens
+	}
+	if target.ImageTokens == 0 {
+		target.ImageTokens = fallback.ImageTokens
+	}
+}
+
+func mergeResponseUsageSnapshots(standard *responseUsageSnapshot, fallback *responseUsageSnapshot) responseUsageSnapshot {
+	if standard == nil {
+		if fallback == nil {
+			return responseUsageSnapshot{}
+		}
+		return *fallback
+	}
+	merged := *standard
+	if fallback == nil {
+		return merged
+	}
+	if merged.input == 0 {
+		merged.input = fallback.input
+	}
+	if merged.output == 0 {
+		merged.output = fallback.output
+	}
+	if merged.cacheRead == 0 {
+		merged.cacheRead = fallback.cacheRead
+	}
+	if merged.cacheWrite == 0 {
+		merged.cacheWrite = fallback.cacheWrite
+	}
+	if merged.cacheWrite5m == 0 {
+		merged.cacheWrite5m = fallback.cacheWrite5m
+	}
+	if merged.cacheWrite1h == 0 {
+		merged.cacheWrite1h = fallback.cacheWrite1h
+	}
+	if merged.reasoning == 0 {
+		merged.reasoning = fallback.reasoning
+	}
+	if merged.usageSource == "" {
+		merged.usageSource = fallback.usageSource
+	}
+	fillInputTokenDetailGaps(&merged.inputDetails, fallback.inputDetails)
+	fillOutputTokenDetailGaps(&merged.outputDetails, fallback.outputDetails)
+	return merged
+}
+
+func finalizeUsageSnapshot(protocol Protocol, snapshot responseUsageSnapshot, base *dto.Usage) *dto.Usage {
+	usage := &dto.Usage{}
+	if base != nil {
+		*usage = *base
+	}
+	usage.BillingUsage = nil
+	snapshot.input = nonNegativeTokens(snapshot.input)
+	snapshot.output = nonNegativeTokens(snapshot.output)
+	snapshot.cacheRead = nonNegativeTokens(snapshot.cacheRead)
+	snapshot.cacheWrite5m = nonNegativeTokens(snapshot.cacheWrite5m)
+	snapshot.cacheWrite1h = nonNegativeTokens(snapshot.cacheWrite1h)
+	snapshot.cacheWrite = maxTokens(nonNegativeTokens(snapshot.cacheWrite), snapshot.cacheWrite5m+snapshot.cacheWrite1h)
+	snapshot.reasoning = nonNegativeTokens(snapshot.reasoning)
+	if snapshot.reasoning > snapshot.output {
+		snapshot.reasoning = snapshot.output
+	}
+
+	usage.PromptTokens = snapshot.input
+	usage.CompletionTokens = snapshot.output
+	usage.TotalTokens = snapshot.input + snapshot.output
+	usage.InputTokens = snapshot.input
+	usage.OutputTokens = snapshot.output
+	usage.PromptCacheHitTokens = snapshot.cacheRead
+	usage.UsageSource = snapshot.usageSource
+	usage.PromptTokensDetails = normalizeInputTokenDetails(snapshot.inputDetails)
+	usage.PromptTokensDetails.CachedTokens = snapshot.cacheRead
+	usage.PromptTokensDetails.CachedCreationTokens = snapshot.cacheWrite
+	usage.PromptTokensDetails.CacheWriteTokens = snapshot.cacheWrite
+	usage.CompletionTokenDetails = normalizeOutputTokenDetails(snapshot.outputDetails)
+	usage.CompletionTokenDetails.ReasoningTokens = snapshot.reasoning
+	usage.ClaudeCacheCreation5mTokens = snapshot.cacheWrite5m
+	usage.ClaudeCacheCreation1hTokens = snapshot.cacheWrite1h
+	usage.InputTokensDetails = nil
 
 	switch protocol {
 	case ProtocolMessages:
-		usage.PromptTokens = u.InputTokens
-		usage.TotalTokens = u.InputTokens + u.OutputTokens
+		usage.InputTokens = snapshot.input + snapshot.cacheRead + snapshot.cacheWrite
 		usage.UsageSemantic = dto.BillingUsageSemanticAnthropic
-		usage.BillingUsage = dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
-			InputTokens:                 u.InputTokens,
-			CacheReadInputTokens:        u.CacheReadTokens,
-			CacheCreationInputTokens:    cacheWrite,
-			OutputTokens:                u.OutputTokens,
-			ClaudeCacheCreation5mTokens: u.CacheWrite5mTokens,
-			ClaudeCacheCreation1hTokens: u.CacheWrite1hTokens,
-		})
+		claudeUsage := &dto.ClaudeUsage{
+			InputTokens:                 snapshot.input,
+			CacheReadInputTokens:        snapshot.cacheRead,
+			CacheCreationInputTokens:    snapshot.cacheWrite,
+			OutputTokens:                snapshot.output,
+			ClaudeCacheCreation5mTokens: snapshot.cacheWrite5m,
+			ClaudeCacheCreation1hTokens: snapshot.cacheWrite1h,
+		}
+		if snapshot.cacheWrite5m > 0 || snapshot.cacheWrite1h > 0 {
+			claudeUsage.CacheCreation = &dto.ClaudeCacheCreationUsage{
+				Ephemeral5mInputTokens: snapshot.cacheWrite5m,
+				Ephemeral1hInputTokens: snapshot.cacheWrite1h,
+			}
+		}
+		usage.BillingUsage = dto.NewClaudeMessagesBillingUsage(claudeUsage)
 	case ProtocolResponses:
 		usage.UsageSemantic = dto.BillingUsageSemanticOpenAI
+		inputDetails := usage.PromptTokensDetails
+		usage.InputTokensDetails = &inputDetails
 		usage.BillingUsage = dto.NewOpenAIResponsesBillingUsage(usage)
 	default:
 		usage.UsageSemantic = dto.BillingUsageSemanticOpenAI
@@ -317,44 +860,34 @@ func (u *normalizedCostUsage) toUsage(protocol Protocol) *dto.Usage {
 	return usage
 }
 
-func finalizeResponseUsage(usage any, state *responseTransformState) any {
-	parsed, _ := usage.(*dto.Usage)
-	if state != nil && !state.sawStandardUsage && state.fallbackUsage != nil {
-		parsed = state.fallbackUsage.toUsage(state.protocol)
+func normalizeInputTokenDetails(details dto.InputTokenDetails) dto.InputTokenDetails {
+	details.CachedTokens = nonNegativeTokens(details.CachedTokens)
+	details.CachedCreationTokens = nonNegativeTokens(details.CachedCreationTokens)
+	details.CacheWriteTokens = nonNegativeTokens(details.CacheWriteTokens)
+	details.TextTokens = nonNegativeTokens(details.TextTokens)
+	details.AudioTokens = nonNegativeTokens(details.AudioTokens)
+	details.ImageTokens = nonNegativeTokens(details.ImageTokens)
+	return details
+}
+
+func normalizeOutputTokenDetails(details dto.OutputTokenDetails) dto.OutputTokenDetails {
+	details.TextTokens = nonNegativeTokens(details.TextTokens)
+	details.AudioTokens = nonNegativeTokens(details.AudioTokens)
+	details.ImageTokens = nonNegativeTokens(details.ImageTokens)
+	details.ReasoningTokens = nonNegativeTokens(details.ReasoningTokens)
+	return details
+}
+
+func nonNegativeTokens(tokens int) int {
+	if tokens < 0 {
+		return 0
 	}
-	if parsed == nil {
-		parsed = &dto.Usage{}
+	return tokens
+}
+
+func maxTokens(first int, second int) int {
+	if second > first {
+		return second
 	}
-	if parsed.PromptTokensDetails.CachedTokens == 0 && parsed.InputTokensDetails != nil {
-		parsed.PromptTokensDetails.CachedTokens = parsed.InputTokensDetails.CachedTokens
-	}
-	if parsed.InputTokens == 0 {
-		parsed.InputTokens = parsed.PromptTokens + parsed.PromptTokensDetails.CachedTokens +
-			parsed.PromptTokensDetails.CacheCreationTokensTotal()
-	}
-	if parsed.OutputTokens == 0 {
-		parsed.OutputTokens = parsed.CompletionTokens
-	}
-	if parsed.TotalTokens == 0 {
-		parsed.TotalTokens = parsed.PromptTokens + parsed.CompletionTokens
-	}
-	if parsed.PromptCacheHitTokens == 0 {
-		parsed.PromptCacheHitTokens = parsed.PromptTokensDetails.CachedTokens
-	}
-	if parsed.BillingUsage == nil && state != nil {
-		switch state.protocol {
-		case ProtocolMessages:
-			parsed.BillingUsage = dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
-				InputTokens:              parsed.PromptTokens,
-				CacheReadInputTokens:     parsed.PromptTokensDetails.CachedTokens,
-				CacheCreationInputTokens: parsed.PromptTokensDetails.CacheCreationTokensTotal(),
-				OutputTokens:             parsed.CompletionTokens,
-			})
-		case ProtocolResponses:
-			parsed.BillingUsage = dto.NewOpenAIResponsesBillingUsage(parsed)
-		default:
-			parsed.BillingUsage = dto.NewOpenAIChatBillingUsage(parsed)
-		}
-	}
-	return parsed
+	return first
 }

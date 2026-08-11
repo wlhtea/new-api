@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -30,7 +31,7 @@ func newAdaptorTestContext() *gin.Context {
 }
 
 func newAdaptorTestInfo(model string, stream bool) *relaycommon.RelayInfo {
-	return &relaycommon.RelayInfo{
+	info := &relaycommon.RelayInfo{
 		OriginModelName: "public-model",
 		IsStream:        stream,
 		ChannelMeta: &relaycommon.ChannelMeta{
@@ -40,6 +41,20 @@ func newAdaptorTestInfo(model string, stream bool) *relaycommon.RelayInfo {
 			ChannelBaseUrl:    "https://untrusted.invalid/custom",
 			UpstreamModelName: model,
 		},
+	}
+	setAdaptorTestClientFormat(info, types.RelayFormatOpenAI)
+	return info
+}
+
+func setAdaptorTestClientFormat(info *relaycommon.RelayInfo, format types.RelayFormat) {
+	info.RelayFormat = format
+	switch format {
+	case types.RelayFormatOpenAI:
+		info.RelayMode = relayconstant.RelayModeChatCompletions
+	case types.RelayFormatClaude:
+		info.RelayMode = relayconstant.RelayModeUnknown
+	case types.RelayFormatOpenAIResponses:
+		info.RelayMode = relayconstant.RelayModeResponses
 	}
 }
 
@@ -72,6 +87,7 @@ func requestForFormat(format types.RelayFormat) any {
 }
 
 func convertAdaptorRequest(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo, format types.RelayFormat, request any) (any, error) {
+	setAdaptorTestClientFormat(info, format)
 	switch format {
 	case types.RelayFormatOpenAI:
 		return a.ConvertOpenAIRequest(c, info, request.(*dto.GeneralOpenAIRequest))
@@ -153,6 +169,7 @@ func TestAdaptorLowersCustomResponsesHistoryBeforeProtocolConversion(t *testing.
 				]`),
 			}
 			info := newAdaptorTestInfo(tt.model, false)
+			setAdaptorTestClientFormat(info, types.RelayFormatOpenAIResponses)
 			adaptor := &Adaptor{}
 			adaptor.Init(info)
 
@@ -248,7 +265,7 @@ func TestAdaptorPassesFailoverPolicyAndPinsStatefulResponses(t *testing.T) {
 	t.Cleanup(func() { selectOpenCodeGoWorkspace = originalSelector })
 
 	info := newAdaptorTestInfo("gpt-5.6-luna", false)
-	info.RelayFormat = types.RelayFormatOpenAIResponses
+	setAdaptorTestClientFormat(info, types.RelayFormatOpenAIResponses)
 	info.ChannelOtherSettings.OpenCodeGo = &dto.OpenCodeGoConfig{
 		GenericFailoverEnabled:       true,
 		GenericFailoverThreshold:     3,
@@ -298,7 +315,7 @@ func TestAdaptorCacheIdentityRemainsStableAcrossPromotedWorkspace(t *testing.T) 
 	requestOnce := func() (string, string) {
 		info := newAdaptorTestInfo("gpt-5.6-luna", false)
 		info.ChannelId = 42
-		info.RelayFormat = types.RelayFormatOpenAIResponses
+		setAdaptorTestClientFormat(info, types.RelayFormatOpenAIResponses)
 		info.ChannelOtherSettings.OpenCodeGo = &dto.OpenCodeGoConfig{GenericFailoverEnabled: true}
 		request := requestForFormat(types.RelayFormatOpenAIResponses).(*dto.OpenAIResponsesRequest)
 		c := newAdaptorTestContext()
@@ -476,7 +493,7 @@ func TestAdaptorResponseErrorWithPayloadOrLocalFailureDoesNotInferIncompleteStre
 
 func TestAdaptorKeepsClaudeChatFamilyFunctionToolsOnChat(t *testing.T) {
 	info := newAdaptorTestInfo("glm-5.2", false)
-	info.RelayFormat = types.RelayFormatClaude
+	setAdaptorTestClientFormat(info, types.RelayFormatClaude)
 	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
 	request.Tools = []map[string]any{
 		{
@@ -525,6 +542,7 @@ func TestAdaptorRoutesOpenAIChatFamilyFunctionToolsThroughResponses(t *testing.T
 
 func TestAdaptorAddsOpenCodeGoResponsesFunctionCallIDFromClaude(t *testing.T) {
 	info := newAdaptorTestInfo("gpt-5.6-luna", false)
+	setAdaptorTestClientFormat(info, types.RelayFormatClaude)
 	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
 	request.Tools = []map[string]any{
 		{"name": "Bash", "input_schema": map[string]any{"type": "object"}},
@@ -562,7 +580,7 @@ func TestAdaptorAddsOpenCodeGoResponsesFunctionCallIDFromClaude(t *testing.T) {
 
 func TestAdaptorBuffersStreamingClaudeFunctionToolsUpstream(t *testing.T) {
 	info := newAdaptorTestInfo("glm-5.2", true)
-	info.RelayFormat = types.RelayFormatClaude
+	setAdaptorTestClientFormat(info, types.RelayFormatClaude)
 	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
 	request.Tools = []map[string]any{
 		{
@@ -593,7 +611,7 @@ func TestAdaptorBuffersStreamingClaudeFunctionToolsUpstream(t *testing.T) {
 
 func TestAdaptorKeepsClaudeToolOnlyContinuationOnChat(t *testing.T) {
 	info := newAdaptorTestInfo("deepseek-v4-flash", true)
-	info.RelayFormat = types.RelayFormatClaude
+	setAdaptorTestClientFormat(info, types.RelayFormatClaude)
 	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
 	request.Tools = []map[string]any{
 		{
@@ -675,6 +693,7 @@ func TestAdaptorKeepsOpenAIReasoningToolContinuationOnChat(t *testing.T) {
 
 func TestAdaptorKeepsReasoningToolHistoryOnChatPath(t *testing.T) {
 	info := newAdaptorTestInfo("glm-5.2", false)
+	setAdaptorTestClientFormat(info, types.RelayFormatClaude)
 	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
 	request.Tools = []map[string]any{
 		{"name": "Bash", "input_schema": map[string]any{"type": "object"}},
@@ -730,7 +749,7 @@ func TestAdaptorKeepsReasoningToolHistoryOnChatPath(t *testing.T) {
 
 func TestAdaptorBuffersStreamingClaudeChatReasoningContinuation(t *testing.T) {
 	info := newAdaptorTestInfo("glm-5.2", true)
-	info.RelayFormat = types.RelayFormatClaude
+	setAdaptorTestClientFormat(info, types.RelayFormatClaude)
 	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
 	request.Tools = []map[string]any{
 		{
@@ -794,6 +813,7 @@ func TestReasoningToolResponseRoundTripsIntoChatContinuation(t *testing.T) {
 	assert.Equal(t, "tool_use", claudeResponse.Content[1].Type)
 
 	info := newAdaptorTestInfo("glm-5.2", false)
+	setAdaptorTestClientFormat(info, types.RelayFormatClaude)
 	request := requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest)
 	request.Tools = []map[string]any{{
 		"name": "Bash", "input_schema": map[string]any{"type": "object"},
@@ -872,6 +892,214 @@ func TestAdaptorRejectsPassThroughAndUnknownProtocol(t *testing.T) {
 	adaptor.Init(info)
 	_, err = adaptor.GetRequestURL(info)
 	require.ErrorContains(t, err, "protocol is not configured")
+}
+
+func TestAdaptorRejectsUnsupportedRelayModesBeforeUpstreamIO(t *testing.T) {
+	originalDoRequest := doOpenCodeGoAPIRequest
+	upstreamCalls := 0
+	doOpenCodeGoAPIRequest = func(_ relaychannel.Adaptor, _ *gin.Context, _ *relaycommon.RelayInfo, _ io.Reader) (*http.Response, error) {
+		upstreamCalls++
+		return nil, errors.New("unexpected upstream request")
+	}
+	t.Cleanup(func() { doOpenCodeGoAPIRequest = originalDoRequest })
+
+	tests := []struct {
+		name        string
+		format      types.RelayFormat
+		mode        int
+		convert     func(*Adaptor, *gin.Context, *relaycommon.RelayInfo) (any, error)
+		wantAllowed bool
+	}{
+		{
+			name:   "chat_completions",
+			format: types.RelayFormatOpenAI,
+			mode:   relayconstant.RelayModeChatCompletions,
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return adaptor.ConvertOpenAIRequest(c, info, requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest))
+			},
+			wantAllowed: true,
+		},
+		{
+			name:   "playground_chat_completions",
+			format: types.RelayFormatOpenAI,
+			mode:   relayconstant.RelayModeChatCompletions,
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				info.IsPlayground = true
+				return adaptor.ConvertOpenAIRequest(c, info, requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest))
+			},
+			wantAllowed: true,
+		},
+		{
+			name:   "messages",
+			format: types.RelayFormatClaude,
+			mode:   relayconstant.RelayModeUnknown,
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return adaptor.ConvertClaudeRequest(c, info, requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest))
+			},
+			wantAllowed: true,
+		},
+		{
+			name:   "responses",
+			format: types.RelayFormatOpenAIResponses,
+			mode:   relayconstant.RelayModeResponses,
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return adaptor.ConvertOpenAIResponsesRequest(c, info, *requestForFormat(types.RelayFormatOpenAIResponses).(*dto.OpenAIResponsesRequest))
+			},
+			wantAllowed: true,
+		},
+		{
+			name:   "legacy_completions",
+			format: types.RelayFormatOpenAI,
+			mode:   relayconstant.RelayModeCompletions,
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return adaptor.ConvertOpenAIRequest(c, info, requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest))
+			},
+		},
+		{
+			name:   "moderations",
+			format: types.RelayFormatOpenAI,
+			mode:   relayconstant.RelayModeModerations,
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return adaptor.ConvertOpenAIRequest(c, info, requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest))
+			},
+		},
+		{
+			name:   "responses_compact",
+			format: types.RelayFormatOpenAIResponses,
+			mode:   relayconstant.RelayModeResponsesCompact,
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return adaptor.ConvertOpenAIResponsesRequest(c, info, *requestForFormat(types.RelayFormatOpenAIResponses).(*dto.OpenAIResponsesRequest))
+			},
+		},
+		{
+			name:   "alpha_search",
+			format: types.RelayFormatOpenAIResponses,
+			mode:   relayconstant.RelayModeAlphaSearch,
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return adaptor.ConvertOpenAIResponsesRequest(c, info, *requestForFormat(types.RelayFormatOpenAIResponses).(*dto.OpenAIResponsesRequest))
+			},
+		},
+		{
+			name:   "format_mode_mismatch",
+			format: types.RelayFormatClaude,
+			mode:   relayconstant.RelayModeChatCompletions,
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return adaptor.ConvertClaudeRequest(c, info, requestForFormat(types.RelayFormatClaude).(*dto.ClaudeRequest))
+			},
+		},
+		{
+			name:   "unknown_format",
+			format: types.RelayFormat("unknown"),
+			mode:   relayconstant.RelayModeUnknown,
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return adaptor.ConvertOpenAIRequest(c, info, requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest))
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			model := "future-unknown"
+			if test.wantAllowed {
+				model = "glm-5.2"
+			}
+			info := newAdaptorTestInfo(model, false)
+			info.RelayFormat = test.format
+			info.RelayMode = test.mode
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+
+			_, err := test.convert(adaptor, newAdaptorTestContext(), info)
+			if test.wantAllowed {
+				require.NoError(t, err)
+				assert.True(t, adaptor.converted)
+				return
+			}
+
+			require.ErrorContains(t, err, "does not support")
+			assert.False(t, adaptor.converted)
+			_, requestErr := adaptor.DoRequest(newAdaptorTestContext(), info, nil)
+			require.ErrorContains(t, requestErr, "does not allow pass-through")
+			assert.Equal(t, 0, upstreamCalls)
+		})
+	}
+}
+
+func TestAdaptorRejectsUnsupportedAPIFamiliesWithoutUpstreamIO(t *testing.T) {
+	originalDoRequest := doOpenCodeGoAPIRequest
+	upstreamCalls := 0
+	doOpenCodeGoAPIRequest = func(_ relaychannel.Adaptor, _ *gin.Context, _ *relaycommon.RelayInfo, _ io.Reader) (*http.Response, error) {
+		upstreamCalls++
+		return nil, errors.New("unexpected upstream request")
+	}
+	t.Cleanup(func() { doOpenCodeGoAPIRequest = originalDoRequest })
+
+	tests := []struct {
+		name    string
+		convert func(*Adaptor, *gin.Context, *relaycommon.RelayInfo) error
+	}{
+		{
+			name: "gemini_generation",
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) error {
+				_, err := adaptor.ConvertGeminiRequest(c, info, &dto.GeminiChatRequest{})
+				return err
+			},
+		},
+		{
+			name: "rerank",
+			convert: func(adaptor *Adaptor, c *gin.Context, _ *relaycommon.RelayInfo) error {
+				_, err := adaptor.ConvertRerankRequest(c, 0, dto.RerankRequest{})
+				return err
+			},
+		},
+		{
+			name: "embedding",
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) error {
+				_, err := adaptor.ConvertEmbeddingRequest(c, info, dto.EmbeddingRequest{})
+				return err
+			},
+		},
+		{
+			name: "audio",
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) error {
+				_, err := adaptor.ConvertAudioRequest(c, info, dto.AudioRequest{})
+				return err
+			},
+		},
+		{
+			name: "image",
+			convert: func(adaptor *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) error {
+				_, err := adaptor.ConvertImageRequest(c, info, dto.ImageRequest{})
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			info := newAdaptorTestInfo("glm-5.2", false)
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+
+			err := test.convert(adaptor, newAdaptorTestContext(), info)
+			require.ErrorContains(t, err, "does not support")
+			assert.False(t, adaptor.converted)
+			_, requestErr := adaptor.DoRequest(newAdaptorTestContext(), info, nil)
+			require.ErrorContains(t, requestErr, "does not allow pass-through")
+			assert.Zero(t, upstreamCalls)
+		})
+	}
+
+	t.Run("realtime_or_pass_through", func(t *testing.T) {
+		info := newAdaptorTestInfo("glm-5.2", false)
+		info.RelayMode = relayconstant.RelayModeRealtime
+		adaptor := &Adaptor{}
+		adaptor.Init(info)
+
+		_, err := adaptor.DoRequest(newAdaptorTestContext(), info, nil)
+		require.ErrorContains(t, err, "does not allow pass-through")
+		assert.Zero(t, upstreamCalls)
+	})
 }
 
 func TestAdaptorPersistsTransportFailureAndSkipsCallerCancellation(t *testing.T) {

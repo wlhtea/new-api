@@ -43,7 +43,7 @@ func messagesToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, res
 		return nil, types.NewOpenAIError(fmt.Errorf("expected OpenAI responses response, got %T", result.Value), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	usage := result.Usage
-	if usage == nil || usage.TotalTokens == 0 {
+	if !hasMessagesToResponsesUsage(usage) {
 		usage = service.ResponseText2Usage(c, service.ExtractOutputTextFromResponses(response), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		response.Usage = relayconvert.UsageFromChatUsage(usage)
 	}
@@ -144,7 +144,7 @@ func messagesToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInf
 		state.SetUsage(relayconvert.UsageFromClaudeUsage(claudeInfo.Usage))
 	}
 	usage := state.Usage()
-	if usage == nil || usage.TotalTokens == 0 {
+	if !hasMessagesToResponsesUsage(usage) {
 		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		state.SetUsage(usage)
 	}
@@ -164,4 +164,11 @@ func messagesToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInf
 		}
 	}
 	return usage, nil
+}
+
+func hasMessagesToResponsesUsage(usage *dto.Usage) bool {
+	if usage == nil {
+		return false
+	}
+	return usage.BillingUsage != nil || dto.HasOpenAIUsageTokens(usage)
 }

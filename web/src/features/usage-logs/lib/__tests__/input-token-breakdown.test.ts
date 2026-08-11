@@ -46,6 +46,23 @@ describe('usage log input token breakdown', () => {
     })
   })
 
+  test('keeps Messages cache writes inside explicit total while separating cache read', () => {
+    assert.deepEqual(
+      getInputTokenBreakdown(100, {
+        input_tokens_total: 210,
+        cache_tokens: 80,
+        cache_creation_tokens_5m: 20,
+        cache_creation_tokens_1h: 10,
+      }),
+      {
+        totalInputTokens: 210,
+        uncachedInputTokens: 130,
+        cacheReadTokens: 80,
+        hasExplicitTotal: true,
+      }
+    )
+  })
+
   test('never displays negative uncached input for inconsistent upstream usage', () => {
     assert.deepEqual(
       getInputTokenBreakdown(100, {

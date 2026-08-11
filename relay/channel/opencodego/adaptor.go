@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -212,6 +213,12 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 }
 
 func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
+	if !isSupportedOpenCodeGoClientRequest(info) {
+		if info == nil {
+			return nil, errors.New("OpenCode Go relay info is nil")
+		}
+		return nil, fmt.Errorf("OpenCode Go does not support relay format %q in mode %d", info.RelayFormat, info.RelayMode)
+	}
 	if request == nil {
 		return nil, errors.New("OpenCode Go request is nil")
 	}
@@ -303,6 +310,22 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	info.FinalRequestRelayFormat = protocol.RelayFormat()
 	a.converted = true
 	return result.Value, nil
+}
+
+func isSupportedOpenCodeGoClientRequest(info *relaycommon.RelayInfo) bool {
+	if info == nil {
+		return false
+	}
+	switch info.RelayFormat {
+	case types.RelayFormatOpenAI:
+		return info.RelayMode == relayconstant.RelayModeChatCompletions
+	case types.RelayFormatClaude:
+		return info.RelayMode == relayconstant.RelayModeUnknown
+	case types.RelayFormatOpenAIResponses:
+		return info.RelayMode == relayconstant.RelayModeResponses
+	default:
+		return false
+	}
 }
 
 func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
@@ -402,6 +425,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		info.UpstreamModelName = upstreamModel
 	}()
 
+	service.ResetResponseBodyWriteError(c)
 	var usage any
 	var responseErr *types.NewAPIError
 	switch protocol {
@@ -451,6 +475,17 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	if responseErr != nil {
 		return nil, responseErr
 	}
+	if writeErr := service.ResponseBodyWriteError(c); writeErr != nil {
+		return nil, types.NewOpenAIError(
+			writeErr,
+			types.ErrorCodeBadResponse,
+			http.StatusInternalServerError,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if settlementErr := a.openCodeGoStreamSettlementError(c, info); settlementErr != nil {
+		return nil, settlementErr
+	}
 	if streamFailureReason == "" && !a.openCodeGoStreamHasLocalErrors(info) {
 		a.recordFailoverSuccess(c, info)
 	}
@@ -479,8 +514,40 @@ func rawJSONFieldPresent(raw []byte) bool {
 	return value != "" && value != "null"
 }
 
+func (a *Adaptor) openCodeGoStreamSettlementError(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	if a == nil || !a.requestUpstreamStream || info == nil {
+		return nil
+	}
+	if openCodeGoCallerCancelled(c, nil) ||
+		(info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone) {
+		return types.NewOpenAIError(
+			context.Canceled,
+			types.ErrorCodeBadResponse,
+			499,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if a.openCodeGoStreamHasLocalErrors(info) {
+		return types.NewOpenAIError(
+			errors.New("OpenCode Go stream terminated by a local relay failure"),
+			types.ErrorCodeBadResponse,
+			http.StatusInternalServerError,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if a.openCodeGoStreamIncomplete(c, info) {
+		return types.NewOpenAIError(
+			errors.New("OpenCode Go upstream stream ended before completion"),
+			types.ErrorCodeBadResponseBody,
+			http.StatusBadGateway,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	return nil
+}
+
 func (a *Adaptor) openCodeGoStreamIncomplete(c *gin.Context, info *relaycommon.RelayInfo) bool {
-	if a == nil || a.failoverAttempt == nil || !a.requestUpstreamStream || info == nil {
+	if a == nil || !a.requestUpstreamStream || info == nil {
 		return false
 	}
 	if openCodeGoCallerCancelled(c, nil) ||

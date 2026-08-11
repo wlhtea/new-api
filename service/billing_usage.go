@@ -140,12 +140,17 @@ func usageFromClaudeBillingUsage(billingUsage *dto.BillingUsage) *dto.Usage {
 	if cacheCreation1h == 0 {
 		cacheCreation1h = claudeUsage.ClaudeCacheCreation1hTokens
 	}
+	cacheCreationTotal := reliableCacheCreationTokens(
+		claudeUsage.CacheCreationInputTokens,
+		cacheCreation5m,
+		cacheCreation1h,
+	)
 
 	usage := &dto.Usage{
 		PromptTokens:                claudeUsage.InputTokens,
 		CompletionTokens:            claudeUsage.OutputTokens,
 		TotalTokens:                 claudeUsage.InputTokens + claudeUsage.OutputTokens,
-		InputTokens:                 claudeUsage.InputTokens + claudeUsage.CacheReadInputTokens + claudeUsage.CacheCreationInputTokens,
+		InputTokens:                 claudeUsage.InputTokens + claudeUsage.CacheReadInputTokens + cacheCreationTotal,
 		OutputTokens:                claudeUsage.OutputTokens,
 		UsageSemantic:               dto.BillingUsageSemanticAnthropic,
 		UsageSource:                 dto.BillingUsageSourceClaudeMessages,
@@ -154,8 +159,25 @@ func usageFromClaudeBillingUsage(billingUsage *dto.BillingUsage) *dto.Usage {
 		ClaudeCacheCreation1hTokens: cacheCreation1h,
 	}
 	usage.PromptTokensDetails.CachedTokens = claudeUsage.CacheReadInputTokens
-	usage.PromptTokensDetails.CachedCreationTokens = claudeUsage.CacheCreationInputTokens
+	usage.PromptTokensDetails.CachedCreationTokens = cacheCreationTotal
 	return usage
+}
+
+func reliableCacheCreationTokens(aggregate, split5m, split1h int) int {
+	if aggregate < 0 {
+		aggregate = 0
+	}
+	if split5m < 0 {
+		split5m = 0
+	}
+	if split1h < 0 {
+		split1h = 0
+	}
+	splitTotal := split5m + split1h
+	if splitTotal > aggregate {
+		return splitTotal
+	}
+	return aggregate
 }
 
 func usageFromGeminiBillingUsage(billingUsage *dto.BillingUsage) *dto.Usage {

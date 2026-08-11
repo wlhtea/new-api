@@ -13,6 +13,38 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const responseBodyWriteErrorKey = "oneapi_response_body_write_error"
+
+// ResetResponseBodyWriteError clears response-copy state before a response
+// handler starts writing to a potentially reused Gin context.
+func ResetResponseBodyWriteError(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	c.Set(responseBodyWriteErrorKey, nil)
+}
+
+// ResponseBodyWriteError returns the first response-copy error recorded for
+// the current request.
+func ResponseBodyWriteError(c *gin.Context) error {
+	if c == nil {
+		return nil
+	}
+	value, exists := c.Get(responseBodyWriteErrorKey)
+	if !exists {
+		return nil
+	}
+	err, _ := value.(error)
+	return err
+}
+
+func recordResponseBodyWriteError(c *gin.Context, err error) {
+	if c == nil || err == nil || ResponseBodyWriteError(c) != nil {
+		return
+	}
+	c.Set(responseBodyWriteErrorKey, err)
+}
+
 func CloseResponseBodyGracefully(httpResponse *http.Response) {
 	if httpResponse == nil || httpResponse.Body == nil {
 		return
@@ -73,6 +105,7 @@ func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
 
 	_, err := io.Copy(c.Writer, body)
 	if err != nil {
+		recordResponseBodyWriteError(c, err)
 		logger.LogError(c, fmt.Sprintf("failed to copy response body: %s", err.Error()))
 	}
 	c.Writer.Flush()

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"math"
 	"net/http/httptest"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -300,8 +302,20 @@ func TestUsageBillingPathForLog(t *testing.T) {
 	require.Equal(t, usageBillingPathOpenAI, usageBillingPathForLog(false, &dto.Usage{
 		BillingUsage: dto.NewOpenAIChatBillingUsage(&dto.Usage{PromptTokens: 1}),
 	}))
+	estimatedOpenAI := dto.NewOpenAIResponsesBillingUsage(&dto.Usage{InputTokens: 1})
+	require.NotNil(t, estimatedOpenAI)
+	estimatedOpenAI.Estimated = true
+	require.Equal(t, usageBillingPathOpenAIEstimated, usageBillingPathForLog(false, &dto.Usage{
+		BillingUsage: estimatedOpenAI,
+	}))
 	require.Equal(t, usageBillingPathAnthropic, usageBillingPathForLog(false, &dto.Usage{
 		BillingUsage: dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{InputTokens: 1}),
+	}))
+	estimatedAnthropic := dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{InputTokens: 1})
+	require.NotNil(t, estimatedAnthropic)
+	estimatedAnthropic.Estimated = true
+	require.Equal(t, usageBillingPathAnthropicEstimated, usageBillingPathForLog(false, &dto.Usage{
+		BillingUsage: estimatedAnthropic,
 	}))
 	require.Equal(t, usageBillingPathGemini, usageBillingPathForLog(false, &dto.Usage{
 		BillingUsage: dto.NewGeminiChatBillingUsage(&dto.GeminiUsageMetadata{PromptTokenCount: 1}),
@@ -1060,4 +1074,404 @@ func TestAppendToolSurchargeLogInfoWritesOnlyStructuredFields(t *testing.T) {
 	assert.NotContains(t, other, "file_search")
 	assert.NotContains(t, other, "image_generation_call")
 	assert.NotContains(t, other, "image_generation_call_price")
+}
+
+func usageAccountingTestContext() *gin.Context {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	return ctx
+}
+
+func usageAccountingPriceData(usePrice bool) hosttypes.PriceData {
+	return hosttypes.PriceData{
+		ModelRatio:           1,
+		CompletionRatio:      2,
+		CacheRatio:           0.25,
+		ModelPrice:           0.12,
+		UsePrice:             usePrice,
+		CacheCreationRatio:   2,
+		CacheCreation5mRatio: 2,
+		CacheCreation1hRatio: 3,
+		GroupRatioInfo:       hosttypes.GroupRatioInfo{GroupRatio: 1},
+	}
+}
+
+func TestCalculateTextQuotaSummaryRepresentativeUsageVector(t *testing.T) {
+	ctx := usageAccountingTestContext()
+	tests := []struct {
+		name      string
+		usage     *dto.Usage
+		wantQuota int
+	}{
+		{
+			name: "openai semantics",
+			usage: &dto.Usage{
+				PromptTokens:     210,
+				CompletionTokens: 40,
+				TotalTokens:      250,
+				InputTokens:      210,
+				UsageSemantic:    dto.BillingUsageSemanticOpenAI,
+				UsageSource:      dto.BillingUsageSourceOAIChat,
+				PromptTokensDetails: dto.InputTokenDetails{
+					CachedTokens:     80,
+					CacheWriteTokens: 30,
+				},
+			},
+			wantQuota: 260,
+		},
+		{
+			name: "anthropic semantics",
+			usage: effectiveBillingUsage(&dto.Usage{BillingUsage: dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
+				InputTokens:              100,
+				CacheReadInputTokens:     80,
+				CacheCreationInputTokens: 30,
+				OutputTokens:             40,
+				CacheCreation: &dto.ClaudeCacheCreationUsage{
+					Ephemeral5mInputTokens: 20,
+					Ephemeral1hInputTokens: 10,
+				},
+			})}),
+			wantQuota: 270,
+		},
+		{
+			name: "anthropic split fallback",
+			usage: effectiveBillingUsage(&dto.Usage{BillingUsage: dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
+				InputTokens:          100,
+				CacheReadInputTokens: 80,
+				OutputTokens:         40,
+				CacheCreation: &dto.ClaudeCacheCreationUsage{
+					Ephemeral5mInputTokens: 20,
+					Ephemeral1hInputTokens: 10,
+				},
+			})}),
+			wantQuota: 270,
+		},
+		{
+			name: "anthropic aggregate generic remainder",
+			usage: effectiveBillingUsage(&dto.Usage{BillingUsage: dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
+				InputTokens:              100,
+				CacheReadInputTokens:     80,
+				CacheCreationInputTokens: 50,
+				OutputTokens:             40,
+				CacheCreation: &dto.ClaudeCacheCreationUsage{
+					Ephemeral5mInputTokens: 20,
+					Ephemeral1hInputTokens: 10,
+				},
+			})}),
+			wantQuota: 310,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.usage.CompletionTokenDetails.ReasoningTokens = 15
+			relayInfo := &relaycommon.RelayInfo{
+				OriginModelName: "usage-accounting-model",
+				PriceData:       usageAccountingPriceData(false),
+				StartTime:       time.Now(),
+			}
+
+			summary := calculateTextQuotaSummary(ctx, relayInfo, tt.usage)
+
+			require.Equal(t, tt.wantQuota, summary.Quota)
+			require.Equal(t, 40, summary.CompletionTokens)
+		})
+	}
+}
+
+func TestCalculateTextQuotaSummaryInputTokensDoesNotAffectSettlement(t *testing.T) {
+	ctx := usageAccountingTestContext()
+	tests := []struct {
+		name      string
+		usage     *dto.Usage
+		wantQuota int
+	}{
+		{
+			name: "openai",
+			usage: &dto.Usage{
+				PromptTokens:     210,
+				CompletionTokens: 40,
+				TotalTokens:      250,
+				InputTokens:      210,
+				UsageSemantic:    dto.BillingUsageSemanticOpenAI,
+				PromptTokensDetails: dto.InputTokenDetails{
+					CachedTokens:     80,
+					CacheWriteTokens: 30,
+				},
+			},
+			wantQuota: 260,
+		},
+		{
+			name: "anthropic",
+			usage: effectiveBillingUsage(&dto.Usage{BillingUsage: dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
+				InputTokens:              100,
+				CacheReadInputTokens:     80,
+				CacheCreationInputTokens: 30,
+				OutputTokens:             40,
+				CacheCreation: &dto.ClaudeCacheCreationUsage{
+					Ephemeral5mInputTokens: 20,
+					Ephemeral1hInputTokens: 10,
+				},
+			})}),
+			wantQuota: 270,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			relayInfo := &relaycommon.RelayInfo{
+				OriginModelName: "usage-accounting-model",
+				PriceData:       usageAccountingPriceData(false),
+				StartTime:       time.Now(),
+			}
+			want := calculateTextQuotaSummary(ctx, relayInfo, tt.usage)
+			tt.usage.InputTokens = 999
+			got := calculateTextQuotaSummary(ctx, relayInfo, tt.usage)
+
+			require.Equal(t, tt.wantQuota, want.Quota)
+			require.Equal(t, want.Quota, got.Quota)
+			require.Equal(t, want.PromptTokens, got.PromptTokens)
+			require.Equal(t, want.CacheTokens, got.CacheTokens)
+			require.Equal(t, want.CacheCreationTokens, got.CacheCreationTokens)
+		})
+	}
+}
+
+func TestCalculateTextQuotaSummaryBillsCacheOnlyUsage(t *testing.T) {
+	ctx := usageAccountingTestContext()
+	cacheOnly := effectiveBillingUsage(&dto.Usage{BillingUsage: dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
+		CacheReadInputTokens: 80,
+		CacheCreation: &dto.ClaudeCacheCreationUsage{
+			Ephemeral5mInputTokens: 20,
+			Ephemeral1hInputTokens: 10,
+		},
+	})})
+	require.NotNil(t, cacheOnly)
+
+	t.Run("ratio", func(t *testing.T) {
+		relayInfo := &relaycommon.RelayInfo{
+			OriginModelName: "usage-accounting-model",
+			PriceData:       usageAccountingPriceData(false),
+			StartTime:       time.Now(),
+		}
+
+		summary := calculateTextQuotaSummary(ctx, relayInfo, cacheOnly)
+
+		require.True(t, summary.hasBillableUsage())
+		require.Equal(t, 90, summary.Quota)
+	})
+
+	t.Run("fixed price", func(t *testing.T) {
+		relayInfo := &relaycommon.RelayInfo{
+			OriginModelName: "usage-accounting-model",
+			PriceData:       usageAccountingPriceData(true),
+			StartTime:       time.Now(),
+		}
+		regular := *cacheOnly
+		regular.PromptTokens = 1
+		regular.TotalTokens = 1
+		wrongDisplayTotal := *cacheOnly
+		wrongDisplayTotal.InputTokens = 999
+
+		cacheOnlySummary := calculateTextQuotaSummary(ctx, relayInfo, cacheOnly)
+		regularSummary := calculateTextQuotaSummary(ctx, relayInfo, &regular)
+		wrongDisplaySummary := calculateTextQuotaSummary(ctx, relayInfo, &wrongDisplayTotal)
+
+		require.True(t, cacheOnlySummary.hasBillableUsage())
+		require.Equal(t, 60000, cacheOnlySummary.Quota)
+		require.Equal(t, regularSummary.Quota, cacheOnlySummary.Quota)
+		require.Equal(t, cacheOnlySummary.Quota, wrongDisplaySummary.Quota)
+	})
+}
+
+func TestTextQuotaSummaryHasBillableUsageIncludesCacheCategories(t *testing.T) {
+	tests := []struct {
+		name    string
+		summary textQuotaSummary
+		want    bool
+	}{
+		{name: "empty", summary: textQuotaSummary{}, want: false},
+		{name: "cache read only", summary: textQuotaSummary{CacheTokens: 1}, want: true},
+		{name: "aggregate cache write only", summary: textQuotaSummary{CacheCreationTokens: 1}, want: true},
+		{name: "5m cache write only", summary: textQuotaSummary{CacheCreationTokens5m: 1}, want: true},
+		{name: "1h cache write only", summary: textQuotaSummary{CacheCreationTokens1h: 1}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, tt.summary.hasBillableUsage())
+		})
+	}
+}
+
+type quotaConsistencyBillingSettler struct {
+	settledQuota int
+	settleCalls  int
+}
+
+func (s *quotaConsistencyBillingSettler) Settle(actualQuota int) error {
+	s.settledQuota = actualQuota
+	s.settleCalls++
+	return nil
+}
+
+func (s *quotaConsistencyBillingSettler) Refund(*gin.Context) {}
+
+func (s *quotaConsistencyBillingSettler) NeedsRefund() bool { return false }
+
+func (s *quotaConsistencyBillingSettler) GetPreConsumedQuota() int { return 0 }
+
+func (s *quotaConsistencyBillingSettler) Reserve(int) error { return nil }
+
+func TestPostTextConsumeQuotaKeepsCacheOnlySettlementConsistent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	truncate(t)
+
+	const tieredExpr = `tier("base", p + c * 2 + cr * 0.25 + cc * 2 + cc1h * 3)`
+	tests := []struct {
+		name     string
+		usePrice bool
+		tiered   bool
+		want     int
+	}{
+		{name: "ratio", want: 90},
+		{name: "fixed price", usePrice: true, want: 60000},
+		{name: "tiered", tiered: true, want: 90},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			userID := 98001 + i
+			channelID := 98101 + i
+			seedUser(t, userID, 1_000_000)
+			seedChannel(t, channelID)
+
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Set("username", "cache_only_user")
+			settler := &quotaConsistencyBillingSettler{}
+			relayInfo := &relaycommon.RelayInfo{
+				UserId:          userID,
+				OriginModelName: "usage-accounting-model",
+				StartTime:       time.Now(),
+				PriceData:       usageAccountingPriceData(tt.usePrice),
+				Billing:         settler,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelId: channelID,
+				},
+				// Avoid wallet notification I/O; the recording settler owns this test's billing assertion.
+				BillingSource: BillingSourceSubscription,
+			}
+			if tt.tiered {
+				relayInfo.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+					BillingMode:  "tiered_expr",
+					ExprString:   tieredExpr,
+					ExprHash:     billingexpr.ExprHashString(tieredExpr),
+					GroupRatio:   1,
+					QuotaPerUnit: 1_000_000,
+				}
+			}
+			usage := &dto.Usage{BillingUsage: dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
+				CacheReadInputTokens: 80,
+				CacheCreation: &dto.ClaudeCacheCreationUsage{
+					Ephemeral5mInputTokens: 20,
+					Ephemeral1hInputTokens: 10,
+				},
+			})}
+
+			PostTextConsumeQuota(ctx, relayInfo, usage, nil)
+
+			assert.Equal(t, 1, settler.settleCalls)
+			assert.Equal(t, tt.want, settler.settledQuota)
+
+			var user model.User
+			require.NoError(t, model.DB.First(&user, userID).Error)
+			assert.Equal(t, tt.want, user.UsedQuota)
+			assert.Equal(t, 1, user.RequestCount)
+
+			var channel model.Channel
+			require.NoError(t, model.DB.First(&channel, channelID).Error)
+			assert.Equal(t, int64(tt.want), channel.UsedQuota)
+
+			var logs []model.Log
+			require.NoError(t, model.LOG_DB.Where("user_id = ?", userID).Find(&logs).Error)
+			require.Len(t, logs, 1)
+			assert.Equal(t, tt.want, logs[0].Quota)
+			assert.Zero(t, logs[0].PromptTokens)
+			assert.Zero(t, logs[0].CompletionTokens)
+
+			var other map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal([]byte(logs[0].Other), &other))
+			var inputTokensTotal int
+			require.NoError(t, json.Unmarshal(other["input_tokens_total"], &inputTokensTotal))
+			assert.Equal(t, 110, inputTokensTotal)
+			var cacheWriteTokens int
+			require.NoError(t, json.Unmarshal(other["cache_write_tokens"], &cacheWriteTokens))
+			assert.Equal(t, 30, cacheWriteTokens)
+		})
+	}
+}
+
+func TestAppendInputTokensTotalForLogUsesTrustedNormalizedUsage(t *testing.T) {
+	rawOpenAIUsage := &dto.Usage{BillingUsage: dto.NewOpenAIChatBillingUsage(&dto.Usage{
+		PromptTokens: 210,
+		InputTokens:  210,
+	})}
+	openAIUsage := effectiveBillingUsage(rawOpenAIUsage)
+	require.NotNil(t, openAIUsage)
+	messagesUsage := effectiveBillingUsage(&dto.Usage{BillingUsage: dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
+		InputTokens:              100,
+		CacheReadInputTokens:     80,
+		CacheCreationInputTokens: 30,
+	})})
+	require.NotNil(t, messagesUsage)
+	trustedZeroUsage := effectiveBillingUsage(&dto.Usage{BillingUsage: dto.NewOpenAIResponsesBillingUsage(&dto.Usage{
+		OutputTokens: 1,
+	})})
+	require.NotNil(t, trustedZeroUsage)
+	estimatedBillingUsage := dto.NewOpenAIResponsesBillingUsage(&dto.Usage{
+		InputTokens:  210,
+		OutputTokens: 1,
+	})
+	require.NotNil(t, estimatedBillingUsage)
+	estimatedBillingUsage.Estimated = true
+	estimatedUsage := effectiveBillingUsage(&dto.Usage{BillingUsage: estimatedBillingUsage})
+	require.NotNil(t, estimatedUsage)
+	negativeUsage := *openAIUsage
+	negativeUsage.InputTokens = -1
+	geminiUsage := effectiveBillingUsage(&dto.Usage{BillingUsage: dto.NewGeminiChatBillingUsage(&dto.GeminiUsageMetadata{
+		PromptTokenCount: 210,
+	})})
+	require.NotNil(t, geminiUsage)
+
+	tests := []struct {
+		name      string
+		usage     *dto.Usage
+		wantValue int
+		wantField bool
+	}{
+		{name: "missing usage", wantField: false},
+		{name: "untrusted top-level usage", usage: &dto.Usage{InputTokens: 210}, wantField: false},
+		{name: "spoofed usage source", usage: &dto.Usage{InputTokens: 210, UsageSource: dto.BillingUsageSourceOAIChat}, wantField: false},
+		{name: "billing usage must be effective", usage: rawOpenAIUsage, wantField: false},
+		{name: "openai trusted total", usage: openAIUsage, wantValue: 210, wantField: true},
+		{name: "messages trusted total", usage: messagesUsage, wantValue: 210, wantField: true},
+		{name: "trusted zero total", usage: trustedZeroUsage, wantValue: 0, wantField: true},
+		{name: "estimated total is not explicit", usage: estimatedUsage, wantField: false},
+		{name: "invalid negative total", usage: &negativeUsage, wantField: false},
+		{name: "gemini has no normalized input contract", usage: geminiUsage, wantField: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			other := map[string]interface{}{}
+
+			appendInputTokensTotalForLog(other, tt.usage)
+
+			value, ok := other["input_tokens_total"]
+			require.Equal(t, tt.wantField, ok)
+			if tt.wantField {
+				require.Equal(t, tt.wantValue, value)
+			}
+		})
+	}
 }
