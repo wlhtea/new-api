@@ -413,7 +413,12 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	if clientModel == "" {
 		clientModel = info.UpstreamModelName
 	}
-	state := &responseTransformState{model: clientModel, protocol: protocol, namespaceTools: a.namespaceTools}
+	state := &responseTransformState{
+		model:                clientModel,
+		protocol:             protocol,
+		namespaceTools:       a.namespaceTools,
+		estimatedInputTokens: info.GetEstimatePromptTokens(),
+	}
 	if err := prepareResponseForRelay(resp, state, info.IsStream && !a.bufferClaudeToolCall); err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
 	}

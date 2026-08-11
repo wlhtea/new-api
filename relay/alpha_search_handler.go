@@ -116,8 +116,7 @@ func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError
 	}
 
 	usage := &dto.Usage{}
-	service.PostTextConsumeQuota(c, info, usage, nil)
-	return nil
+	return service.PostTextConsumeQuota(c, info, usage, nil)
 }
 
 // buildAlphaSearchRequestBody returns RawBody unchanged unless the model was

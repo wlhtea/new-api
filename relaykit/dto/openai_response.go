@@ -224,6 +224,7 @@ type Usage struct {
 	PromptTokens         int           `json:"prompt_tokens"`
 	CompletionTokens     int           `json:"completion_tokens"`
 	TotalTokens          int           `json:"total_tokens"`
+	CachedTokens         int           `json:"cached_tokens,omitempty"`
 	PromptCacheHitTokens int           `json:"prompt_cache_hit_tokens,omitempty"`
 	UsageSemantic        string        `json:"-"`
 	UsageSource          string        `json:"-"`
@@ -264,6 +265,22 @@ type InputTokenDetails struct {
 	TextTokens       int `json:"text_tokens"`
 	AudioTokens      int `json:"audio_tokens"`
 	ImageTokens      int `json:"image_tokens"`
+}
+
+func (d *InputTokenDetails) UnmarshalJSON(data []byte) error {
+	type inputTokenDetailsAlias InputTokenDetails
+	decoded := struct {
+		inputTokenDetailsAlias
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	}{}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*d = InputTokenDetails(decoded.inputTokenDetailsAlias)
+	if decoded.CacheCreationInputTokens > d.CachedCreationTokens {
+		d.CachedCreationTokens = decoded.CacheCreationInputTokens
+	}
+	return nil
 }
 
 // CacheCreationTokensTotal returns the cache-write token count regardless of

@@ -38,6 +38,12 @@ func RelayMidjourneyImage(c *gin.Context) {
 	var httpClient *http.Client
 	var proxy string
 	if channel, err := model.CacheGetChannel(midjourneyTask.ChannelId); err == nil {
+		if !model.ChannelTypeSupportsRequestPath(channel.Type, c.Request.URL.Path) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "task_channel_unsupported_endpoint",
+			})
+			return
+		}
 		proxy = channel.GetSetting().Proxy
 		if proxy != "" {
 			if httpClient, err = service.GetHttpClientWithProxy(proxy); err != nil {
@@ -306,6 +312,9 @@ func RelayMidjourneyTaskImageSeed(c *gin.Context) *dto.MidjourneyResponse {
 	if channel.Status != common.ChannelStatusEnabled {
 		return service.MidjourneyErrorWrapper(constant.MjRequestError, "该任务所属渠道已被禁用")
 	}
+	if !model.ChannelTypeSupportsRequestPath(channel.Type, c.Request.URL.Path) {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, "该任务所属渠道不支持当前接口")
+	}
 	c.Set("channel_id", originTask.ChannelId)
 	c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", channel.Key))
 
@@ -479,6 +488,9 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 			}
 			if channel.Status != common.ChannelStatusEnabled {
 				return service.MidjourneyErrorWrapper(constant.MjRequestError, "该任务所属渠道已被禁用")
+			}
+			if !model.ChannelTypeSupportsRequestPath(channel.Type, c.Request.URL.Path) {
+				return service.MidjourneyErrorWrapper(constant.MjRequestError, "该任务所属渠道不支持当前接口")
 			}
 			c.Set("base_url", channel.GetBaseURL())
 			c.Set("channel_id", originTask.ChannelId)

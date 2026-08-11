@@ -81,6 +81,7 @@ func HasOpenAIUsageTokens(usage *Usage) bool {
 		usage.TotalTokens != 0 ||
 		usage.InputTokens != 0 ||
 		usage.OutputTokens != 0 ||
+		usage.CachedTokens != 0 ||
 		usage.PromptCacheHitTokens != 0 ||
 		usage.ClaudeCacheCreation5mTokens != 0 ||
 		usage.ClaudeCacheCreation1hTokens != 0 {

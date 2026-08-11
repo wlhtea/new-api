@@ -793,15 +793,8 @@ export function useCommonLogsColumns(isAdmin: boolean): ColumnDef<UsageLog>[] {
             </span>
             {(cacheReadTokens > 0 || cacheWriteTokens > 0) && (
               <div className='flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px]'>
-                {cacheReadTokens > 0 && tokenBreakdown.hasExplicitTotal && (
-                  <span className='text-muted-foreground/60'>
-                    {t('Total Input Tokens')}{' '}
-                    {tokenBreakdown.totalInputTokens.toLocaleString()}
-                  </span>
-                )}
                 {cacheReadTokens > 0 && (
                   <span className='text-muted-foreground/60'>
-                    {tokenBreakdown.hasExplicitTotal && '· '}
                     {t('Cache')}↓ {cacheReadTokens.toLocaleString()}
                   </span>
                 )}

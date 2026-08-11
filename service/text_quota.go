@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 	"math"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -23,6 +24,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 )
+
+var scheduleTextRelaySuccessSample = func(relayInfo *relaycommon.RelayInfo, completionTokens int) {
+	gopool.Go(func() {
+		perfmetrics.RecordRelaySample(relayInfo, true, int64(completionTokens))
+	})
+}
 
 // ToolSurchargeItem is one billable tool-call line for consume logs.
 type ToolSurchargeItem struct {
@@ -426,7 +433,7 @@ func usageSemanticFromUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) 
 	return "openai"
 }
 
-func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []string) {
+func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []string) *types.NewAPIError {
 	originUsage := usage
 	billingUsage := effectiveBillingUsage(usage)
 	if usage == nil {
@@ -472,16 +479,29 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		extraContent = append(extraContent, fmt.Sprintf("Audio Input 花费 %s", logger.LogQuota(common.QuotaFromDecimal(q))))
 	}
 
+	settlementStage := BillingSettlementStage("")
+	if err := SettleBilling(ctx, relayInfo, summary.Quota); err != nil {
+		stage, classified := BillingSettlementStageFromError(err)
+		if !classified || stage != BillingSettlementStageTokenQuota {
+			logger.LogError(ctx, "error settling billing before funding commit: "+err.Error())
+			return types.NewErrorWithStatusCode(
+				fmt.Errorf("text billing settlement failed: %w", err),
+				types.ErrorCodeBillingSettlementFailed,
+				http.StatusInternalServerError,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		settlementStage = stage
+		logger.LogError(ctx, "billing settlement degraded after funding commit: "+err.Error())
+		extraContent = append(extraContent, "资金结算已提交，令牌额度调整失败")
+	}
+
 	if !summary.hasBillableUsage() {
 		extraContent = append(extraContent, "上游没有返回计费信息，无法扣费（可能是上游超时）")
 		logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, summary.ModelName, relayInfo.FinalPreConsumedQuota))
 	} else {
 		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, summary.Quota)
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, summary.Quota)
-	}
-
-	if err := SettleBilling(ctx, relayInfo, summary.Quota); err != nil {
-		logger.LogError(ctx, "error settling billing: "+err.Error())
 	}
 
 	logModel := summary.ModelName
@@ -511,6 +531,10 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	appendUsageBillingPathForLog(other, common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens), originUsage)
 	if adminRejectReason != "" {
 		other["reject_reason"] = adminRejectReason
+	}
+	if settlementStage != "" {
+		other["billing_settlement_degraded"] = true
+		other["billing_settlement_stage"] = string(settlementStage)
 	}
 	if summary.ImageTokens != 0 {
 		other["image"] = true
@@ -566,7 +590,6 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
 	})
-	gopool.Go(func() {
-		perfmetrics.RecordRelaySample(relayInfo, true, int64(summary.CompletionTokens))
-	})
+	scheduleTextRelaySuccessSample(relayInfo, summary.CompletionTokens)
+	return nil
 }

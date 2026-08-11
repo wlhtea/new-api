@@ -25,15 +25,17 @@ type normalizedCostUsage struct {
 }
 
 type responseTransformState struct {
-	model                    string
-	protocol                 Protocol
-	namespaceTools           map[string]openCodeGoNamespaceTool
-	sawStandardUsage         bool
-	sawPositiveStandardUsage bool
-	sawStandardInputField    bool
-	sawFallbackInputField    bool
-	standardUsageCategories  responseUsageCategoryPresence
-	fallbackUsage            *normalizedCostUsage
+	model                     string
+	protocol                  Protocol
+	namespaceTools            map[string]openCodeGoNamespaceTool
+	estimatedInputTokens      int
+	sawStandardUsage          bool
+	sawPositiveStandardUsage  bool
+	sawStandardInputField     bool
+	sawFallbackInputField     bool
+	emittedSyntheticChatUsage bool
+	standardUsageCategories   responseUsageCategoryPresence
+	fallbackUsage             *normalizedCostUsage
 }
 
 func prepareResponseForRelay(resp *http.Response, state *responseTransformState, stream bool) error {
@@ -131,8 +133,10 @@ func (s *responseTransformState) transformJSON(data []byte, stream bool) []byte 
 		return data
 	}
 	if isCostExtension(data) {
-		s.captureFallbackUsage(data)
-		if stream && s.protocol == ProtocolChat && !s.sawStandardUsage && s.fallbackUsage != nil {
+		capturedFallback := s.captureFallbackUsage(data)
+		if stream && s.protocol == ProtocolChat && !s.sawStandardUsage && !s.emittedSyntheticChatUsage &&
+			capturedFallback && s.sawFallbackInputField {
+			s.emittedSyntheticChatUsage = true
 			return s.standardChatUsageFrame()
 		}
 		if stream {
@@ -206,8 +210,20 @@ func isCostExtension(data []byte) bool {
 	if strings.EqualFold(gjson.GetBytes(data, "x-opencode-type").String(), "inference-cost") {
 		return true
 	}
-	return strings.EqualFold(gjson.GetBytes(data, "type").String(), "ping") &&
-		gjson.GetBytes(data, "cost").Exists()
+	if strings.EqualFold(gjson.GetBytes(data, "type").String(), "ping") &&
+		gjson.GetBytes(data, "cost").Exists() {
+		return true
+	}
+
+	// OpenCode's oa-compatible endpoint appends a bare Chat trailer after the
+	// provider usage chunk: {"choices":[],"cost":"..."}.
+	choices := gjson.GetBytes(data, "choices")
+	return gjson.GetBytes(data, "cost").Exists() &&
+		choices.IsArray() && len(choices.Array()) == 0 &&
+		!hasStandardUsage(data) &&
+		!gjson.GetBytes(data, "id").Exists() &&
+		!gjson.GetBytes(data, "object").Exists() &&
+		!gjson.GetBytes(data, "model").Exists()
 }
 
 func hasStandardUsage(data []byte) bool {
@@ -223,10 +239,10 @@ func hasStandardUsage(data []byte) bool {
 func hasPositiveStandardUsage(data []byte) bool {
 	usagePaths := []string{"usage", "message.usage", "response.usage"}
 	tokenPaths := []string{
-		"prompt_tokens", "input_tokens", "completion_tokens", "output_tokens", "prompt_cache_hit_tokens",
+		"prompt_tokens", "input_tokens", "completion_tokens", "output_tokens", "cached_tokens", "prompt_cache_hit_tokens",
 		"cache_read_input_tokens", "cache_creation_input_tokens",
-		"prompt_tokens_details.cached_tokens", "prompt_tokens_details.cached_creation_tokens", "prompt_tokens_details.cache_write_tokens",
-		"input_tokens_details.cached_tokens", "input_tokens_details.cached_creation_tokens", "input_tokens_details.cache_write_tokens",
+		"prompt_tokens_details.cached_tokens", "prompt_tokens_details.cached_creation_tokens", "prompt_tokens_details.cache_creation_input_tokens", "prompt_tokens_details.cache_write_tokens",
+		"input_tokens_details.cached_tokens", "input_tokens_details.cached_creation_tokens", "input_tokens_details.cache_creation_input_tokens", "input_tokens_details.cache_write_tokens",
 		"completion_tokens_details.reasoning_tokens", "output_tokens_details.reasoning_tokens",
 		"prompt_tokens_details.text_tokens", "prompt_tokens_details.audio_tokens", "prompt_tokens_details.image_tokens",
 		"input_tokens_details.text_tokens", "input_tokens_details.audio_tokens", "input_tokens_details.image_tokens",
@@ -302,10 +318,10 @@ func (s *responseTransformState) capturePositiveStandardUsageCategories(data []b
 		s.standardUsageCategories.output = s.standardUsageCategories.output || hasPositiveTokenField(data, usagePath,
 			"completion_tokens", "output_tokens")
 		s.standardUsageCategories.cacheRead = s.standardUsageCategories.cacheRead || hasPositiveTokenField(data, usagePath,
-			"prompt_cache_hit_tokens", "cache_read_input_tokens", "prompt_tokens_details.cached_tokens", "input_tokens_details.cached_tokens")
+			"cached_tokens", "prompt_cache_hit_tokens", "cache_read_input_tokens", "prompt_tokens_details.cached_tokens", "input_tokens_details.cached_tokens")
 		s.standardUsageCategories.cacheWrite = s.standardUsageCategories.cacheWrite || hasPositiveTokenField(data, usagePath,
-			"cache_creation_input_tokens", "prompt_tokens_details.cached_creation_tokens", "prompt_tokens_details.cache_write_tokens",
-			"input_tokens_details.cached_creation_tokens", "input_tokens_details.cache_write_tokens")
+			"cache_creation_input_tokens", "prompt_tokens_details.cached_creation_tokens", "prompt_tokens_details.cache_creation_input_tokens", "prompt_tokens_details.cache_write_tokens",
+			"input_tokens_details.cached_creation_tokens", "input_tokens_details.cache_creation_input_tokens", "input_tokens_details.cache_write_tokens")
 		s.standardUsageCategories.cacheWrite5m = s.standardUsageCategories.cacheWrite5m || hasPositiveTokenField(data, usagePath,
 			"cache_creation.ephemeral_5m_input_tokens", "claude_cache_creation_5_m_tokens")
 		s.standardUsageCategories.cacheWrite1h = s.standardUsageCategories.cacheWrite1h || hasPositiveTokenField(data, usagePath,
@@ -363,27 +379,30 @@ func normalizeResponseModel(data []byte, model string) []byte {
 	return data
 }
 
-func (s *responseTransformState) captureFallbackUsage(data []byte) {
+func (s *responseTransformState) captureFallbackUsage(data []byte) bool {
 	raw := gjson.GetBytes(data, "normalizedUsage")
 	if !raw.Exists() || !raw.IsObject() {
-		return
+		return false
 	}
 	inputField := raw.Get("inputTokens")
 	hasInputField := inputField.Type == gjson.Number && inputField.Float() >= 0
 	var usage normalizedCostUsage
 	if err := common.Unmarshal([]byte(raw.Raw), &usage); err != nil {
-		return
+		return false
 	}
 	if usage.InputTokens < 0 || usage.OutputTokens < 0 || usage.ReasoningTokens < 0 || usage.CacheReadTokens < 0 ||
 		usage.CacheWrite5mTokens < 0 || usage.CacheWrite1hTokens < 0 {
-		return
+		return false
 	}
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.ReasoningTokens == 0 && usage.CacheReadTokens == 0 &&
+	// An explicit zero input is authoritative and must not be replaced by a
+	// request-side estimate, even when every normalized category is zero.
+	if !hasInputField && usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.ReasoningTokens == 0 && usage.CacheReadTokens == 0 &&
 		usage.CacheWrite5mTokens == 0 && usage.CacheWrite1hTokens == 0 {
-		return
+		return false
 	}
 	s.fallbackUsage = &usage
 	s.sawFallbackInputField = hasInputField
+	return true
 }
 
 func (s *responseTransformState) standardChatUsageFrame() []byte {
@@ -428,6 +447,12 @@ func finalizeResponseUsage(usage any, state *responseTransformState) any {
 	var fallback *responseUsageSnapshot
 	if state != nil && state.fallbackUsage != nil {
 		candidate := responseUsageSnapshotFromCost(protocol, state.fallbackUsage)
+		if !state.sawFallbackInputField {
+			// For Chat and Responses, the cost snapshot normally adds cache
+			// categories to inputTokens. Without that field the sum is only a
+			// partial input and must not suppress a request-side estimate.
+			candidate.input = 0
+		}
 		fallback = &candidate
 	}
 	var parsedSnapshot *responseUsageSnapshot
@@ -446,8 +471,9 @@ func finalizeResponseUsage(usage any, state *responseTransformState) any {
 
 	reconciled := mergeResponseUsageSnapshots(standard, fallback)
 	estimated := state == nil && parsed != nil && parsed.BillingUsage != nil && parsed.BillingUsage.Estimated
-	if state != nil && parsedSnapshot != nil && responseUsageSnapshotNeedsLocalFallback(reconciled, *parsedSnapshot) {
-		fillResponseUsageDetailGaps(&reconciled, parsedSnapshot, true)
+	localFallback := localResponseUsageFallback(protocol, state, parsedSnapshot, reconciled)
+	if localFallback != nil && responseUsageSnapshotNeedsLocalFallback(reconciled, *localFallback) {
+		fillResponseUsageDetailGaps(&reconciled, localFallback, true)
 		estimated = true
 	}
 	result := finalizeUsageSnapshot(protocol, reconciled, parsed)
@@ -458,6 +484,39 @@ func finalizeResponseUsage(usage any, state *responseTransformState) any {
 		result.BillingUsage.Estimated = estimated
 	}
 	return result
+}
+
+func localResponseUsageFallback(
+	protocol Protocol,
+	state *responseTransformState,
+	parsed *responseUsageSnapshot,
+	provider responseUsageSnapshot,
+) *responseUsageSnapshot {
+	if parsed == nil && state == nil {
+		return nil
+	}
+	local := responseUsageSnapshot{}
+	if parsed != nil {
+		local = *parsed
+	}
+	if state == nil {
+		return &local
+	}
+	if state.sawStandardInputField || state.sawFallbackInputField {
+		local.input = 0
+		return &local
+	}
+	estimatedInput := nonNegativeTokens(state.estimatedInputTokens)
+	if estimatedInput > 0 || local.input == 0 {
+		local.input = estimatedInput
+	}
+	if protocol == ProtocolMessages {
+		// Request-side estimates represent the full prompt. Messages billing
+		// stores uncached input separately, so remove provider-reported cache
+		// categories before using the estimate as an input fallback.
+		local.input = nonNegativeTokens(local.input - provider.cacheRead - provider.cacheWrite)
+	}
+	return &local
 }
 
 // responseUsageSnapshotNeedsLocalFallback distinguishes handler-generated token
@@ -672,6 +731,9 @@ func responseUsageSnapshotFromOpenAIUsage(protocol Protocol, usage *dto.Usage) r
 
 func canonicalInputTokenDetails(protocol Protocol, usage *dto.Usage) dto.InputTokenDetails {
 	details := normalizeInputTokenDetails(usage.PromptTokensDetails)
+	if details.CachedTokens == 0 {
+		details.CachedTokens = nonNegativeTokens(usage.CachedTokens)
+	}
 	if details.CachedTokens == 0 {
 		details.CachedTokens = nonNegativeTokens(usage.PromptCacheHitTokens)
 	}

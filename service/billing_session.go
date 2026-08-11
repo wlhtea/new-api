@@ -40,6 +40,59 @@ type BillingSession struct {
 	mu               sync.Mutex
 }
 
+// BillingSettlementStage identifies the last durable side effect reached by
+// BillingSession.Settle when it returns an error.
+type BillingSettlementStage string
+
+const (
+	BillingSettlementStageFunding    BillingSettlementStage = "funding"
+	BillingSettlementStageTokenQuota BillingSettlementStage = "token_quota"
+)
+
+// BillingSettlementError distinguishes a refundable funding failure from a
+// token-quota adjustment failure after the funding source has already committed.
+type BillingSettlementError struct {
+	stage BillingSettlementStage
+	err   error
+}
+
+func newBillingSettlementError(stage BillingSettlementStage, err error) *BillingSettlementError {
+	return &BillingSettlementError{stage: stage, err: err}
+}
+
+func (e *BillingSettlementError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("billing settlement failed at %s: %v", e.stage, e.err)
+}
+
+func (e *BillingSettlementError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (e *BillingSettlementError) Stage() BillingSettlementStage {
+	if e == nil {
+		return ""
+	}
+	return e.stage
+}
+
+func (e *BillingSettlementError) FundingCommitted() bool {
+	return e != nil && e.stage == BillingSettlementStageTokenQuota
+}
+
+func BillingSettlementStageFromError(err error) (BillingSettlementStage, bool) {
+	var settlementErr *BillingSettlementError
+	if !errors.As(err, &settlementErr) {
+		return "", false
+	}
+	return settlementErr.Stage(), true
+}
+
 // DurableTaskBillingPlan is a mutation-free funding decision used to create
 // the immutable model.TaskBillingAttempt before synchronous preconsume.
 type DurableTaskBillingPlan struct {
@@ -85,7 +138,7 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	// 1) 调整资金来源（仅在尚未提交时执行，防止重复调用）
 	if !s.fundingSettled {
 		if err := s.funding.Settle(delta); err != nil {
-			return err
+			return newBillingSettlementError(BillingSettlementStageFunding, err)
 		}
 		s.fundingSettled = true
 	}
@@ -108,7 +161,10 @@ func (s *BillingSession) Settle(actualQuota int) error {
 		s.relayInfo.SubscriptionPostDelta += int64(delta)
 	}
 	s.settled = true
-	return tokenErr
+	if tokenErr != nil {
+		return newBillingSettlementError(BillingSettlementStageTokenQuota, tokenErr)
+	}
+	return nil
 }
 
 // Refund 退还所有预扣费，幂等安全，异步执行。

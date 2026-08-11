@@ -811,6 +811,7 @@ type responseUsageVector struct {
 	textInput       int
 	textOutput      int
 	openAIInput     int
+	zeroOpenAIInput bool
 }
 
 func (v responseUsageVector) cacheWrite() int {
@@ -826,6 +827,9 @@ func (v responseUsageVector) normalizedInput() int {
 }
 
 func (v responseUsageVector) nativeOpenAIInput() int {
+	if v.zeroOpenAIInput {
+		return 0
+	}
 	if v.openAIInput > 0 {
 		return v.openAIInput
 	}
@@ -1235,7 +1239,7 @@ func TestFinalizeResponseUsageReconcilesStandardAndCostByCategory(t *testing.T) 
 		{name: "cost only", cost: true, want: fallback},
 		{name: "standard before cost", standard: &fallback, parsed: nativeResponseUsage(ProtocolChat, fallback), cost: true, standardFirst: true, want: fallback},
 		{name: "cost before standard", standard: &fallback, parsed: nativeResponseUsage(ProtocolChat, fallback), cost: true, want: fallback},
-		{name: "zero standard does not preserve local estimate", standard: &zero, parsed: &dto.Usage{PromptTokens: 999, CompletionTokens: 999, TotalTokens: 1998}, cost: true, standardFirst: true, want: fallback},
+		{name: "positive cost fills zero standard input", standard: &zero, parsed: &dto.Usage{PromptTokens: 999, CompletionTokens: 999, TotalTokens: 1998}, cost: true, standardFirst: true, want: fallback},
 		{name: "partial standard is completed by cost", standard: &partial, parsed: nativeResponseUsage(ProtocolChat, partial), cost: true, standardFirst: true, want: responseUsageVector{input: 110, openAIInput: 110, cacheRead: 80, cacheWrite5m: 20, cacheWrite1h: 10, output: 40, reasoning: 17}},
 		{name: "positive standard fields win conflicts", standard: &conflict, parsed: nativeResponseUsage(ProtocolChat, conflict), cost: true, standardFirst: true, want: conflict},
 	}
@@ -1247,7 +1251,7 @@ func TestFinalizeResponseUsageReconcilesStandardAndCostByCategory(t *testing.T) 
 				var parsed *dto.Usage
 				if test.standard != nil {
 					parsed = nativeResponseUsage(protocol, *test.standard)
-					if test.name == "zero standard does not preserve local estimate" {
+					if test.name == "positive cost fills zero standard input" {
 						parsed = test.parsed
 					}
 				}

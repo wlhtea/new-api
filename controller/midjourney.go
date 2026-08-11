@@ -100,6 +100,10 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 			}
 			continue
 		}
+		if !model.ChannelTypeSupportsRequestPath(midjourneyChannel.Type, "/mj/task/list-by-condition") {
+			logger.LogError(ctx, fmt.Sprintf("Channel #%d does not support Midjourney task polling", channelId))
+			continue
+		}
 		requestUrl := fmt.Sprintf("%s/mj/task/list-by-condition", *midjourneyChannel.BaseURL)
 
 		body, err := common.Marshal(map[string]any{

@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http/httptest"
 	"testing"
@@ -1323,6 +1324,100 @@ func (s *quotaConsistencyBillingSettler) GetPreConsumedQuota() int { return 0 }
 
 func (s *quotaConsistencyBillingSettler) Reserve(int) error { return nil }
 
+type settlementBoundaryFunding struct {
+	settleErr    error
+	settleCalls  int
+	settledDelta int
+	refundCalls  int
+}
+
+func (*settlementBoundaryFunding) Source() string { return BillingSourceWallet }
+
+func (*settlementBoundaryFunding) PreConsume(int) error { return nil }
+
+func (f *settlementBoundaryFunding) Settle(delta int) error {
+	f.settleCalls++
+	f.settledDelta = delta
+	return f.settleErr
+}
+
+func (f *settlementBoundaryFunding) Refund() error {
+	f.refundCalls++
+	return nil
+}
+
+func settlementBoundaryUsage() *dto.Usage {
+	return &dto.Usage{
+		PromptTokens:     210,
+		CompletionTokens: 40,
+		TotalTokens:      250,
+		InputTokens:      210,
+		UsageSemantic:    dto.BillingUsageSemanticOpenAI,
+		UsageSource:      dto.BillingUsageSourceOAIChat,
+		PromptTokensDetails: dto.InputTokenDetails{
+			CachedTokens:     80,
+			CacheWriteTokens: 30,
+		},
+	}
+}
+
+func settlementBoundaryRelayInfo(
+	userID int,
+	channelID int,
+	tokenID int,
+	tokenKey string,
+	funding FundingSource,
+) (*relaycommon.RelayInfo, *BillingSession) {
+	relayInfo := &relaycommon.RelayInfo{
+		UserId:                userID,
+		TokenId:               tokenID,
+		TokenKey:              tokenKey,
+		OriginModelName:       "usage-accounting-model",
+		StartTime:             time.Now(),
+		PriceData:             usageAccountingPriceData(false),
+		BillingSource:         BillingSourceWallet,
+		FinalPreConsumedQuota: 50,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: channelID,
+		},
+	}
+	session := &BillingSession{
+		relayInfo:        relayInfo,
+		funding:          funding,
+		preConsumedQuota: 50,
+		tokenConsumed:    50,
+	}
+	relayInfo.Billing = session
+	return relayInfo, session
+}
+
+func settlementBoundaryNoSessionToolRelayInfo(userID, channelID, tokenID int, tokenKey string) *relaycommon.RelayInfo {
+	return &relaycommon.RelayInfo{
+		UserId:          userID,
+		TokenId:         tokenID,
+		TokenKey:        tokenKey,
+		OriginModelName: "free-tool-surcharge-model",
+		StartTime:       time.Now(),
+		BillingSource:   BillingSourceWallet,
+		PriceData: hosttypes.PriceData{
+			FreeModel:       true,
+			UsePrice:        true,
+			ModelPrice:      0,
+			CompletionRatio: 1,
+			GroupRatioInfo:  hosttypes.GroupRatioInfo{GroupRatio: 1},
+		},
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+			BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+				dto.BuildInToolWebSearchPreview: {
+					ToolName:  dto.BuildInToolWebSearchPreview,
+					CallCount: 1,
+				},
+			},
+		},
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channelID},
+	}
+}
+
 func TestPostTextConsumeQuotaKeepsCacheOnlySettlementConsistent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	truncate(t)
@@ -1378,7 +1473,7 @@ func TestPostTextConsumeQuotaKeepsCacheOnlySettlementConsistent(t *testing.T) {
 				},
 			})}
 
-			PostTextConsumeQuota(ctx, relayInfo, usage, nil)
+			require.Nil(t, PostTextConsumeQuota(ctx, relayInfo, usage, nil))
 
 			assert.Equal(t, 1, settler.settleCalls)
 			assert.Equal(t, tt.want, settler.settledQuota)
@@ -1409,6 +1504,347 @@ func TestPostTextConsumeQuotaKeepsCacheOnlySettlementConsistent(t *testing.T) {
 			assert.Equal(t, 30, cacheWriteTokens)
 		})
 	}
+}
+
+func TestPostTextConsumeQuotaFundingFailureHasNoSuccessSideEffects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	truncate(t)
+
+	const (
+		userID    = 98201
+		channelID = 98202
+	)
+	seedUser(t, userID, 1_000_000)
+	seedChannel(t, channelID)
+
+	fundingErr := errors.New("forced funding settlement failure")
+	funding := &settlementBoundaryFunding{settleErr: fundingErr}
+	relayInfo, session := settlementBoundaryRelayInfo(userID, channelID, 0, "", funding)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("username", "settlement_failure_user")
+
+	originalScheduler := scheduleTextRelaySuccessSample
+	successSamples := 0
+	scheduleTextRelaySuccessSample = func(*relaycommon.RelayInfo, int) {
+		successSamples++
+	}
+	t.Cleanup(func() { scheduleTextRelaySuccessSample = originalScheduler })
+
+	apiErr := PostTextConsumeQuota(ctx, relayInfo, settlementBoundaryUsage(), nil)
+
+	require.NotNil(t, apiErr)
+	assert.Equal(t, types.ErrorCodeBillingSettlementFailed, apiErr.GetErrorCode())
+	assert.True(t, types.IsSkipRetryError(apiErr))
+	assert.ErrorIs(t, apiErr, fundingErr)
+	stage, classified := BillingSettlementStageFromError(apiErr)
+	require.True(t, classified)
+	assert.Equal(t, BillingSettlementStageFunding, stage)
+	var typedErr *BillingSettlementError
+	require.ErrorAs(t, apiErr, &typedErr)
+	assert.False(t, typedErr.FundingCommitted())
+	assert.True(t, session.NeedsRefund())
+	assert.Equal(t, 1, funding.settleCalls)
+	assert.Equal(t, 210, funding.settledDelta)
+	assert.Zero(t, funding.refundCalls)
+	assert.Zero(t, successSamples)
+
+	var user model.User
+	require.NoError(t, model.DB.First(&user, userID).Error)
+	assert.Zero(t, user.UsedQuota)
+	assert.Zero(t, user.RequestCount)
+
+	var channel model.Channel
+	require.NoError(t, model.DB.First(&channel, channelID).Error)
+	assert.Zero(t, channel.UsedQuota)
+
+	var logs []model.Log
+	require.NoError(t, model.LOG_DB.Where("user_id = ?", userID).Find(&logs).Error)
+	assert.Empty(t, logs)
+}
+
+func TestPostTextConsumeQuotaTokenFailureRecordsCommittedFundingDegradation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	truncate(t)
+
+	const (
+		userID    = 98301
+		channelID = 98302
+		tokenID   = 98303
+		tokenKey  = "sk-settlement-degraded"
+	)
+	seedUser(t, userID, 1_000_000)
+	seedChannel(t, channelID)
+	seedToken(t, tokenID, userID, tokenKey, 999_950)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", 50).Error)
+	require.NoError(t, model.DB.Exec(`
+		CREATE TRIGGER fail_text_settlement_token_update
+		BEFORE UPDATE ON tokens
+		WHEN OLD.id = 98303
+		BEGIN
+			SELECT RAISE(FAIL, 'forced token quota adjustment failure');
+		END
+	`).Error)
+	t.Cleanup(func() {
+		model.DB.Exec("DROP TRIGGER IF EXISTS fail_text_settlement_token_update")
+	})
+
+	funding := &settlementBoundaryFunding{}
+	relayInfo, session := settlementBoundaryRelayInfo(userID, channelID, tokenID, tokenKey, funding)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("username", "settlement_degraded_user")
+
+	originalScheduler := scheduleTextRelaySuccessSample
+	successSamples := 0
+	sampledCompletionTokens := 0
+	scheduleTextRelaySuccessSample = func(_ *relaycommon.RelayInfo, completionTokens int) {
+		successSamples++
+		sampledCompletionTokens = completionTokens
+	}
+	t.Cleanup(func() { scheduleTextRelaySuccessSample = originalScheduler })
+
+	apiErr := PostTextConsumeQuota(ctx, relayInfo, settlementBoundaryUsage(), nil)
+
+	require.Nil(t, apiErr)
+	assert.Equal(t, 1, funding.settleCalls)
+	assert.Equal(t, 210, funding.settledDelta)
+	assert.True(t, session.fundingSettled)
+	assert.True(t, session.settled)
+	assert.False(t, session.NeedsRefund())
+	assert.Zero(t, funding.refundCalls)
+	assert.Equal(t, 1, successSamples)
+	assert.Equal(t, 40, sampledCompletionTokens)
+
+	var user model.User
+	require.NoError(t, model.DB.First(&user, userID).Error)
+	assert.Equal(t, 260, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+
+	var channel model.Channel
+	require.NoError(t, model.DB.First(&channel, channelID).Error)
+	assert.Equal(t, int64(260), channel.UsedQuota)
+
+	var token model.Token
+	require.NoError(t, model.DB.First(&token, tokenID).Error)
+	assert.Equal(t, 999_950, token.RemainQuota)
+	assert.Equal(t, 50, token.UsedQuota)
+
+	var logs []model.Log
+	require.NoError(t, model.LOG_DB.Where("user_id = ?", userID).Find(&logs).Error)
+	require.Len(t, logs, 1)
+	assert.Equal(t, 260, logs[0].Quota)
+	assert.Contains(t, logs[0].Content, "资金结算已提交，令牌额度调整失败")
+
+	var other map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(logs[0].Other), &other))
+	assert.JSONEq(t, `true`, string(other["billing_settlement_degraded"]))
+	assert.JSONEq(t, `"token_quota"`, string(other["billing_settlement_stage"]))
+}
+
+func TestPostTextConsumeQuotaLegacyFallbackFundingFailureHasNoSuccessSideEffects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	truncate(t)
+
+	const (
+		userID       = 98401
+		channelID    = 98402
+		tokenID      = 98403
+		tokenKey     = "sk-legacy-funding-failure"
+		initialQuota = 1_000_000
+	)
+	seedUser(t, userID, initialQuota)
+	seedChannel(t, channelID)
+	seedToken(t, tokenID, userID, tokenKey, initialQuota)
+	require.NoError(t, model.DB.Exec(`
+		CREATE TRIGGER fail_legacy_text_funding_update
+		BEFORE UPDATE OF quota ON users
+		WHEN OLD.id = 98401
+		BEGIN
+			SELECT RAISE(FAIL, 'forced legacy funding settlement failure');
+		END
+	`).Error)
+	t.Cleanup(func() {
+		model.DB.Exec("DROP TRIGGER IF EXISTS fail_legacy_text_funding_update")
+	})
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("username", "legacy_funding_failure_user")
+	relayInfo := settlementBoundaryNoSessionToolRelayInfo(userID, channelID, tokenID, tokenKey)
+	usage := &dto.Usage{}
+	expectedQuota := calculateTextQuotaSummary(ctx, relayInfo, usage).Quota
+	require.Positive(t, expectedQuota)
+	require.Nil(t, relayInfo.Billing)
+	require.True(t, relayInfo.PriceData.FreeModel)
+
+	originalScheduler := scheduleTextRelaySuccessSample
+	successSamples := 0
+	scheduleTextRelaySuccessSample = func(*relaycommon.RelayInfo, int) {
+		successSamples++
+	}
+	t.Cleanup(func() { scheduleTextRelaySuccessSample = originalScheduler })
+
+	apiErr := PostTextConsumeQuota(ctx, relayInfo, usage, nil)
+
+	require.NotNil(t, apiErr)
+	assert.Equal(t, types.ErrorCodeBillingSettlementFailed, apiErr.GetErrorCode())
+	assert.True(t, types.IsSkipRetryError(apiErr))
+	assert.ErrorContains(t, apiErr, "forced legacy funding settlement failure")
+	stage, classified := BillingSettlementStageFromError(apiErr)
+	require.True(t, classified)
+	assert.Equal(t, BillingSettlementStageFunding, stage)
+	assert.Zero(t, successSamples)
+
+	var user model.User
+	require.NoError(t, model.DB.First(&user, userID).Error)
+	assert.Equal(t, initialQuota, user.Quota)
+	assert.Zero(t, user.UsedQuota)
+	assert.Zero(t, user.RequestCount)
+
+	var token model.Token
+	require.NoError(t, model.DB.First(&token, tokenID).Error)
+	assert.Equal(t, initialQuota, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+
+	var channel model.Channel
+	require.NoError(t, model.DB.First(&channel, channelID).Error)
+	assert.Zero(t, channel.UsedQuota)
+
+	var logs []model.Log
+	require.NoError(t, model.LOG_DB.Where("user_id = ?", userID).Find(&logs).Error)
+	assert.Empty(t, logs)
+}
+
+func TestPostTextConsumeQuotaLegacyFallbackTokenFailureRecordsCommittedFundingDegradation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	truncate(t)
+
+	const (
+		userID       = 98501
+		channelID    = 98502
+		tokenID      = 98503
+		tokenKey     = "sk-legacy-token-degraded"
+		initialQuota = 1_000_000
+	)
+	seedUser(t, userID, initialQuota)
+	seedChannel(t, channelID)
+	seedToken(t, tokenID, userID, tokenKey, initialQuota)
+	require.NoError(t, model.DB.Exec(`
+		CREATE TRIGGER fail_legacy_text_token_update
+		BEFORE UPDATE ON tokens
+		WHEN OLD.id = 98503
+		BEGIN
+			SELECT RAISE(FAIL, 'forced legacy token quota adjustment failure');
+		END
+	`).Error)
+	t.Cleanup(func() {
+		model.DB.Exec("DROP TRIGGER IF EXISTS fail_legacy_text_token_update")
+	})
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("username", "legacy_token_degraded_user")
+	relayInfo := settlementBoundaryNoSessionToolRelayInfo(userID, channelID, tokenID, tokenKey)
+	usage := &dto.Usage{}
+	expectedQuota := calculateTextQuotaSummary(ctx, relayInfo, usage).Quota
+	require.Positive(t, expectedQuota)
+	require.Nil(t, relayInfo.Billing)
+	require.True(t, relayInfo.PriceData.FreeModel)
+
+	originalScheduler := scheduleTextRelaySuccessSample
+	successSamples := 0
+	sampledCompletionTokens := -1
+	scheduleTextRelaySuccessSample = func(_ *relaycommon.RelayInfo, completionTokens int) {
+		successSamples++
+		sampledCompletionTokens = completionTokens
+	}
+	t.Cleanup(func() { scheduleTextRelaySuccessSample = originalScheduler })
+
+	apiErr := PostTextConsumeQuota(ctx, relayInfo, usage, nil)
+
+	require.Nil(t, apiErr)
+	assert.Equal(t, 1, successSamples)
+	assert.Zero(t, sampledCompletionTokens)
+
+	var user model.User
+	require.NoError(t, model.DB.First(&user, userID).Error)
+	assert.Equal(t, initialQuota-expectedQuota, user.Quota)
+	assert.Equal(t, expectedQuota, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+
+	var token model.Token
+	require.NoError(t, model.DB.First(&token, tokenID).Error)
+	assert.Equal(t, initialQuota, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+
+	var channel model.Channel
+	require.NoError(t, model.DB.First(&channel, channelID).Error)
+	assert.Equal(t, int64(expectedQuota), channel.UsedQuota)
+
+	var logs []model.Log
+	require.NoError(t, model.LOG_DB.Where("user_id = ?", userID).Find(&logs).Error)
+	require.Len(t, logs, 1)
+	assert.Equal(t, expectedQuota, logs[0].Quota)
+	assert.Contains(t, logs[0].Content, "资金结算已提交，令牌额度调整失败")
+
+	var other map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(logs[0].Other), &other))
+	assert.JSONEq(t, `true`, string(other["billing_settlement_degraded"]))
+	assert.JSONEq(t, `"token_quota"`, string(other["billing_settlement_stage"]))
+}
+
+func TestPostConsumeQuotaPreservesRawSettlementErrors(t *testing.T) {
+	t.Run("funding", func(t *testing.T) {
+		err := PostConsumeQuota(&relaycommon.RelayInfo{
+			BillingSource: BillingSourceSubscription,
+		}, 10, 0, false)
+
+		require.EqualError(t, err, "subscription id is missing")
+		_, classified := BillingSettlementStageFromError(err)
+		assert.False(t, classified)
+	})
+
+	t.Run("token after funding", func(t *testing.T) {
+		truncate(t)
+
+		const (
+			userID       = 98601
+			tokenID      = 98603
+			tokenKey     = "sk-legacy-public-raw-error"
+			initialQuota = 1_000_000
+			quota        = 500
+		)
+		seedUser(t, userID, initialQuota)
+		seedToken(t, tokenID, userID, tokenKey, initialQuota)
+		require.NoError(t, model.DB.Exec(`
+			CREATE TRIGGER fail_public_legacy_token_update
+			BEFORE UPDATE ON tokens
+			WHEN OLD.id = 98603
+			BEGIN
+				SELECT RAISE(FAIL, 'forced public legacy token failure');
+			END
+		`).Error)
+		t.Cleanup(func() {
+			model.DB.Exec("DROP TRIGGER IF EXISTS fail_public_legacy_token_update")
+		})
+
+		err := PostConsumeQuota(&relaycommon.RelayInfo{
+			UserId:        userID,
+			TokenId:       tokenID,
+			TokenKey:      tokenKey,
+			BillingSource: BillingSourceWallet,
+		}, quota, 0, false)
+
+		require.ErrorContains(t, err, "forced public legacy token failure")
+		_, classified := BillingSettlementStageFromError(err)
+		assert.False(t, classified)
+
+		var user model.User
+		require.NoError(t, model.DB.First(&user, userID).Error)
+		assert.Equal(t, initialQuota-quota, user.Quota)
+
+		var token model.Token
+		require.NoError(t, model.DB.First(&token, tokenID).Error)
+		assert.Equal(t, initialQuota, token.RemainQuota)
+		assert.Zero(t, token.UsedQuota)
+	})
 }
 
 func TestAppendInputTokensTotalForLogUsesTrustedNormalizedUsage(t *testing.T) {

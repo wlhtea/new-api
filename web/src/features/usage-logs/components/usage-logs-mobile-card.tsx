@@ -228,12 +228,6 @@ function MobileTokensField({ log }: { log: UsageLog }) {
           <div className='text-muted-foreground flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-none'>
             {cacheReadTokens > 0 && (
               <span>
-                {tokenBreakdown.hasExplicitTotal && (
-                  <>
-                    {t('Total Input Tokens')}{' '}
-                    {tokenBreakdown.totalInputTokens.toLocaleString()} ·{' '}
-                  </>
-                )}
                 {t('Cache')}↓ {cacheReadTokens.toLocaleString()}
               </span>
             )}

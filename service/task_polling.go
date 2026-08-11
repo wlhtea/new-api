@@ -601,6 +601,9 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 		}
 		return channelErr
 	}
+	if !model.ChannelTypeSupportsRequestPath(ch.Type, "/suno/fetch") {
+		return fmt.Errorf("channel #%d does not support Suno task polling", channelId)
+	}
 	adaptor := GetTaskAdaptorFunc(constant.TaskPlatformSuno)
 	if adaptor == nil {
 		return errors.New("adaptor not found")
@@ -822,6 +825,9 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 			common.SysLog(fmt.Sprintf("UpdateVideoTask error: %v", errUpdate))
 		}
 		return fmt.Errorf("CacheGetChannel failed: %w", err)
+	}
+	if !model.ChannelTypeSupportsRequestPath(cacheGetChannel.Type, "/v1/videos/:task_id") {
+		return fmt.Errorf("channel #%d does not support video task polling", channelId)
 	}
 	adaptor := GetTaskAdaptorFunc(platform)
 	if adaptor == nil {

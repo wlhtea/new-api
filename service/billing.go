@@ -89,7 +89,10 @@ func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuo
 	// 回退：无 BillingSession 时使用旧路径
 	quotaDelta := actualQuota - relayInfo.FinalPreConsumedQuota
 	if quotaDelta != 0 {
-		return PostConsumeQuota(relayInfo, quotaDelta, relayInfo.FinalPreConsumedQuota, true)
+		stage, err := postConsumeQuotaWithSettlementStage(relayInfo, quotaDelta, relayInfo.FinalPreConsumedQuota, true)
+		if err != nil {
+			return newBillingSettlementError(stage, err)
+		}
 	}
 	return nil
 }

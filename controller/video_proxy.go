@@ -105,6 +105,18 @@ func VideoProxy(c *gin.Context) {
 		return
 	}
 
+	if originChannel, channelErr := model.GetChannelById(task.ChannelId, true); channelErr == nil &&
+		!model.ChannelTypeSupportsRequestPath(originChannel.Type, c.Request.URL.Path) {
+		videoProxyError(
+			c,
+			http.StatusBadRequest,
+			"invalid_request_error",
+			"task_channel_unsupported_endpoint",
+			"video task channel does not support content retrieval",
+		)
+		return
+	}
+
 	adaptor := getVideoProxyTaskAdaptor(c, task.Platform)
 	if fetcher, ok := adaptor.(channel.VideoContentFetcher); ok {
 		channelModel, channelErr := model.GetChannelById(task.ChannelId, true)

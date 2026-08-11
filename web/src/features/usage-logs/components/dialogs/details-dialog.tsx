@@ -424,12 +424,6 @@ export function TokenBreakdown(props: { log: UsageLog; other: LogOtherData }) {
     label: t('Uncached Input Tokens'),
     value: tokenBreakdown.uncachedInputTokens.toLocaleString(),
   })
-  if (cacheRead > 0 && tokenBreakdown.hasExplicitTotal) {
-    rows.push({
-      label: t('Total Input Tokens'),
-      value: tokenBreakdown.totalInputTokens.toLocaleString(),
-    })
-  }
   rows.push({
     label: t('Output Tokens'),
     value: completionTokens.toLocaleString(),

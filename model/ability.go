@@ -8,7 +8,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/relaykit/dto"
 
 	"github.com/samber/lo"
 	"gorm.io/gorm"
@@ -60,12 +59,23 @@ func GetAllEnableAbilities() []Ability {
 	return abilities
 }
 
-func getPriority(group string, model string, retry int) (int, error) {
+func getEnabledAbilityQuery(group string, model string, requestPath string) *gorm.DB {
+	query := DB.Model(&Ability{}).
+		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
+	if !IsOpenCodeGoSupportedRequestPath(requestPath) {
+		openCodeGoChannelIDs := DB.Model(&Channel{}).
+			Select("id").
+			Where("type = ?", constant.ChannelTypeOpenCodeGo)
+		query = query.Where("channel_id NOT IN (?)", openCodeGoChannelIDs)
+	}
+	return query
+}
+
+func getPriority(group string, model string, retry int, requestPath string) (int, error) {
 
 	var priorities []int
-	err := DB.Model(&Ability{}).
+	err := getEnabledAbilityQuery(group, model, requestPath).
 		Select("DISTINCT(priority)").
-		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).
 		Order("priority DESC").              // 按优先级降序排序
 		Pluck("priority", &priorities).Error // Pluck用于将查询的结果直接扫描到一个切片中
 
@@ -90,15 +100,15 @@ func getPriority(group string, model string, retry int) (int, error) {
 	return priorityToUse, nil
 }
 
-func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
-	maxPrioritySubQuery := DB.Model(&Ability{}).Select("MAX(priority)").Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
-	channelQuery := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = (?)", group, model, true, maxPrioritySubQuery)
+func getChannelQuery(group string, model string, retry int, requestPath string) (*gorm.DB, error) {
+	maxPrioritySubQuery := getEnabledAbilityQuery(group, model, requestPath).Select("MAX(priority)")
+	channelQuery := getEnabledAbilityQuery(group, model, requestPath).Where("priority = (?)", maxPrioritySubQuery)
 	if retry != 0 {
-		priority, err := getPriority(group, model, retry)
+		priority, err := getPriority(group, model, retry, requestPath)
 		if err != nil {
 			return nil, err
 		} else {
-			channelQuery = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = ?", group, model, true, priority)
+			channelQuery = getEnabledAbilityQuery(group, model, requestPath).Where("priority = ?", priority)
 		}
 	}
 
@@ -109,7 +119,7 @@ func GetChannel(group string, model string, retry int, requestPath string) (*Cha
 	var abilities []Ability
 
 	var err error = nil
-	channelQuery, err := getChannelQuery(group, model, retry)
+	channelQuery, err := getChannelQuery(group, model, retry, requestPath)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +131,10 @@ func GetChannel(group string, model string, retry int, requestPath string) (*Cha
 	if err != nil {
 		return nil, err
 	}
-	abilities = filterAbilitiesByRequestPathAndModel(abilities, requestPath, model)
+	abilities, err = filterAbilitiesByRequestPathAndModel(abilities, requestPath, model)
+	if err != nil {
+		return nil, err
+	}
 	channel := Channel{}
 	if len(abilities) > 0 {
 		// Randomly choose one
@@ -143,17 +156,21 @@ func GetChannel(group string, model string, retry int, requestPath string) (*Cha
 		return nil, nil
 	}
 	err = DB.First(&channel, "id = ?", channel.Id).Error
-	return &channel, err
+	if err != nil {
+		return nil, err
+	}
+	if !ChannelSupportsRequestPath(&channel, requestPath, model) {
+		return nil, nil
+	}
+	return &channel, nil
 }
 
 // filterAbilitiesByRequestPathAndModel restricts candidates by request path and
-// model for the DB (non-memory-cache) selection path. Only Advanced Custom
-// (type 58) channels are path-checked: kept only when one of their routes matches
-// requestPath and model; all other channel types always pass. When requestPath is
-// empty, filtering is skipped.
-func filterAbilitiesByRequestPathAndModel(abilities []Ability, requestPath string, model string) []Ability {
-	if requestPath == "" || len(abilities) == 0 {
-		return abilities
+// model for the DB (non-memory-cache) selection path. OpenCode Go and Advanced
+// Custom use the same endpoint contract as the memory-cache selection path.
+func filterAbilitiesByRequestPathAndModel(abilities []Ability, requestPath string, model string) ([]Ability, error) {
+	if len(abilities) == 0 {
+		return abilities, nil
 	}
 
 	channelIds := make([]int, 0, len(abilities))
@@ -168,29 +185,21 @@ func filterAbilitiesByRequestPathAndModel(abilities []Ability, requestPath strin
 
 	var channels []*Channel
 	if err := DB.Where("id IN ?", channelIds).Find(&channels).Error; err != nil {
-		// On error, fall back to unfiltered candidates to avoid blocking selection
-		return abilities
+		return nil, err
 	}
 
-	advancedConfigs := make(map[int]*dto.AdvancedCustomConfig)
+	channelsByID := make(map[int]*Channel, len(channels))
 	for _, channel := range channels {
-		if channel.Type == constant.ChannelTypeAdvancedCustom {
-			advancedConfigs[channel.Id] = channel.GetOtherSettings().AdvancedCustom
-		}
+		channelsByID[channel.Id] = channel
 	}
 
 	filtered := make([]Ability, 0, len(abilities))
 	for _, ability := range abilities {
-		config, isAdvancedCustom := advancedConfigs[ability.ChannelId]
-		if !isAdvancedCustom {
-			filtered = append(filtered, ability)
-			continue
-		}
-		if config != nil && config.SupportsPathForModel(requestPath, model) {
+		if ChannelSupportsRequestPath(channelsByID[ability.ChannelId], requestPath, model) {
 			filtered = append(filtered, ability)
 		}
 	}
-	return filtered
+	return filtered, nil
 }
 
 func (channel *Channel) AddAbilities(tx *gorm.DB) error {

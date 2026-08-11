@@ -183,13 +183,25 @@ func TestFinalizeResponseUsageRequiresExplicitProviderInputForExactUsage(t *test
 	for _, protocol := range []Protocol{ProtocolChat, ProtocolMessages, ProtocolResponses} {
 		t.Run(string(protocol)+"/missing_input", func(t *testing.T) {
 			state := &responseTransformState{protocol: protocol}
-			state.captureFallbackUsage([]byte(`{"normalizedUsage":{"outputTokens":40,"cacheReadTokens":80}}`))
+			state.captureFallbackUsage([]byte(`{"normalizedUsage":{"outputTokens":40,"cacheReadTokens":80,"cacheWrite5mTokens":20,"cacheWrite1hTokens":10}}`))
 
-			usage := finalizeResponseUsage(nil, state).(*dto.Usage)
+			usage := finalizeResponseUsage(reconciliationEstimatedUsage(), state).(*dto.Usage)
 
 			require.NotNil(t, usage.BillingUsage)
 			assert.True(t, usage.BillingUsage.Estimated)
 			assert.False(t, state.sawFallbackInputField)
+			assert.Equal(t, 999, usage.InputTokens)
+			assert.Equal(t, 80, usage.PromptTokensDetails.CachedTokens)
+			assert.Equal(t, 30, usage.PromptTokensDetails.CacheCreationTokensTotal())
+			if protocol == ProtocolMessages {
+				assert.Equal(t, 889, usage.PromptTokens)
+				require.NotNil(t, usage.BillingUsage.ClaudeUsage)
+				assert.Equal(t, 889, usage.BillingUsage.ClaudeUsage.InputTokens)
+			} else {
+				assert.Equal(t, 999, usage.PromptTokens)
+				require.NotNil(t, usage.BillingUsage.OpenAIUsage)
+				assert.Equal(t, 999, usage.BillingUsage.OpenAIUsage.InputTokens)
+			}
 		})
 
 		t.Run(string(protocol)+"/explicit_zero_input", func(t *testing.T) {
@@ -202,6 +214,24 @@ func TestFinalizeResponseUsageRequiresExplicitProviderInputForExactUsage(t *test
 			assert.False(t, usage.BillingUsage.Estimated)
 			assert.True(t, state.sawFallbackInputField)
 			assert.Equal(t, 80, usage.InputTokens)
+		})
+
+		t.Run(string(protocol)+"/all_zero_explicit_input", func(t *testing.T) {
+			state := &responseTransformState{protocol: protocol, estimatedInputTokens: 999}
+			captured := state.captureFallbackUsage([]byte(`{"normalizedUsage":{"inputTokens":0,"outputTokens":0,"reasoningTokens":0,"cacheReadTokens":0,"cacheWrite5mTokens":0,"cacheWrite1hTokens":0}}`))
+			parsed := &dto.Usage{PromptTokens: 999, TotalTokens: 999, InputTokens: 999}
+
+			usage := finalizeResponseUsage(parsed, state).(*dto.Usage)
+
+			assert.True(t, captured)
+			assert.True(t, state.sawFallbackInputField)
+			assert.Equal(t, "opencode_go_inference_cost", usage.UsageSource)
+			if usage.BillingUsage != nil {
+				assert.False(t, usage.BillingUsage.Estimated)
+			}
+			assert.Zero(t, usage.PromptTokens)
+			assert.Zero(t, usage.InputTokens)
+			assert.Zero(t, usage.TotalTokens)
 		})
 
 		t.Run(string(protocol)+"/latest_partial_fallback_replaces_complete_input", func(t *testing.T) {
@@ -230,6 +260,272 @@ func TestFinalizeResponseUsageRequiresExplicitProviderInputForExactUsage(t *test
 			assert.Equal(t, 100, usage.PromptTokens)
 			assert.Equal(t, 40, usage.OutputTokens)
 		})
+	}
+}
+
+func TestAdaptorChatStreamMissingCostInputUsesHandlerEstimate(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"id":"chat_partial_cost","object":"chat.completion.chunk","created":1710000000,"model":"vendor/chat-alias","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}`,
+		`data: {"id":"chat_partial_cost","object":"chat.completion.chunk","created":1710000000,"model":"vendor/chat-alias","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`data: {"choices":[],"x-opencode-type":"inference-cost","cost":"private","normalizedUsage":{"outputTokens":40,"cacheReadTokens":80,"cacheWrite5mTokens":20,"cacheWrite1hTokens":10}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	info := responseTestInfo(ProtocolChat, types.RelayFormatOpenAI, true)
+	info.SetEstimatePromptTokens(999)
+	c, recorder := responseTestContext(types.RelayFormatOpenAI)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+	adaptor.requestUpstreamStream = true
+
+	rawUsage, apiErr := adaptor.DoResponse(c, resp, info)
+
+	require.Nil(t, apiErr)
+	usage, ok := rawUsage.(*dto.Usage)
+	require.True(t, ok)
+	require.NotNil(t, usage.BillingUsage)
+	assert.True(t, usage.BillingUsage.Estimated)
+	assert.Equal(t, 999, usage.InputTokens)
+	assert.Equal(t, 999, usage.PromptTokens)
+	assert.Equal(t, 40, usage.OutputTokens)
+	assert.Equal(t, 80, usage.PromptTokensDetails.CachedTokens)
+	assert.Equal(t, 30, usage.PromptTokensDetails.CacheCreationTokensTotal())
+	assert.True(t, common.GetContextKeyBool(c, constant.ContextKeyLocalCountTokens))
+	assert.NotContains(t, recorder.Body.String(), `"prompt_tokens":110`)
+	assert.NotContains(t, recorder.Body.String(), "private")
+	assert.NotContains(t, recorder.Body.String(), "normalizedUsage")
+}
+
+func openCodeRealChatUsageFixture(stream bool) string {
+	usage := `"usage":{"prompt_tokens":210,"completion_tokens":40,"total_tokens":250,"cached_tokens":80,"prompt_tokens_details":{"cache_creation_input_tokens":30},"completion_tokens_details":{"reasoning_tokens":15}}`
+	if !stream {
+		return `{"id":"chat_real","object":"chat.completion","created":1710000000,"model":"vendor/chat-alias","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],` + usage + `,"cost":"0"}`
+	}
+	return strings.Join([]string{
+		`data: {"id":"chat_real","object":"chat.completion.chunk","created":1710000000,"model":"vendor/chat-alias","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}`,
+		`data: {"id":"chat_real","object":"chat.completion.chunk","created":1710000000,"model":"vendor/chat-alias","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`data: {"id":"chat_real","object":"chat.completion.chunk","created":1710000000,"model":"vendor/chat-alias","choices":[],` + usage + `}`,
+		`data: {"choices":[],"cost":"0"}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+}
+
+func TestAdaptorChatRealWirePreservesUsageAcrossClientFormats(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	want := responseUsageVector{
+		openAIInput:     210,
+		cacheRead:       80,
+		cacheWriteTotal: 30,
+		output:          40,
+		reasoning:       15,
+	}
+	clients := []types.RelayFormat{
+		types.RelayFormatOpenAI,
+		types.RelayFormatClaude,
+		types.RelayFormatOpenAIResponses,
+	}
+	for _, stream := range []bool{false, true} {
+		for _, client := range clients {
+			name := string(client) + "/json"
+			contentType := "application/json"
+			if stream {
+				name = string(client) + "/sse"
+				contentType = "text/event-stream"
+			}
+			t.Run(name, func(t *testing.T) {
+				info := responseTestInfo(ProtocolChat, client, stream)
+				info.SetEstimatePromptTokens(999)
+				c, recorder := responseTestContext(client)
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{contentType}},
+					Body:       io.NopCloser(strings.NewReader(openCodeRealChatUsageFixture(stream))),
+				}
+				adaptor := &Adaptor{}
+				adaptor.Init(info)
+				adaptor.requestUpstreamStream = stream
+
+				rawUsage, apiErr := adaptor.DoResponse(c, resp, info)
+
+				require.Nil(t, apiErr)
+				usage, ok := rawUsage.(*dto.Usage)
+				require.True(t, ok)
+				assertFinalResponseUsage(t, ProtocolChat, usage, want)
+				require.NotNil(t, usage.BillingUsage)
+				assert.False(t, usage.BillingUsage.Estimated)
+				assert.False(t, common.GetContextKeyBool(c, constant.ContextKeyLocalCountTokens))
+				assert.NotContains(t, recorder.Body.String(), `"cost"`)
+			})
+		}
+	}
+}
+
+func TestTransformChatCostTrailerDoesNotRepeatSyntheticUsage(t *testing.T) {
+	tagged := []byte(`{"choices":[],"x-opencode-type":"inference-cost","cost":"0","normalizedUsage":{"inputTokens":100,"outputTokens":40}}`)
+	tests := []struct {
+		name    string
+		trailer []byte
+	}{
+		{name: "bare trailer", trailer: []byte(`{"choices":[],"cost":"0"}`)},
+		{name: "bare trailer with normalized usage", trailer: []byte(`{"choices":[],"cost":"0","normalizedUsage":{"inputTokens":100,"outputTokens":40}}`)},
+		{name: "repeated tagged cost", trailer: tagged},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := &responseTransformState{protocol: ProtocolChat}
+			first := state.transformJSON(tagged, true)
+			second := state.transformJSON(tt.trailer, true)
+
+			require.NotNil(t, first)
+			assert.True(t, gjson.GetBytes(first, "usage").Exists())
+			assert.Nil(t, second)
+		})
+	}
+}
+
+func TestFinalizeResponseUsageKeepsExplicitZeroStandardInputOverLocalEstimate(t *testing.T) {
+	standards := map[Protocol][]byte{
+		ProtocolChat:      []byte(`{"usage":{"prompt_tokens":0,"completion_tokens":40}}`),
+		ProtocolMessages:  []byte(`{"usage":{"input_tokens":0,"output_tokens":40}}`),
+		ProtocolResponses: []byte(`{"response":{"usage":{"input_tokens":0,"output_tokens":40}}}`),
+	}
+	for _, protocol := range []Protocol{ProtocolChat, ProtocolMessages, ProtocolResponses} {
+		t.Run(string(protocol), func(t *testing.T) {
+			state := &responseTransformState{protocol: protocol, estimatedInputTokens: 999}
+			state.transformJSON(standards[protocol], true)
+			parsed := &dto.Usage{
+				PromptTokens:     999,
+				CompletionTokens: 40,
+				TotalTokens:      1039,
+				InputTokens:      999,
+				OutputTokens:     40,
+			}
+			assert.True(t, state.sawStandardInputField)
+			assert.False(t, state.standardUsageCategories.input)
+
+			usage := finalizeResponseUsage(parsed, state).(*dto.Usage)
+
+			require.NotNil(t, usage.BillingUsage)
+			assert.False(t, usage.BillingUsage.Estimated)
+			assert.Zero(t, usage.PromptTokens)
+			assert.Zero(t, usage.InputTokens)
+			assert.Equal(t, 40, usage.OutputTokens)
+			assert.Equal(t, 40, usage.TotalTokens)
+		})
+	}
+}
+
+func missingProviderInputFixture(protocol Protocol, stream bool) string {
+	if !stream {
+		switch protocol {
+		case ProtocolMessages:
+			return `{"id":"msg_partial","type":"message","role":"assistant","model":"vendor/messages-alias","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"cache_read_input_tokens":80,"cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":10},"output_tokens":40},"cost":"0"}`
+		case ProtocolResponses:
+			return `{"id":"resp_partial","object":"response","created_at":1710000000,"model":"vendor/responses-alias","status":"completed","output":[{"id":"msg_partial","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK"}]}],"usage":{"output_tokens":40,"input_tokens_details":{"cached_tokens":80,"cache_write_tokens":30},"output_tokens_details":{"reasoning_tokens":15}},"cost":"0"}`
+		}
+	}
+
+	partialCost := `data: {"type":"ping","cost":"0","normalizedUsage":{"outputTokens":40,"reasoningTokens":15,"cacheReadTokens":80,"cacheWrite5mTokens":20,"cacheWrite1hTokens":10}}`
+	switch protocol {
+	case ProtocolMessages:
+		return strings.Join([]string{
+			`data: {"type":"message_start","message":{"id":"msg_partial","type":"message","role":"assistant","model":"vendor/messages-alias","content":[],"usage":{"cache_read_input_tokens":80,"cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":10},"output_tokens":0}}}`,
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}`,
+			`data: {"type":"content_block_stop","index":0}`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":40}}`,
+			`data: {"type":"message_stop"}`,
+			partialCost,
+			`data: [DONE]`,
+			``,
+		}, "\n")
+	case ProtocolResponses:
+		return strings.Join([]string{
+			`data: {"type":"response.created","response":{"id":"resp_partial","object":"response","model":"vendor/responses-alias","created_at":1710000000,"status":"in_progress"}}`,
+			`data: {"type":"response.output_text.delta","delta":"OK"}`,
+			`data: {"type":"response.completed","response":{"id":"resp_partial","object":"response","model":"vendor/responses-alias","status":"completed","usage":{"output_tokens":40,"input_tokens_details":{"cached_tokens":80,"cache_write_tokens":30},"output_tokens_details":{"reasoning_tokens":15}}}}`,
+			partialCost,
+			`data: [DONE]`,
+			``,
+		}, "\n")
+	default:
+		panic("unsupported missing-input fixture protocol")
+	}
+}
+
+func TestAdaptorMissingProviderInputUsesRequestEstimateAcrossClientFormats(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	clients := []types.RelayFormat{
+		types.RelayFormatOpenAI,
+		types.RelayFormatClaude,
+		types.RelayFormatOpenAIResponses,
+	}
+	for _, protocol := range []Protocol{ProtocolMessages, ProtocolResponses} {
+		for _, stream := range []bool{false, true} {
+			for _, client := range clients {
+				name := string(protocol) + "/" + string(client) + "/json"
+				contentType := "application/json"
+				if stream {
+					name = string(protocol) + "/" + string(client) + "/sse"
+					contentType = "text/event-stream"
+				}
+				t.Run(name, func(t *testing.T) {
+					info := responseTestInfo(protocol, client, stream)
+					info.SetEstimatePromptTokens(999)
+					c, recorder := responseTestContext(client)
+					resp := &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{contentType}},
+						Body:       io.NopCloser(strings.NewReader(missingProviderInputFixture(protocol, stream))),
+					}
+					adaptor := &Adaptor{}
+					adaptor.Init(info)
+					adaptor.requestUpstreamStream = stream
+
+					rawUsage, apiErr := adaptor.DoResponse(c, resp, info)
+
+					require.Nil(t, apiErr)
+					usage, ok := rawUsage.(*dto.Usage)
+					require.True(t, ok)
+					want := responseUsageVector{
+						input:           889,
+						openAIInput:     999,
+						cacheRead:       80,
+						cacheWriteTotal: 30,
+						output:          40,
+					}
+					if protocol == ProtocolMessages || stream {
+						want.cacheWrite5m = 20
+						want.cacheWrite1h = 10
+					}
+					if protocol == ProtocolResponses || stream {
+						want.reasoning = 15
+					}
+					assertFinalResponseUsage(t, protocol, usage, want)
+					require.NotNil(t, usage.BillingUsage)
+					assert.True(t, usage.BillingUsage.Estimated)
+					assert.NotContains(t, recorder.Body.String(), `"cost"`)
+					assert.NotContains(t, recorder.Body.String(), "normalizedUsage")
+				})
+			}
+		}
 	}
 }
 

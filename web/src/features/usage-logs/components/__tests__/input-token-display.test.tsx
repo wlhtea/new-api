@@ -112,7 +112,7 @@ describe('usage log input token display', () => {
     domWindow.close()
   })
 
-  test('labels uncached, total, and cache-read input separately', async () => {
+  test('labels uncached and cache-read input without exposing total input', async () => {
     const container = document.createElement('div')
     document.body.append(container)
     const root = createRoot(container)
@@ -139,7 +139,8 @@ describe('usage log input token display', () => {
 
     const text = (container.textContent ?? '').replaceAll(/\s+/g, ' ')
     assert.match(text, /Uncached Input Tokens\s*337/)
-    assert.match(text, /Total Input Tokens\s*30,289/)
+    assert.doesNotMatch(text, /Total Input Tokens/)
+    assert.doesNotMatch(text, /30,289/)
     assert.match(text, /Cache Read\s*29,952/)
     assert.match(text, /Output Tokens\s*55/)
 
@@ -179,7 +180,7 @@ describe('usage log input token display', () => {
     container.remove()
   })
 
-  test('renders Messages total, cache reads, split writes, and output across views', async () => {
+  test('hides Messages total while rendering cache and output across views', async () => {
     const container = document.createElement('div')
     document.body.append(container)
     const root = createRoot(container)
@@ -223,19 +224,22 @@ describe('usage log input token display', () => {
 
     const desktopText = textFor('desktop')
     assert.match(desktopText, /130 \/ 40/)
-    assert.match(desktopText, /Total Input Tokens 210/)
+    assert.doesNotMatch(desktopText, /Total Input Tokens/)
+    assert.doesNotMatch(desktopText, /\b210\b/)
     assert.match(desktopText, /Cache↓ 80/)
     assert.match(desktopText, /↑ 30/)
 
     const mobileText = textFor('mobile')
     assert.match(mobileText, /130 \/ 40/)
-    assert.match(mobileText, /Total Input Tokens 210/)
+    assert.doesNotMatch(mobileText, /Total Input Tokens/)
+    assert.doesNotMatch(mobileText, /\b210\b/)
     assert.match(mobileText, /Cache↓ 80/)
     assert.match(mobileText, /↑ 30/)
 
     const detailsText = textFor('details')
     assert.match(detailsText, /Uncached Input Tokens\s*130/)
-    assert.match(detailsText, /Total Input Tokens\s*210/)
+    assert.doesNotMatch(detailsText, /Total Input Tokens/)
+    assert.doesNotMatch(detailsText, /\b210\b/)
     assert.match(detailsText, /Output Tokens\s*40/)
     assert.match(detailsText, /Cache Read\s*80/)
     assert.match(detailsText, /Cache Write \(5m\)\s*20/)

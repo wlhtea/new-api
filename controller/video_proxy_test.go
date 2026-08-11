@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -286,6 +287,70 @@ func TestVideoProxyContentStateErrorsUseOpenAICodes(t *testing.T) {
 			response := decodeOpenAIVideoError(t, writer.Body.Bytes())
 			assert.Equal(t, "invalid_request_error", response.Error.Type)
 			assert.Equal(t, test.wantCode, response.Error.Code)
+		})
+	}
+}
+
+func TestVideoProxyRejectsOpenCodeGoOriginBeforeContentFetch(t *testing.T) {
+	tests := []struct {
+		name        string
+		withFetcher bool
+	}{
+		{name: "content fetcher", withFetcher: true},
+		{name: "result URL fallback", withFetcher: false},
+	}
+
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupVideoProxyDB(t)
+			taskID := "task_opencodego_content_guard_" + strconv.Itoa(index)
+			const storedKey = "STORED_KEY"
+			createVideoProxyChannel(
+				t, db, 601+index, constant.ChannelTypeOpenCodeGo, storedKey,
+				"https://opencode.ai/zen/go/v1", "",
+			)
+
+			var externalRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				externalRequests.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(server.Close)
+			createVideoProxyTask(
+				t, db, taskID, 41, 601+index, constant.TaskPlatform("59"),
+				model.TaskStatusSuccess, storedKey, "UPSTREAM_PRIVATE", server.URL+"/video.mp4",
+			)
+
+			lookupCalls := 0
+			fetchCalls := 0
+			writer := newTrackingWriter()
+			ctx := newVideoProxyContext(writer, "/v1/videos/"+taskID+"/content", taskID, 41)
+			ctx.Set(videoProxyTaskAdaptorLookupContextKey, videoProxyTaskAdaptorLookupFunc(
+				func(constant.TaskPlatform) channel.TaskAdaptor {
+					lookupCalls++
+					if !test.withFetcher {
+						return nil
+					}
+					return &videoProxyFetcherFixture{
+						fetch: func(context.Context, string, string, string, string) (*channel.VideoContent, error) {
+							fetchCalls++
+							return nil, errors.New("unexpected fetch")
+						},
+					}
+				},
+			))
+
+			VideoProxy(ctx)
+
+			require.Equal(t, http.StatusBadRequest, writer.Code)
+			response := decodeOpenAIVideoError(t, writer.Body.Bytes())
+			assert.Equal(t, "invalid_request_error", response.Error.Type)
+			assert.Equal(t, "task_channel_unsupported_endpoint", response.Error.Code)
+			assert.Zero(t, lookupCalls)
+			assert.Zero(t, fetchCalls)
+			assert.Zero(t, externalRequests.Load())
+			assert.NotContains(t, writer.Body.String(), storedKey)
+			assert.NotContains(t, writer.Body.String(), "UPSTREAM_PRIVATE")
 		})
 	}
 }

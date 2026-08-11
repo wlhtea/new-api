@@ -208,13 +208,56 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 	return nil, errors.New("channel not found")
 }
 
+// IsOpenCodeGoSupportedRequestPath reports whether requestPath is one of the
+// inference endpoints implemented by OpenCode Go. Keep this exact: prefix
+// matching would accidentally admit endpoints such as /v1/responses/compact.
+func IsOpenCodeGoSupportedRequestPath(requestPath string) bool {
+	switch requestPath {
+	case "/v1/chat/completions", "/pg/chat/completions", "/v1/messages", "/v1/responses":
+		return true
+	default:
+		return false
+	}
+}
+
+// ChannelTypeSupportsRequestPath applies endpoint restrictions that depend
+// only on channel type. Callers that do not have a model (for example, an
+// origin-task lookup) can still enforce the OpenCode Go boundary with it.
+func ChannelTypeSupportsRequestPath(channelType int, requestPath string) bool {
+	return channelType != constant.ChannelTypeOpenCodeGo || IsOpenCodeGoSupportedRequestPath(requestPath)
+}
+
+// ChannelSupportsRequestPath applies all channel-selection endpoint rules.
+func ChannelSupportsRequestPath(channel *Channel, requestPath string, requestModel string) bool {
+	if channel == nil {
+		return false
+	}
+	var advancedConfig *dto.AdvancedCustomConfig
+	if channel.Type == constant.ChannelTypeAdvancedCustom {
+		advancedConfig = channel.GetOtherSettings().AdvancedCustom
+	}
+	return channelSupportsRequestPath(channel, requestPath, requestModel, advancedConfig)
+}
+
+func channelSupportsRequestPath(channel *Channel, requestPath string, requestModel string, advancedConfig *dto.AdvancedCustomConfig) bool {
+	if !ChannelTypeSupportsRequestPath(channel.Type, requestPath) {
+		return false
+	}
+	if channel.Type != constant.ChannelTypeAdvancedCustom {
+		return true
+	}
+	if requestPath == "" {
+		return true
+	}
+	return advancedConfig != nil && advancedConfig.SupportsPathForModel(requestPath, requestModel)
+}
+
 // filterChannelsByRequestPathAndModel restricts candidates by request path and
-// model. Only Advanced Custom (type 58) channels are path-checked: they are kept
-// only when one of their configured routes matches requestPath and model. All
-// other channel types always pass. When requestPath is empty, filtering is skipped.
+// model. OpenCode Go is restricted to its implemented inference endpoints;
+// Advanced Custom channels are kept only when a configured route matches.
 // Caller must hold channelSyncLock (read lock). The cached slice is never mutated.
 func filterChannelsByRequestPathAndModel(channels []int, requestPath string, model string) []int {
-	if requestPath == "" || len(channels) == 0 {
+	if len(channels) == 0 {
 		return channels
 	}
 	filtered := make([]int, 0, len(channels))
@@ -225,11 +268,11 @@ func filterChannelsByRequestPathAndModel(channels []int, requestPath string, mod
 			filtered = append(filtered, channelId)
 			continue
 		}
-		if channel.Type != constant.ChannelTypeAdvancedCustom {
-			filtered = append(filtered, channelId)
-			continue
+		var advancedConfig *dto.AdvancedCustomConfig
+		if channel.Type == constant.ChannelTypeAdvancedCustom {
+			advancedConfig = channel2advancedCustomConfig[channelId]
 		}
-		if config := channel2advancedCustomConfig[channelId]; config != nil && config.SupportsPathForModel(requestPath, model) {
+		if channelSupportsRequestPath(channel, requestPath, model, advancedConfig) {
 			filtered = append(filtered, channelId)
 		}
 	}

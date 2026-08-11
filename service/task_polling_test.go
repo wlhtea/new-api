@@ -1630,6 +1630,79 @@ func TestUpdateVideoTasksMixedChannelSleepSettings(t *testing.T) {
 	assert.ElementsMatch(t, []string{"upstream_sleepy_1", "upstream_fast_1", "upstream_fast_2"}, adaptor.fetchedTaskIDs())
 }
 
+func TestTaskPollingRejectsOpenCodeGoChannelBeforeAdaptorLookup(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(channelID int) error
+	}{
+		{
+			name: "Suno",
+			run: func(channelID int) error {
+				task := &model.Task{
+					TaskID:    "opencodego-suno-public",
+					Platform:  constant.TaskPlatformSuno,
+					ChannelId: channelID,
+					Status:    model.TaskStatusInProgress,
+				}
+				return updateSunoTasks(
+					context.Background(),
+					channelID,
+					[]string{"opencodego-suno-upstream"},
+					map[string]*model.Task{"opencodego-suno-upstream": task},
+				)
+			},
+		},
+		{
+			name: "video",
+			run: func(channelID int) error {
+				task := &model.Task{
+					TaskID:    "opencodego-video-public",
+					Platform:  constant.TaskPlatform("kling"),
+					ChannelId: channelID,
+					Status:    model.TaskStatusInProgress,
+				}
+				return updateVideoTasks(
+					context.Background(),
+					constant.TaskPlatform("kling"),
+					channelID,
+					[]string{"opencodego-video-upstream"},
+					map[string]*model.Task{"opencodego-video-upstream": task},
+				)
+			},
+		},
+	}
+
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			truncate(t)
+			channelID := 351 + index
+			baseURL := "https://opencode.ai/zen/go/v1"
+			require.NoError(t, model.DB.Create(&model.Channel{
+				Id:      channelID,
+				Type:    constant.ChannelTypeOpenCodeGo,
+				Name:    "OpenCode Go polling endpoint guard",
+				Status:  common.ChannelStatusEnabled,
+				BaseURL: &baseURL,
+			}).Error)
+
+			adaptor := &taskPollingFetchAdaptor{}
+			factoryCalls := 0
+			previousFactory := GetTaskAdaptorFunc
+			GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+				factoryCalls++
+				return adaptor
+			}
+			t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+			err := test.run(channelID)
+
+			require.ErrorContains(t, err, "does not support")
+			assert.Zero(t, factoryCalls)
+			assert.Zero(t, adaptor.fetchCount())
+		})
+	}
+}
+
 func TestUpdateSunoTasksStalePollsRefundExactlyOnce(t *testing.T) {
 	truncate(t)
 

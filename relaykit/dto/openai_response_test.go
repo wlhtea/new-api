@@ -93,6 +93,52 @@ func TestUsageMarshalKeepsCanonicalOutputTokenDetailsSchema(t *testing.T) {
 	assert.NotContains(t, string(encoded), `"output_tokens_details"`)
 }
 
+func TestInputTokenDetailsUnmarshalCacheCreationInputTokensAlias(t *testing.T) {
+	tests := []struct {
+		name string
+		wire string
+		want InputTokenDetails
+	}{
+		{
+			name: "openai-compatible alias",
+			wire: `{"cached_tokens":80,"cache_creation_input_tokens":30}`,
+			want: InputTokenDetails{CachedTokens: 80, CachedCreationTokens: 30},
+		},
+		{
+			name: "larger alias wins canonical aggregate",
+			wire: `{"cached_creation_tokens":20,"cache_creation_input_tokens":30,"cache_write_tokens":25}`,
+			want: InputTokenDetails{CachedCreationTokens: 30, CacheWriteTokens: 25},
+		},
+		{
+			name: "larger canonical aggregate wins alias",
+			wire: `{"cached_creation_tokens":40,"cache_creation_input_tokens":30,"cache_write_tokens":25}`,
+			want: InputTokenDetails{CachedCreationTokens: 40, CacheWriteTokens: 25},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var details InputTokenDetails
+			require.NoError(t, json.Unmarshal([]byte(tt.wire), &details))
+			assert.Equal(t, tt.want, details)
+
+			encoded, err := json.Marshal(details)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), "cache_creation_input_tokens")
+		})
+	}
+}
+
+func TestUsageUnmarshalTopLevelCachedTokensAlias(t *testing.T) {
+	var usage Usage
+	require.NoError(t, json.Unmarshal([]byte(`{"prompt_tokens":210,"cached_tokens":80}`), &usage))
+
+	assert.Equal(t, 210, usage.PromptTokens)
+	assert.Equal(t, 80, usage.CachedTokens)
+	assert.True(t, HasOpenAIUsageTokens(&Usage{CachedTokens: usage.CachedTokens}))
+	require.NotNil(t, NewOpenAIChatBillingUsage(&Usage{CachedTokens: usage.CachedTokens}))
+}
+
 func TestUsageMarshalOmitsInternalBillingMetadata(t *testing.T) {
 	usage := Usage{
 		UsageSemantic: BillingUsageSemanticAnthropic,
