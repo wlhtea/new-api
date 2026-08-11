@@ -40,7 +40,11 @@ import { cn } from '@/lib/utils'
 
 import { LOG_TYPE_ENUM } from '../constants'
 import type { UsageLog } from '../data/schema'
-import { getInputTokenBreakdown, parseLogOther } from '../lib/format'
+import {
+  getInputTokenBreakdown,
+  parseLogOther,
+  resolveUsageLogAffinity,
+} from '../lib/format'
 import {
   getLogTypeConfig,
   isDisplayableLogType,
@@ -325,6 +329,9 @@ function CommonLogsCard<TData>({
   const modelCell = cells.get('model_name')
   const quotaCell = cells.get('quota')
   const rowData = cells.get('created_at')?.row.original as UsageLog | undefined
+  const affinity = rowData
+    ? resolveUsageLogAffinity(parseLogOther(rowData.other))
+    : null
 
   return (
     <div className='space-y-2.5'>
@@ -356,6 +363,12 @@ function CommonLogsCard<TData>({
           cell={cells.get('token_name')}
           valueClassName='[&_.flex-col]:max-w-none [&_.flex-col>*:not(:first-child)]:text-[11px] [&_.flex-col>*:not(:first-child)]:leading-none'
         />
+        {affinity && (
+          <SummaryField
+            cell={cells.get('affinity')}
+            valueClassName='[&_[data-affinity-method]]:max-w-none'
+          />
+        )}
         {rowData ? (
           <MobileStreamTimingField log={rowData} />
         ) : (

@@ -25,7 +25,7 @@ import {
 } from '@/features/pricing/lib/billing-expr'
 
 import type { UsageLog } from '../data/schema'
-import type { LogOtherData } from '../types'
+import type { LogOtherData, UsageLogAffinityDisplay } from '../types'
 
 export { normalizeTierLabel }
 
@@ -195,6 +195,90 @@ export function parseLogOther(other: string): LogOtherData | null {
     console.error('Failed to parse log other field:', error)
     return null
   }
+}
+
+const OPEN_CODE_GO_AFFINITY_VALUE_MAX_LENGTH = 64
+const OPEN_CODE_GO_WORKSPACE_SHORT_ID_LENGTH = 8
+
+function normalizedAffinityValue(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim()
+  if (
+    normalized === '' ||
+    normalized.length > OPEN_CODE_GO_AFFINITY_VALUE_MAX_LENGTH
+  ) {
+    return undefined
+  }
+  return normalized
+}
+
+function firstAffinityValue(
+  publicValue: unknown,
+  adminValue: unknown
+): string | undefined {
+  return (
+    normalizedAffinityValue(publicValue) ?? normalizedAffinityValue(adminValue)
+  )
+}
+
+export function resolveUsageLogAffinity(
+  other: LogOtherData | null | undefined
+): UsageLogAffinityDisplay | null {
+  if (!other) return null
+
+  const source = firstAffinityValue(
+    other.opencode_go_affinity_source,
+    other.admin_info?.opencode_go_affinity_source
+  )
+  const workspaceUid = firstAffinityValue(
+    other.opencode_go_workspace_uid,
+    other.admin_info?.opencode_go_workspace_uid
+  )
+  if (!source && !workspaceUid) return null
+
+  const affinity: UsageLogAffinityDisplay = {}
+  if (workspaceUid) {
+    affinity.workspaceUid = workspaceUid
+    affinity.workspaceShortId = workspaceUid.slice(
+      0,
+      OPEN_CODE_GO_WORKSPACE_SHORT_ID_LENGTH
+    )
+  }
+
+  if (!source) return affinity
+
+  affinity.source = source
+  switch (source) {
+    case 'token':
+      affinity.method = 'token'
+      affinity.sourceDetail = source
+      break
+    case 'claude-code-session':
+      affinity.method = 'fingerprint'
+      affinity.sourceDetail = 'X-Claude-Code-Session-Id'
+      break
+    case 'claude-metadata-session':
+      affinity.method = 'fingerprint'
+      affinity.sourceDetail = 'metadata.user_id.session_id'
+      break
+    case 'opencode-session':
+      affinity.method = 'fingerprint'
+      affinity.sourceDetail = 'x-opencode-session'
+      break
+    case 'prompt_cache_key':
+      affinity.method = 'fingerprint'
+      affinity.sourceDetail = source
+      break
+    case 'none':
+      affinity.method = 'round_robin'
+      affinity.sourceDetail = source
+      break
+    default:
+      affinity.method = 'other'
+      affinity.sourceDetail = source
+  }
+
+  return affinity
 }
 
 /**

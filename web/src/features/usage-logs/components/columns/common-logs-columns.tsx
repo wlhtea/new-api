@@ -17,7 +17,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import type { ColumnDef } from '@tanstack/react-table'
-import { GitBranch, Sparkles, KeyRound } from 'lucide-react'
+import {
+  CircleHelp,
+  Fingerprint,
+  GitBranch,
+  KeyRound,
+  Shuffle,
+  Sparkles,
+} from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -47,9 +54,10 @@ import {
   getInputTokenBreakdown,
   getTieredBillingSummary,
   hasAnyCacheTokens,
-  parseLogOther,
   isViolationFeeLog,
+  parseLogOther,
   renderAuditContent,
+  resolveUsageLogAffinity,
 } from '../../lib/format'
 import {
   isDisplayableLogType,
@@ -597,6 +605,117 @@ export function useCommonLogsColumns(isAdmin: boolean): ColumnDef<UsageLog>[] {
       )
     },
     size: 160,
+  })
+  columns.push({
+    id: 'affinity',
+    header: t('Affinity'),
+    accessorFn: (row) => row.other,
+    cell: ({ row }) => {
+      const log = row.original
+      if (!isDisplayableLogType(log.type)) return null
+
+      const affinity = resolveUsageLogAffinity(parseLogOther(log.other))
+      if (!affinity) return null
+
+      let MethodIcon = CircleHelp
+      let methodLabel: string | undefined
+      let iconClassName = 'text-muted-foreground'
+      switch (affinity.method) {
+        case 'token':
+          MethodIcon = KeyRound
+          methodLabel = t('Token')
+          iconClassName = 'text-amber-600 dark:text-amber-400'
+          break
+        case 'fingerprint':
+          MethodIcon = Fingerprint
+          methodLabel = t('Request Fingerprint')
+          iconClassName = 'text-cyan-600 dark:text-cyan-400'
+          break
+        case 'round_robin':
+          MethodIcon = Shuffle
+          methodLabel = t('Round Robin')
+          iconClassName = 'text-emerald-600 dark:text-emerald-400'
+          break
+        case 'other':
+          methodLabel = t('Other')
+          break
+      }
+
+      const accessibleLabel = [
+        methodLabel,
+        affinity.sourceDetail
+          ? `${t('Source')}: ${affinity.sourceDetail}`
+          : undefined,
+        affinity.workspaceUid
+          ? `${t('Workspace')}: ${affinity.workspaceUid}`
+          : undefined,
+      ]
+        .filter(Boolean)
+        .join(', ')
+
+      return (
+        <TooltipProvider delay={300}>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <div
+                  className='flex w-fit max-w-[148px] flex-col gap-0.5'
+                  tabIndex={0}
+                  aria-label={accessibleLabel}
+                  data-affinity-method={affinity.method ?? 'workspace'}
+                />
+              }
+            >
+              {methodLabel && (
+                <div className='flex min-w-0 items-center gap-1.5'>
+                  <MethodIcon
+                    className={cn('size-3.5 shrink-0', iconClassName)}
+                    aria-hidden='true'
+                  />
+                  <span className='truncate text-xs font-medium'>
+                    {methodLabel}
+                  </span>
+                </div>
+              )}
+              {affinity.workspaceShortId && (
+                <span
+                  className={cn(
+                    'text-muted-foreground block max-w-full truncate font-mono text-[11px] leading-none',
+                    methodLabel && 'pl-5'
+                  )}
+                >
+                  ws: {affinity.workspaceShortId}
+                </span>
+              )}
+            </TooltipTrigger>
+            <TooltipContent side='top' className='max-w-xs text-xs'>
+              <div className='space-y-1'>
+                {affinity.sourceDetail && (
+                  <p className='break-all'>
+                    <span className='text-muted-foreground'>
+                      {t('Source')}:
+                    </span>{' '}
+                    {affinity.sourceDetail}
+                  </p>
+                )}
+                {affinity.workspaceUid && (
+                  <p className='break-all'>
+                    <span className='text-muted-foreground'>
+                      {t('Workspace')}:
+                    </span>{' '}
+                    <span className='font-mono'>{affinity.workspaceUid}</span>
+                  </p>
+                )}
+              </div>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      )
+    },
+    enableSorting: false,
+    size: 136,
+    minSize: 120,
+    maxSize: 160,
   })
   columns.push(
     {

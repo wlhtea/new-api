@@ -107,7 +107,7 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	}
 
 	AppendChannelAffinityAdminInfo(ctx, adminInfo)
-	appendOpenCodeGoWorkspaceAdminInfo(ctx, adminInfo)
+	AppendOpenCodeGoWorkspaceAdminInfo(ctx, adminInfo)
 
 	other["admin_info"] = adminInfo
 	appendRequestPath(ctx, relayInfo, other)
@@ -119,7 +119,7 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	return other
 }
 
-func appendOpenCodeGoWorkspaceAdminInfo(ctx *gin.Context, adminInfo map[string]interface{}) {
+func AppendOpenCodeGoWorkspaceAdminInfo(ctx *gin.Context, adminInfo map[string]interface{}) {
 	if ctx == nil || adminInfo == nil {
 		return
 	}
@@ -132,7 +132,7 @@ func appendOpenCodeGoWorkspaceAdminInfo(ctx *gin.Context, adminInfo map[string]i
 	// explicitly as "none" so admin logs distinguish it from a missing marker.
 	affinitySource := common.GetContextKeyString(ctx, constant.ContextKeyOpenCodeGoAffinitySource)
 	if affinitySource == "" {
-		affinitySource = "none"
+		affinitySource = constant.OpenCodeGoAffinitySourceNone
 	}
 	adminInfo["opencode_go_affinity_source"] = affinitySource
 	if affinityKey := common.GetContextKeyString(ctx, constant.ContextKeyOpenCodeGoAffinityKey); affinityKey != "" {

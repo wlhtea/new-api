@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
@@ -48,11 +49,11 @@ func cacheIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, reques
 // Affinity source labels recorded in the consume log (admin_info) so each
 // request shows which workspace-affinity path selected the account.
 const (
-	AffinitySourceToken             = "token"
-	AffinitySourceClaudeCodeSession = "claude-code-session"
-	AffinitySourceClaudeMetadata    = "claude-metadata-session"
-	AffinitySourceOpenCodeSession   = "opencode-session"
-	AffinitySourcePromptCacheKey    = "prompt_cache_key"
+	AffinitySourceToken             = constant.OpenCodeGoAffinitySourceToken
+	AffinitySourceClaudeCodeSession = constant.OpenCodeGoAffinitySourceClaudeCodeSession
+	AffinitySourceClaudeMetadata    = constant.OpenCodeGoAffinitySourceClaudeMetadataSession
+	AffinitySourceOpenCodeSession   = constant.OpenCodeGoAffinitySourceOpenCodeSession
+	AffinitySourcePromptCacheKey    = constant.OpenCodeGoAffinitySourcePromptCacheKey
 )
 
 // affinityIdentityForRequest resolves the workspace-affinity key and its source

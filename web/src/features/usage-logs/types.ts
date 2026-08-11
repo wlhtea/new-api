@@ -112,6 +112,20 @@ export interface ToolSurchargeItem {
   price: number
 }
 
+export type UsageLogAffinityMethod =
+  | 'token'
+  | 'fingerprint'
+  | 'round_robin'
+  | 'other'
+
+export interface UsageLogAffinityDisplay {
+  method?: UsageLogAffinityMethod
+  source?: string
+  sourceDetail?: string
+  workspaceUid?: string
+  workspaceShortId?: string
+}
+
 export interface LogOtherData {
   admin_info?: {
     is_multi_key?: boolean
@@ -120,6 +134,8 @@ export interface LogOtherData {
     local_count_tokens?: boolean
     usage_billing_path?: UsageBillingPath | string
     channel_affinity?: ChannelAffinityInfo
+    opencode_go_affinity_source?: string
+    opencode_go_workspace_uid?: string
     // Top-up audit fields (type=1, admin only)
     payment_method?: string
     callback_payment_method?: string
@@ -162,6 +178,10 @@ export interface LogOtherData {
   user_agent?: string
   request_path?: string
   request_conversion?: string[]
+  // Public-safe projection for the log owner. The affinity key remains nested
+  // in admin_info on the backend and is never included here.
+  opencode_go_affinity_source?: string
+  opencode_go_workspace_uid?: string
   ws?: boolean
   audio?: boolean
   audio_input?: number
