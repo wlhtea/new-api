@@ -993,14 +993,51 @@ func TestInitOpenCodeGoPoolsReconcilesAnEmptyLegacyChannel(t *testing.T) {
 
 	reloaded, err := model.GetChannelById(channel.Id, true)
 	require.NoError(t, err)
-	require.Empty(t, reloaded.Models)
+	// Channel models are admin-managed and must survive a pool reconcile even
+	// when the pool has no eligible workspaces.
+	require.Equal(t, "model-a,model-b", reloaded.Models)
 	require.Equal(t, common.ChannelStatusAutoDisabled, reloaded.Status)
 	require.Equal(t, openCodeGoNoEligibleWorkspaceReason, reloaded.GetOtherInfo()["status_reason"])
 	var abilityCount int64
 	require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).Count(&abilityCount).Error)
-	require.Zero(t, abilityCount)
+	require.NotZero(t, abilityCount)
 	_, err = SelectOpenCodeGoWorkspace(channel.Id, "model-a")
 	require.ErrorIs(t, err, ErrOpenCodeGoNoEligibleWorkspace)
+}
+
+func TestOpenCodeGoReconcileDoesNotRestoreAdminRemovedModels(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+
+	// The pool supports both models, but the channel exposes only model-a.
+	createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "one", "workspace-one", "wrk_ALPHA1", []string{"model-a", "model-b"})
+	channel.Models = "model-a"
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("models", channel.Models).Error)
+
+	require.NoError(t, ReconcileOpenCodeGoPoolChannel(channel.Id))
+
+	reloaded, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	// model-b stays removed even though the pool still supports it.
+	require.Equal(t, "model-a", reloaded.Models)
+
+	// Kept models still resolve through the pool snapshot.
+	_, err = SelectOpenCodeGoWorkspace(channel.Id, "model-a")
+	require.NoError(t, err)
+}
+
+func TestOpenCodeGoReconcilePreservesManualModelsOutsidePool(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "one", "workspace-one", "wrk_ALPHA1", []string{"model-a"})
+	channel.Models = "model-a,manual-model"
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("models", channel.Models).Error)
+
+	require.NoError(t, ReconcileOpenCodeGoPoolChannel(channel.Id))
+
+	reloaded, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	// Manual models the pool does not cover are preserved; reconcile neither
+	// prunes nor appends to the admin-managed model list.
+	require.Equal(t, "model-a,manual-model", reloaded.Models)
 }
 
 func TestOpenCodeGoPoolConcurrentCursorIsBalanced(t *testing.T) {
@@ -1109,27 +1146,4 @@ func TestOpenCodeGoWorkspaceEligibilityRejectsEverySchedulingBlocker(t *testing.
 			require.False(t, isOpenCodeGoWorkspaceEligibleForSnapshot(value, now))
 		})
 	}
-}
-
-func TestSyncOpenCodeGoChannelModelsRemovesUnavailableModelsAndKeepsAvailableAliases(t *testing.T) {
-	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
-	mapping := `{"public-a":"model-a","public-missing":"model-missing"}`
-	channel.ModelMapping = &mapping
-	channel.Models = "model-a,model-b,old-model,public-a,public-missing"
-	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]interface{}{
-		"models":        channel.Models,
-		"model_mapping": mapping,
-	}).Error)
-	createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "one", "workspace-one", "wrk_ALPHA1", []string{"model-a"})
-
-	require.NoError(t, syncOpenCodeGoChannelModels(channel.Id))
-	reloaded, err := model.GetChannelById(channel.Id, true)
-	require.NoError(t, err)
-	require.Equal(t, "model-a,public-a", reloaded.Models)
-
-	var abilities []model.Ability
-	require.NoError(t, db.Where("channel_id = ?", channel.Id).Order("model asc").Find(&abilities).Error)
-	require.Len(t, abilities, 2)
-	require.Equal(t, "model-a", abilities[0].Model)
-	require.Equal(t, "public-a", abilities[1].Model)
 }

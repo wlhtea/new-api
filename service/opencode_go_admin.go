@@ -470,9 +470,6 @@ func ReconcileOpenCodeGoPoolChannel(channelID int) error {
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return err
 	}
-	if err := syncOpenCodeGoChannelModels(channelID); err != nil {
-		return err
-	}
 	return RebuildOpenCodeGoPoolChannel(channelID)
 }
 

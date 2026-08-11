@@ -106,7 +106,7 @@ func TestOpenCodeGoPoolViewConvertsHealthObservationNanosecondsToSeconds(t *test
 	require.Zero(t, openCodeGoHealthObservedAtForView(0))
 }
 
-func TestOpenCodeGoManualEnablementInvalidatesModelsAndPoolSnapshots(t *testing.T) {
+func TestOpenCodeGoManualEnablementInvalidatesPoolSnapshotsOnly(t *testing.T) {
 	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
 	workspace := createEligibleOpenCodeGoWorkspace(
 		t,
@@ -118,7 +118,6 @@ func TestOpenCodeGoManualEnablementInvalidatesModelsAndPoolSnapshots(t *testing.
 		"wrk_ALPHA1",
 		[]string{"model-a"},
 	)
-	require.NoError(t, syncOpenCodeGoChannelModels(channel.Id))
 	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
 	_, err := SelectOpenCodeGoWorkspace(channel.Id, "model-a")
 	require.NoError(t, err)
@@ -132,14 +131,15 @@ func TestOpenCodeGoManualEnablementInvalidatesModelsAndPoolSnapshots(t *testing.
 	require.ErrorIs(t, err, ErrOpenCodeGoNoEligibleWorkspace)
 	reloaded, err := model.GetChannelById(channel.Id, true)
 	require.NoError(t, err)
-	require.Empty(t, reloaded.Models)
+	// Channel models are admin-managed; pool enablement toggles must not rewrite them.
+	require.Equal(t, "model-a,model-b", reloaded.Models)
 
 	require.NoError(t, adminService.SetIdentityEnabled(channel.Id, "identity-one", true))
 	_, err = SelectOpenCodeGoWorkspace(channel.Id, "model-a")
 	require.NoError(t, err)
 	reloaded, err = model.GetChannelById(channel.Id, true)
 	require.NoError(t, err)
-	require.Equal(t, "model-a", reloaded.Models)
+	require.Equal(t, "model-a,model-b", reloaded.Models)
 
 	require.NoError(t, adminService.SetWorkspaceEnabled(channel.Id, workspace.UID, false))
 	_, err = SelectOpenCodeGoWorkspace(channel.Id, "model-a")

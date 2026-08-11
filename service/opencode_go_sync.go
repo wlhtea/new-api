@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -279,9 +278,6 @@ func (service *OpenCodeGoAccountPoolService) importOneIdentity(
 	if err != nil {
 		return "", 0, err
 	}
-	if err := syncOpenCodeGoChannelModels(channelID); err != nil {
-		return "", 0, err
-	}
 	if service.rebuild != nil {
 		if err := service.rebuild(channelID); err != nil {
 			return "", 0, err
@@ -469,9 +465,6 @@ func (service *OpenCodeGoAccountPoolService) refreshIdentityWithCookie(
 		return nil
 	})
 	if err != nil {
-		return nil, err
-	}
-	if err := syncOpenCodeGoChannelModels(channelID); err != nil {
 		return nil, err
 	}
 	if service.rebuild != nil {
@@ -1030,70 +1023,6 @@ func validateOpenCodeGoPoolChannelTx(tx *gorm.DB, channelID int) error {
 	if channel.Type != constant.ChannelTypeOpenCodeGo {
 		return errors.New("channel is not an OpenCode Go channel")
 	}
-	return nil
-}
-
-func syncOpenCodeGoChannelModels(channelID int) error {
-	var discovered []string
-	now := time.Now().Unix()
-	if err := model.DB.Table("open_code_go_workspace_models AS workspace_models").
-		Joins("JOIN open_code_go_workspaces AS workspaces ON workspaces.id = workspace_models.workspace_id").
-		Joins("JOIN open_code_go_identities AS identities ON identities.id = workspaces.identity_id").
-		Where("workspaces.channel_id = ?", channelID).
-		Where("identities.status = ?", model.OpenCodeGoIdentityStatusActive).
-		Where("workspaces.manual_enabled = ? AND workspaces.effective_state = ?", true, model.OpenCodeGoStateEligible).
-		Where("workspace_models.discovered = ? AND workspace_models.state = ?", true, model.OpenCodeGoModelAvailable).
-		Where("workspace_models.disabled_until = 0 OR workspace_models.disabled_until <= ?", now).
-		Distinct("workspace_models.model").
-		Pluck("workspace_models.model", &discovered).Error; err != nil {
-		return err
-	}
-	channel, err := model.GetChannelById(channelID, true)
-	if err != nil {
-		return err
-	}
-	discoveredSet := make(map[string]struct{}, len(discovered))
-	for _, modelID := range discovered {
-		modelID = strings.TrimSpace(modelID)
-		if modelID != "" {
-			discoveredSet[modelID] = struct{}{}
-		}
-	}
-	modelSet := make(map[string]struct{}, len(discoveredSet))
-	for modelID := range discoveredSet {
-		modelSet[modelID] = struct{}{}
-	}
-	if rawMapping := strings.TrimSpace(channel.GetModelMapping()); rawMapping != "" {
-		mapping := map[string]string{}
-		if err := common.UnmarshalJsonStr(rawMapping, &mapping); err != nil {
-			return errors.New("OpenCode Go channel model mapping is invalid")
-		}
-		for publicModel, upstreamModel := range mapping {
-			publicModel = strings.TrimSpace(publicModel)
-			upstreamModel = strings.TrimSpace(upstreamModel)
-			if publicModel == "" || upstreamModel == "" {
-				continue
-			}
-			if _, available := discoveredSet[upstreamModel]; available {
-				modelSet[publicModel] = struct{}{}
-			}
-		}
-	}
-	models := make([]string, 0, len(modelSet))
-	for modelID := range modelSet {
-		models = append(models, modelID)
-	}
-	sort.Strings(models)
-	channel.Models = strings.Join(models, ",")
-	if err := model.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&model.Channel{}).Where("id = ?", channelID).Update("models", channel.Models).Error; err != nil {
-			return err
-		}
-		return channel.UpdateAbilities(tx)
-	}); err != nil {
-		return err
-	}
-	model.InitChannelCache()
 	return nil
 }
 

@@ -338,7 +338,7 @@ export const channelFormSchema = z
     opencode_go_auto_cancel_subscription_renewal: z.boolean().optional(),
   })
   .superRefine((data, ctx) => {
-    if (data.type !== CHANNEL_TYPE_OPENCODE_GO && !data.models.trim()) {
+    if (!data.models.trim()) {
       addRequiredIssue(ctx, 'models', ERROR_MESSAGES.REQUIRED_MODELS)
     }
 

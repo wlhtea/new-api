@@ -3334,16 +3334,13 @@ export function ChannelMutateDrawer({
                                   <div className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
                                     <div className='space-y-1'>
                                       <FormLabel>
-                                        {currentType ===
-                                        CHANNEL_TYPE_OPENCODE_GO
-                                          ? t('Models')
-                                          : t('Models *')}
+                                        {t('Models *')}
                                       </FormLabel>
                                       <FormDescription>
                                         {currentType ===
                                         CHANNEL_TYPE_OPENCODE_GO
                                           ? t(
-                                              'Models are derived from the account pool and cannot be edited here.'
+                                              'Edit the models this channel exposes. The account pool sync never rewrites this list, so removed models stay removed.'
                                             )
                                           : t(FIELD_DESCRIPTIONS.MODELS)}
                                       </FormDescription>
@@ -3366,9 +3363,6 @@ export function ChannelMutateDrawer({
                                       createLabel='Add custom model "{{value}}"'
                                       maxVisibleChips={8}
                                       copyChipOnClick
-                                      disabled={
-                                        currentType === CHANNEL_TYPE_OPENCODE_GO
-                                      }
                                     />
                                   </FormControl>
                                   {modelMappingGuardrail.exposedTargetModels

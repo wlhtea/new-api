@@ -82,6 +82,22 @@ describe('OpenCode Go channel configuration', () => {
     assert.equal(channelFormSchema.safeParse(form).success, true)
   })
 
+  test('preserves an admin-curated model subset on create payload', () => {
+    // The admin removed the expensive models from the account pool list; the
+    // payload must carry exactly the curated subset, not the full pool set.
+    const curated = 'glm-5.2,glm-5.1,kimi-k2.7-code'
+    const result = transformFormDataToCreatePayload({
+      ...CHANNEL_FORM_DEFAULT_VALUES,
+      name: 'OpenCode Go pool',
+      type: CHANNEL_TYPE_OPENCODE_GO,
+      base_url: OPENCODE_GO_BASE_URL,
+      key: '',
+      models: curated,
+    })
+
+    assert.equal(result.channel.models, curated)
+  })
+
   test('never serializes a legacy key into the channel payload', () => {
     const result = transformFormDataToCreatePayload({
       ...CHANNEL_FORM_DEFAULT_VALUES,
@@ -142,7 +158,7 @@ describe('OpenCode Go channel configuration', () => {
         ...CHANNEL_FORM_DEFAULT_VALUES,
         name: 'OpenCode Go pool',
         type: CHANNEL_TYPE_OPENCODE_GO,
-        models: '',
+        models: 'glm-5.2',
         opencode_go_referral_rewards_max_per_run: 0,
       }).success,
       true
@@ -161,7 +177,7 @@ describe('OpenCode Go channel configuration', () => {
       response_time: 0,
       balance_updated_time: 0,
       base_url: OPENCODE_GO_BASE_URL,
-      models: '',
+      models: 'glm-5.2',
       settings: JSON.stringify({
         retained_setting: 'keep-me',
         opencode_go: {
@@ -184,7 +200,7 @@ describe('OpenCode Go channel configuration', () => {
     const defaults = transformChannelToFormDefaults(channel)
 
     assert.equal(defaults.key, '')
-    assert.equal(defaults.models, '')
+    assert.equal(defaults.models, 'glm-5.2')
     assert.equal(defaults.opencode_go_default_protocol, 'messages')
     assert.equal(defaults.opencode_go_generic_failover_enabled, true)
     assert.equal(defaults.opencode_go_generic_failover_threshold, 3)
