@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -19,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestValidateChannelProxy(t *testing.T) {
@@ -149,7 +151,7 @@ func TestAddOpenCodeGoChannelWithoutLegacyKey(t *testing.T) {
 			"name":"OpenCode Go pool",
 			"type":62,
 			"key":"",
-			"models":"glm-5.2",
+			"models":"model-a,model-b",
 			"group":"default",
 			"status":1
 		}
@@ -172,16 +174,19 @@ func TestAddOpenCodeGoChannelWithoutLegacyKey(t *testing.T) {
 	require.NoError(t, db.Where("type = ?", constant.ChannelTypeOpenCodeGo).Find(&channels).Error)
 	require.Len(t, channels, 1)
 	assert.Empty(t, channels[0].Key)
-	assert.Empty(t, channels[0].Models)
+	assert.Equal(t, "model-a,model-b", channels[0].Models)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, channels[0].Status)
 	assert.Equal(t, "opencode_go:no_eligible_workspace", channels[0].GetOtherInfo()["status_reason"])
 
-	var abilityCount int64
-	require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", channels[0].Id).Count(&abilityCount).Error)
-	assert.Zero(t, abilityCount)
+	var abilities []model.Ability
+	require.NoError(t, db.Where("channel_id = ?", channels[0].Id).Order("model ASC").Find(&abilities).Error)
+	require.Len(t, abilities, 2)
+	assert.Equal(t, []string{"model-a", "model-b"}, []string{abilities[0].Model, abilities[1].Model})
+	assert.False(t, abilities[0].Enabled)
+	assert.False(t, abilities[1].Enabled)
 }
 
-func TestCopyOpenCodeGoChannelCreatesDisabledEmptyPool(t *testing.T) {
+func TestCopyOpenCodeGoChannelPreservesAdminModelsInDisabledEmptyPool(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(
 		&model.OpenCodeGoIdentity{},
@@ -193,17 +198,25 @@ func TestCopyOpenCodeGoChannelCreatesDisabledEmptyPool(t *testing.T) {
 	origin := &model.Channel{
 		Type:   constant.ChannelTypeOpenCodeGo,
 		Name:   "OpenCode Go source",
-		Models: "model-a",
-		Group:  "default",
+		Key:    "legacy-key-placeholder",
+		Models: "model-a,model-b",
+		Group:  "vip",
 		Status: common.ChannelStatusEnabled,
 	}
 	require.NoError(t, db.Create(origin).Error)
-	require.NoError(t, db.Create(&model.OpenCodeGoIdentity{
+	identity := &model.OpenCodeGoIdentity{
 		UID:                   "identity-source",
 		ChannelID:             origin.Id,
 		AuthCookieCiphertext:  "synthetic-ciphertext",
 		AuthCookieFingerprint: fmt.Sprintf("%064s", "source"),
 		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, db.Create(identity).Error)
+	require.NoError(t, db.Create(&model.OpenCodeGoWorkspace{
+		UID:                 "workspace-source",
+		ChannelID:           origin.Id,
+		IdentityID:          identity.ID,
+		UpstreamWorkspaceID: "workspace-source-upstream",
 	}).Error)
 
 	recorder := httptest.NewRecorder()
@@ -227,19 +240,26 @@ func TestCopyOpenCodeGoChannelCreatesDisabledEmptyPool(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, constant.ChannelTypeOpenCodeGo, clone.Type)
 	assert.Empty(t, clone.Key)
-	assert.Empty(t, clone.Models)
+	assert.Equal(t, "model-a,model-b", clone.Models)
+	assert.Equal(t, "vip", clone.Group)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, clone.Status)
 	assert.Equal(t, "opencode_go:no_eligible_workspace", clone.GetOtherInfo()["status_reason"])
 
 	var identityCount int64
 	require.NoError(t, db.Model(&model.OpenCodeGoIdentity{}).Where("channel_id = ?", clone.Id).Count(&identityCount).Error)
 	assert.Zero(t, identityCount)
-	var abilityCount int64
-	require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", clone.Id).Count(&abilityCount).Error)
-	assert.Zero(t, abilityCount)
+	var workspaceCount int64
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspace{}).Where("channel_id = ?", clone.Id).Count(&workspaceCount).Error)
+	assert.Zero(t, workspaceCount)
+	var abilities []model.Ability
+	require.NoError(t, db.Where("channel_id = ?", clone.Id).Order("model ASC").Find(&abilities).Error)
+	require.Len(t, abilities, 2)
+	assert.Equal(t, []string{"model-a", "model-b"}, []string{abilities[0].Model, abilities[1].Model})
+	assert.False(t, abilities[0].Enabled)
+	assert.False(t, abilities[1].Enabled)
 }
 
-func TestUpdateOpenCodeGoChannelReconcilesDerivedModelsAndEmptyPoolStatus(t *testing.T) {
+func TestUpdateOpenCodeGoChannelPersistsAdminModelsWithEmptyPool(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(
 		&model.OpenCodeGoIdentity{},
@@ -252,7 +272,7 @@ func TestUpdateOpenCodeGoChannelReconcilesDerivedModelsAndEmptyPoolStatus(t *tes
 		Type:   constant.ChannelTypeOpenCodeGo,
 		Name:   "OpenCode Go edit",
 		Status: common.ChannelStatusAutoDisabled,
-		Models: "",
+		Models: "model-a,model-b",
 		Group:  "default",
 	}
 	service.PrepareOpenCodeGoPoolContainer(channel)
@@ -263,7 +283,7 @@ func TestUpdateOpenCodeGoChannelReconcilesDerivedModelsAndEmptyPoolStatus(t *tes
 		"type":62,
 		"name":"OpenCode Go edited",
 		"key":"",
-		"models":"forged-model",
+		"models":"model-a",
 		"group":"default"
 	}`, channel.Id))
 	recorder := httptest.NewRecorder()
@@ -276,17 +296,23 @@ func TestUpdateOpenCodeGoChannelReconcilesDerivedModelsAndEmptyPoolStatus(t *tes
 	var response struct {
 		Success bool   `json:"success"`
 		Message string `json:"message"`
+		Data    struct {
+			Models string `json:"models"`
+		} `json:"data"`
 	}
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 	require.True(t, response.Success, response.Message)
+	assert.Equal(t, "model-a", response.Data.Models)
 	reloaded, err := model.GetChannelById(channel.Id, true)
 	require.NoError(t, err)
 	assert.Equal(t, "OpenCode Go edited", reloaded.Name)
-	assert.Empty(t, reloaded.Models)
+	assert.Equal(t, "model-a", reloaded.Models)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, reloaded.Status)
-	var abilityCount int64
-	require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).Count(&abilityCount).Error)
-	assert.Zero(t, abilityCount)
+	var abilities []model.Ability
+	require.NoError(t, db.Where("channel_id = ?", channel.Id).Find(&abilities).Error)
+	require.Len(t, abilities, 1)
+	assert.Equal(t, "model-a", abilities[0].Model)
+	assert.False(t, abilities[0].Enabled)
 }
 
 func TestUpdateOpenCodeGoChannelPreservesLifecyclePolicy(t *testing.T) {
@@ -305,6 +331,7 @@ func TestUpdateOpenCodeGoChannelPreservesLifecyclePolicy(t *testing.T) {
 		Type:   constant.ChannelTypeOpenCodeGo,
 		Name:   "OpenCode Go protected policy",
 		Status: common.ChannelStatusAutoDisabled,
+		Models: "model-old",
 		Group:  "default",
 	}
 	channel.SetOtherSettings(dto.ChannelOtherSettings{
@@ -337,7 +364,7 @@ func TestUpdateOpenCodeGoChannelPreservesLifecyclePolicy(t *testing.T) {
 		"type":     constant.ChannelTypeOpenCodeGo,
 		"name":     "OpenCode Go protocol edited",
 		"key":      "",
-		"models":   "forged-model",
+		"models":   "model-new",
 		"group":    "default",
 		"settings": string(encodedSettings),
 	})
@@ -358,6 +385,7 @@ func TestUpdateOpenCodeGoChannelPreservesLifecyclePolicy(t *testing.T) {
 	require.True(t, response.Success, response.Message)
 	reloaded, err := model.GetChannelById(channel.Id, true)
 	require.NoError(t, err)
+	assert.Equal(t, "model-new", reloaded.Models)
 	config := reloaded.GetOtherSettings().OpenCodeGo
 	require.NotNil(t, config)
 	assert.Equal(t, dto.OpenCodeGoProtocolResponses, config.DefaultProtocol)
@@ -369,6 +397,206 @@ func TestUpdateOpenCodeGoChannelPreservesLifecyclePolicy(t *testing.T) {
 	require.NotNil(t, config.ReferralRewardsMaxPerRun)
 	assert.Zero(t, *config.ReferralRewardsMaxPerRun)
 	assert.True(t, config.AutoCancelSubscriptionRenewal)
+	var abilities []model.Ability
+	require.NoError(t, db.Where("channel_id = ?", channel.Id).Find(&abilities).Error)
+	require.Len(t, abilities, 1)
+	assert.Equal(t, "model-new", abilities[0].Model)
+	assert.False(t, abilities[0].Enabled)
+}
+
+func TestUpdateOpenCodeGoChannelRefreshesMemoryRoutingAfterModelRemoval(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.OpenCodeGoIdentity{},
+		&model.OpenCodeGoWorkspace{},
+		&model.OpenCodeGoQuotaWindow{},
+		&model.OpenCodeGoWorkspaceModel{},
+		&model.OpenCodeGoOperation{},
+	))
+	enableOpenCodeGoControllerMemoryCache(t)
+
+	channel := &model.Channel{
+		Type:   constant.ChannelTypeOpenCodeGo,
+		Name:   "OpenCode Go cache edit",
+		Status: common.ChannelStatusEnabled,
+		Models: "model-a,model-b",
+		Group:  "default",
+	}
+	require.NoError(t, channel.Insert())
+	t.Cleanup(func() { service.RemoveOpenCodeGoPoolChannel(channel.Id) })
+	createEligibleOpenCodeGoControllerWorkspace(t, db, channel.Id, []string{"model-a", "model-b"})
+	require.NoError(t, service.ReconcileOpenCodeGoPoolChannel(channel.Id))
+	model.InitChannelCache()
+
+	for _, modelID := range []string{"model-a", "model-b"} {
+		selected, err := model.GetRandomSatisfiedChannel("default", modelID, 0, "/v1/chat/completions")
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Equal(t, channel.Id, selected.Id)
+	}
+
+	body := []byte(fmt.Sprintf(`{
+		"id":%d,
+		"type":62,
+		"name":"OpenCode Go cache edited",
+		"key":"",
+		"models":"model-a",
+		"group":"default"
+	}`, channel.Id))
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/channel", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	UpdateChannel(ctx)
+
+	var response struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.True(t, response.Success, response.Message)
+	retained, err := model.GetRandomSatisfiedChannel("default", "model-a", 0, "/v1/chat/completions")
+	require.NoError(t, err)
+	require.NotNil(t, retained)
+	assert.Equal(t, channel.Id, retained.Id)
+	removed, err := model.GetRandomSatisfiedChannel("default", "model-b", 0, "/v1/chat/completions")
+	require.NoError(t, err)
+	assert.Nil(t, removed)
+}
+
+func TestUpdateOpenCodeGoChannelRefreshesMemoryRoutingWhenReconcileFails(t *testing.T) {
+	setupModelListControllerTestDB(t)
+	enableOpenCodeGoControllerMemoryCache(t)
+
+	channel := &model.Channel{
+		Type:   constant.ChannelTypeOpenCodeGo,
+		Name:   "OpenCode Go failed reconcile edit",
+		Status: common.ChannelStatusEnabled,
+		Models: "model-a,model-b",
+		Group:  "default",
+	}
+	require.NoError(t, channel.Insert())
+	t.Cleanup(func() { service.RemoveOpenCodeGoPoolChannel(channel.Id) })
+	model.InitChannelCache()
+	selected, err := model.GetRandomSatisfiedChannel("default", "model-b", 0, "/v1/chat/completions")
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+
+	body := []byte(fmt.Sprintf(`{
+		"id":%d,
+		"type":62,
+		"name":"OpenCode Go persisted before reconcile error",
+		"key":"",
+		"models":"model-a",
+		"group":"default"
+	}`, channel.Id))
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/channel", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	UpdateChannel(ctx)
+
+	var response struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.False(t, response.Success)
+	assert.NotEmpty(t, response.Message)
+	reloaded, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	assert.Equal(t, "model-a", reloaded.Models)
+	retained, err := model.GetRandomSatisfiedChannel("default", "model-a", 0, "/v1/chat/completions")
+	require.NoError(t, err)
+	require.NotNil(t, retained)
+	removed, err := model.GetRandomSatisfiedChannel("default", "model-b", 0, "/v1/chat/completions")
+	require.NoError(t, err)
+	assert.Nil(t, removed)
+}
+
+func enableOpenCodeGoControllerMemoryCache(t *testing.T) {
+	t.Helper()
+	previousMemoryCache := common.MemoryCacheEnabled
+	previousSecret := common.CryptoSecret
+	previousSecretConfigured := common.CryptoSecretExplicitlyConfigured
+	common.MemoryCacheEnabled = true
+	common.CryptoSecret = "test-only-controller-cache-secret"
+	common.CryptoSecretExplicitlyConfigured = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		common.CryptoSecret = previousSecret
+		common.CryptoSecretExplicitlyConfigured = previousSecretConfigured
+	})
+}
+
+func createEligibleOpenCodeGoControllerWorkspace(
+	t *testing.T,
+	db *gorm.DB,
+	channelID int,
+	models []string,
+) {
+	t.Helper()
+	codec, err := service.NewOpenCodeGoCredentialCodec(common.CryptoSecret)
+	require.NoError(t, err)
+	identityUID := "identity-controller-cache"
+	cookie := "cookie-controller-cache"
+	cookieCiphertext, err := codec.Encrypt(service.OpenCodeGoCredentialAuthCookie, channelID, identityUID, cookie)
+	require.NoError(t, err)
+	cookieFingerprint, err := codec.Fingerprint(service.OpenCodeGoCredentialAuthCookie, cookie)
+	require.NoError(t, err)
+	identity := &model.OpenCodeGoIdentity{
+		UID:                   identityUID,
+		ChannelID:             channelID,
+		AuthCookieCiphertext:  cookieCiphertext,
+		AuthCookieFingerprint: cookieFingerprint,
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, db.Create(identity).Error)
+
+	workspaceUID := "workspace-controller-cache"
+	apiKey := "sk-controller-cache"
+	apiKeyCiphertext, err := codec.Encrypt(service.OpenCodeGoCredentialAPIKey, channelID, workspaceUID, apiKey)
+	require.NoError(t, err)
+	apiKeyFingerprint, err := codec.Fingerprint(service.OpenCodeGoCredentialAPIKey, apiKey)
+	require.NoError(t, err)
+	fetchedAt := time.Now().Unix()
+	workspace := &model.OpenCodeGoWorkspace{
+		UID:                 workspaceUID,
+		ChannelID:           channelID,
+		IdentityID:          identity.ID,
+		UpstreamWorkspaceID: "workspace-controller-cache-upstream",
+		APIKeyCiphertext:    apiKeyCiphertext,
+		APIKeyFingerprint:   apiKeyFingerprint,
+		CredentialStatus:    model.OpenCodeGoCredentialValid,
+		MembershipStatus:    model.OpenCodeGoMembershipActive,
+		ManualEnabled:       true,
+		EffectiveState:      model.OpenCodeGoStateEligible,
+		QuotaSnapshotStatus: model.OpenCodeGoQuotaSnapshotComplete,
+		QuotaFetchedAt:      fetchedAt,
+		QuotaNextRefreshAt:  fetchedAt + 3600,
+		QuotaParserVersion:  service.OpenCodeGoSSRParserVersion,
+	}
+	require.NoError(t, db.Create(workspace).Error)
+	for index, kind := range model.OpenCodeGoQuotaKinds {
+		require.NoError(t, db.Create(&model.OpenCodeGoQuotaWindow{
+			WorkspaceID:  workspace.ID,
+			Kind:         kind,
+			UsedPercent:  float64(10 + index),
+			ResetSeconds: int64((index + 1) * 3600),
+			ResetAt:      fetchedAt + int64((index+1)*3600),
+			FetchedAt:    fetchedAt,
+		}).Error)
+	}
+	for _, modelID := range models {
+		require.NoError(t, db.Create(&model.OpenCodeGoWorkspaceModel{
+			WorkspaceID: workspace.ID,
+			Model:       modelID,
+			Discovered:  true,
+			State:       model.OpenCodeGoModelAvailable,
+		}).Error)
+	}
 }
 
 func TestOpenCodeGoChannelTypeCannotBeChangedAfterCreation(t *testing.T) {

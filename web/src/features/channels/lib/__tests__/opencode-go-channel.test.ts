@@ -220,6 +220,7 @@ describe('OpenCode Go channel configuration', () => {
     const update = transformFormDataToUpdatePayload(defaults, channel.id)
     const settings = JSON.parse(String(update.settings))
     assert.equal('key' in update, false)
+    assert.equal(update.models, 'glm-5.2')
     assert.equal(settings.retained_setting, 'keep-me')
     assert.equal(settings.opencode_go.referral_rewards_max_per_run, 0)
     assert.equal(settings.opencode_go.generic_failover_enabled, true)

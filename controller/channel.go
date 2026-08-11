@@ -1034,7 +1034,6 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	if channel.Type == constant.ChannelTypeOpenCodeGo {
-		channel.Models = originChannel.Models
 		preserveOpenCodeGoLifecycleSettings(&channel.Channel, originChannel)
 	}
 	originProxy := originChannel.GetSetting().Proxy
@@ -1144,6 +1143,7 @@ func UpdateChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	defer model.InitChannelCache()
 	if channel.Type == constant.ChannelTypeOpenCodeGo {
 		if err := service.ReconcileOpenCodeGoPoolChannel(channel.Id); err != nil {
 			common.ApiError(c, err)
@@ -1152,8 +1152,6 @@ func UpdateChannel(c *gin.Context) {
 		if reconciled, reloadErr := model.GetChannelById(channel.Id, true); reloadErr == nil {
 			channel.Channel = *reconciled
 		}
-	} else {
-		model.InitChannelCache()
 	}
 	if proxyChanged {
 		service.InvalidateProxyClient(originProxy)

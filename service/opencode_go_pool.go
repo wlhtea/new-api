@@ -103,15 +103,15 @@ type openCodeGoBulkFailureCounter struct {
 
 var openCodeGoPoolChannels sync.Map
 
-// PrepareOpenCodeGoPoolContainer removes derived routing state from a newly
-// created channel. Credentials and model availability are populated only after
-// an account-pool import succeeds.
+// PrepareOpenCodeGoPoolContainer removes pool-owned routing state from a newly
+// created channel. The administrator-owned model list and group are preserved;
+// credentials and eligible workspace candidates are populated only after an
+// account-pool import succeeds.
 func PrepareOpenCodeGoPoolContainer(channel *model.Channel) {
 	if channel == nil || channel.Type != constant.ChannelTypeOpenCodeGo {
 		return
 	}
 	channel.Key = ""
-	channel.Models = ""
 	if channel.Status == common.ChannelStatusManuallyDisabled {
 		return
 	}
