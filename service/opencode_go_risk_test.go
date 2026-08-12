@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -196,6 +197,45 @@ func TestOpenCodeGoRiskBatchSerializesWorkspacesSharingIdentity(t *testing.T) {
 	assert.Equal(t, 2, summary.Total)
 	assert.Equal(t, 2, summary.Recovered)
 	assert.Equal(t, 1, fake.maxActive)
+}
+
+func TestOpenCodeGoRiskBatchCreatesOneChannelScopedProbe(t *testing.T) {
+	_, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	identity := model.OpenCodeGoIdentity{
+		UID:                   "identity-risk-scoped-batch",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie-risk-scoped-batch",
+		AuthCookieFingerprint: "fingerprint-risk-scoped-batch",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, model.DB.Create(&identity).Error)
+	seedOpenCodeGoRiskWorkspace(t, codec, channel.Id, identity.ID, "workspace-risk-scoped-one", "risk-scoped-key-one")
+	seedOpenCodeGoRiskWorkspace(t, codec, channel.Id, identity.ID, "workspace-risk-scoped-two", "risk-scoped-key-two")
+	fake := &fakeOpenCodeGoRiskProbe{response: OpenCodeGoRiskProbeResponse{StatusCode: http.StatusOK}}
+	var factoryCalls atomic.Int32
+	riskService := &OpenCodeGoRiskRecheckService{
+		probeFactory: func(gotChannelID int) (openCodeGoRiskProbeClient, error) {
+			assert.Equal(t, channel.Id, gotChannelID)
+			factoryCalls.Add(1)
+			return fake, nil
+		},
+		codec:   codec,
+		now:     func() time.Time { return time.Unix(1_900_000_300, 0) },
+		rebuild: func(int) error { return nil },
+	}
+
+	summary, err := riskService.RecheckRiskWorkspaces(
+		context.Background(),
+		channel.Id,
+		2,
+		100,
+		"task",
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 2, summary.Recovered)
+	assert.Equal(t, int32(1), factoryCalls.Load())
+	assert.Len(t, fake.apiKeys, 2)
 }
 
 func TestOpenCodeGoRiskProbeClientSendsMinimalNonStreamingRequest(t *testing.T) {

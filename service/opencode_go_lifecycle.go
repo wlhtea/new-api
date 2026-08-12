@@ -67,10 +67,11 @@ type OpenCodeGoLifecycleBatchSummary struct {
 }
 
 type OpenCodeGoLifecycleService struct {
-	reader  openCodeGoLifecycleReader
-	mutator openCodeGoLifecycleMutator
-	pool    *OpenCodeGoAccountPoolService
-	now     func() time.Time
+	reader        openCodeGoLifecycleReader
+	mutator       openCodeGoLifecycleMutator
+	pool          *OpenCodeGoAccountPoolService
+	scopedFactory func(channelID int) (*OpenCodeGoLifecycleService, error)
+	now           func() time.Time
 }
 
 type openCodeGoLifecycleTarget struct {
@@ -84,8 +85,27 @@ func NewConfiguredOpenCodeGoLifecycleService() (*OpenCodeGoLifecycleService, err
 	if err != nil {
 		return nil, err
 	}
-	console := NewOpenCodeGoConsoleClient()
-	mutator, err := newOpenCodeGoLifecycleClient(console, "https://billing.stripe.com", GetHttpClient())
+	return &OpenCodeGoLifecycleService{
+		scopedFactory: func(channelID int) (*OpenCodeGoLifecycleService, error) {
+			return newOpenCodeGoChannelLifecycleService(channelID, codec)
+		},
+		now: time.Now,
+	}, nil
+}
+
+func newOpenCodeGoChannelLifecycleService(
+	channelID int,
+	codec *OpenCodeGoCredentialCodec,
+) (*OpenCodeGoLifecycleService, error) {
+	baseClient, err := getOpenCodeGoChannelHTTPClient(channelID)
+	if err != nil {
+		return nil, err
+	}
+	console, err := newOpenCodeGoConsoleClient(openCodeGoConsoleOrigin, openCodeGoInferenceOrigin, baseClient)
+	if err != nil {
+		return nil, err
+	}
+	mutator, err := newOpenCodeGoLifecycleClient(console, "https://billing.stripe.com", baseClient)
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +124,26 @@ func newOpenCodeGoLifecycleService(
 		pool:    pool,
 		now:     time.Now,
 	}
+}
+
+func (service *OpenCodeGoLifecycleService) scopedForChannel(channelID int) (*OpenCodeGoLifecycleService, error) {
+	if service == nil {
+		return nil, errors.New("OpenCode Go lifecycle service is not configured")
+	}
+	if service.reader != nil && service.mutator != nil && service.pool != nil {
+		return service, nil
+	}
+	if service.scopedFactory == nil {
+		return nil, errors.New("OpenCode Go lifecycle service is not configured")
+	}
+	scoped, err := service.scopedFactory(channelID)
+	if err != nil {
+		return nil, err
+	}
+	if scoped == nil {
+		return nil, errors.New("OpenCode Go lifecycle service is not configured")
+	}
+	return scoped, nil
 }
 
 func GetOpenCodeGoLifecyclePolicy(channelID int) (OpenCodeGoLifecyclePolicy, error) {
@@ -206,6 +246,11 @@ func (service *OpenCodeGoLifecycleService) EnableChinaModels(
 	workspaceUID string,
 	source string,
 ) (*model.OpenCodeGoOperation, error) {
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return nil, err
+	}
+	service = scoped
 	if err := service.validate(); err != nil {
 		return nil, err
 	}
@@ -267,6 +312,11 @@ func (service *OpenCodeGoLifecycleService) DisableChinaModels(
 	workspaceUID string,
 	source string,
 ) (*model.OpenCodeGoOperation, error) {
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return nil, err
+	}
+	service = scoped
 	if err := service.validate(); err != nil {
 		return nil, err
 	}
@@ -330,6 +380,11 @@ func (service *OpenCodeGoLifecycleService) ApplyReferralRewards(
 	maxRewards int,
 ) (OpenCodeGoReferralApplySummary, error) {
 	summary := OpenCodeGoReferralApplySummary{}
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return summary, err
+	}
+	service = scoped
 	if err := service.validate(); err != nil {
 		return summary, err
 	}
@@ -427,6 +482,11 @@ func (service *OpenCodeGoLifecycleService) CancelSubscriptionRenewal(
 	source string,
 ) (*model.OpenCodeGoOperation, OpenCodeGoSubscriptionCancellation, error) {
 	result := OpenCodeGoSubscriptionCancellation{}
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return nil, result, err
+	}
+	service = scoped
 	if err := service.validate(); err != nil {
 		return nil, result, err
 	}
@@ -509,6 +569,11 @@ func (service *OpenCodeGoLifecycleService) RunIdentityAutomations(
 	if !policy.AutomationEnabled {
 		return summary, nil
 	}
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return summary, err
+	}
+	service = scoped
 	identity, err := model.GetOpenCodeGoIdentityPool(channelID, identityUID)
 	if err != nil {
 		return summary, err

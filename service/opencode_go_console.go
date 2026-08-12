@@ -47,6 +47,14 @@ func NewOpenCodeGoConsoleClient() *OpenCodeGoConsoleClient {
 	return client
 }
 
+func newOpenCodeGoChannelConsoleClient(channelID int) (*OpenCodeGoConsoleClient, error) {
+	baseClient, err := getOpenCodeGoChannelHTTPClient(channelID)
+	if err != nil {
+		return nil, err
+	}
+	return newOpenCodeGoConsoleClient(openCodeGoConsoleOrigin, openCodeGoInferenceOrigin, baseClient)
+}
+
 func newOpenCodeGoConsoleClient(consoleBase string, inferenceBase string, baseClient *http.Client) (*OpenCodeGoConsoleClient, error) {
 	consoleURL, err := url.Parse(consoleBase)
 	if err != nil || consoleURL.Scheme == "" || consoleURL.Host == "" {

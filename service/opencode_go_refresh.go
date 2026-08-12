@@ -47,6 +47,11 @@ func (service *OpenCodeGoAccountPoolService) RefreshAllIdentities(
 	concurrency int,
 	reportProgress func(processed, total int),
 ) (OpenCodeGoRefreshSummary, error) {
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return OpenCodeGoRefreshSummary{}, err
+	}
+	service = scoped
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return OpenCodeGoRefreshSummary{}, err
 	}
@@ -70,7 +75,7 @@ func (service *OpenCodeGoAccountPoolService) RefreshIdentityTargets(
 	concurrency int,
 	reportProgress func(processed, total int),
 ) (OpenCodeGoRefreshSummary, error) {
-	if service == nil || service.console == nil || service.codec == nil {
+	if service == nil || service.codec == nil || (service.console == nil && service.consoleFactory == nil) {
 		return OpenCodeGoRefreshSummary{}, errors.New("OpenCode Go refresh service is not configured")
 	}
 	targets = uniqueOpenCodeGoRefreshTargets(targets)

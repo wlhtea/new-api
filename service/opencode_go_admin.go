@@ -377,15 +377,15 @@ func (service *OpenCodeGoAccountPoolService) SetWorkspaceEnabled(channelID int, 
 		result := tx.Model(&model.OpenCodeGoWorkspace{}).
 			Where("id = ?", workspace.ID).
 			Updates(map[string]interface{}{
-				"manual_enabled":     reduced.ManualEnabled,
-				"effective_state":    reduced.EffectiveState,
-				"state_reason":       reduced.StateReason,
-				"health_observation": reduced.HealthObservation,
-				"health_observed_at": reduced.HealthObservedAt,
-				"quota_recovery_at":  reduced.QuotaRecoveryAt,
-				"cooldown_until":     reduced.CooldownUntil,
+				"manual_enabled":           reduced.ManualEnabled,
+				"effective_state":          reduced.EffectiveState,
+				"state_reason":             reduced.StateReason,
+				"health_observation":       reduced.HealthObservation,
+				"health_observed_at":       reduced.HealthObservedAt,
+				"quota_recovery_at":        reduced.QuotaRecoveryAt,
+				"cooldown_until":           reduced.CooldownUntil,
 				"bulk_failure_detected_at": reduced.BulkFailureDetectedAt,
-				"updated_at":         common.GetTimestamp(),
+				"updated_at":               common.GetTimestamp(),
 			})
 		if result.Error != nil {
 			return result.Error
@@ -404,6 +404,11 @@ func (service *OpenCodeGoAccountPoolService) RefreshWorkspace(
 	channelID int,
 	workspaceUID string,
 ) (*model.OpenCodeGoWorkspace, error) {
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return nil, err
+	}
+	service = scoped
 	workspace, err := model.GetOpenCodeGoWorkspace(channelID, workspaceUID)
 	if err != nil {
 		return nil, err

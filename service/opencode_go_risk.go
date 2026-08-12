@@ -35,16 +35,19 @@ type openCodeGoRiskProbeClient interface {
 	Probe(ctx context.Context, apiKey string, modelID string) (OpenCodeGoRiskProbeResponse, error)
 }
 
+type openCodeGoRiskProbeFactory func(channelID int) (openCodeGoRiskProbeClient, error)
+
 type openCodeGoHTTPRiskProbeClient struct {
 	endpoint *url.URL
 	client   *http.Client
 }
 
 type OpenCodeGoRiskRecheckService struct {
-	probe   openCodeGoRiskProbeClient
-	codec   *OpenCodeGoCredentialCodec
-	now     func() time.Time
-	rebuild func(int) error
+	probe        openCodeGoRiskProbeClient
+	probeFactory openCodeGoRiskProbeFactory
+	codec        *OpenCodeGoCredentialCodec
+	now          func() time.Time
+	rebuild      func(int) error
 }
 
 type OpenCodeGoRiskRecheckResult struct {
@@ -94,12 +97,14 @@ func NewConfiguredOpenCodeGoRiskRecheckService() (*OpenCodeGoRiskRecheckService,
 	if err != nil {
 		return nil, err
 	}
-	probe, err := newOpenCodeGoHTTPRiskProbeClient(openCodeGoInferenceOrigin, GetHttpClient())
-	if err != nil {
-		return nil, err
-	}
 	return &OpenCodeGoRiskRecheckService{
-		probe:   probe,
+		probeFactory: func(channelID int) (openCodeGoRiskProbeClient, error) {
+			baseClient, err := getOpenCodeGoChannelHTTPClient(channelID)
+			if err != nil {
+				return nil, err
+			}
+			return newOpenCodeGoHTTPRiskProbeClient(openCodeGoInferenceOrigin, baseClient)
+		},
 		codec:   codec,
 		now:     time.Now,
 		rebuild: ReconcileOpenCodeGoPoolChannel,
@@ -116,6 +121,26 @@ func newOpenCodeGoRiskRecheckService(
 		now:     time.Now,
 		rebuild: ReconcileOpenCodeGoPoolChannel,
 	}
+}
+
+func (service *OpenCodeGoRiskRecheckService) scopedForChannel(channelID int) (*OpenCodeGoRiskRecheckService, error) {
+	if service == nil || service.codec == nil {
+		return nil, errors.New("OpenCode Go risk recheck service is not configured")
+	}
+	if service.probe != nil {
+		return service, nil
+	}
+	if service.probeFactory == nil {
+		return nil, errors.New("OpenCode Go risk recheck service is not configured")
+	}
+	probe, err := service.probeFactory(channelID)
+	if err != nil {
+		return nil, err
+	}
+	scoped := *service
+	scoped.probe = probe
+	scoped.probeFactory = nil
+	return &scoped, nil
 }
 
 func newOpenCodeGoHTTPRiskProbeClient(baseURL string, baseClient *http.Client) (*openCodeGoHTTPRiskProbeClient, error) {
@@ -195,7 +220,12 @@ func (service *OpenCodeGoRiskRecheckService) RecheckWorkspace(
 		WorkspaceUID: strings.TrimSpace(workspaceUID),
 		Status:       "failed",
 	}
-	if service == nil || service.probe == nil || service.codec == nil || service.now == nil {
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return result, err
+	}
+	service = scoped
+	if service.probe == nil || service.codec == nil || service.now == nil {
 		return result, errors.New("OpenCode Go risk recheck service is not configured")
 	}
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
@@ -396,6 +426,11 @@ func (service *OpenCodeGoRiskRecheckService) RecheckRiskWorkspaces(
 	if len(targets) == 0 {
 		return summary, nil
 	}
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return summary, err
+	}
+	service = scoped
 	concurrency = normalizeOpenCodeGoRiskRecheckConcurrency(concurrency, len(targets))
 
 	jobs := make(chan openCodeGoIndexedRiskTarget)

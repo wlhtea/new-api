@@ -450,6 +450,106 @@ func TestOpenCodeGoRefreshTargetsUsesBoundedConcurrentWorkers(t *testing.T) {
 	require.Equal(t, "identity-two", summary.Results[1].IdentityUID)
 }
 
+func TestOpenCodeGoRefreshTargetsScopesConsoleByChannel(t *testing.T) {
+	db, firstChannel, codec := setupOpenCodeGoPoolTestDB(t)
+	secondChannel := &model.Channel{
+		Type:   constant.ChannelTypeOpenCodeGo,
+		Key:    "",
+		Name:   "OpenCode Go second refresh channel",
+		Status: common.ChannelStatusEnabled,
+		Models: "model-a",
+		Group:  "default",
+	}
+	require.NoError(t, db.Create(secondChannel).Error)
+	fetchedAt := int64(1_900_000_000)
+	createEligibleOpenCodeGoWorkspace(t, db, codec, firstChannel.Id, "first-channel", "workspace-first-channel", "wrk_FIRST1", []string{"model-a"})
+	createEligibleOpenCodeGoWorkspace(t, db, codec, secondChannel.Id, "second-channel", "workspace-second-channel", "wrk_SECOND2", []string{"model-a"})
+
+	newChannelConsole := func(cookie string, workspaceID string, apiKey string) *fakeOpenCodeGoConsole {
+		return &fakeOpenCodeGoConsole{
+			discoveredByCookie: map[string][]OpenCodeGoWorkspacePageResult{
+				cookie: {{
+					Workspace: OpenCodeGoDiscoveredWorkspace{ID: workspaceID},
+					Page:      completeOpenCodeGoConsolePage(workspaceID, 25, fetchedAt+60),
+				}},
+			},
+			discoverErr:            errors.New("console received an identity from another channel"),
+			discoverErrorsByCookie: map[string]error{cookie: nil},
+			keys:                   map[string]string{workspaceID: apiKey},
+			keyErrors:              map[string]error{},
+			models:                 map[string][]string{apiKey: {"model-a"}},
+			modelErrors:            map[string]error{},
+		}
+	}
+	consoles := map[int]openCodeGoConsoleReader{
+		firstChannel.Id:  newChannelConsole("cookie-first-channel", "wrk_FIRST1", "sk-synthetic-first-channel"),
+		secondChannel.Id: newChannelConsole("cookie-second-channel", "wrk_SECOND2", "sk-synthetic-second-channel"),
+	}
+	var factoryMutex sync.Mutex
+	factoryCalls := make(map[int]int)
+	poolService := &OpenCodeGoAccountPoolService{
+		consoleFactory: func(channelID int) (openCodeGoConsoleReader, error) {
+			factoryMutex.Lock()
+			defer factoryMutex.Unlock()
+			factoryCalls[channelID]++
+			console, ok := consoles[channelID]
+			if !ok {
+				return nil, errors.New("unexpected OpenCode Go channel")
+			}
+			return console, nil
+		},
+		codec:   codec,
+		now:     func() time.Time { return time.Unix(fetchedAt+60, 0) },
+		rebuild: nil,
+	}
+
+	summary, err := poolService.RefreshIdentityTargets(
+		context.Background(),
+		[]model.OpenCodeGoRefreshTarget{
+			{ChannelID: firstChannel.Id, IdentityUID: "identity-first-channel"},
+			{ChannelID: secondChannel.Id, IdentityUID: "identity-second-channel"},
+		},
+		2,
+		nil,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 2, summary.Succeeded)
+	require.Zero(t, summary.Failed)
+	assert.Equal(t, map[int]int{firstChannel.Id: 1, secondChannel.Id: 1}, factoryCalls)
+}
+
+func TestOpenCodeGoImportAutomationContextLivesUntilRunnerCompletes(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	completed := make(chan struct{})
+	var gotChannelID int
+	var gotIdentityUIDs []string
+	runner := func(ctx context.Context, channelID int, identityUIDs []string) error {
+		gotChannelID = channelID
+		gotIdentityUIDs = append([]string(nil), identityUIDs...)
+		close(started)
+		select {
+		case <-release:
+			assert.NoError(t, ctx.Err())
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		close(completed)
+		return nil
+	}
+
+	runOpenCodeGoImportAutomationsWithRunner(context.Background(), 62, []string{"identity-import-one"}, runner)
+	<-started
+	assert.Equal(t, 62, gotChannelID)
+	assert.Equal(t, []string{"identity-import-one"}, gotIdentityUIDs)
+	close(release)
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("OpenCode Go import automation did not complete")
+	}
+}
+
 func TestOpenCodeGoOlderConsoleCommitCannotOverwriteNewerRiskObservation(t *testing.T) {
 	_, channel, _ := setupOpenCodeGoPoolTestDB(t)
 	identity := model.OpenCodeGoIdentity{

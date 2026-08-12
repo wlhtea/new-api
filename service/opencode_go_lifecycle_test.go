@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/stretchr/testify/assert"
@@ -428,6 +429,61 @@ func TestOpenCodeGoRefreshAutomationRunsOnlyAfterSuccessfulRefreshResults(t *tes
 	assert.Equal(t, 1, enabledSummary.Succeeded)
 	assert.Zero(t, enabledSummary.Failed)
 	assert.Equal(t, 1, fake.enableCalls)
+}
+
+func TestOpenCodeGoRefreshAutomationsScopeRuntimeByResultChannel(t *testing.T) {
+	db, firstChannel, codec := setupOpenCodeGoPoolTestDB(t)
+	secondChannel := &model.Channel{
+		Type:   constant.ChannelTypeOpenCodeGo,
+		Key:    "",
+		Name:   "OpenCode Go second lifecycle channel",
+		Status: common.ChannelStatusEnabled,
+		Models: "model-a",
+		Group:  "default",
+	}
+	require.NoError(t, db.Create(secondChannel).Error)
+	firstWorkspace := createEligibleOpenCodeGoWorkspace(
+		t, db, codec, firstChannel.Id, "lifecycle-first", "workspace-lifecycle-first", "wrk_LIFEFIRST1", []string{"model-a"},
+	)
+	secondWorkspace := createEligibleOpenCodeGoWorkspace(
+		t, db, codec, secondChannel.Id, "lifecycle-second", "workspace-lifecycle-second", "wrk_LIFESECOND2", []string{"model-a"},
+	)
+	enabled := true
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspace{}).
+		Where("id IN ?", []int64{firstWorkspace.ID, secondWorkspace.ID}).
+		Update("china_models_enabled", enabled).Error)
+
+	snapshot := snapshotOpenCodeGoLifecycleAutomationOption(t)
+	t.Cleanup(func() { restoreOpenCodeGoLifecycleAutomationOption(t, snapshot) })
+	common.OptionMapRWMutex.Lock()
+	delete(common.OptionMap, "OpenCodeGoLifecycleAutomationEnabled")
+	common.OptionMapRWMutex.Unlock()
+	t.Setenv("OPENCODE_GO_LIFECYCLE_AUTOMATION_ENABLED", "true")
+
+	var factoryMutex sync.Mutex
+	factoryCalls := make(map[int]int)
+	root := &OpenCodeGoLifecycleService{
+		scopedFactory: func(channelID int) (*OpenCodeGoLifecycleService, error) {
+			factoryMutex.Lock()
+			factoryCalls[channelID]++
+			factoryMutex.Unlock()
+			fake := &fakeOpenCodeGoLifecycleBackend{models: []string{"model-a"}}
+			return newOpenCodeGoLifecycleTestService(codec, fake, time.Unix(1_900_100_000, 0)), nil
+		},
+		now: time.Now,
+	}
+
+	summary, err := root.RunRefreshAutomations(
+		context.Background(),
+		[]OpenCodeGoRefreshResult{
+			{ChannelID: firstChannel.Id, IdentityUID: "identity-lifecycle-first", Status: "refreshed"},
+			{ChannelID: secondChannel.Id, IdentityUID: "identity-lifecycle-second", Status: "refreshed"},
+		},
+		"refresh_task",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 2, summary.Identities)
+	assert.Equal(t, map[int]int{firstChannel.Id: 1, secondChannel.Id: 1}, factoryCalls)
 }
 
 func TestOpenCodeGoEnableChinaModelsIsIdempotentAndReturnsFinishedOperation(t *testing.T) {

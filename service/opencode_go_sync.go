@@ -30,6 +30,8 @@ var (
 	openCodeGoCookiePattern          = regexp.MustCompile(`(?i)auth=[^;\s]+`)
 	openCodeGoUpstreamIDPattern      = regexp.MustCompile(`(?i)wrk_[a-z0-9]+`)
 	openCodeGoReferralIDPattern      = regexp.MustCompile(`(?i)ref_[a-z0-9]+`)
+	openCodeGoProxyUserinfoPattern   = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^/@\s]+@[^/\s]+`)
+	openCodeGoAuthorizationPattern   = regexp.MustCompile(`(?i)(\b(?:proxy-)?authorization\s*[:=]\s*)[^\r\n]+`)
 )
 
 type openCodeGoConsoleReader interface {
@@ -38,11 +40,14 @@ type openCodeGoConsoleReader interface {
 	FetchModels(ctx context.Context, apiKey string) ([]string, error)
 }
 
+type openCodeGoConsoleReaderFactory func(channelID int) (openCodeGoConsoleReader, error)
+
 type OpenCodeGoAccountPoolService struct {
-	console openCodeGoConsoleReader
-	codec   *OpenCodeGoCredentialCodec
-	now     func() time.Time
-	rebuild func(int) error
+	console        openCodeGoConsoleReader
+	consoleFactory openCodeGoConsoleReaderFactory
+	codec          *OpenCodeGoCredentialCodec
+	now            func() time.Time
+	rebuild        func(int) error
 }
 
 type OpenCodeGoImportResult struct {
@@ -72,7 +77,9 @@ func NewConfiguredOpenCodeGoAccountPoolService() (*OpenCodeGoAccountPoolService,
 		return nil, err
 	}
 	return &OpenCodeGoAccountPoolService{
-		console: NewOpenCodeGoConsoleClient(),
+		consoleFactory: func(channelID int) (openCodeGoConsoleReader, error) {
+			return newOpenCodeGoChannelConsoleClient(channelID)
+		},
 		codec:   codec,
 		now:     time.Now,
 		rebuild: RebuildOpenCodeGoPoolChannel,
@@ -95,12 +102,37 @@ func NewOpenCodeGoAccountPoolAdminService() *OpenCodeGoAccountPoolService {
 	}
 }
 
+func (service *OpenCodeGoAccountPoolService) scopedForChannel(channelID int) (*OpenCodeGoAccountPoolService, error) {
+	if service == nil || service.codec == nil {
+		return nil, errors.New("OpenCode Go account pool service is not configured")
+	}
+	if service.console != nil {
+		return service, nil
+	}
+	if service.consoleFactory == nil {
+		return nil, errors.New("OpenCode Go account pool service is not configured")
+	}
+	console, err := service.consoleFactory(channelID)
+	if err != nil {
+		return nil, err
+	}
+	scoped := *service
+	scoped.console = console
+	scoped.consoleFactory = nil
+	return &scoped, nil
+}
+
 func (service *OpenCodeGoAccountPoolService) ImportAuthCookies(
 	ctx context.Context,
 	channelID int,
 	label string,
 	input string,
 ) ([]OpenCodeGoImportResult, error) {
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return nil, err
+	}
+	service = scoped
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return nil, err
 	}
@@ -173,7 +205,7 @@ func (service *OpenCodeGoAccountPoolService) ImportAuthCookies(
 	// away instead of waiting for the periodic refresh. Best-effort and
 	// asynchronous: failures are recorded as operations and do not fail the
 	// import. Only runs when the global automation master switch is enabled.
-	if len(importedIdentityUIDs) > 0 {
+	if len(importedIdentityUIDs) > 0 && openCodeGoLifecycleAutomationEnabled() {
 		runOpenCodeGoImportAutomations(context.Background(), channelID, importedIdentityUIDs)
 	}
 	return results, nil
@@ -183,28 +215,43 @@ func (service *OpenCodeGoAccountPoolService) ImportAuthCookies(
 // freshly imported identities in the background. It is bounded by a timeout
 // and never returns an error to the caller.
 func runOpenCodeGoImportAutomations(ctx context.Context, channelID int, identityUIDs []string) {
-	runCtx, cancel := context.WithTimeout(ctx, openCodeGoImportAutomationTimeout)
-	defer cancel()
+	runOpenCodeGoImportAutomationsWithRunner(ctx, channelID, identityUIDs, runConfiguredOpenCodeGoImportAutomations)
+}
+
+func runOpenCodeGoImportAutomationsWithRunner(
+	ctx context.Context,
+	channelID int,
+	identityUIDs []string,
+	runner func(context.Context, int, []string) error,
+) {
 	go func() {
+		runCtx, cancel := context.WithTimeout(ctx, openCodeGoImportAutomationTimeout)
+		defer cancel()
 		defer func() {
 			if r := recover(); r != nil {
-				common.SysError(fmt.Sprintf("OpenCode Go import automation panic recovered: %v", r))
+				common.SysError(sanitizeOpenCodeGoError(fmt.Errorf("OpenCode Go import automation panic recovered: %v", r)))
 			}
 		}()
-		lifecycle, err := NewConfiguredOpenCodeGoLifecycleService()
-		if err != nil {
-			common.SysError(fmt.Sprintf("failed to start OpenCode Go import automation: %v", err))
-			return
-		}
-		for _, identityUID := range identityUIDs {
-			if err := runCtx.Err(); err != nil {
-				return
-			}
-			if _, err := lifecycle.RunIdentityAutomations(runCtx, channelID, identityUID, "import"); err != nil {
-				common.SysError(fmt.Sprintf("OpenCode Go import automation failed for identity %s: %v", identityUID, err))
-			}
+		if err := runner(runCtx, channelID, identityUIDs); err != nil {
+			common.SysError(sanitizeOpenCodeGoError(err))
 		}
 	}()
+}
+
+func runConfiguredOpenCodeGoImportAutomations(ctx context.Context, channelID int, identityUIDs []string) error {
+	lifecycle, err := NewConfiguredOpenCodeGoLifecycleService()
+	if err != nil {
+		return fmt.Errorf("failed to start OpenCode Go import automation: %w", err)
+	}
+	for _, identityUID := range identityUIDs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := lifecycle.RunIdentityAutomations(ctx, channelID, identityUID, "import"); err != nil {
+			common.SysError(sanitizeOpenCodeGoError(fmt.Errorf("OpenCode Go import automation failed for identity %s: %w", identityUID, err)))
+		}
+	}
+	return nil
 }
 
 func (service *OpenCodeGoAccountPoolService) importOneIdentity(
@@ -291,6 +338,11 @@ func (service *OpenCodeGoAccountPoolService) RefreshIdentity(
 	channelID int,
 	identityUID string,
 ) (*model.OpenCodeGoIdentity, error) {
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return nil, err
+	}
+	service = scoped
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return nil, err
 	}
@@ -323,6 +375,11 @@ func (service *OpenCodeGoAccountPoolService) ReplaceIdentityAuthCookie(
 	identityUID string,
 	input string,
 ) (*model.OpenCodeGoIdentity, error) {
+	scoped, err := service.scopedForChannel(channelID)
+	if err != nil {
+		return nil, err
+	}
+	service = scoped
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return nil, err
 	}
@@ -1047,6 +1104,8 @@ func sanitizeOpenCodeGoError(err error, secrets ...string) string {
 	message = openCodeGoCookiePattern.ReplaceAllString(message, "auth=[redacted]")
 	message = openCodeGoUpstreamIDPattern.ReplaceAllString(message, "[workspace]")
 	message = openCodeGoReferralIDPattern.ReplaceAllString(message, "[referral]")
+	message = openCodeGoProxyUserinfoPattern.ReplaceAllString(message, "[redacted-proxy]")
+	message = openCodeGoAuthorizationPattern.ReplaceAllString(message, "$1[redacted]")
 	message = strings.ToValidUTF8(message, "\uFFFD")
 	message = strings.Join(strings.Fields(message), " ")
 	if len(message) > 512 {
