@@ -1097,7 +1097,7 @@
     "Console Area": "控制台区域",
     "Console Content": "控制台内容",
     "Consume": "消耗",
-    "Consume one available reward and refresh quota for workspace \"{{name}}\"?": "要为工作区“{{name}}”使用一次可用奖励并刷新额度吗？",
+    "Applying this reward immediately offsets current usage for workspace \"{{name}}\". Any unused value does not carry over.": "应用此奖励会立即抵扣工作区“{{name}}”的当前用量。未使用的价值不会结转。",
     "Consumed in the last 24 hours": "近 24 小时消耗量",
     "Container": "容器",
     "Container name": "容器名称",

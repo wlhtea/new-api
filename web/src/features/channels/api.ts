@@ -84,8 +84,8 @@ const openCodeGoChinaModelsMutationSchema = z.object({
 })
 const openCodeGoReferralMutationSchema = z.object({
   summary: z.object({
-    attempted: z.number().int().nonnegative(),
-    applied: z.number().int().nonnegative(),
+    attempted: z.literal(1),
+    applied: z.literal(1),
   }),
   pool: openCodeGoPoolSchema,
 })

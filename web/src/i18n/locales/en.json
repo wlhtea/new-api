@@ -1097,7 +1097,7 @@
     "Console Area": "Console Area",
     "Console Content": "Console Content",
     "Consume": "Consume",
-    "Consume one available reward and refresh quota for workspace \"{{name}}\"?": "Consume one available reward and refresh quota for workspace \"{{name}}\"?",
+    "Applying this reward immediately offsets current usage for workspace \"{{name}}\". Any unused value does not carry over.": "Applying this reward immediately offsets current usage for workspace \"{{name}}\". Any unused value does not carry over.",
     "Consumed in the last 24 hours": "Consumed in the last 24 hours",
     "Container": "Container",
     "Container name": "Container name",

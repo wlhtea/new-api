@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -53,6 +54,15 @@ type openCodeGoBatchChinaModelsRequest struct {
 
 type openCodeGoBatchCancelRenewalRequest struct {
 	Confirmation string `json:"confirmation"`
+}
+
+type openCodeGoReferralRewardLifecycle interface {
+	ApplyReferralReward(
+		ctx context.Context,
+		channelID int,
+		workspaceUID string,
+		source string,
+	) (service.OpenCodeGoReferralApplySummary, error)
 }
 
 func GetOpenCodeGoPool(c *gin.Context) {
@@ -141,18 +151,26 @@ func EnableOpenCodeGoChinaModels(c *gin.Context) {
 }
 
 func ApplyOpenCodeGoReferralReward(c *gin.Context) {
-	channelID, workspaceUID, ok := openCodeGoWorkspaceParams(c)
-	if !ok {
-		return
-	}
 	lifecycle, err := service.NewConfiguredOpenCodeGoLifecycleService()
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	summary, err := lifecycle.ApplyReferralRewards(c.Request.Context(), channelID, workspaceUID, "manual", 1)
+	applyOpenCodeGoReferralReward(c, lifecycle)
+}
+
+func applyOpenCodeGoReferralReward(c *gin.Context, lifecycle openCodeGoReferralRewardLifecycle) {
+	channelID, workspaceUID, ok := openCodeGoWorkspaceParams(c)
+	if !ok {
+		return
+	}
+	summary, err := lifecycle.ApplyReferralReward(c.Request.Context(), channelID, workspaceUID, "manual")
 	if err != nil {
 		common.ApiError(c, err)
+		return
+	}
+	if summary.Attempted != 1 || summary.Applied != 1 {
+		common.ApiError(c, errors.New("OpenCode Go referral reward was not applied and verified"))
 		return
 	}
 	view, err := service.GetOpenCodeGoPoolView(channelID)

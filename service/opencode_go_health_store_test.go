@@ -123,7 +123,7 @@ func TestApplyOpenCodeGoClassifiedFailureRejectsOlderWorkspaceObservation(t *tes
 	risk, ok := ClassifyOpenCodeGoProviderFailure(OpenCodeGoProviderFailure{
 		StatusCode: 401,
 		ErrorType:  "AuthError",
-		Message:    "Request blocked by upstream provider.",
+		Message:    "This account has found to be committing fraud or is in breach of terms of services and has been blocked.",
 	}, later)
 	require.True(t, ok)
 	rebuilds := 0

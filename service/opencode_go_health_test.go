@@ -203,6 +203,7 @@ func TestReduceOpenCodeGoModelHealthIsScopedAndDeadlineBound(t *testing.T) {
 func TestReduceOpenCodeGoWorkspaceHealthManualDisableOutranksRisk(t *testing.T) {
 	baseTime := time.Unix(1_900_000_000, 0)
 	workspace, windows := openCodeGoHealthyReducerFixture(baseTime.Unix())
+	const blockedReason = "This account has found to be committing fraud or is in breach of terms of services and has been blocked."
 	disabled, applied, err := ReduceOpenCodeGoWorkspaceHealth(
 		workspace,
 		workspace,
@@ -216,11 +217,80 @@ func TestReduceOpenCodeGoWorkspaceHealthManualDisableOutranksRisk(t *testing.T) 
 		disabled,
 		disabled,
 		windows,
-		OpenCodeGoHealthObservation{Kind: OpenCodeGoObservationRiskBlocked, ObservedAt: baseTime.Add(time.Minute)},
+		OpenCodeGoHealthObservation{
+			Kind:       OpenCodeGoObservationRiskBlocked,
+			ObservedAt: baseTime.Add(time.Minute),
+			Reason:     blockedReason,
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+	assert.Equal(t, model.OpenCodeGoStateManualDisabled, blocked.EffectiveState)
+	assert.Equal(t, baseTime.Add(time.Minute).Unix(), blocked.RiskDetectedAt)
+	assert.Equal(t, baseTime.Add(time.Minute).Unix(), blocked.RiskLastCheckedAt)
+	assert.Equal(t, blockedReason, blocked.LastError)
+
+	consoleCandidate := blocked
+	consoleCandidate.LastError = ""
+	consoleCandidate.QuotaFetchedAt = baseTime.Add(2 * time.Minute).Unix()
+	preserved, applied, err := ReduceOpenCodeGoWorkspaceHealth(
+		blocked,
+		consoleCandidate,
+		windows,
+		OpenCodeGoHealthObservation{
+			Kind:            OpenCodeGoObservationConsoleSnapshot,
+			ObservedAt:      baseTime.Add(2 * time.Minute),
+			HasUsableModels: true,
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+	assert.Equal(t, model.OpenCodeGoStateManualDisabled, preserved.EffectiveState)
+	assert.Equal(t, blocked.RiskDetectedAt, preserved.RiskDetectedAt)
+	assert.Equal(t, blockedReason, preserved.LastError)
+
+	reenabled, applied, err := ReduceOpenCodeGoWorkspaceHealth(
+		preserved,
+		preserved,
+		windows,
+		OpenCodeGoHealthObservation{
+			Kind:            OpenCodeGoObservationManualEnabled,
+			ObservedAt:      baseTime.Add(3 * time.Minute),
+			HasUsableModels: true,
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+	assert.True(t, reenabled.ManualEnabled)
+	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, reenabled.EffectiveState)
+	assert.Equal(t, blocked.RiskDetectedAt, reenabled.RiskDetectedAt)
+	assert.Equal(t, blockedReason, reenabled.StateReason)
+}
+
+func TestReduceOpenCodeGoWorkspaceHealthRiskOutranksBulkFailure(t *testing.T) {
+	baseTime := time.Unix(1_900_000_000, 0)
+	workspace, windows := openCodeGoHealthyReducerFixture(baseTime.Unix())
+	workspace.EffectiveState = model.OpenCodeGoStateRiskBlocked
+	workspace.StateReason = "authoritative fraud block"
+	workspace.LastError = workspace.StateReason
+	workspace.RiskDetectedAt = baseTime.Unix()
+	workspace.RiskLastCheckedAt = baseTime.Unix()
+	workspace.HealthObservation = string(OpenCodeGoObservationRiskBlocked)
+	workspace.HealthObservedAt = baseTime.UnixNano()
+
+	reduced, applied, err := ReduceOpenCodeGoWorkspaceHealth(
+		workspace,
+		workspace,
+		windows,
+		OpenCodeGoHealthObservation{
+			Kind:       OpenCodeGoObservationBulkFailure,
+			ObservedAt: baseTime.Add(time.Minute),
+			Reason:     "repeated provider failures",
+		},
 	)
 	require.NoError(t, err)
 	assert.False(t, applied)
-	assert.Equal(t, model.OpenCodeGoStateManualDisabled, blocked.EffectiveState)
+	assert.Equal(t, workspace, reduced)
 }
 
 func TestReduceOpenCodeGoWorkspaceHealthPreservesStaleCandidateSnapshotFields(t *testing.T) {
@@ -246,6 +316,37 @@ func TestReduceOpenCodeGoWorkspaceHealthPreservesStaleCandidateSnapshotFields(t 
 	assert.Equal(t, model.OpenCodeGoQuotaSnapshotError, reduced.QuotaSnapshotStatus)
 	assert.Equal(t, "quota parser failed", reduced.QuotaError)
 	assert.Equal(t, model.OpenCodeGoStateStale, reduced.EffectiveState)
+}
+
+func TestReduceOpenCodeGoWorkspaceHealthStaleSnapshotPreservesRiskReason(t *testing.T) {
+	baseTime := time.Unix(1_900_000_000, 0)
+	workspace, windows := openCodeGoHealthyReducerFixture(baseTime.Unix())
+	workspace.EffectiveState = model.OpenCodeGoStateRiskBlocked
+	workspace.StateReason = "authoritative fraud block"
+	workspace.LastError = workspace.StateReason
+	workspace.RiskDetectedAt = baseTime.Unix()
+	workspace.RiskLastCheckedAt = baseTime.Unix()
+	workspace.HealthObservation = string(OpenCodeGoObservationRiskBlocked)
+	workspace.HealthObservedAt = baseTime.UnixNano()
+	candidate := workspace
+	candidate.LastError = "temporary console timeout"
+	candidate.QuotaError = candidate.LastError
+
+	reduced, applied, err := ReduceOpenCodeGoWorkspaceHealth(
+		workspace,
+		candidate,
+		windows,
+		OpenCodeGoHealthObservation{
+			Kind:       OpenCodeGoObservationStaleSnapshot,
+			ObservedAt: baseTime.Add(time.Minute),
+			Reason:     candidate.LastError,
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, reduced.EffectiveState)
+	assert.Equal(t, workspace.RiskDetectedAt, reduced.RiskDetectedAt)
+	assert.Equal(t, workspace.LastError, reduced.LastError)
 }
 
 func TestReduceOpenCodeGoHealthFailureWinsSameTimestampRecovery(t *testing.T) {

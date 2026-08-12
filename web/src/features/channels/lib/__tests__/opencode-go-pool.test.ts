@@ -110,6 +110,7 @@ function workspace(
     referral_code: 'TEST-CODE',
     available_referral_rewards: 2,
     used_referral_rewards: 1,
+    referral_reward_eligible: true,
     referral_reward_applied_at: 0,
     risk_detected_at: 0,
     risk_last_checked_at: 1_900_000_000,
@@ -299,6 +300,31 @@ describe('OpenCode Go pool contracts', () => {
         error: 'Cookie was rejected',
       },
     ])
+  })
+
+  test('defaults missing referral reward eligibility to false', () => {
+    const legacyPool = poolFixture()
+    const identity = legacyPool.identities[0]
+    assert.ok(identity)
+    const primary = identity.workspaces[0]
+    assert.ok(primary)
+    const legacyPrimary: Partial<OpenCodeGoWorkspace> = { ...primary }
+    delete legacyPrimary.referral_reward_eligible
+
+    const parsed = openCodeGoPoolSchema.parse({
+      ...legacyPool,
+      identities: [
+        {
+          ...identity,
+          workspaces: [legacyPrimary, ...identity.workspaces.slice(1)],
+        },
+      ],
+    })
+
+    assert.equal(
+      parsed.identities[0]?.workspaces[0]?.referral_reward_eligible,
+      false
+    )
   })
 
   test('normalizes task progress and preserves partial refresh results', () => {

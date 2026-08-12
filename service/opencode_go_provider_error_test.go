@@ -21,7 +21,15 @@ func TestClassifyOpenCodeGoProviderFailureMatrix(t *testing.T) {
 		wantQuota string
 		wantDelay time.Duration
 	}{
-		{name: "risk control", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "Request blocked by upstream provider."}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationRiskBlocked},
+		{name: "legacy generic block is credential failure", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "Request blocked by upstream provider."}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
+		{name: "production fraud block", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "This account has found to be committing fraud or is in breach of terms of services and has been blocked."}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationRiskBlocked},
+		{name: "production fraud block normalized", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: " AUTHERROR ", Message: "  THIS account has found to be committing fraud\n or is in breach of terms of services and has been blocked!  "}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationRiskBlocked},
+		{name: "production fraud block terminal punctuation", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "This account has found to be committing fraud or is in breach of terms of services and has been blocked?!"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationRiskBlocked},
+		{name: "fraud wording comma is not normalized", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "This account has found to be committing fraud or is in breach of terms of services and has been blocked,"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
+		{name: "generic blocked is credential failure", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "This account has been blocked."}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
+		{name: "fraud wording suffix is not authoritative", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "This account has found to be committing fraud or is in breach of terms of services and has been blocked temporarily."}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
+		{name: "fraud wording requires 401", failure: OpenCodeGoProviderFailure{StatusCode: 403, ErrorType: "AuthError", Message: "This account has found to be committing fraud or is in breach of terms of services and has been blocked."}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
+		{name: "fraud wording requires AuthError", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "Error", Message: "This account has found to be committing fraud or is in breach of terms of services and has been blocked."}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
 		{name: "invalid key is not risk", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "Invalid API key"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
 		{name: "auth model denial", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "Model alpha-test is not supported"}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationModelBlocked, wantDelay: openCodeGoDefaultModelCooldown},
 		{name: "credits", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "CreditsError"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationQuotaExhausted},
@@ -73,6 +81,19 @@ func TestObserveOpenCodeGoProviderFailureDoesNotPersistProvider5xx(t *testing.T)
 
 	require.NoError(t, err)
 	assert.False(t, applied)
+}
+
+func TestParseAndClassifyOpenCodeGoProductionFraudBlock(t *testing.T) {
+	failure := ParseOpenCodeGoProviderFailure(
+		http.StatusUnauthorized,
+		nil,
+		[]byte(`{"type":"AuthError","message":"This account has found to be committing fraud or is in breach of terms of services and has been blocked."}`),
+	)
+
+	classified, ok := ClassifyOpenCodeGoProviderFailure(failure, time.Unix(1_900_000_000, 0))
+	require.True(t, ok)
+	assert.Equal(t, OpenCodeGoHealthScopeWorkspace, classified.Scope)
+	assert.Equal(t, OpenCodeGoObservationRiskBlocked, classified.Observation.Kind)
 }
 
 func TestParseOpenCodeGoRetryAfterSupportsHTTPDateAndBoundsValues(t *testing.T) {

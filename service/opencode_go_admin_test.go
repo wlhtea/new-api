@@ -260,27 +260,30 @@ func TestSetOpenCodeGoWorkspaceEnabledCannotClearRiskBlock(t *testing.T) {
 		[]string{"model-a"},
 	)
 	riskAt := time.Unix(1_900_000_100, 0)
+	adminService := NewOpenCodeGoAccountPoolAdminService()
+	adminService.now = func() time.Time { return riskAt.Add(-time.Minute) }
+	require.NoError(t, adminService.SetWorkspaceEnabled(channel.Id, workspace.UID, false))
+
 	classified, ok := ClassifyOpenCodeGoProviderFailure(OpenCodeGoProviderFailure{
 		StatusCode: 401,
 		ErrorType:  "AuthError",
-		Message:    "Request blocked by upstream provider.",
+		Message:    "This account has found to be committing fraud or is in breach of terms of services and has been blocked.",
 	}, riskAt)
 	require.True(t, ok)
 	applied, err := applyOpenCodeGoClassifiedFailure(channel.Id, workspace.UID, "model-a", classified, nil)
 	require.NoError(t, err)
 	require.True(t, applied)
 
-	adminService := NewOpenCodeGoAccountPoolAdminService()
-	adminService.now = func() time.Time { return riskAt.Add(time.Minute) }
-	require.NoError(t, adminService.SetWorkspaceEnabled(channel.Id, workspace.UID, false))
-
 	disabled, err := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
 	require.NoError(t, err)
 	assert.False(t, disabled.ManualEnabled)
 	assert.Equal(t, model.OpenCodeGoStateManualDisabled, disabled.EffectiveState)
 	assert.Equal(t, riskAt.Unix(), disabled.RiskDetectedAt)
+	assert.Equal(t, classified.Observation.Reason, disabled.LastError)
+	_, err = SelectOpenCodeGoWorkspace(channel.Id, "model-a")
+	require.ErrorIs(t, err, ErrOpenCodeGoNoEligibleWorkspace)
 
-	adminService.now = func() time.Time { return riskAt.Add(2 * time.Minute) }
+	adminService.now = func() time.Time { return riskAt.Add(time.Minute) }
 	require.NoError(t, adminService.SetWorkspaceEnabled(channel.Id, workspace.UID, true))
 
 	after, err := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
@@ -289,6 +292,9 @@ func TestSetOpenCodeGoWorkspaceEnabledCannotClearRiskBlock(t *testing.T) {
 	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, after.EffectiveState)
 	assert.Equal(t, string(OpenCodeGoObservationManualEnabled), after.HealthObservation)
 	assert.Equal(t, riskAt.Unix(), after.RiskDetectedAt)
+	assert.Equal(t, classified.Observation.Reason, after.StateReason)
+	_, err = SelectOpenCodeGoWorkspace(channel.Id, "model-a")
+	require.ErrorIs(t, err, ErrOpenCodeGoNoEligibleWorkspace)
 }
 
 func TestOpenCodeGoAdminDeletesOwnedRowsAndRebuildsDerivedState(t *testing.T) {

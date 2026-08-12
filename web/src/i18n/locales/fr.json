@@ -1097,7 +1097,7 @@
     "Console Area": "Zone console",
     "Console Content": "Contenu de la console",
     "Consume": "Consommation",
-    "Consume one available reward and refresh quota for workspace \"{{name}}\"?": "Utiliser une récompense disponible et actualiser les quotas de l'espace de travail « {{name}} » ?",
+    "Applying this reward immediately offsets current usage for workspace \"{{name}}\". Any unused value does not carry over.": "L'application de cette récompense compense immédiatement l'utilisation actuelle de l'espace de travail « {{name}} ». Toute valeur inutilisée n'est pas reportée.",
     "Consumed in the last 24 hours": "Consommé dans les dernières 24 heures",
     "Container": "Conteneur",
     "Container name": "Nom du conteneur",

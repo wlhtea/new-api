@@ -21,6 +21,7 @@ type fakeOpenCodeGoLifecycleBackend struct {
 	mutex               sync.Mutex
 	page                *OpenCodeGoConsolePage
 	pages               map[string]*OpenCodeGoConsolePage
+	fetchPages          []*OpenCodeGoConsolePage
 	fetchWorkspaceCalls int
 	discoverCalls       int
 	enableCalls         int
@@ -43,6 +44,14 @@ func (fake *fakeOpenCodeGoLifecycleBackend) FetchWorkspacePage(
 	fake.mutex.Lock()
 	defer fake.mutex.Unlock()
 	fake.fetchWorkspaceCalls++
+	if len(fake.fetchPages) > 0 {
+		page := fake.fetchPages[0]
+		fake.fetchPages = fake.fetchPages[1:]
+		if page == nil || page.WorkspaceID != workspaceID {
+			return nil, errors.New("synthetic workspace page is unavailable")
+		}
+		return cloneOpenCodeGoLifecyclePage(page), nil
+	}
 	if page, ok := fake.pages[workspaceID]; ok {
 		return cloneOpenCodeGoLifecyclePage(page), nil
 	}
@@ -130,12 +139,12 @@ func (fake *fakeOpenCodeGoLifecycleBackend) ApplyReferralReward(
 	_ string,
 	_ *OpenCodeGoConsolePage,
 	rewardID string,
-) error {
+) (int, error) {
 	fake.mutex.Lock()
 	defer fake.mutex.Unlock()
 	fake.referralCalls++
 	if fake.referralErr != nil {
-		return fake.referralErr
+		return 0, fake.referralErr
 	}
 	remaining := make([]string, 0, len(fake.page.AvailableReferralRewardIDs))
 	removed := false
@@ -150,7 +159,7 @@ func (fake *fakeOpenCodeGoLifecycleBackend) ApplyReferralReward(
 	fake.page.AvailableReferralRewardIDs = remaining
 	fake.page.AvailableReferralRewards = len(remaining)
 	fake.page.UsedReferralRewards = len(fake.page.UsedReferralRewardIDs)
-	return nil
+	return 500, nil
 }
 
 func (fake *fakeOpenCodeGoLifecycleBackend) CancelSubscriptionRenewal(
@@ -614,7 +623,8 @@ func TestOpenCodeGoReferralRewardsRefreshQuotaAfterEverySuccessAndRespectLimit(t
 	require.NoError(t, err)
 	assert.Equal(t, OpenCodeGoReferralApplySummary{Attempted: 2, Applied: 2}, summary)
 	assert.Equal(t, 2, fake.referralCalls)
-	assert.Equal(t, 2, fake.discoverCalls, "every successful reward must perform a complete quota refresh")
+	assert.Equal(t, 4, fake.fetchWorkspaceCalls, "each reward must have one preflight GET and one verification GET")
+	assert.Zero(t, fake.discoverCalls)
 	assert.Len(t, fake.page.AvailableReferralRewardIDs, 1)
 
 	updated, loadErr := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
@@ -630,6 +640,348 @@ func TestOpenCodeGoReferralRewardsRefreshQuotaAfterEverySuccessAndRespectLimit(t
 	for _, operation := range operations {
 		assert.Equal(t, OpenCodeGoOperationStatusSucceeded, operation.Status)
 	}
+}
+
+func TestOpenCodeGoManualReferralRewardAppliesAtAnyUsagePercentage(t *testing.T) {
+	for _, usedPercent := range []float64{0, 4, 31, 99, 100} {
+		t.Run(fmt.Sprintf("used_%.0f_percent", usedPercent), func(t *testing.T) {
+			db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+			workspace := createEligibleOpenCodeGoWorkspace(
+				t,
+				db,
+				codec,
+				channel.Id,
+				fmt.Sprintf("manual-reward-%.0f", usedPercent),
+				fmt.Sprintf("workspace-manual-reward-%.0f", usedPercent),
+				fmt.Sprintf("wrk_MANUAL%.0f", usedPercent),
+				[]string{"model-a"},
+			)
+			now := time.Unix(1_900_100_000, 0)
+			page := newOpenCodeGoLifecyclePage(workspace.UpstreamWorkspaceID, usedPercent, now)
+			page.AvailableReferralRewardIDs = []string{"ref_MANUAL"}
+			page.AvailableReferralRewards = 1
+			configureOpenCodeGoLifecycleWorkspace(t, db, workspace, page)
+			fake := &fakeOpenCodeGoLifecycleBackend{page: page, models: []string{"model-a"}}
+			service := newOpenCodeGoLifecycleTestService(codec, fake, now)
+
+			summary, err := service.ApplyReferralReward(context.Background(), channel.Id, workspace.UID, "manual")
+			require.NoError(t, err)
+			assert.Equal(t, OpenCodeGoReferralApplySummary{Attempted: 1, Applied: 1}, summary)
+			assert.Equal(t, 1, fake.referralCalls)
+			assert.Equal(t, 2, fake.fetchWorkspaceCalls)
+		})
+	}
+}
+
+func TestOpenCodeGoManualReferralRewardRequiresAvailableReward(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t, db, codec, channel.Id, "manual-no-reward", "workspace-manual-no-reward", "wrk_MANUALNONE", []string{"model-a"},
+	)
+	now := time.Unix(1_900_100_000, 0)
+	page := newOpenCodeGoLifecyclePage(workspace.UpstreamWorkspaceID, 31, now)
+	configureOpenCodeGoLifecycleWorkspace(t, db, workspace, page)
+	fake := &fakeOpenCodeGoLifecycleBackend{page: page, models: []string{"model-a"}}
+	service := newOpenCodeGoLifecycleTestService(codec, fake, now)
+
+	summary, err := service.ApplyReferralReward(context.Background(), channel.Id, workspace.UID, "manual")
+	require.ErrorIs(t, err, ErrOpenCodeGoReferralRewardUnavailable)
+	assert.Equal(t, OpenCodeGoReferralApplySummary{}, summary)
+	assert.Zero(t, fake.referralCalls)
+
+	var operationCount int64
+	require.NoError(t, db.Model(&model.OpenCodeGoOperation{}).Where("workspace_id = ?", workspace.ID).Count(&operationCount).Error)
+	assert.Zero(t, operationCount)
+}
+
+func TestOpenCodeGoAutomaticReferralRewardStillRequiresExhaustedQuota(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t, db, codec, channel.Id, "automatic-non-exhausted", "workspace-automatic-non-exhausted", "wrk_AUTONOTFULL", []string{"model-a"},
+	)
+	now := time.Unix(1_900_100_000, 0)
+	page := newOpenCodeGoLifecyclePage(workspace.UpstreamWorkspaceID, 31, now)
+	page.AvailableReferralRewardIDs = []string{"ref_AUTOMATIC"}
+	page.AvailableReferralRewards = 1
+	configureOpenCodeGoLifecycleWorkspace(t, db, workspace, page)
+	fake := &fakeOpenCodeGoLifecycleBackend{page: page, models: []string{"model-a"}}
+	service := newOpenCodeGoLifecycleTestService(codec, fake, now)
+
+	summary, err := service.ApplyReferralRewards(context.Background(), channel.Id, workspace.UID, "scheduled", 1)
+	require.NoError(t, err)
+	assert.Equal(t, OpenCodeGoReferralApplySummary{}, summary)
+	assert.Zero(t, fake.referralCalls)
+}
+
+func TestOpenCodeGoReferralRewardRejectsInvalidAppliedPostStates(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*OpenCodeGoConsolePage)
+	}{
+		{
+			name: "reward still available",
+			mutate: func(page *OpenCodeGoConsolePage) {
+				page.AvailableReferralRewardIDs = []string{"ref_UNVERIFIED"}
+				page.AvailableReferralRewards = 1
+				page.UsedReferralRewardIDs = []string{"ref_UNVERIFIED"}
+				page.UsedReferralRewards = 1
+			},
+		},
+		{
+			name: "used reward missing",
+			mutate: func(page *OpenCodeGoConsolePage) {
+				page.UsedReferralRewardIDs = nil
+				page.UsedReferralRewards = 0
+			},
+		},
+		{
+			name: "used reward duplicated",
+			mutate: func(page *OpenCodeGoConsolePage) {
+				page.UsedReferralRewardIDs = []string{"ref_UNVERIFIED", "ref_UNVERIFIED"}
+				page.UsedReferralRewards = 2
+			},
+		},
+		{
+			name: "quota snapshot incomplete",
+			mutate: func(page *OpenCodeGoConsolePage) {
+				page.Quota.Windows = page.Quota.Windows[:2]
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+			workspace := createEligibleOpenCodeGoWorkspace(
+				t, db, codec, channel.Id, "manual-unverified", "workspace-manual-unverified", "wrk_UNVERIFIED", []string{"model-a"},
+			)
+			now := time.Unix(1_900_100_000, 0)
+			preflight := newOpenCodeGoLifecyclePage(workspace.UpstreamWorkspaceID, 31, now)
+			preflight.AvailableReferralRewardIDs = []string{"ref_UNVERIFIED"}
+			preflight.AvailableReferralRewards = 1
+			configureOpenCodeGoLifecycleWorkspace(t, db, workspace, preflight)
+			postState := cloneOpenCodeGoLifecyclePage(preflight)
+			postState.AvailableReferralRewardIDs = nil
+			postState.AvailableReferralRewards = 0
+			postState.UsedReferralRewardIDs = []string{"ref_UNVERIFIED"}
+			postState.UsedReferralRewards = 1
+			test.mutate(postState)
+			fake := &fakeOpenCodeGoLifecycleBackend{
+				page:       preflight,
+				fetchPages: []*OpenCodeGoConsolePage{preflight, postState},
+				models:     []string{"model-a"},
+			}
+			service := newOpenCodeGoLifecycleTestService(codec, fake, now)
+
+			_, err := service.ApplyReferralReward(context.Background(), channel.Id, workspace.UID, "manual")
+			require.Error(t, err)
+			assert.Equal(t, 1, fake.referralCalls, "an unverifiable mutation must never be replayed")
+			assert.Equal(t, 2, fake.fetchWorkspaceCalls)
+
+			var operation model.OpenCodeGoOperation
+			require.NoError(t, db.Where("workspace_id = ?", workspace.ID).First(&operation).Error)
+			assert.Equal(t, OpenCodeGoOperationStatusFailed, operation.Status)
+			updated, loadErr := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+			require.NoError(t, loadErr)
+			assert.Equal(t, 1, updated.AvailableReferralRewards)
+			assert.Equal(t, 0, updated.UsedReferralRewards)
+		})
+	}
+}
+
+func TestOpenCodeGoReferralRewardPersistsCompleteVerifiedSnapshotAndDerivedHealth(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t, db, codec, channel.Id, "manual-persisted", "workspace-manual-persisted", "wrk_PERSISTED", []string{"model-a"},
+	)
+	now := time.Unix(1_900_100_000, 0)
+	preflight := newOpenCodeGoLifecyclePage(workspace.UpstreamWorkspaceID, 100, now)
+	preflight.AvailableReferralRewardIDs = []string{"ref_PERSISTED", "ref_REMAINING"}
+	preflight.AvailableReferralRewards = 2
+	configureOpenCodeGoLifecycleWorkspace(t, db, workspace, preflight)
+	postFetchedAt := now.Add(30 * time.Second)
+	postState := newOpenCodeGoLifecyclePage(workspace.UpstreamWorkspaceID, 23, postFetchedAt)
+	postState.Quota.Windows[1].UsedPercent = 47
+	postState.Quota.Windows[2].UsedPercent = 68
+	postState.AvailableReferralRewardIDs = []string{"ref_REMAINING"}
+	postState.AvailableReferralRewards = 1
+	postState.UsedReferralRewardIDs = []string{"ref_PERSISTED"}
+	postState.UsedReferralRewards = 1
+	fake := &fakeOpenCodeGoLifecycleBackend{
+		page:       preflight,
+		fetchPages: []*OpenCodeGoConsolePage{preflight, postState},
+		models:     []string{"model-a"},
+	}
+	service := newOpenCodeGoLifecycleTestService(codec, fake, postFetchedAt)
+
+	summary, err := service.ApplyReferralReward(context.Background(), channel.Id, workspace.UID, "manual")
+	require.NoError(t, err)
+	assert.Equal(t, OpenCodeGoReferralApplySummary{Attempted: 1, Applied: 1}, summary)
+	assert.Equal(t, 1, fake.referralCalls)
+
+	updated, loadErr := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+	require.NoError(t, loadErr)
+	require.NotNil(t, updated)
+	assert.Equal(t, 1, updated.AvailableReferralRewards)
+	assert.Equal(t, 1, updated.UsedReferralRewards)
+	assert.Equal(t, model.OpenCodeGoQuotaSnapshotComplete, updated.QuotaSnapshotStatus)
+	assert.Equal(t, postState.Quota.FetchedAt, updated.QuotaFetchedAt)
+	assert.Equal(t, postState.Quota.NextRefreshAt, updated.QuotaNextRefreshAt)
+	assert.Equal(t, OpenCodeGoSSRParserVersion, updated.QuotaParserVersion)
+	assert.Empty(t, updated.QuotaError)
+	assert.Equal(t, postFetchedAt.Unix(), updated.LastSyncedAt)
+	assert.Equal(t, postFetchedAt.Unix(), updated.ReferralRewardAppliedAt)
+	assert.Equal(t, model.OpenCodeGoStateEligible, updated.EffectiveState)
+	assert.Zero(t, updated.QuotaRecoveryAt)
+	require.Len(t, updated.QuotaWindows, len(model.OpenCodeGoQuotaKinds))
+	for _, expected := range postState.Quota.Windows {
+		var actual *model.OpenCodeGoQuotaWindow
+		for index := range updated.QuotaWindows {
+			if updated.QuotaWindows[index].Kind == expected.Kind {
+				actual = &updated.QuotaWindows[index]
+				break
+			}
+		}
+		require.NotNil(t, actual)
+		assert.Equal(t, expected.UsedPercent, actual.UsedPercent)
+		assert.Equal(t, expected.ResetSeconds, actual.ResetSeconds)
+		assert.Equal(t, expected.ResetAt, actual.ResetAt)
+		assert.Equal(t, expected.FetchedAt, actual.FetchedAt)
+	}
+}
+
+func TestPersistOpenCodeGoReferralVerificationPreservesManualAndRiskEvidence(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t, db, codec, channel.Id, "manual-risk", "workspace-manual-risk", "wrk_MANUALRISK", []string{"model-a"},
+	)
+	now := time.Unix(1_900_100_000, 0)
+	page := newOpenCodeGoLifecyclePage(workspace.UpstreamWorkspaceID, 18, now)
+	page.UsedReferralRewardIDs = []string{"ref_PRESERVED"}
+	page.UsedReferralRewards = 1
+	riskAt := now.Add(-time.Minute).Unix()
+	healthObservedAt := now.Add(-time.Minute).UnixNano()
+	reason := "confirmed provider risk block"
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspace{}).Where("id = ?", workspace.ID).Updates(map[string]interface{}{
+		"manual_enabled":       false,
+		"effective_state":      model.OpenCodeGoStateManualDisabled,
+		"state_reason":         "workspace is manually disabled",
+		"health_observation":   string(OpenCodeGoObservationManualDisabled),
+		"health_observed_at":   healthObservedAt,
+		"risk_detected_at":     riskAt,
+		"risk_last_checked_at": riskAt,
+		"last_error":           reason,
+	}).Error)
+	service := newOpenCodeGoLifecycleTestService(codec, &fakeOpenCodeGoLifecycleBackend{page: page}, now)
+
+	require.NoError(t, service.persistReferralVerification(channel.Id, workspace.UID, "ref_PRESERVED", page))
+	updated, err := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.False(t, updated.ManualEnabled)
+	assert.Equal(t, model.OpenCodeGoStateManualDisabled, updated.EffectiveState)
+	assert.Equal(t, riskAt, updated.RiskDetectedAt)
+	assert.Equal(t, riskAt, updated.RiskLastCheckedAt)
+	assert.Equal(t, reason, updated.LastError)
+	assert.Equal(t, 1, updated.UsedReferralRewards)
+}
+
+func TestPersistOpenCodeGoReferralVerificationPreservesRiskBlockedState(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t, db, codec, channel.Id, "risk-preserved", "workspace-risk-preserved", "wrk_RISKPRESERVED", []string{"model-a"},
+	)
+	now := time.Unix(1_900_100_000, 0)
+	page := newOpenCodeGoLifecyclePage(workspace.UpstreamWorkspaceID, 18, now)
+	page.UsedReferralRewardIDs = []string{"ref_RISKPRESERVED"}
+	page.UsedReferralRewards = 1
+	riskAt := now.Add(-time.Minute).Unix()
+	reason := "confirmed provider risk block"
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspace{}).Where("id = ?", workspace.ID).Updates(map[string]interface{}{
+		"effective_state":      model.OpenCodeGoStateRiskBlocked,
+		"state_reason":         reason,
+		"health_observation":   string(OpenCodeGoObservationRiskBlocked),
+		"health_observed_at":   now.Add(-time.Minute).UnixNano(),
+		"risk_detected_at":     riskAt,
+		"risk_last_checked_at": riskAt,
+		"last_error":           reason,
+	}).Error)
+	service := newOpenCodeGoLifecycleTestService(codec, &fakeOpenCodeGoLifecycleBackend{page: page}, now)
+
+	require.NoError(t, service.persistReferralVerification(channel.Id, workspace.UID, "ref_RISKPRESERVED", page))
+	updated, err := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, updated.EffectiveState)
+	assert.Equal(t, riskAt, updated.RiskDetectedAt)
+	assert.Equal(t, riskAt, updated.RiskLastCheckedAt)
+	assert.Equal(t, reason, updated.LastError)
+}
+
+func TestPersistOpenCodeGoReferralVerificationPreservesBulkDisableEvidence(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t, db, codec, channel.Id, "bulk-preserved", "workspace-bulk-preserved", "wrk_BULKPRESERVED", []string{"model-a"},
+	)
+	now := time.Unix(1_900_100_000, 0)
+	page := newOpenCodeGoLifecyclePage(workspace.UpstreamWorkspaceID, 18, now)
+	page.UsedReferralRewardIDs = []string{"ref_BULKPRESERVED"}
+	page.UsedReferralRewards = 1
+	bulkAt := now.Add(-time.Minute).Unix()
+	reason := "persistent provider failures require manual verification"
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspace{}).Where("id = ?", workspace.ID).Updates(map[string]interface{}{
+		"effective_state":          model.OpenCodeGoStateBulkDisabled,
+		"state_reason":             reason,
+		"health_observation":       string(OpenCodeGoObservationBulkFailure),
+		"health_observed_at":       now.Add(-time.Minute).UnixNano(),
+		"bulk_failure_detected_at": bulkAt,
+		"last_error":               reason,
+	}).Error)
+	service := newOpenCodeGoLifecycleTestService(codec, &fakeOpenCodeGoLifecycleBackend{page: page}, now)
+
+	require.NoError(t, service.persistReferralVerification(channel.Id, workspace.UID, "ref_BULKPRESERVED", page))
+	updated, err := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, model.OpenCodeGoStateBulkDisabled, updated.EffectiveState)
+	assert.Equal(t, bulkAt, updated.BulkFailureDetectedAt)
+	assert.Equal(t, reason, updated.LastError)
+	assert.Equal(t, 1, updated.UsedReferralRewards)
+}
+
+func TestPersistOpenCodeGoReferralVerificationRollsBackWorkspaceAndQuotaTogether(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t, db, codec, channel.Id, "reward-rollback", "workspace-reward-rollback", "wrk_REWARDROLLBACK", []string{"model-a"},
+	)
+	now := time.Unix(1_900_100_000, 0)
+	before, err := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	beforeWindows := append([]model.OpenCodeGoQuotaWindow(nil), before.QuotaWindows...)
+	page := newOpenCodeGoLifecyclePage(workspace.UpstreamWorkspaceID, 42, now)
+	page.UsedReferralRewardIDs = []string{"ref_ROLLBACK"}
+	page.UsedReferralRewards = 1
+	callbackName := "opencode_go_test_fail_referral_quota_create"
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "open_code_go_quota_windows" {
+			tx.AddError(errors.New("injected referral quota insert failure"))
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Create().Remove(callbackName) })
+	service := newOpenCodeGoLifecycleTestService(codec, &fakeOpenCodeGoLifecycleBackend{page: page}, now)
+
+	err = service.persistReferralVerification(channel.Id, workspace.UID, "ref_ROLLBACK", page)
+	require.ErrorContains(t, err, "injected referral quota insert failure")
+	after, loadErr := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+	require.NoError(t, loadErr)
+	require.NotNil(t, after)
+	assert.Equal(t, before.AvailableReferralRewards, after.AvailableReferralRewards)
+	assert.Equal(t, before.UsedReferralRewards, after.UsedReferralRewards)
+	assert.Equal(t, before.ReferralRewardAppliedAt, after.ReferralRewardAppliedAt)
+	assert.Equal(t, before.QuotaFetchedAt, after.QuotaFetchedAt)
+	assert.Equal(t, before.EffectiveState, after.EffectiveState)
+	assert.Equal(t, beforeWindows, after.QuotaWindows)
 }
 
 func TestOpenCodeGoRenewalCancellationIsNotAutomaticByDefaultAndPreservesEntitlement(t *testing.T) {

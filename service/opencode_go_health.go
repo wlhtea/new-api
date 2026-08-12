@@ -30,7 +30,7 @@ const (
 	// OpenCodeGoObservationBulkFailure marks a workspace auto-disabled by
 	// repeated persistent provider failures (for example bulk 401/403),
 	// awaiting manual verification before it can be re-enabled.
-	OpenCodeGoObservationBulkFailure           OpenCodeGoHealthObservationKind = "bulk_failure"
+	OpenCodeGoObservationBulkFailure OpenCodeGoHealthObservationKind = "bulk_failure"
 )
 
 type OpenCodeGoHealthObservation struct {
@@ -86,6 +86,12 @@ func ReduceOpenCodeGoWorkspaceHealth(
 			candidate.ManualEnabled = false
 			candidate.EffectiveState = model.OpenCodeGoStateManualDisabled
 			candidate.StateReason = firstNonEmptyOpenCodeGoMessage(current.StateReason, "workspace is manually disabled")
+			candidate.RiskDetectedAt = current.RiskDetectedAt
+			candidate.RiskLastCheckedAt = current.RiskLastCheckedAt
+			candidate.BulkFailureDetectedAt = current.BulkFailureDetectedAt
+			if current.RiskDetectedAt > 0 || current.BulkFailureDetectedAt > 0 {
+				candidate.LastError = current.LastError
+			}
 			candidate.QuotaRecoveryAt = current.QuotaRecoveryAt
 			break
 		}
@@ -93,6 +99,8 @@ func ReduceOpenCodeGoWorkspaceHealth(
 			candidate.EffectiveState = current.EffectiveState
 			candidate.StateReason = current.StateReason
 			candidate.RiskDetectedAt = current.RiskDetectedAt
+			candidate.RiskLastCheckedAt = current.RiskLastCheckedAt
+			candidate.LastError = current.LastError
 			candidate.QuotaRecoveryAt = current.QuotaRecoveryAt
 			return candidate, true, nil
 		}
@@ -114,6 +122,10 @@ func ReduceOpenCodeGoWorkspaceHealth(
 			candidate.StateReason = current.StateReason
 			candidate.RiskDetectedAt = current.RiskDetectedAt
 			candidate.RiskLastCheckedAt = current.RiskLastCheckedAt
+			candidate.BulkFailureDetectedAt = current.BulkFailureDetectedAt
+			if current.RiskDetectedAt > 0 || current.BulkFailureDetectedAt > 0 {
+				candidate.LastError = current.LastError
+			}
 			candidate.QuotaRecoveryAt = current.QuotaRecoveryAt
 			candidate.CooldownUntil = current.CooldownUntil
 			break
@@ -152,10 +164,13 @@ func ReduceOpenCodeGoWorkspaceHealth(
 	case OpenCodeGoObservationRiskBlocked:
 		candidate = current
 		if current.EffectiveState == model.OpenCodeGoStateManualDisabled {
-			return current, false, nil
+			candidate.EffectiveState = model.OpenCodeGoStateManualDisabled
+			candidate.StateReason = firstNonEmptyOpenCodeGoMessage(current.StateReason, "workspace is manually disabled")
+			candidate.LastError = firstNonEmptyOpenCodeGoMessage(reason, current.LastError)
+		} else {
+			candidate.EffectiveState = model.OpenCodeGoStateRiskBlocked
+			candidate.StateReason = firstNonEmptyOpenCodeGoMessage(reason, "request blocked by upstream provider")
 		}
-		candidate.EffectiveState = model.OpenCodeGoStateRiskBlocked
-		candidate.StateReason = firstNonEmptyOpenCodeGoMessage(reason, "request blocked by upstream provider")
 		if candidate.RiskDetectedAt == 0 {
 			candidate.RiskDetectedAt = observation.ObservedAt.Unix()
 		}
@@ -179,7 +194,12 @@ func ReduceOpenCodeGoWorkspaceHealth(
 		candidate = current
 		candidate.RiskLastCheckedAt = observation.ObservedAt.Unix()
 	case OpenCodeGoObservationBulkFailure:
-		if current.EffectiveState == model.OpenCodeGoStateManualDisabled {
+		// An authoritative risk block is stronger than the heuristic bulk
+		// failure counter. Keep the risk evidence and reason intact so later
+		// refreshes and manual re-enable continue to project risk_blocked.
+		if current.EffectiveState == model.OpenCodeGoStateManualDisabled ||
+			current.EffectiveState == model.OpenCodeGoStateRiskBlocked ||
+			current.RiskDetectedAt > 0 {
 			return current, false, nil
 		}
 		candidate = current

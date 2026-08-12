@@ -128,6 +128,8 @@ export function OpenCodeGoWorkspaceRow(props: OpenCodeGoWorkspaceRowProps) {
   const refreshBusy = props.busyKey === `workspace:${workspace.uid}:refresh`
   const toggleBusy = props.busyKey === `workspace:${workspace.uid}:toggle`
   const riskBusy = props.busyKey === `workspace:${workspace.uid}:risk`
+  const referralRewardBusy =
+    props.busyKey === `workspace:${workspace.uid}:referral`
   const bulkDisabled = workspace.effective_state === 'bulk_disabled'
   let toggleIcon = <Power className='text-success size-4' />
   if (toggleBusy) {
@@ -311,7 +313,8 @@ export function OpenCodeGoWorkspaceRow(props: OpenCodeGoWorkspaceRowProps) {
               <DropdownMenuItem
                 disabled={
                   !props.canSensitiveWrite ||
-                  workspace.available_referral_rewards <= 0
+                  !workspace.referral_reward_eligible ||
+                  referralRewardBusy
                 }
                 onClick={() =>
                   props.onSensitiveAction('apply-referral-reward', workspace)
@@ -319,7 +322,11 @@ export function OpenCodeGoWorkspaceRow(props: OpenCodeGoWorkspaceRowProps) {
               >
                 {t('Apply one referral reward')}
                 <DropdownMenuShortcut>
-                  <Gift className='size-4' />
+                  {referralRewardBusy ? (
+                    <Loader2 className='size-4 animate-spin' />
+                  ) : (
+                    <Gift className='size-4' />
+                  )}
                 </DropdownMenuShortcut>
               </DropdownMenuItem>
               <DropdownMenuItem

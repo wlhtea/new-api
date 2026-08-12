@@ -75,6 +75,7 @@ type OpenCodeGoWorkspaceView struct {
 	ReferralCode             string                         `json:"referral_code"`
 	AvailableReferralRewards int                            `json:"available_referral_rewards"`
 	UsedReferralRewards      int                            `json:"used_referral_rewards"`
+	ReferralRewardEligible   bool                           `json:"referral_reward_eligible"`
 	ReferralRewardAppliedAt  int64                          `json:"referral_reward_applied_at"`
 	RiskDetectedAt           int64                          `json:"risk_detected_at"`
 	RiskLastCheckedAt        int64                          `json:"risk_last_checked_at"`
@@ -162,7 +163,9 @@ func GetOpenCodeGoPoolView(channelID int) (*OpenCodeGoPoolView, error) {
 			Workspaces:    make([]OpenCodeGoWorkspaceView, 0, len(identity.Workspaces)),
 		}
 		for _, workspace := range identity.Workspaces {
-			identityView.Workspaces = append(identityView.Workspaces, openCodeGoWorkspaceToView(channelID, workspace))
+			workspaceView := openCodeGoWorkspaceToView(channelID, workspace)
+			workspaceView.ReferralRewardEligible = openCodeGoReferralRewardEligible(identity, workspace)
+			identityView.Workspaces = append(identityView.Workspaces, workspaceView)
 		}
 		view.Identities = append(view.Identities, identityView)
 	}
@@ -397,7 +400,10 @@ func (service *OpenCodeGoAccountPoolService) SetWorkspaceEnabled(channelID int, 
 				"health_observed_at":       reduced.HealthObservedAt,
 				"quota_recovery_at":        reduced.QuotaRecoveryAt,
 				"cooldown_until":           reduced.CooldownUntil,
+				"risk_detected_at":         reduced.RiskDetectedAt,
+				"risk_last_checked_at":     reduced.RiskLastCheckedAt,
 				"bulk_failure_detected_at": reduced.BulkFailureDetectedAt,
+				"last_error":               reduced.LastError,
 				"updated_at":               common.GetTimestamp(),
 			})
 		if result.Error != nil {

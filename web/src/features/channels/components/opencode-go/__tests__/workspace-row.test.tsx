@@ -22,6 +22,7 @@ import { after, afterEach, describe, test } from 'node:test'
 import { Window } from 'happy-dom'
 
 import type { OpenCodeGoWorkspace } from '../../../lib/opencode-go-schemas'
+import type { OpenCodeGoWorkspaceSensitiveAction } from '../opencode-go-workspace-row'
 
 const domWindow = new Window({ url: 'http://localhost' })
 const domGlobals = [
@@ -77,6 +78,15 @@ type RenderedRow = {
 }
 
 let renderedRow: RenderedRow | null = null
+
+type RenderWorkspaceOptions = {
+  canSensitiveWrite?: boolean
+  busyKey?: string | null
+  onSensitiveAction?: (
+    action: OpenCodeGoWorkspaceSensitiveAction,
+    workspace: OpenCodeGoWorkspace
+  ) => void
+}
 
 function workspaceFixture(
   overrides: Partial<OpenCodeGoWorkspace> = {}
@@ -153,6 +163,7 @@ function workspaceFixture(
     referral_code: '',
     available_referral_rewards: 0,
     used_referral_rewards: 0,
+    referral_reward_eligible: false,
     referral_reward_applied_at: 0,
     risk_detected_at: 0,
     risk_last_checked_at: now,
@@ -167,7 +178,8 @@ function workspaceFixture(
 async function renderWorkspace(
   workspace: OpenCodeGoWorkspace,
   canOperate = true,
-  locale = 'en'
+  locale = 'en',
+  options: RenderWorkspaceOptions = {}
 ): Promise<HTMLDivElement> {
   const host = document.createElement('div')
   document.body.append(host)
@@ -183,12 +195,12 @@ async function renderWorkspace(
             nowSeconds={1_900_000_000}
             locale={locale}
             canOperate={canOperate}
-            canSensitiveWrite={false}
-            busyKey={null}
+            canSensitiveWrite={options.canSensitiveWrite ?? false}
+            busyKey={options.busyKey ?? null}
             onRefresh={() => undefined}
             onRiskRecheck={() => undefined}
             onToggle={() => undefined}
-            onSensitiveAction={() => undefined}
+            onSensitiveAction={options.onSensitiveAction ?? (() => undefined)}
           />
         </TooltipProvider>
       </I18nextProvider>
@@ -196,6 +208,31 @@ async function renderWorkspace(
   })
 
   return host
+}
+
+async function openRewardMenuItem(): Promise<HTMLElement> {
+  const trigger = document.querySelector<HTMLButtonElement>(
+    'button[aria-label="Workspace actions"]'
+  )
+  assert.ok(trigger)
+  await act(async () => {
+    trigger.click()
+    await Promise.resolve()
+  })
+  const item = [
+    ...document.querySelectorAll<HTMLElement>('[role="menuitem"]'),
+  ].find((candidate) =>
+    candidate.textContent?.includes('Apply one referral reward')
+  )
+  assert.ok(item)
+  return item
+}
+
+function isMenuItemDisabled(item: HTMLElement): boolean {
+  return (
+    item.getAttribute('aria-disabled') === 'true' ||
+    item.hasAttribute('data-disabled')
+  )
 }
 
 afterEach(async () => {
@@ -290,5 +327,59 @@ describe('OpenCode Go workspace status row', () => {
       assert.ok(button)
       assert.equal(button.disabled, true)
     }
+  })
+
+  test('keeps the reward action disabled when backend eligibility is false', async () => {
+    await renderWorkspace(
+      workspaceFixture({
+        available_referral_rewards: 2,
+        referral_reward_eligible: false,
+      }),
+      true,
+      'en',
+      { canSensitiveWrite: true }
+    )
+
+    assert.equal(isMenuItemDisabled(await openRewardMenuItem()), true)
+  })
+
+  test('enables the reward action from backend eligibility instead of the count', async () => {
+    const actions: OpenCodeGoWorkspaceSensitiveAction[] = []
+    await renderWorkspace(
+      workspaceFixture({
+        available_referral_rewards: 0,
+        referral_reward_eligible: true,
+      }),
+      true,
+      'en',
+      {
+        canSensitiveWrite: true,
+        onSensitiveAction: (action) => actions.push(action),
+      }
+    )
+
+    const item = await openRewardMenuItem()
+    assert.equal(isMenuItemDisabled(item), false)
+    await act(async () => item.click())
+    assert.deepEqual(actions, ['apply-referral-reward'])
+  })
+
+  test('keeps the reward action disabled and busy while it is applying', async () => {
+    await renderWorkspace(
+      workspaceFixture({
+        available_referral_rewards: 1,
+        referral_reward_eligible: true,
+      }),
+      true,
+      'en',
+      {
+        canSensitiveWrite: true,
+        busyKey: 'workspace:workspace-test:referral',
+      }
+    )
+
+    const item = await openRewardMenuItem()
+    assert.equal(isMenuItemDisabled(item), true)
+    assert.ok(item.querySelector('svg.animate-spin'))
   })
 })

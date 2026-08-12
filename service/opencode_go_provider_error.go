@@ -275,7 +275,7 @@ func ClassifyOpenCodeGoProviderFailure(
 
 	switch errorType {
 	case "autherror":
-		if failure.StatusCode == http.StatusUnauthorized && strings.Contains(strings.ToLower(message), "request blocked by upstream provider") {
+		if failure.StatusCode == http.StatusUnauthorized && openCodeGoAuthErrorIsRiskBlocked(message) {
 			return workspace(OpenCodeGoObservationRiskBlocked)
 		}
 		if openCodeGoAuthErrorIsModelScoped(message) {
@@ -317,6 +317,12 @@ func ClassifyOpenCodeGoProviderFailure(
 	default:
 		return OpenCodeGoClassifiedFailure{}, false
 	}
+}
+
+func openCodeGoAuthErrorIsRiskBlocked(message string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(message), " "))
+	normalized = strings.TrimRight(normalized, ".!? ")
+	return normalized == "this account has found to be committing fraud or is in breach of terms of services and has been blocked"
 }
 
 func ClassifyOpenCodeGoTransportFailure(message string, observedAt time.Time) OpenCodeGoClassifiedFailure {

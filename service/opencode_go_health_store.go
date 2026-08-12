@@ -118,7 +118,11 @@ func applyOpenCodeGoClassifiedFailureWithMutation(
 			if err != nil || !changed {
 				return err
 			}
-			next.LastError = firstNonEmptyOpenCodeGoMessage(next.StateReason, next.LastError)
+			if classified.Observation.Kind == OpenCodeGoObservationRiskBlocked && next.EffectiveState == model.OpenCodeGoStateManualDisabled {
+				next.LastError = firstNonEmptyOpenCodeGoMessage(next.LastError, next.StateReason)
+			} else {
+				next.LastError = firstNonEmptyOpenCodeGoMessage(next.StateReason, next.LastError)
+			}
 			result := tx.Model(&model.OpenCodeGoWorkspace{}).
 				Where("id = ? AND COALESCE(health_observed_at, 0) <= ?", workspace.ID, classified.Observation.ObservedAt.UnixNano()).
 				Updates(openCodeGoWorkspaceHealthUpdates(next))

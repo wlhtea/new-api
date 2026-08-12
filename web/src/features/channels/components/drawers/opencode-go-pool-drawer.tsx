@@ -312,7 +312,7 @@ export function OpenCodeGoPoolDrawer(props: OpenCodeGoPoolDrawerProps) {
       case 'apply-referral-reward':
         confirmationTitle = t('Apply one referral reward')
         confirmationDescription = t(
-          'Consume one available reward and refresh quota for workspace "{{name}}"?',
+          'Applying this reward immediately offsets current usage for workspace "{{name}}". Any unused value does not carry over.',
           { name: confirmation.workspace.name || confirmation.workspace.uid }
         )
         break

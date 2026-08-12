@@ -1097,7 +1097,7 @@
     "Console Area": "コンソールエリア",
     "Console Content": "コンソールコンテンツ",
     "Consume": "消費",
-    "Consume one available reward and refresh quota for workspace \"{{name}}\"?": "利用可能な報酬を 1 件使用し、ワークスペース「{{name}}」のクォータを更新しますか？",
+    "Applying this reward immediately offsets current usage for workspace \"{{name}}\". Any unused value does not carry over.": "この報酬を適用すると、ワークスペース「{{name}}」の現在の使用量が直ちに相殺されます。未使用分は繰り越されません。",
     "Consumed in the last 24 hours": "直近24時間の消費量",
     "Container": "コンテナ",
     "Container name": "コンテナ名",

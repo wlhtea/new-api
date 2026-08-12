@@ -848,7 +848,7 @@ func TestOpenCodeGoOlderConsoleCommitCannotOverwriteNewerRiskObservation(t *test
 	risk, ok := ClassifyOpenCodeGoProviderFailure(OpenCodeGoProviderFailure{
 		StatusCode: 401,
 		ErrorType:  "AuthError",
-		Message:    "Request blocked by upstream provider.",
+		Message:    "This account has found to be committing fraud or is in breach of terms of services and has been blocked.",
 	}, riskTime)
 	require.True(t, ok)
 	applied, err := applyOpenCodeGoClassifiedFailure(channel.Id, seeded.UID, "glm-5.2", risk, nil)

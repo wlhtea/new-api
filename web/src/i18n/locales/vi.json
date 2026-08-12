@@ -1097,7 +1097,7 @@
     "Console Area": "Khu vực bảng điều khiển",
     "Console Content": "Nội dung bảng điều khiển",
     "Consume": "Tiêu thụ",
-    "Consume one available reward and refresh quota for workspace \"{{name}}\"?": "Dùng một phần thưởng hiện có và làm mới hạn mức cho không gian làm việc “{{name}}”?",
+    "Applying this reward immediately offsets current usage for workspace \"{{name}}\". Any unused value does not carry over.": "Áp dụng phần thưởng này sẽ ngay lập tức bù vào mức sử dụng hiện tại của không gian làm việc “{{name}}”. Giá trị chưa sử dụng sẽ không được chuyển tiếp.",
     "Consumed in the last 24 hours": "Đã tiêu thụ trong 24 giờ qua",
     "Container": "Thùng chứa",
     "Container name": "Tên container",

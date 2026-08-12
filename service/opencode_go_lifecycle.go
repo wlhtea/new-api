@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +19,8 @@ const (
 	OpenCodeGoDefaultReferralRewardsPerRun = 3
 	OpenCodeGoMaxReferralRewardsPerRun     = 20
 )
+
+var ErrOpenCodeGoReferralRewardUnavailable = errors.New("OpenCode Go referral reward is not currently available")
 
 type openCodeGoLifecycleReader interface {
 	FetchWorkspacePage(ctx context.Context, authCookie string, workspaceID string) (*OpenCodeGoConsolePage, error)
@@ -387,6 +390,26 @@ func (service *OpenCodeGoLifecycleService) ApplyReferralRewards(
 	source string,
 	maxRewards int,
 ) (OpenCodeGoReferralApplySummary, error) {
+	return service.applyReferralRewards(ctx, channelID, workspaceUID, source, maxRewards, true)
+}
+
+func (service *OpenCodeGoLifecycleService) ApplyReferralReward(
+	ctx context.Context,
+	channelID int,
+	workspaceUID string,
+	source string,
+) (OpenCodeGoReferralApplySummary, error) {
+	return service.applyReferralRewards(ctx, channelID, workspaceUID, source, 1, false)
+}
+
+func (service *OpenCodeGoLifecycleService) applyReferralRewards(
+	ctx context.Context,
+	channelID int,
+	workspaceUID string,
+	source string,
+	maxRewards int,
+	requireExhaustedQuota bool,
+) (OpenCodeGoReferralApplySummary, error) {
 	summary := OpenCodeGoReferralApplySummary{}
 	maxRewards = normalizeOpenCodeGoReferralRewardLimit(maxRewards)
 	scoped, target, unlock, err := service.scopedTarget(channelID, workspaceUID)
@@ -395,19 +418,32 @@ func (service *OpenCodeGoLifecycleService) ApplyReferralRewards(
 	}
 	service = scoped
 	defer unlock()
-	if !openCodeGoWorkspaceHasExhaustedQuota(*target.workspace) {
+	if requireExhaustedQuota && !openCodeGoWorkspaceHasExhaustedQuota(*target.workspace) {
 		return summary, nil
+	}
+	if !openCodeGoReferralRewardEligible(*target.identity, *target.workspace) {
+		if requireExhaustedQuota {
+			return summary, nil
+		}
+		return summary, ErrOpenCodeGoReferralRewardUnavailable
 	}
 
 	attempted := make(map[string]struct{})
-	for summary.Attempted < maxRewards && openCodeGoWorkspaceHasExhaustedQuota(*target.workspace) {
+	for summary.Attempted < maxRewards {
+		if requireExhaustedQuota && !openCodeGoWorkspaceHasExhaustedQuota(*target.workspace) {
+			break
+		}
 		page, inspectErr := service.reader.FetchWorkspacePage(ctx, target.authCookie, target.workspace.UpstreamWorkspaceID)
 		if inspectErr != nil {
 			return summary, inspectErr
 		}
-		if page.MembershipStatus != model.OpenCodeGoMembershipActive || !openCodeGoPageHasExhaustedQuota(page) {
+		if page.MembershipStatus != model.OpenCodeGoMembershipActive {
+			return summary, errors.New("OpenCode Go referral reward requires an active membership")
+		}
+		if requireExhaustedQuota && !openCodeGoPageHasExhaustedQuota(page) {
 			return summary, errors.New("OpenCode Go referral reward requires authoritative exhausted member quota")
 		}
+
 		rewardID := ""
 		for _, candidate := range page.AvailableReferralRewardIDs {
 			if _, seen := attempted[candidate]; !seen {
@@ -416,6 +452,9 @@ func (service *OpenCodeGoLifecycleService) ApplyReferralRewards(
 			}
 		}
 		if rewardID == "" {
+			if !requireExhaustedQuota && summary.Attempted == 0 {
+				return summary, ErrOpenCodeGoReferralRewardUnavailable
+			}
 			break
 		}
 		attempted[rewardID] = struct{}{}
@@ -431,46 +470,52 @@ func (service *OpenCodeGoLifecycleService) ApplyReferralRewards(
 			return summary, startErr
 		}
 
-		mutationErr := service.mutator.ApplyReferralReward(ctx, target.authCookie, page, rewardID)
+		amount, mutationErr := service.mutator.ApplyReferralReward(ctx, target.authCookie, page, rewardID)
 		if mutationErr != nil {
-			latest, verifyErr := service.reader.FetchWorkspacePage(ctx, target.authCookie, target.workspace.UpstreamWorkspaceID)
-			if verifyErr != nil || containsOpenCodeGoReferralReward(latest, rewardID) {
-				return summary, service.failOperation(operation, mutationErr)
-			}
+			return summary, service.failOperation(operation, mutationErr)
 		}
-
-		refreshed, refreshErr := service.pool.refreshIdentityWithCookie(
-			ctx,
-			channelID,
-			target.identity,
-			target.authCookie,
-			nil,
-			true,
-		)
-		if refreshErr != nil {
-			return summary, service.failOperation(operation, refreshErr)
-		}
-		refreshedWorkspace := findOpenCodeGoIdentityWorkspace(refreshed, workspaceUID)
-		if refreshedWorkspace == nil {
-			err = errors.New("OpenCode Go referral verification workspace is missing")
+		if amount <= 0 {
+			err = errors.New("OpenCode Go referral action amount was invalid")
 			return summary, service.failOperation(operation, err)
 		}
-		verifiedPage, verifyErr := service.reader.FetchWorkspacePage(ctx, target.authCookie, refreshedWorkspace.UpstreamWorkspaceID)
+
+		verifiedPage, verifyErr := service.reader.FetchWorkspacePage(ctx, target.authCookie, target.workspace.UpstreamWorkspaceID)
 		if verifyErr != nil {
 			return summary, service.failOperation(operation, verifyErr)
 		}
-		if containsOpenCodeGoReferralReward(verifiedPage, rewardID) {
-			err = errors.New("OpenCode Go referral reward remained available after apply")
-			return summary, service.failOperation(operation, err)
+		persistErr := func() error {
+			releaseMutation := BeginOpenCodeGoPoolMutation(channelID)
+			defer releaseMutation()
+			if err := service.persistReferralVerification(channelID, workspaceUID, rewardID, verifiedPage); err != nil {
+				return err
+			}
+			if service.pool.rebuild == nil {
+				return nil
+			}
+			openCodeGoIdentityProxyClients.advanceSelectionGeneration(channelID)
+			return service.pool.rebuild(channelID)
+		}()
+		if persistErr != nil {
+			return summary, service.failOperation(operation, persistErr)
 		}
-		if err := service.persistReferralAppliedAt(channelID, workspaceUID); err != nil {
-			return summary, service.failOperation(operation, err)
-		}
-		if err := finishOpenCodeGoOperation(operation, OpenCodeGoOperationStatusSucceeded, "referral reward applied and quota refreshed", nil, service.now()); err != nil {
+		if err := finishOpenCodeGoOperation(
+			operation,
+			OpenCodeGoOperationStatusSucceeded,
+			fmt.Sprintf("referral reward applied and verified (amount=%d)", amount),
+			nil,
+			service.now(),
+		); err != nil {
 			return summary, err
 		}
 		summary.Applied++
-		target.identity = refreshed
+
+		refreshedWorkspace, loadErr := model.GetOpenCodeGoWorkspace(channelID, workspaceUID)
+		if loadErr != nil {
+			return summary, loadErr
+		}
+		if refreshedWorkspace == nil {
+			return summary, errors.New("OpenCode Go referral verification workspace is missing")
+		}
 		target.workspace = refreshedWorkspace
 	}
 	return summary, nil
@@ -804,11 +849,180 @@ func (service *OpenCodeGoLifecycleService) persistChinaModelVerification(
 	})
 }
 
-func (service *OpenCodeGoLifecycleService) persistReferralAppliedAt(channelID int, workspaceUID string) error {
-	now := service.now().Unix()
-	return model.DB.Model(&model.OpenCodeGoWorkspace{}).
-		Where("channel_id = ? AND uid = ?", channelID, workspaceUID).
-		Update("referral_reward_applied_at", now).Error
+func (service *OpenCodeGoLifecycleService) persistReferralVerification(
+	channelID int,
+	workspaceUID string,
+	rewardID string,
+	page *OpenCodeGoConsolePage,
+) error {
+	windows, err := validateOpenCodeGoReferralVerificationPage(page, rewardID)
+	if err != nil {
+		return err
+	}
+	observedAt := service.now()
+	return model.DB.Transaction(func(tx *gorm.DB) error {
+		var current model.OpenCodeGoWorkspace
+		if err := model.LockForUpdate(tx).
+			Where("channel_id = ? AND uid = ?", channelID, workspaceUID).
+			Preload("QuotaWindows").
+			Preload("Models").
+			First(&current).Error; err != nil {
+			return err
+		}
+		if !strings.EqualFold(page.WorkspaceID, current.UpstreamWorkspaceID) {
+			return errors.New("OpenCode Go referral verification page is for another workspace")
+		}
+		if page.Quota.FetchedAt < current.LastSyncedAt || page.Quota.FetchedAt < current.QuotaFetchedAt {
+			return errors.New("OpenCode Go referral verification page is older than the stored snapshot")
+		}
+
+		for index := range windows {
+			windows[index].WorkspaceID = current.ID
+		}
+		candidate := current
+		candidate.MembershipStatus = page.MembershipStatus
+		candidate.QuotaSnapshotStatus = model.OpenCodeGoQuotaSnapshotComplete
+		candidate.QuotaFetchedAt = page.Quota.FetchedAt
+		candidate.QuotaNextRefreshAt = page.Quota.NextRefreshAt
+		candidate.QuotaParserVersion = OpenCodeGoSSRParserVersion
+		candidate.QuotaError = ""
+		candidate.AvailableReferralRewards = page.AvailableReferralRewards
+		candidate.UsedReferralRewards = page.UsedReferralRewards
+		candidate.ReferralRewardAppliedAt = observedAt.Unix()
+		candidate.LastSyncedAt = page.Quota.FetchedAt
+		candidate.LastError = ""
+		if current.RiskDetectedAt > 0 || current.BulkFailureDetectedAt > 0 {
+			candidate.LastError = current.LastError
+		}
+		candidate.StateReason = ""
+
+		// A verified reward is explicit quota-recovery evidence, so it may
+		// replace the pre-reward reset fence with the authoritative post-state.
+		reducerCurrent := current
+		if reducerCurrent.EffectiveState == model.OpenCodeGoStateQuotaExhausted {
+			reducerCurrent.QuotaRecoveryAt = 0
+		}
+		reduced, applied, err := ReduceOpenCodeGoWorkspaceHealth(
+			reducerCurrent,
+			candidate,
+			windows,
+			OpenCodeGoHealthObservation{
+				Kind:            OpenCodeGoObservationConsoleSnapshot,
+				ObservedAt:      observedAt,
+				HasUsableModels: hasUsableOpenCodeGoModels(nil, false, &current),
+			},
+		)
+		if err != nil {
+			return err
+		}
+		if applied {
+			candidate = reduced
+		} else {
+			copyOpenCodeGoWorkspaceHealthOutputs(&candidate, current)
+			candidate.LastError = current.LastError
+		}
+
+		if err := tx.Model(&model.OpenCodeGoWorkspace{}).
+			Where("id = ?", current.ID).
+			Updates(map[string]interface{}{
+				"membership_status":          candidate.MembershipStatus,
+				"effective_state":            candidate.EffectiveState,
+				"state_reason":               candidate.StateReason,
+				"health_observation":         candidate.HealthObservation,
+				"health_observed_at":         candidate.HealthObservedAt,
+				"cooldown_until":             candidate.CooldownUntil,
+				"quota_snapshot_status":      candidate.QuotaSnapshotStatus,
+				"quota_fetched_at":           candidate.QuotaFetchedAt,
+				"quota_next_refresh_at":      candidate.QuotaNextRefreshAt,
+				"quota_recovery_at":          candidate.QuotaRecoveryAt,
+				"quota_parser_version":       candidate.QuotaParserVersion,
+				"quota_error":                candidate.QuotaError,
+				"available_referral_rewards": candidate.AvailableReferralRewards,
+				"used_referral_rewards":      candidate.UsedReferralRewards,
+				"referral_reward_applied_at": candidate.ReferralRewardAppliedAt,
+				"risk_detected_at":           candidate.RiskDetectedAt,
+				"risk_last_checked_at":       candidate.RiskLastCheckedAt,
+				"bulk_failure_detected_at":   candidate.BulkFailureDetectedAt,
+				"last_synced_at":             candidate.LastSyncedAt,
+				"last_error":                 candidate.LastError,
+				"updated_at":                 common.GetTimestamp(),
+			}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("workspace_id = ?", current.ID).Delete(&model.OpenCodeGoQuotaWindow{}).Error; err != nil {
+			return err
+		}
+		return tx.Create(&windows).Error
+	})
+}
+
+func validateOpenCodeGoReferralVerificationPage(
+	page *OpenCodeGoConsolePage,
+	rewardID string,
+) ([]model.OpenCodeGoQuotaWindow, error) {
+	if page == nil || page.MembershipStatus != model.OpenCodeGoMembershipActive ||
+		page.Quota == nil || strings.TrimSpace(page.QuotaParseError) != "" {
+		return nil, errors.New("OpenCode Go referral verification page is not authoritative")
+	}
+	if page.AvailableReferralRewards != len(page.AvailableReferralRewardIDs) ||
+		page.UsedReferralRewards != len(page.UsedReferralRewardIDs) ||
+		countOpenCodeGoReferralReward(page.AvailableReferralRewardIDs, rewardID) != 0 ||
+		countOpenCodeGoReferralReward(page.UsedReferralRewardIDs, rewardID) != 1 {
+		return nil, errors.New("OpenCode Go referral reward application could not be verified")
+	}
+	seenRewards := make(map[string]struct{}, page.AvailableReferralRewards+page.UsedReferralRewards)
+	for _, rewardIDs := range [][]string{page.AvailableReferralRewardIDs, page.UsedReferralRewardIDs} {
+		for _, candidate := range rewardIDs {
+			if !openCodeGoReferralRewardIDPattern.MatchString(candidate) {
+				return nil, errors.New("OpenCode Go referral verification page is not authoritative")
+			}
+			if _, exists := seenRewards[candidate]; exists {
+				return nil, errors.New("OpenCode Go referral reward application could not be verified")
+			}
+			seenRewards[candidate] = struct{}{}
+		}
+	}
+
+	quota := page.Quota
+	if quota.FetchedAt <= 0 || quota.NextRefreshAt <= 0 || len(quota.Windows) != len(model.OpenCodeGoQuotaKinds) {
+		return nil, errors.New("OpenCode Go referral verification quota snapshot is incomplete")
+	}
+	expectedKinds := make(map[string]struct{}, len(model.OpenCodeGoQuotaKinds))
+	for _, kind := range model.OpenCodeGoQuotaKinds {
+		expectedKinds[kind] = struct{}{}
+	}
+	seenKinds := make(map[string]struct{}, len(quota.Windows))
+	windows := make([]model.OpenCodeGoQuotaWindow, 0, len(quota.Windows))
+	nextRefreshAt := int64(0)
+	for _, window := range quota.Windows {
+		if _, expected := expectedKinds[window.Kind]; !expected {
+			return nil, errors.New("OpenCode Go referral verification quota snapshot is incomplete")
+		}
+		if _, duplicate := seenKinds[window.Kind]; duplicate {
+			return nil, errors.New("OpenCode Go referral verification quota snapshot is incomplete")
+		}
+		if math.IsNaN(window.UsedPercent) || math.IsInf(window.UsedPercent, 0) || window.UsedPercent < 0 ||
+			window.FetchedAt != quota.FetchedAt || window.ResetSeconds < 0 ||
+			window.ResetSeconds > openCodeGoMaxResetSeconds || window.ResetAt < quota.FetchedAt ||
+			window.ResetAt-quota.FetchedAt != window.ResetSeconds {
+			return nil, errors.New("OpenCode Go referral verification quota snapshot is incomplete")
+		}
+		seenKinds[window.Kind] = struct{}{}
+		if nextRefreshAt == 0 || window.ResetAt < nextRefreshAt {
+			nextRefreshAt = window.ResetAt
+		}
+		windows = append(windows, model.OpenCodeGoQuotaWindow{
+			Kind:         window.Kind,
+			UsedPercent:  window.UsedPercent,
+			ResetSeconds: window.ResetSeconds,
+			ResetAt:      window.ResetAt,
+			FetchedAt:    window.FetchedAt,
+		})
+	}
+	if len(seenKinds) != len(expectedKinds) || nextRefreshAt != quota.NextRefreshAt {
+		return nil, errors.New("OpenCode Go referral verification quota snapshot is incomplete")
+	}
+	return windows, nil
 }
 
 func (service *OpenCodeGoLifecycleService) persistRenewalVerification(
@@ -867,16 +1081,40 @@ func openCodeGoPageHasExhaustedQuota(page *OpenCodeGoConsolePage) bool {
 	return false
 }
 
-func containsOpenCodeGoReferralReward(page *OpenCodeGoConsolePage, rewardID string) bool {
-	if page == nil {
-		return false
-	}
-	for _, candidate := range page.AvailableReferralRewardIDs {
+func countOpenCodeGoReferralReward(rewardIDs []string, rewardID string) int {
+	count := 0
+	for _, candidate := range rewardIDs {
 		if candidate == rewardID {
-			return true
+			count++
 		}
 	}
-	return false
+	return count
+}
+
+func openCodeGoReferralRewardEligible(
+	identity model.OpenCodeGoIdentity,
+	workspace model.OpenCodeGoWorkspace,
+) bool {
+	if (identity.Status != model.OpenCodeGoIdentityStatusActive && identity.Status != model.OpenCodeGoIdentityStatusStale) ||
+		identity.AuthCookieCiphertext == "" ||
+		!workspace.ManualEnabled ||
+		workspace.MembershipStatus != model.OpenCodeGoMembershipActive ||
+		workspace.AvailableReferralRewards <= 0 ||
+		workspace.RiskDetectedAt > 0 ||
+		workspace.BulkFailureDetectedAt > 0 {
+		return false
+	}
+	switch workspace.EffectiveState {
+	case model.OpenCodeGoStateManualDisabled,
+		model.OpenCodeGoStateAuthError,
+		model.OpenCodeGoStateKeyError,
+		model.OpenCodeGoStateMembershipExpired,
+		model.OpenCodeGoStateRiskBlocked,
+		model.OpenCodeGoStateBulkDisabled:
+		return false
+	default:
+		return true
+	}
 }
 
 func normalizeOpenCodeGoReferralRewardLimit(limit int) int {

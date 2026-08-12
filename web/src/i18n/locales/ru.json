@@ -1097,7 +1097,7 @@
     "Console Area": "Область консоли",
     "Console Content": "Содержимое консоли",
     "Consume": "Расход",
-    "Consume one available reward and refresh quota for workspace \"{{name}}\"?": "Использовать один доступный бонус и обновить квоту рабочей области «{{name}}»?",
+    "Applying this reward immediately offsets current usage for workspace \"{{name}}\". Any unused value does not carry over.": "Применение этой награды немедленно компенсирует текущее использование рабочего пространства «{{name}}». Неиспользованная сумма не переносится.",
     "Consumed in the last 24 hours": "Потреблено за последние 24 часа",
     "Container": "Контейнер",
     "Container name": "Имя контейнера",

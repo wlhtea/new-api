@@ -23,6 +23,7 @@ const (
 
 var (
 	openCodeGoReferralActionPattern  = regexp.MustCompile(`(?is)createServerReference\("([a-f0-9]{64})"\).{0,300}"go\.referral\.reward\.apply"`)
+	openCodeGoReferralResultPattern  = regexp.MustCompile(`(?s)^\s*;0x[0-9a-fA-F]+;\(\(self\.\$R=self\.\$R\|\|\{\}\)\["server-fn:1"\]=\[\],\(\$R=>\$R\[0\]=\{amount:([1-9][0-9]*)\}\)\(\$R\["server-fn:1"\]\)\)\s*$`)
 	openCodeGoBillingActionPattern   = regexp.MustCompile(`(?i)createSessionUrl_action\s*=\s*createServerReference\("([a-f0-9]{64})"\)`)
 	openCodeGoStripeVersionPattern   = regexp.MustCompile(`\d{4}-\d{2}-\d{2}\.[a-z]+`)
 	openCodeGoSubscriptionIDPattern  = regexp.MustCompile(`^sub_[A-Za-z0-9]+$`)
@@ -37,7 +38,7 @@ type OpenCodeGoSubscriptionCancellation struct {
 type openCodeGoLifecycleMutator interface {
 	EnableChinaModels(ctx context.Context, authCookie string, page *OpenCodeGoConsolePage) error
 	DisableChinaModels(ctx context.Context, authCookie string, page *OpenCodeGoConsolePage) error
-	ApplyReferralReward(ctx context.Context, authCookie string, page *OpenCodeGoConsolePage, rewardID string) error
+	ApplyReferralReward(ctx context.Context, authCookie string, page *OpenCodeGoConsolePage, rewardID string) (int, error)
 	CancelSubscriptionRenewal(ctx context.Context, authCookie string, page *OpenCodeGoConsolePage) (OpenCodeGoSubscriptionCancellation, error)
 }
 
@@ -185,16 +186,41 @@ func (client *OpenCodeGoLifecycleClient) ApplyReferralReward(
 	authCookie string,
 	page *OpenCodeGoConsolePage,
 	rewardID string,
-) error {
+) (int, error) {
 	if page == nil || !openCodeGoWorkspaceIDPattern.MatchString(page.WorkspaceID) ||
 		!openCodeGoReferralRewardIDPattern.MatchString(rewardID) || len(rewardID) > 96 {
-		return errors.New("OpenCode Go referral action target is invalid")
+		return 0, errors.New("OpenCode Go referral action target is invalid")
 	}
 	serverID, err := client.resolveServerAction(ctx, authCookie, page, openCodeGoReferralActionPattern)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return client.postConsoleServerAction(ctx, authCookie, page.WorkspaceID, serverID, []string{page.WorkspaceID, rewardID})
+	body, err := client.postConsoleServerActionBodyWithClient(
+		ctx,
+		authCookie,
+		page.WorkspaceID,
+		serverID,
+		[]string{page.WorkspaceID, rewardID},
+		client.console.manualClient,
+		"server-fn:1",
+		true,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return parseOpenCodeGoReferralApplyAmount(body)
+}
+
+func parseOpenCodeGoReferralApplyAmount(body []byte) (int, error) {
+	match := openCodeGoReferralResultPattern.FindSubmatch(body)
+	if len(match) != 2 {
+		return 0, errors.New("OpenCode Go referral action response was not authoritative")
+	}
+	amount, err := strconv.Atoi(string(match[1]))
+	if err != nil || amount <= 0 {
+		return 0, errors.New("OpenCode Go referral action amount was invalid")
+	}
+	return amount, nil
 }
 
 func (client *OpenCodeGoLifecycleClient) CancelSubscriptionRenewal(
@@ -320,17 +346,6 @@ func marshalOpenCodeGoServerArgs(args []string) ([]byte, error) {
 	return common.Marshal(payload)
 }
 
-func (client *OpenCodeGoLifecycleClient) postConsoleServerAction(
-	ctx context.Context,
-	authCookie string,
-	workspaceID string,
-	serverID string,
-	args []string,
-) error {
-	_, err := client.postConsoleServerActionBody(ctx, authCookie, workspaceID, serverID, args)
-	return err
-}
-
 func (client *OpenCodeGoLifecycleClient) postConsoleServerActionBody(
 	ctx context.Context,
 	authCookie string,
@@ -338,8 +353,33 @@ func (client *OpenCodeGoLifecycleClient) postConsoleServerActionBody(
 	serverID string,
 	args []string,
 ) ([]byte, error) {
+	return client.postConsoleServerActionBodyWithClient(
+		ctx,
+		authCookie,
+		workspaceID,
+		serverID,
+		args,
+		client.console.followClient,
+		"server-fn:0",
+		false,
+	)
+}
+
+func (client *OpenCodeGoLifecycleClient) postConsoleServerActionBodyWithClient(
+	ctx context.Context,
+	authCookie string,
+	workspaceID string,
+	serverID string,
+	args []string,
+	httpClient *http.Client,
+	serverInstance string,
+	singleFlight bool,
+) ([]byte, error) {
 	if !openCodeGoServerActionIDPattern.MatchString(serverID) {
 		return nil, errors.New("OpenCode Go server action could not be resolved")
+	}
+	if httpClient == nil {
+		return nil, errors.New("OpenCode Go server action client is unavailable")
 	}
 	cookieHeader, err := BuildOpenCodeGoCookieHeader(authCookie)
 	if err != nil {
@@ -357,9 +397,13 @@ func (client *OpenCodeGoLifecycleClient) postConsoleServerActionBody(
 	client.setConsoleMutationHeaders(request, cookieHeader, workspaceID)
 	request.Header.Set("Accept", "*/*")
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", openCodeGoURLOrigin(client.console.consoleBase))
 	request.Header.Set("X-Server-Id", serverID)
-	request.Header.Set("X-Server-Instance", "server-fn:0")
-	response, err := client.console.followClient.Do(request)
+	request.Header.Set("X-Server-Instance", serverInstance)
+	if singleFlight {
+		request.Header.Set("X-Single-Flight", "true")
+	}
+	response, err := httpClient.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("OpenCode Go server action failed: %w", err)
 	}

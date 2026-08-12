@@ -141,6 +141,7 @@ function workspaceFixture(uid: string, usedOffset = 0): OpenCodeGoWorkspace {
     referral_code: '',
     available_referral_rewards: 1,
     used_referral_rewards: 0,
+    referral_reward_eligible: true,
     referral_reward_applied_at: 0,
     risk_detected_at: 0,
     risk_last_checked_at: now,
