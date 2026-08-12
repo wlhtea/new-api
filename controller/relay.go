@@ -34,6 +34,22 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	groupUpstreamOverloadedMessage = "当前分组上游负载已饱和，请稍后再试"
+	rateLimitErrorCode             = "rate_limit_error"
+)
+
+func publicRelayError(newAPIError *types.NewAPIError) *types.NewAPIError {
+	if newAPIError == nil || !errors.Is(newAPIError, service.ErrOpenCodeGoNoEligibleWorkspace) {
+		return newAPIError
+	}
+	return types.WithOpenAIError(types.OpenAIError{
+		Message: groupUpstreamOverloadedMessage,
+		Type:    rateLimitErrorCode,
+		Code:    rateLimitErrorCode,
+	}, http.StatusTooManyRequests, types.ErrOptionWithSkipRetry())
+}
+
 func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
 	var err *types.NewAPIError
 	switch info.RelayMode {
@@ -77,6 +93,7 @@ func renderRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websock
 	if relayFormat != types.RelayFormatOpenAIRealtime && c.Writer.Written() {
 		return
 	}
+	newAPIError = publicRelayError(newAPIError)
 	newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestID))
 	switch relayFormat {
 	case types.RelayFormatOpenAIRealtime:
@@ -899,7 +916,7 @@ func respondTaskErrorForRequest(c *gin.Context, taskErr *taskdto.TaskError) {
 // respondTaskError 统一输出 Task 错误响应（含 429 限流提示改写）
 func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
 	if taskErr.StatusCode == http.StatusTooManyRequests {
-		taskErr.Message = "当前分组上游负载已饱和，请稍后再试"
+		taskErr.Message = groupUpstreamOverloadedMessage
 	}
 	c.JSON(taskErr.StatusCode, taskErr)
 }
