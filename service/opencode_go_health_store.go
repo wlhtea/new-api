@@ -56,6 +56,24 @@ func applyOpenCodeGoClassifiedFailure(
 	classified OpenCodeGoClassifiedFailure,
 	rebuild func(int) error,
 ) (bool, error) {
+	return applyOpenCodeGoClassifiedFailureWithMutation(
+		channelID,
+		workspaceUID,
+		upstreamModel,
+		classified,
+		rebuild,
+		false,
+	)
+}
+
+func applyOpenCodeGoClassifiedFailureWithMutation(
+	channelID int,
+	workspaceUID string,
+	upstreamModel string,
+	classified OpenCodeGoClassifiedFailure,
+	rebuild func(int) error,
+	mutationAlreadyHeld bool,
+) (bool, error) {
 	workspaceUID = strings.TrimSpace(workspaceUID)
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if channelID <= 0 || workspaceUID == "" || len(workspaceUID) > 64 {
@@ -67,6 +85,12 @@ func applyOpenCodeGoClassifiedFailure(
 	if classified.Scope == OpenCodeGoHealthScopeModel && (upstreamModel == "" || len(upstreamModel) > 191) {
 		return false, errors.New("OpenCode Go model health observation target is invalid")
 	}
+	restrictive := isRestrictiveOpenCodeGoHealthObservation(classified.Observation.Kind)
+	releaseMutation := func() {}
+	if restrictive && !mutationAlreadyHeld {
+		releaseMutation = BeginOpenCodeGoPoolMutation(channelID)
+	}
+	defer releaseMutation()
 
 	applied := false
 	err := model.DB.Transaction(func(tx *gorm.DB) error {
@@ -134,8 +158,14 @@ func applyOpenCodeGoClassifiedFailure(
 			return errors.New("unsupported OpenCode Go health observation scope")
 		}
 	})
-	if err != nil || !applied || rebuild == nil {
+	if err != nil || !applied {
 		return applied, err
+	}
+	if restrictive && !mutationAlreadyHeld {
+		InvalidateOpenCodeGoIdentityProxyChannel(channelID)
+	}
+	if rebuild == nil {
+		return true, nil
 	}
 	if err := rebuild(channelID); err != nil {
 		return true, err
@@ -143,20 +173,36 @@ func applyOpenCodeGoClassifiedFailure(
 	return true, nil
 }
 
+func isRestrictiveOpenCodeGoHealthObservation(kind OpenCodeGoHealthObservationKind) bool {
+	switch kind {
+	case OpenCodeGoObservationCredentialFailure,
+		OpenCodeGoObservationQuotaExhausted,
+		OpenCodeGoObservationRiskBlocked,
+		OpenCodeGoObservationRegionBlocked,
+		OpenCodeGoObservationModelBlocked,
+		OpenCodeGoObservationRPMThrottled,
+		OpenCodeGoObservationTransientFailure,
+		OpenCodeGoObservationBulkFailure:
+		return true
+	default:
+		return false
+	}
+}
+
 func openCodeGoWorkspaceHealthUpdates(workspace model.OpenCodeGoWorkspace) map[string]interface{} {
 	return map[string]interface{}{
-		"credential_status":     workspace.CredentialStatus,
-		"effective_state":       workspace.EffectiveState,
-		"state_reason":          workspace.StateReason,
-		"health_observation":    workspace.HealthObservation,
-		"health_observed_at":    workspace.HealthObservedAt,
-		"cooldown_until":        workspace.CooldownUntil,
-		"quota_next_refresh_at": workspace.QuotaNextRefreshAt,
-		"quota_recovery_at":     workspace.QuotaRecoveryAt,
-		"risk_detected_at":      workspace.RiskDetectedAt,
-		"risk_last_checked_at":  workspace.RiskLastCheckedAt,
+		"credential_status":        workspace.CredentialStatus,
+		"effective_state":          workspace.EffectiveState,
+		"state_reason":             workspace.StateReason,
+		"health_observation":       workspace.HealthObservation,
+		"health_observed_at":       workspace.HealthObservedAt,
+		"cooldown_until":           workspace.CooldownUntil,
+		"quota_next_refresh_at":    workspace.QuotaNextRefreshAt,
+		"quota_recovery_at":        workspace.QuotaRecoveryAt,
+		"risk_detected_at":         workspace.RiskDetectedAt,
+		"risk_last_checked_at":     workspace.RiskLastCheckedAt,
 		"bulk_failure_detected_at": workspace.BulkFailureDetectedAt,
-		"last_error":            workspace.LastError,
-		"updated_at":            common.GetTimestamp(),
+		"last_error":               workspace.LastError,
+		"updated_at":               common.GetTimestamp(),
 	}
 }

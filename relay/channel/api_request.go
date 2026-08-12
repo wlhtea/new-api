@@ -332,6 +332,48 @@ func downstreamRequestMethod(c *gin.Context) (string, error) {
 }
 
 func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	return doApiRequest(a, c, info, requestBody, nil)
+}
+
+// DoApiRequestWithClientLease resolves a request-local client and holds the
+// returned consistency lease until the outbound request has failed or returned
+// its response headers.
+func DoApiRequestWithClientLease(
+	a Adaptor,
+	c *gin.Context,
+	info *common.RelayInfo,
+	requestBody io.Reader,
+	resolveClient func() (*http.Client, func(), error),
+) (*http.Response, error) {
+	if resolveClient == nil {
+		return nil, errors.New("HTTP client resolver is unavailable")
+	}
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+	return doApiRequest(a, c, info, requestBody, func() (*http.Client, error) {
+		client, resolvedRelease, err := resolveClient()
+		if err != nil {
+			if resolvedRelease != nil {
+				resolvedRelease()
+			}
+			return nil, err
+		}
+		release = resolvedRelease
+		return client, nil
+	})
+}
+
+func doApiRequest(
+	a Adaptor,
+	c *gin.Context,
+	info *common.RelayInfo,
+	requestBody io.Reader,
+	resolveClient func() (*http.Client, error),
+) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
@@ -359,7 +401,19 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		return nil, err
 	}
 	applyHeaderOverrideToRequest(req, headerOverride)
-	resp, err := doRequest(c, req, info)
+	var client *http.Client
+	if resolveClient != nil {
+		client, err = resolveClient()
+		if err != nil {
+			return nil, fmt.Errorf("resolve request HTTP client failed: %w", err)
+		}
+	}
+	var resp *http.Response
+	if client == nil {
+		resp, err = doRequest(c, req, info)
+	} else {
+		resp, err = doRequestWithClient(c, req, info, client)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}
@@ -522,6 +576,13 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
 	if err != nil {
 		return nil, fmt.Errorf("new proxy http client failed: %w", err)
+	}
+	return doRequestWithClient(c, req, info, client)
+}
+
+func doRequestWithClient(c *gin.Context, req *http.Request, info *common.RelayInfo, client *http.Client) (*http.Response, error) {
+	if client == nil {
+		return nil, errors.New("http client is nil")
 	}
 	// Clients are cached and shared across channels, so override redirect
 	// behavior on a shallow copy instead of mutating the cached client. This

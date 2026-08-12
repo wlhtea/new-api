@@ -16,7 +16,7 @@ const (
 
 type OpenCodeGoRefreshResult struct {
 	ChannelID   int    `json:"channel_id"`
-	IdentityUID string `json:"identity_uid"`
+	IdentityUID string `json:"-"`
 	Status      string `json:"status"`
 	Error       string `json:"error,omitempty"`
 }
@@ -47,11 +47,6 @@ func (service *OpenCodeGoAccountPoolService) RefreshAllIdentities(
 	concurrency int,
 	reportProgress func(processed, total int),
 ) (OpenCodeGoRefreshSummary, error) {
-	scoped, err := service.scopedForChannel(channelID)
-	if err != nil {
-		return OpenCodeGoRefreshSummary{}, err
-	}
-	service = scoped
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return OpenCodeGoRefreshSummary{}, err
 	}

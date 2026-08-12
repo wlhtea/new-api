@@ -313,12 +313,10 @@ describe('OpenCode Go pool contracts', () => {
         results: [
           {
             channel_id: 62,
-            identity_uid: 'identity-ok',
             status: 'refreshed',
           },
           {
             channel_id: 62,
-            identity_uid: 'identity-failed',
             status: 'error',
             error: 'upstream unavailable',
           },
@@ -332,9 +330,9 @@ describe('OpenCode Go pool contracts', () => {
       progress: 100,
     })
     assert.deepEqual(getOpenCodeGoTaskResults(task), [
-      { key: 'identity-ok', status: 'refreshed', error: undefined },
+      { key: 'refresh-1', status: 'refreshed', error: undefined },
       {
-        key: 'identity-failed',
+        key: 'refresh-2',
         status: 'error',
         error: 'upstream unavailable',
       },

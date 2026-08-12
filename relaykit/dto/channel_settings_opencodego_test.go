@@ -1,6 +1,7 @@
 package dto
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -16,6 +17,9 @@ func TestOpenCodeGoConfigValidate(t *testing.T) {
 		GenericFailoverLeaseSeconds:  OpenCodeGoGenericFailoverDefaultLeaseSeconds,
 		AffinityFallback:             "token",
 		LoadAwareEnabled:             true,
+		IdentityProxyEnabled:         true,
+		IdentityProxyCountry:         "us",
+		IdentityProxyRotateMinutes:   10,
 		ModelProtocols: map[string]string{
 			"future-*": OpenCodeGoProtocolMessages,
 		},
@@ -37,6 +41,11 @@ func TestOpenCodeGoConfigValidate(t *testing.T) {
 		{name: "failover backups exceed MVP", config: OpenCodeGoConfig{GenericFailoverMaxBackups: 2}, match: "generic_failover_max_backups"},
 		{name: "failover lease too large", config: OpenCodeGoConfig{GenericFailoverLeaseSeconds: OpenCodeGoGenericFailoverMaxLeaseSeconds + 1}, match: "generic_failover_lease_seconds"},
 		{name: "affinity fallback unknown", config: OpenCodeGoConfig{AffinityFallback: "apikey"}, match: "affinity_fallback"},
+		{name: "identity proxy country too long", config: OpenCodeGoConfig{IdentityProxyEnabled: true, IdentityProxyCountry: "USA", IdentityProxyRotateMinutes: 10}, match: "identity_proxy_country"},
+		{name: "identity proxy country non ASCII", config: OpenCodeGoConfig{IdentityProxyEnabled: true, IdentityProxyCountry: "\u7f8e\u56fd", IdentityProxyRotateMinutes: 10}, match: "identity_proxy_country"},
+		{name: "identity proxy country unicode uppercase lookalike", config: OpenCodeGoConfig{IdentityProxyEnabled: true, IdentityProxyCountry: "u\u017f", IdentityProxyRotateMinutes: 10}, match: "identity_proxy_country"},
+		{name: "identity proxy interval too small", config: OpenCodeGoConfig{IdentityProxyEnabled: true, IdentityProxyCountry: "US", IdentityProxyRotateMinutes: -1}, match: "identity_proxy_rotate_minutes"},
+		{name: "identity proxy interval too large", config: OpenCodeGoConfig{IdentityProxyEnabled: true, IdentityProxyCountry: "US", IdentityProxyRotateMinutes: OpenCodeGoIdentityProxyMaxRotateMinutes + 1}, match: "identity_proxy_rotate_minutes"},
 	}
 	require.NoError(t, (&OpenCodeGoConfig{AffinityFallback: "none"}).Validate())
 
@@ -45,4 +54,55 @@ func TestOpenCodeGoConfigValidate(t *testing.T) {
 			require.ErrorContains(t, test.config.Validate(), test.match)
 		})
 	}
+}
+
+func TestOpenCodeGoConfigRejectsExplicitZeroRotateMinutes(t *testing.T) {
+	var config OpenCodeGoConfig
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"identity_proxy_enabled": true,
+		"identity_proxy_country": "US",
+		"identity_proxy_rotate_minutes": 0
+	}`), &config))
+
+	require.ErrorContains(t, config.Validate(), "identity_proxy_rotate_minutes")
+	encoded, err := json.Marshal(config)
+	require.NoError(t, err)
+	require.JSONEq(t, `{
+		"identity_proxy_enabled": true,
+		"identity_proxy_country": "US",
+		"identity_proxy_rotate_minutes": 0
+	}`, string(encoded))
+}
+
+func TestChannelOtherSettingsPreserveUnknownJSONFields(t *testing.T) {
+	raw := `{
+		"future_root": {"enabled": true},
+		"opencode_go": {
+			"identity_proxy_enabled": true,
+			"identity_proxy_country": "us",
+			"future_nested": {"mode": "keep"}
+		}
+	}`
+	var settings ChannelOtherSettings
+	require.NoError(t, json.Unmarshal([]byte(raw), &settings))
+	require.NotNil(t, settings.OpenCodeGo)
+	require.True(t, settings.OpenCodeGo.NormalizeIdentityProxy())
+
+	encoded, err := json.Marshal(settings)
+	require.NoError(t, err)
+	var roundTrip map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &roundTrip))
+	require.Equal(t, map[string]any{"enabled": true}, roundTrip["future_root"])
+	openCodeGo := roundTrip["opencode_go"].(map[string]any)
+	require.Equal(t, map[string]any{"mode": "keep"}, openCodeGo["future_nested"])
+	require.Equal(t, "US", openCodeGo["identity_proxy_country"])
+	require.Equal(t, float64(OpenCodeGoIdentityProxyDefaultRotateMinutes), openCodeGo["identity_proxy_rotate_minutes"])
+}
+
+func TestOpenCodeGoConfigNormalizeIdentityProxy(t *testing.T) {
+	config := OpenCodeGoConfig{IdentityProxyEnabled: true, IdentityProxyCountry: " gb "}
+	require.True(t, config.NormalizeIdentityProxy())
+	require.Equal(t, "GB", config.IdentityProxyCountry)
+	require.Equal(t, OpenCodeGoIdentityProxyDefaultRotateMinutes, config.IdentityProxyRotateMinutes)
+	require.NoError(t, config.Validate())
 }

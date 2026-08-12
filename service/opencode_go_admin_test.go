@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -147,6 +148,103 @@ func TestOpenCodeGoManualEnablementInvalidatesPoolSnapshotsOnly(t *testing.T) {
 	require.NoError(t, adminService.SetWorkspaceEnabled(channel.Id, workspace.UID, true))
 	_, err = SelectOpenCodeGoWorkspace(channel.Id, "model-a")
 	require.NoError(t, err)
+}
+
+func TestOpenCodeGoIdentityDisableKeepsRelayBlockedUntilRebuildCompletes(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	createEligibleOpenCodeGoWorkspace(
+		t,
+		db,
+		codec,
+		channel.Id,
+		"disable-barrier",
+		"workspace-disable-barrier",
+		"wrk_DISABLEBARRIER",
+		[]string{"model-a"},
+	)
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+	selection, err := SelectOpenCodeGoWorkspace(channel.Id, "model-a")
+	require.NoError(t, err)
+
+	rebuildStarted := make(chan struct{})
+	allowRebuild := make(chan struct{})
+	adminService := &OpenCodeGoAccountPoolService{now: time.Now}
+	adminService.rebuild = func(channelID int) error {
+		close(rebuildStarted)
+		<-allowRebuild
+		return RebuildOpenCodeGoPoolChannel(channelID)
+	}
+	disableResult := make(chan error, 1)
+	disableStarted := make(chan struct{})
+	go func() {
+		close(disableStarted)
+		disableResult <- adminService.SetIdentityEnabled(channel.Id, selection.IdentityUID, false)
+	}()
+	<-disableStarted
+	select {
+	case <-rebuildStarted:
+	case err := <-disableResult:
+		t.Fatalf("identity disable returned before rebuild: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("identity disable did not reach rebuild")
+	}
+
+	relayAcquired := make(chan struct{}, 1)
+	go func() {
+		release := openCodeGoPoolMutations.beginRelay(channel.Id)
+		release()
+		relayAcquired <- struct{}{}
+	}()
+	select {
+	case <-relayAcquired:
+		t.Fatal("relay crossed the identity-disable commit-to-rebuild window")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(allowRebuild)
+	require.NoError(t, <-disableResult)
+	select {
+	case <-relayAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("relay lease did not resume after identity-disable rebuild")
+	}
+}
+
+func TestOpenCodeGoIdentityEnableDoesNotAcquireRestrictiveMutationBarrier(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	createEligibleOpenCodeGoWorkspace(
+		t,
+		db,
+		codec,
+		channel.Id,
+		"enable-no-barrier",
+		"workspace-enable-no-barrier",
+		"wrk_ENABLENOBARRIER",
+		[]string{"model-a"},
+	)
+	require.NoError(t, db.Model(&model.OpenCodeGoIdentity{}).
+		Where("channel_id = ? AND uid = ?", channel.Id, "identity-enable-no-barrier").
+		Update("status", model.OpenCodeGoIdentityStatusManualDisabled).Error)
+
+	relayRelease := openCodeGoPoolMutations.beginRelay(channel.Id)
+	defer relayRelease()
+	var rebuilds atomic.Int32
+	adminService := NewOpenCodeGoAccountPoolAdminService()
+	adminService.rebuild = func(int) error {
+		rebuilds.Add(1)
+		return nil
+	}
+	enabled := make(chan error, 1)
+	go func() {
+		enabled <- adminService.SetIdentityEnabled(channel.Id, "identity-enable-no-barrier", true)
+	}()
+	select {
+	case err := <-enabled:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("restorative enable waited on a relay lease")
+	}
+	require.Equal(t, int32(1), rebuilds.Load())
 }
 
 func TestSetOpenCodeGoWorkspaceEnabledCannotClearRiskBlock(t *testing.T) {

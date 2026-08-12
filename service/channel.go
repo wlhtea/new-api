@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -25,7 +26,13 @@ func DisableChannel(channelError types.ChannelError, reason string) {
 		return
 	}
 
-	success := model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason)
+	success := updateOpenCodeGoChannelStatus(
+		channelError.ChannelId,
+		channelError.ChannelType,
+		channelError.UsingKey,
+		common.ChannelStatusAutoDisabled,
+		reason,
+	)
 	if success {
 		subject := fmt.Sprintf("通道「%s」（#%d）已被禁用", channelError.ChannelName, channelError.ChannelId)
 		content := fmt.Sprintf("通道「%s」（#%d）已被禁用，原因：%s", channelError.ChannelName, channelError.ChannelId, reason)
@@ -33,13 +40,34 @@ func DisableChannel(channelError types.ChannelError, reason string) {
 	}
 }
 
-func EnableChannel(channelId int, usingKey string, channelName string) {
-	success := model.UpdateChannelStatus(channelId, usingKey, common.ChannelStatusEnabled, "")
+func EnableChannel(channelId int, channelType int, usingKey string, channelName string) {
+	success := updateOpenCodeGoChannelStatus(channelId, channelType, usingKey, common.ChannelStatusEnabled, "")
 	if success {
 		subject := fmt.Sprintf("通道「%s」（#%d）已被启用", channelName, channelId)
 		content := fmt.Sprintf("通道「%s」（#%d）已被启用", channelName, channelId)
 		NotifyRootUser(formatNotifyType(channelId, common.ChannelStatusEnabled), subject, content)
 	}
+}
+
+func updateOpenCodeGoChannelStatus(channelID int, channelType int, usingKey string, status int, reason string) bool {
+	if channelType != constant.ChannelTypeOpenCodeGo {
+		return model.UpdateChannelStatus(channelID, usingKey, status, reason)
+	}
+
+	releaseMutation := BeginOpenCodeGoPoolMutation(channelID)
+	defer releaseMutation()
+	if !model.UpdateChannelStatus(channelID, usingKey, status, reason) {
+		return false
+	}
+	if status != common.ChannelStatusEnabled {
+		RemoveOpenCodeGoPoolChannel(channelID)
+		return true
+	}
+	InvalidateOpenCodeGoIdentityProxyChannel(channelID)
+	if err := ReconcileOpenCodeGoPoolChannel(channelID); err != nil {
+		common.SysError(fmt.Sprintf("failed to rebuild OpenCode Go account pool after channel enable: channel_id=%d error=%v", channelID, err))
+	}
+	return true
 }
 
 func ShouldDisableChannel(err *types.NewAPIError) bool {

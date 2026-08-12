@@ -167,7 +167,11 @@ func Distribute() func(c *gin.Context) {
 			return
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+		if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil &&
+			channel != nil && channel.Type == constant.ChannelTypeOpenCodeGo {
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, setupErr.MaskSensitiveError(), setupErr.GetErrorCode())
+			return
+		}
 		c.Next()
 		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)
@@ -438,8 +442,32 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelName, channel.Name)
 	common.SetContextKey(c, constant.ContextKeyChannelType, channel.Type)
 	common.SetContextKey(c, constant.ContextKeyChannelCreateTime, channel.CreatedTime)
-	common.SetContextKey(c, constant.ContextKeyChannelSetting, channel.GetSetting())
-	common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, channel.GetOtherSettings())
+	var channelSetting dto.ChannelSettings
+	var channelOtherSettings dto.ChannelOtherSettings
+	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		var err error
+		channelSetting, err = channel.DecodeSetting()
+		if err != nil {
+			return types.NewError(
+				errors.New("OpenCode Go channel HTTP settings are invalid"),
+				types.ErrorCodeGetChannelFailed,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		channelOtherSettings, err = channel.DecodeOtherSettings()
+		if err != nil {
+			return types.NewError(
+				errors.New("OpenCode Go channel identity proxy settings are invalid"),
+				types.ErrorCodeGetChannelFailed,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+	} else {
+		channelSetting = channel.GetSetting()
+		channelOtherSettings = channel.GetOtherSettings()
+	}
+	common.SetContextKey(c, constant.ContextKeyChannelSetting, channelSetting)
+	common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, channelOtherSettings)
 	paramOverride := channel.GetParamOverride()
 	headerOverride := channel.GetHeaderOverride()
 	if mergedParam, applied := service.ApplyChannelAffinityOverrideTemplate(c, paramOverride); applied {

@@ -30,6 +30,7 @@ var (
 	openCodeGoCookiePattern          = regexp.MustCompile(`(?i)auth=[^;\s]+`)
 	openCodeGoUpstreamIDPattern      = regexp.MustCompile(`(?i)wrk_[a-z0-9]+`)
 	openCodeGoReferralIDPattern      = regexp.MustCompile(`(?i)ref_[a-z0-9]+`)
+	openCodeGoIdentityUIDPattern     = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b`)
 	openCodeGoProxyUserinfoPattern   = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^/@\s]+@[^/\s]+`)
 	openCodeGoAuthorizationPattern   = regexp.MustCompile(`(?i)(\b(?:proxy-)?authorization\s*[:=]\s*)[^\r\n]+`)
 )
@@ -40,20 +41,28 @@ type openCodeGoConsoleReader interface {
 	FetchModels(ctx context.Context, apiKey string) ([]string, error)
 }
 
-type openCodeGoConsoleReaderFactory func(channelID int) (openCodeGoConsoleReader, error)
+type openCodeGoConsoleReaderFactory func(channelID int, identityUID string) (openCodeGoConsoleReader, error)
 
 type OpenCodeGoAccountPoolService struct {
-	console        openCodeGoConsoleReader
-	consoleFactory openCodeGoConsoleReaderFactory
-	codec          *OpenCodeGoCredentialCodec
-	now            func() time.Time
-	rebuild        func(int) error
+	console                   openCodeGoConsoleReader
+	consoleFactory            openCodeGoConsoleReaderFactory
+	provisionalConsoleFactory openCodeGoConsoleReaderFactory
+	codec                     *OpenCodeGoCredentialCodec
+	now                       func() time.Time
+	rebuild                   func(int) error
+}
+
+func (service *OpenCodeGoAccountPoolService) rebuildPoolChannel(channelID int) error {
+	if service != nil && service.rebuild != nil {
+		return service.rebuild(channelID)
+	}
+	return ReconcileOpenCodeGoPoolChannel(channelID)
 }
 
 type OpenCodeGoImportResult struct {
 	Index          int    `json:"index"`
 	Status         string `json:"status"`
-	IdentityUID    string `json:"identity_uid,omitempty"`
+	IdentityUID    string `json:"-"`
 	WorkspaceCount int    `json:"workspace_count,omitempty"`
 	Error          string `json:"error,omitempty"`
 }
@@ -77,8 +86,15 @@ func NewConfiguredOpenCodeGoAccountPoolService() (*OpenCodeGoAccountPoolService,
 		return nil, err
 	}
 	return &OpenCodeGoAccountPoolService{
-		consoleFactory: func(channelID int) (openCodeGoConsoleReader, error) {
-			return newOpenCodeGoChannelConsoleClient(channelID)
+		consoleFactory: func(channelID int, identityUID string) (openCodeGoConsoleReader, error) {
+			return newOpenCodeGoIdentityConsoleClient(channelID, identityUID)
+		},
+		provisionalConsoleFactory: func(channelID int, identityUID string) (openCodeGoConsoleReader, error) {
+			baseClient, err := getOpenCodeGoProvisionalIdentityHTTPClient(channelID, identityUID)
+			if err != nil {
+				return nil, err
+			}
+			return newOpenCodeGoConsoleClient(openCodeGoConsoleOrigin, openCodeGoInferenceOrigin, baseClient)
 		},
 		codec:   codec,
 		now:     time.Now,
@@ -102,23 +118,40 @@ func NewOpenCodeGoAccountPoolAdminService() *OpenCodeGoAccountPoolService {
 	}
 }
 
-func (service *OpenCodeGoAccountPoolService) scopedForChannel(channelID int) (*OpenCodeGoAccountPoolService, error) {
+func (service *OpenCodeGoAccountPoolService) scopedForIdentity(channelID int, identityUID string) (*OpenCodeGoAccountPoolService, error) {
+	return service.scopedForIdentityWithFactory(channelID, identityUID, service.consoleFactory)
+}
+
+func (service *OpenCodeGoAccountPoolService) scopedForProvisionalIdentity(channelID int, identityUID string) (*OpenCodeGoAccountPoolService, error) {
+	factory := service.provisionalConsoleFactory
+	if factory == nil {
+		factory = service.consoleFactory
+	}
+	return service.scopedForIdentityWithFactory(channelID, identityUID, factory)
+}
+
+func (service *OpenCodeGoAccountPoolService) scopedForIdentityWithFactory(
+	channelID int,
+	identityUID string,
+	factory openCodeGoConsoleReaderFactory,
+) (*OpenCodeGoAccountPoolService, error) {
 	if service == nil || service.codec == nil {
 		return nil, errors.New("OpenCode Go account pool service is not configured")
 	}
 	if service.console != nil {
 		return service, nil
 	}
-	if service.consoleFactory == nil {
+	if factory == nil {
 		return nil, errors.New("OpenCode Go account pool service is not configured")
 	}
-	console, err := service.consoleFactory(channelID)
+	console, err := factory(channelID, identityUID)
 	if err != nil {
 		return nil, err
 	}
 	scoped := *service
 	scoped.console = console
 	scoped.consoleFactory = nil
+	scoped.provisionalConsoleFactory = nil
 	return &scoped, nil
 }
 
@@ -128,11 +161,6 @@ func (service *OpenCodeGoAccountPoolService) ImportAuthCookies(
 	label string,
 	input string,
 ) ([]OpenCodeGoImportResult, error) {
-	scoped, err := service.scopedForChannel(channelID)
-	if err != nil {
-		return nil, err
-	}
-	service = scoped
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return nil, err
 	}
@@ -248,7 +276,7 @@ func runConfiguredOpenCodeGoImportAutomations(ctx context.Context, channelID int
 			return err
 		}
 		if _, err := lifecycle.RunIdentityAutomations(ctx, channelID, identityUID, "import"); err != nil {
-			common.SysError(sanitizeOpenCodeGoError(fmt.Errorf("OpenCode Go import automation failed for identity %s: %w", identityUID, err)))
+			common.SysError(sanitizeOpenCodeGoError(fmt.Errorf("OpenCode Go import automation failed: %w", err)))
 		}
 	}
 	return nil
@@ -273,6 +301,11 @@ func (service *OpenCodeGoAccountPoolService) importOneIdentity(
 	}
 
 	identityUID := uuid.NewString()
+	scoped, err := service.scopedForProvisionalIdentity(channelID, identityUID)
+	if err != nil {
+		return "", 0, err
+	}
+	service = scoped
 	ciphertext, err := service.codec.Encrypt(OpenCodeGoCredentialAuthCookie, channelID, identityUID, authCookie)
 	if err != nil {
 		return "", 0, err
@@ -338,11 +371,6 @@ func (service *OpenCodeGoAccountPoolService) RefreshIdentity(
 	channelID int,
 	identityUID string,
 ) (*model.OpenCodeGoIdentity, error) {
-	scoped, err := service.scopedForChannel(channelID)
-	if err != nil {
-		return nil, err
-	}
-	service = scoped
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return nil, err
 	}
@@ -356,6 +384,11 @@ func (service *OpenCodeGoAccountPoolService) RefreshIdentity(
 	if identity == nil {
 		return nil, gorm.ErrRecordNotFound
 	}
+	scoped, err := service.scopedForIdentity(channelID, identity.UID)
+	if err != nil {
+		return nil, err
+	}
+	service = scoped
 	authCookie, err := service.codec.Decrypt(
 		OpenCodeGoCredentialAuthCookie,
 		channelID,
@@ -375,11 +408,6 @@ func (service *OpenCodeGoAccountPoolService) ReplaceIdentityAuthCookie(
 	identityUID string,
 	input string,
 ) (*model.OpenCodeGoIdentity, error) {
-	scoped, err := service.scopedForChannel(channelID)
-	if err != nil {
-		return nil, err
-	}
-	service = scoped
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return nil, err
 	}
@@ -403,6 +431,11 @@ func (service *OpenCodeGoAccountPoolService) ReplaceIdentityAuthCookie(
 	if identity == nil {
 		return nil, gorm.ErrRecordNotFound
 	}
+	scoped, err := service.scopedForIdentity(channelID, identity.UID)
+	if err != nil {
+		return nil, err
+	}
+	service = scoped
 	duplicate, err := model.GetOpenCodeGoIdentityByFingerprint(channelID, fingerprint)
 	if err != nil {
 		return nil, err
@@ -475,6 +508,11 @@ func (service *OpenCodeGoAccountPoolService) refreshIdentityWithCookie(
 		prepared = append(prepared, prepareMissingOpenCodeGoWorkspace(*existing, service.now().Unix()))
 	}
 
+	// Discovery is intentionally outside the barrier. Once persistence begins,
+	// keep relay behind the mutation until the selection epoch advances and the
+	// replacement snapshot has been published.
+	releaseMutation := BeginOpenCodeGoPoolMutation(channelID)
+	defer releaseMutation()
 	now := service.now().Unix()
 	err = model.DB.Transaction(func(tx *gorm.DB) error {
 		if err := validateOpenCodeGoPoolChannelTx(tx, channelID); err != nil {
@@ -525,6 +563,11 @@ func (service *OpenCodeGoAccountPoolService) refreshIdentityWithCookie(
 		return nil, err
 	}
 	if service.rebuild != nil {
+		// Workspace/API-key state may have changed, so selections from the
+		// previous snapshot must become stale. Cookie refresh does not change the
+		// identity's proxy binding, so advance only the selection epoch and retain
+		// its clients.
+		openCodeGoIdentityProxyClients.advanceSelectionGeneration(channelID)
 		if err := service.rebuild(channelID); err != nil {
 			return nil, err
 		}
@@ -933,6 +976,14 @@ func (service *OpenCodeGoAccountPoolService) markIdentityRefreshFailure(
 	if status == model.OpenCodeGoIdentityStatusAuthError {
 		observationKind = OpenCodeGoObservationAuthenticationFailure
 	}
+	// Transient refresh failures preserve the last complete relay snapshot.
+	// Authentication failures revoke the identity and therefore need the full
+	// commit-to-invalidation barrier.
+	releaseMutation := func() {}
+	if status == model.OpenCodeGoIdentityStatusAuthError {
+		releaseMutation = BeginOpenCodeGoPoolMutation(channelID)
+	}
+	defer releaseMutation()
 	dbErr := model.DB.Transaction(func(tx *gorm.DB) error {
 		var currentIdentity model.OpenCodeGoIdentity
 		if err := model.LockForUpdate(tx).
@@ -1040,8 +1091,14 @@ func (service *OpenCodeGoAccountPoolService) markIdentityRefreshFailure(
 		}
 		return nil
 	})
-	if dbErr != nil || service.rebuild == nil {
+	if dbErr != nil {
 		return dbErr
+	}
+	if status == model.OpenCodeGoIdentityStatusAuthError {
+		InvalidateOpenCodeGoIdentityProxyChannel(channelID)
+	}
+	if service.rebuild == nil {
+		return nil
 	}
 	return service.rebuild(channelID)
 }
@@ -1104,6 +1161,7 @@ func sanitizeOpenCodeGoError(err error, secrets ...string) string {
 	message = openCodeGoCookiePattern.ReplaceAllString(message, "auth=[redacted]")
 	message = openCodeGoUpstreamIDPattern.ReplaceAllString(message, "[workspace]")
 	message = openCodeGoReferralIDPattern.ReplaceAllString(message, "[referral]")
+	message = openCodeGoIdentityUIDPattern.ReplaceAllString(message, "[identity]")
 	message = openCodeGoProxyUserinfoPattern.ReplaceAllString(message, "[redacted-proxy]")
 	message = openCodeGoAuthorizationPattern.ReplaceAllString(message, "$1[redacted]")
 	message = strings.ToValidUTF8(message, "\uFFFD")

@@ -19,7 +19,11 @@ For commercial licensing, please contact support@quantumnous.com
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { CHANNEL_TYPE_OPENCODE_GO, CHANNEL_TYPE_OPTIONS } from '../../constants'
+import {
+  CHANNEL_TYPE_OPENCODE_GO,
+  CHANNEL_TYPE_OPTIONS,
+  MODEL_FETCHABLE_TYPES,
+} from '../../constants'
 import { channelSchema } from '../../types'
 import {
   CHANNEL_FORM_DEFAULT_VALUES,
@@ -48,6 +52,7 @@ describe('OpenCode Go channel configuration', () => {
     assert.deepEqual(options, [
       { value: CHANNEL_TYPE_OPENCODE_GO, label: 'OpenCode Go' },
     ])
+    assert.equal(MODEL_FETCHABLE_TYPES.has(CHANNEL_TYPE_OPENCODE_GO), true)
   })
 
   test('uses the fixed inference root and official model defaults', () => {
@@ -136,6 +141,9 @@ describe('OpenCode Go channel configuration', () => {
     const settings = JSON.parse(String(result.channel.settings))
 
     assert.deepEqual(settings.opencode_go, {
+      identity_proxy_enabled: false,
+      identity_proxy_country: 'US',
+      identity_proxy_rotate_minutes: 10,
       model_protocols: {
         'glm-*': 'messages',
         'kimi-k3': 'chat',
@@ -228,6 +236,96 @@ describe('OpenCode Go channel configuration', () => {
     assert.equal(settings.opencode_go.generic_failover_window_seconds, 45)
     assert.equal(settings.opencode_go.generic_failover_max_backups, 1)
     assert.equal(settings.opencode_go.generic_failover_lease_seconds, 600)
+  })
+
+  test('round-trips normalized identity proxy policy without losing nested settings', () => {
+    const channel = channelSchema.parse({
+      id: 63,
+      type: CHANNEL_TYPE_OPENCODE_GO,
+      key: '',
+      status: 1,
+      name: 'Identity proxy pool',
+      created_time: 1,
+      test_time: 0,
+      response_time: 0,
+      balance_updated_time: 0,
+      base_url: OPENCODE_GO_BASE_URL,
+      models: 'glm-5.2',
+      setting: JSON.stringify({
+        proxy:
+          'http://account_zone_US_sid_template_time_10:secret@proxy.example:8080',
+      }),
+      settings: JSON.stringify({
+        retained_setting: 'keep-me',
+        opencode_go: {
+          retained_nested_setting: 'keep-me-too',
+          identity_proxy_enabled: true,
+          identity_proxy_country: 'gb',
+          identity_proxy_rotate_minutes: 20,
+        },
+      }),
+    })
+
+    const defaults = transformChannelToFormDefaults(channel)
+    assert.equal(defaults.opencode_go_identity_proxy_enabled, true)
+    assert.equal(defaults.opencode_go_identity_proxy_country, 'GB')
+    assert.equal(defaults.opencode_go_identity_proxy_rotate_minutes, 20)
+    assert.equal(channelFormSchema.safeParse(defaults).success, true)
+
+    defaults.opencode_go_identity_proxy_country = ' ca '
+    const update = transformFormDataToUpdatePayload(defaults, channel.id)
+    const setting = JSON.parse(String(update.setting))
+    const settings = JSON.parse(String(update.settings))
+    assert.equal(
+      setting.proxy,
+      'http://account_zone_US_sid_template_time_10:secret@proxy.example:8080'
+    )
+    assert.equal(settings.retained_setting, 'keep-me')
+    assert.equal(settings.opencode_go.retained_nested_setting, 'keep-me-too')
+    assert.equal(settings.opencode_go.identity_proxy_enabled, true)
+    assert.equal(settings.opencode_go.identity_proxy_country, 'CA')
+    assert.equal(settings.opencode_go.identity_proxy_rotate_minutes, 20)
+    assert.equal('proxy' in settings.opencode_go, false)
+  })
+
+  test('requires a valid identity proxy policy only while routing is enabled', () => {
+    const validForm = {
+      ...CHANNEL_FORM_DEFAULT_VALUES,
+      name: 'Identity proxy pool',
+      type: CHANNEL_TYPE_OPENCODE_GO,
+      models: 'glm-5.2',
+      opencode_go_identity_proxy_enabled: true,
+      opencode_go_identity_proxy_country: 'us',
+      opencode_go_identity_proxy_rotate_minutes: 10,
+      proxy:
+        'https://account_custom_zone_US_sid_template_time_10:secret@proxy.example:8443',
+    }
+    assert.equal(channelFormSchema.safeParse(validForm).success, true)
+
+    for (const invalid of [
+      { proxy: '' },
+      { proxy: 'socks5://account_sid_1:secret@proxy.example:1080' },
+      { proxy: 'http://account_sid_1_sid_2:secret@proxy.example:8080' },
+      { opencode_go_identity_proxy_country: 'USA' },
+      { opencode_go_identity_proxy_country: '美国' },
+      { opencode_go_identity_proxy_rotate_minutes: 0 },
+      { opencode_go_identity_proxy_rotate_minutes: 181 },
+      { opencode_go_identity_proxy_rotate_minutes: 10.5 },
+    ]) {
+      const parsed = channelFormSchema.safeParse({ ...validForm, ...invalid })
+      assert.equal(parsed.success, false, JSON.stringify(invalid))
+    }
+
+    assert.equal(
+      channelFormSchema.safeParse({
+        ...validForm,
+        opencode_go_identity_proxy_enabled: false,
+        proxy: '',
+        opencode_go_identity_proxy_country: '',
+        opencode_go_identity_proxy_rotate_minutes: 0,
+      }).success,
+      true
+    )
   })
 
   test('rejects failover values outside the bounded first-release policy', () => {

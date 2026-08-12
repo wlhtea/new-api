@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"regexp"
 
 	"github.com/QuantumNous/new-api/common"
 
@@ -27,6 +28,8 @@ const (
 )
 
 var ErrSystemTaskLockLost = errors.New("system task lock lost")
+
+var openCodeGoSystemTaskIdentityUIDPattern = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b`)
 
 type SystemTask struct {
 	ID        int64            `json:"id" gorm:"primary_key"`
@@ -463,6 +466,12 @@ func (task *SystemTask) DecodeState(v any) error {
 }
 
 func (task *SystemTask) ToResponse() SystemTaskResponse {
+	result := decodeSystemTaskJSONValue(task.Result)
+	errorMessage := task.Error
+	if task.Type == SystemTaskTypeOpenCodeGoRefresh {
+		result = sanitizeOpenCodeGoRefreshTaskResult(result)
+		errorMessage = openCodeGoSystemTaskIdentityUIDPattern.ReplaceAllString(errorMessage, "[identity]")
+	}
 	return SystemTaskResponse{
 		ID:        task.ID,
 		TaskID:    task.TaskID,
@@ -471,12 +480,29 @@ func (task *SystemTask) ToResponse() SystemTaskResponse {
 		ActiveKey: task.ActiveKey,
 		Payload:   decodeSystemTaskJSONValue(task.Payload),
 		State:     decodeSystemTaskJSONValue(task.State),
-		Result:    decodeSystemTaskJSONValue(task.Result),
-		Error:     task.Error,
+		Result:    result,
+		Error:     errorMessage,
 		LockedBy:  task.LockedBy,
 		CreatedAt: task.CreatedAt,
 		UpdatedAt: task.UpdatedAt,
 	}
+}
+
+func sanitizeOpenCodeGoRefreshTaskResult(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		delete(typed, "identity_uid")
+		for key, nested := range typed {
+			typed[key] = sanitizeOpenCodeGoRefreshTaskResult(nested)
+		}
+	case []any:
+		for index, nested := range typed {
+			typed[index] = sanitizeOpenCodeGoRefreshTaskResult(nested)
+		}
+	case string:
+		return openCodeGoSystemTaskIdentityUIDPattern.ReplaceAllString(typed, "[identity]")
+	}
+	return value
 }
 
 func activeSystemTaskStatuses() []string {

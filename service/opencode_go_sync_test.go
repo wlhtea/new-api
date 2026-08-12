@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -256,6 +257,134 @@ func TestOpenCodeGoBatchImportCreatesTwoIndependentIdentities(t *testing.T) {
 	}
 }
 
+func TestOpenCodeGoImportAndCookieReplacementKeepIdentityProxyBinding(t *testing.T) {
+	_, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	previousCache := openCodeGoIdentityProxyClients
+	openCodeGoIdentityProxyClients = newOpenCodeGoIdentityProxyClientCache(8, time.Hour)
+	t.Cleanup(func() {
+		openCodeGoIdentityProxyClients.reset()
+		openCodeGoIdentityProxyClients = previousCache
+	})
+	fetchedAt := int64(1_900_000_000)
+	fake := &fakeOpenCodeGoConsole{
+		discoveredByCookie: map[string][]OpenCodeGoWorkspacePageResult{
+			"original-cookie": {{
+				Workspace: OpenCodeGoDiscoveredWorkspace{ID: "wrk_PROXY1"},
+				Page:      completeOpenCodeGoConsolePage("wrk_PROXY1", 10, fetchedAt),
+			}},
+			"replacement-cookie": {{
+				Workspace: OpenCodeGoDiscoveredWorkspace{ID: "wrk_PROXY1"},
+				Page:      completeOpenCodeGoConsolePage("wrk_PROXY1", 20, fetchedAt+60),
+			}},
+		},
+		keys:        map[string]string{"wrk_PROXY1": "sk-synthetic-proxy"},
+		keyErrors:   map[string]error{},
+		models:      map[string][]string{"sk-synthetic-proxy": {"model-a"}},
+		modelErrors: map[string]error{},
+	}
+	var factoryMutex sync.Mutex
+	identityUIDs := make([]string, 0, 2)
+	poolService := &OpenCodeGoAccountPoolService{
+		consoleFactory: func(gotChannelID int, identityUID string) (openCodeGoConsoleReader, error) {
+			assert.Equal(t, channel.Id, gotChannelID)
+			assert.NotEmpty(t, identityUID, "import must allocate the identity before its first upstream request")
+			factoryMutex.Lock()
+			identityUIDs = append(identityUIDs, identityUID)
+			factoryMutex.Unlock()
+			return fake, nil
+		},
+		codec:   codec,
+		now:     func() time.Time { return time.Unix(fetchedAt, 0) },
+		rebuild: RebuildOpenCodeGoPoolChannel,
+	}
+
+	results, err := poolService.ImportAuthCookies(context.Background(), channel.Id, "", "original-cookie")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, "imported", results[0].Status)
+	identityUID := results[0].IdentityUID
+	require.NotEmpty(t, identityUID)
+	selectionBefore, err := SelectOpenCodeGoWorkspace(channel.Id, "model-a")
+	require.NoError(t, err)
+
+	proxySettings := dto.ChannelSettings{
+		Proxy: "http://test_custom_zone_US_sid_1_time_10:secret@proxy.example:8080",
+	}
+	proxyConfig := &dto.OpenCodeGoConfig{
+		IdentityProxyEnabled:       true,
+		IdentityProxyCountry:       "US",
+		IdentityProxyRotateMinutes: 10,
+	}
+	proxyTime := time.Unix(fetchedAt+1, 0)
+	identityClientBefore, err := resolveOpenCodeGoIdentityHTTPClient(
+		channel.Id,
+		identityUID,
+		proxySettings,
+		proxyConfig,
+		proxyTime,
+	)
+	require.NoError(t, err)
+	unrelatedClientBefore, err := resolveOpenCodeGoIdentityHTTPClient(
+		channel.Id,
+		"unrelated-identity",
+		proxySettings,
+		proxyConfig,
+		proxyTime,
+	)
+	require.NoError(t, err)
+
+	poolService.now = func() time.Time { return time.Unix(fetchedAt+60, 0) }
+	_, err = poolService.ReplaceIdentityAuthCookie(
+		context.Background(),
+		channel.Id,
+		identityUID,
+		"replacement-cookie",
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{identityUID, identityUID}, identityUIDs)
+	selectionAfter, err := SelectOpenCodeGoWorkspace(channel.Id, "model-a")
+	require.NoError(t, err)
+	assert.NotEqual(t, selectionBefore.IdentityProxyGeneration, selectionAfter.IdentityProxyGeneration)
+	_, err = resolveOpenCodeGoIdentityHTTPClientWithGeneration(
+		channel.Id,
+		identityUID,
+		proxySettings,
+		proxyConfig,
+		proxyTime,
+		&selectionBefore.IdentityProxyGeneration,
+	)
+	require.ErrorIs(t, err, ErrOpenCodeGoIdentityProxySelectionStale)
+
+	identityClientAfter, err := resolveOpenCodeGoIdentityHTTPClientWithGeneration(
+		channel.Id,
+		identityUID,
+		proxySettings,
+		proxyConfig,
+		proxyTime,
+		&selectionAfter.IdentityProxyGeneration,
+	)
+	require.NoError(t, err)
+	unrelatedClientAfter, err := resolveOpenCodeGoIdentityHTTPClientWithGeneration(
+		channel.Id,
+		"unrelated-identity",
+		proxySettings,
+		proxyConfig,
+		proxyTime,
+		&selectionAfter.IdentityProxyGeneration,
+	)
+	require.NoError(t, err)
+	assert.Same(t, identityClientBefore, identityClientAfter)
+	assert.Same(t, unrelatedClientBefore, unrelatedClientAfter)
+
+	const bucket = int64(1234)
+	assert.Equal(
+		t,
+		deriveOpenCodeGoIdentityProxySID(common.CryptoSecret, channel.Id, identityUIDs[0], bucket),
+		deriveOpenCodeGoIdentityProxySID(common.CryptoSecret, channel.Id, identityUIDs[1], bucket),
+		"replacing a Cookie must retain the current-bucket proxy SID",
+	)
+}
+
 func TestOpenCodeGoIncompleteRefreshPreservesCompleteQuotaRows(t *testing.T) {
 	_, channel, codec := setupOpenCodeGoPoolTestDB(t)
 	fetchedAt := int64(1_900_000_000)
@@ -330,6 +459,129 @@ func TestOpenCodeGoAuthenticationFailureMarksIdentityAndWorkspaces(t *testing.T)
 	require.Equal(t, model.OpenCodeGoStateAuthError, identity.Workspaces[0].EffectiveState)
 	require.Equal(t, model.OpenCodeGoQuotaSnapshotStale, identity.Workspaces[0].QuotaSnapshotStatus)
 	require.Len(t, identity.Workspaces[0].QuotaWindows, 3)
+}
+
+func TestOpenCodeGoRefreshKeepsRelayBlockedUntilSnapshotRebuildCompletes(t *testing.T) {
+	_, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	fetchedAt := int64(1_900_000_000)
+	fake := &fakeOpenCodeGoConsole{
+		discovered: []OpenCodeGoWorkspacePageResult{{
+			Workspace: OpenCodeGoDiscoveredWorkspace{ID: "wrk_BARRIER"},
+			Page:      completeOpenCodeGoConsolePage("wrk_BARRIER", 10, fetchedAt),
+		}},
+		keys:        map[string]string{"wrk_BARRIER": "sk-barrier-before"},
+		keyErrors:   map[string]error{},
+		models:      map[string][]string{"sk-barrier-before": {"model-a"}, "sk-barrier-after": {"model-a"}},
+		modelErrors: map[string]error{},
+	}
+	poolService := newOpenCodeGoAccountPoolService(fake, codec)
+	poolService.now = func() time.Time { return time.Unix(fetchedAt, 0) }
+	poolService.rebuild = nil
+	results, err := poolService.ImportAuthCookies(context.Background(), channel.Id, "", "barrier-cookie")
+	require.NoError(t, err)
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+	_, err = SelectOpenCodeGoWorkspace(channel.Id, "model-a")
+	require.NoError(t, err)
+
+	fake.mutex.Lock()
+	fake.keys["wrk_BARRIER"] = "sk-barrier-after"
+	fake.discovered[0].Page = completeOpenCodeGoConsolePage("wrk_BARRIER", 20, fetchedAt+60)
+	fake.mutex.Unlock()
+	poolService.now = func() time.Time { return time.Unix(fetchedAt+60, 0) }
+	rebuildStarted := make(chan struct{})
+	allowRebuild := make(chan struct{})
+	poolService.rebuild = func(channelID int) error {
+		close(rebuildStarted)
+		<-allowRebuild
+		return RebuildOpenCodeGoPoolChannel(channelID)
+	}
+
+	refreshResult := make(chan error, 1)
+	go func() {
+		_, refreshErr := poolService.RefreshIdentity(context.Background(), channel.Id, results[0].IdentityUID)
+		refreshResult <- refreshErr
+	}()
+	<-rebuildStarted
+
+	relayAcquired := make(chan struct{}, 1)
+	go func() {
+		release := openCodeGoPoolMutations.beginRelay(channel.Id)
+		release()
+		relayAcquired <- struct{}{}
+	}()
+	select {
+	case <-relayAcquired:
+		t.Fatal("relay crossed the refresh commit-to-rebuild window")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(allowRebuild)
+	require.NoError(t, <-refreshResult)
+	select {
+	case <-relayAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("relay lease did not resume after refresh rebuild")
+	}
+}
+
+func TestOpenCodeGoAuthenticationFailureKeepsRelayBlockedUntilRebuildCompletes(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	createEligibleOpenCodeGoWorkspace(
+		t,
+		db,
+		codec,
+		channel.Id,
+		"auth-barrier",
+		"workspace-auth-barrier",
+		"wrk_AUTHBARRIER",
+		[]string{"model-a"},
+	)
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+	selection, err := SelectOpenCodeGoWorkspace(channel.Id, "model-a")
+	require.NoError(t, err)
+	identity, err := model.GetOpenCodeGoIdentityPool(channel.Id, selection.IdentityUID)
+	require.NoError(t, err)
+
+	rebuildStarted := make(chan struct{})
+	allowRebuild := make(chan struct{})
+	poolService := NewOpenCodeGoAccountPoolAdminService()
+	poolService.now = func() time.Time { return time.Unix(1_900_000_100, 0) }
+	poolService.rebuild = func(channelID int) error {
+		close(rebuildStarted)
+		<-allowRebuild
+		return RebuildOpenCodeGoPoolChannel(channelID)
+	}
+
+	refreshResult := make(chan error, 1)
+	go func() {
+		refreshResult <- poolService.markIdentityRefreshFailure(
+			channel.Id,
+			identity,
+			model.OpenCodeGoIdentityStatusAuthError,
+			ErrOpenCodeGoAuthenticationInvalid,
+		)
+	}()
+	<-rebuildStarted
+
+	relayAcquired := make(chan struct{}, 1)
+	go func() {
+		release := openCodeGoPoolMutations.beginRelay(channel.Id)
+		release()
+		relayAcquired <- struct{}{}
+	}()
+	select {
+	case <-relayAcquired:
+		t.Fatal("relay crossed the authentication-failure commit-to-rebuild window")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(allowRebuild)
+	require.NoError(t, <-refreshResult)
+	select {
+	case <-relayAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("relay lease did not resume after authentication-failure rebuild")
+	}
 }
 
 func TestReplaceOpenCodeGoIdentityCookieCommitsOnlyAfterSuccessfulDiscovery(t *testing.T) {
@@ -450,7 +702,7 @@ func TestOpenCodeGoRefreshTargetsUsesBoundedConcurrentWorkers(t *testing.T) {
 	require.Equal(t, "identity-two", summary.Results[1].IdentityUID)
 }
 
-func TestOpenCodeGoRefreshTargetsScopesConsoleByChannel(t *testing.T) {
+func TestOpenCodeGoRefreshTargetsScopesConsoleByChannelAndIdentity(t *testing.T) {
 	db, firstChannel, codec := setupOpenCodeGoPoolTestDB(t)
 	secondChannel := &model.Channel{
 		Type:   constant.ChannelTypeOpenCodeGo,
@@ -486,12 +738,12 @@ func TestOpenCodeGoRefreshTargetsScopesConsoleByChannel(t *testing.T) {
 		secondChannel.Id: newChannelConsole("cookie-second-channel", "wrk_SECOND2", "sk-synthetic-second-channel"),
 	}
 	var factoryMutex sync.Mutex
-	factoryCalls := make(map[int]int)
+	factoryCalls := make(map[string]int)
 	poolService := &OpenCodeGoAccountPoolService{
-		consoleFactory: func(channelID int) (openCodeGoConsoleReader, error) {
+		consoleFactory: func(channelID int, identityUID string) (openCodeGoConsoleReader, error) {
 			factoryMutex.Lock()
 			defer factoryMutex.Unlock()
-			factoryCalls[channelID]++
+			factoryCalls[fmt.Sprintf("%d:%s", channelID, identityUID)]++
 			console, ok := consoles[channelID]
 			if !ok {
 				return nil, errors.New("unexpected OpenCode Go channel")
@@ -515,7 +767,10 @@ func TestOpenCodeGoRefreshTargetsScopesConsoleByChannel(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, summary.Succeeded)
 	require.Zero(t, summary.Failed)
-	assert.Equal(t, map[int]int{firstChannel.Id: 1, secondChannel.Id: 1}, factoryCalls)
+	assert.Equal(t, map[string]int{
+		fmt.Sprintf("%d:%s", firstChannel.Id, "identity-first-channel"):   1,
+		fmt.Sprintf("%d:%s", secondChannel.Id, "identity-second-channel"): 1,
+	}, factoryCalls)
 }
 
 func TestOpenCodeGoImportAutomationContextLivesUntilRunnerCompletes(t *testing.T) {
@@ -842,6 +1097,15 @@ func TestSanitizeOpenCodeGoErrorTruncatesAtUTF8Boundary(t *testing.T) {
 	assert.True(t, utf8.ValidString(sanitized))
 	assert.LessOrEqual(t, len(sanitized), 512)
 	assert.NotContains(t, sanitized, string([]byte{0xff}))
+}
+
+func TestSanitizeOpenCodeGoErrorRedactsIdentityUID(t *testing.T) {
+	const identityUID = "123e4567-e89b-42d3-a456-426614174000"
+
+	sanitized := sanitizeOpenCodeGoError(fmt.Errorf("identity %s proxy request failed", identityUID))
+
+	assert.NotContains(t, sanitized, identityUID)
+	assert.Contains(t, sanitized, "[identity]")
 }
 
 func TestRefreshOpenCodeGoWorkspaceRefreshesItsOwningIdentityOnce(t *testing.T) {

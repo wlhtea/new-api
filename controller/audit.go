@@ -45,11 +45,11 @@ var auditContentTemplates = map[string]string{
 	"channel.upstream_apply":                  "Applied upstream model changes to channel (ID: ${id})",
 	"channel.upstream_apply_all":              "Applied upstream model changes to ${count} channels",
 	"channel.opencode_go_import":              "Imported ${imported} of ${total} OpenCode Go identities into channel (ID: ${id})",
-	"channel.opencode_go_identity_update":     "Updated OpenCode Go identity ${identity_uid} in channel (ID: ${id})",
-	"channel.opencode_go_identity_status":     "Set OpenCode Go identity ${identity_uid} enabled=${enabled} in channel (ID: ${id})",
-	"channel.opencode_go_cookie_replace":      "Replaced the Cookie for OpenCode Go identity ${identity_uid} in channel (ID: ${id})",
-	"channel.opencode_go_identity_refresh":    "Refreshed OpenCode Go identity ${identity_uid} in channel (ID: ${id})",
-	"channel.opencode_go_identity_delete":     "Deleted OpenCode Go identity ${identity_uid} from channel (ID: ${id})",
+	"channel.opencode_go_identity_update":     "Updated an OpenCode Go identity in channel (ID: ${id})",
+	"channel.opencode_go_identity_status":     "Set an OpenCode Go identity enabled=${enabled} in channel (ID: ${id})",
+	"channel.opencode_go_cookie_replace":      "Replaced the Cookie for an OpenCode Go identity in channel (ID: ${id})",
+	"channel.opencode_go_identity_refresh":    "Refreshed an OpenCode Go identity in channel (ID: ${id})",
+	"channel.opencode_go_identity_delete":     "Deleted an OpenCode Go identity from channel (ID: ${id})",
 	"channel.opencode_go_workspace_status":    "Set OpenCode Go workspace ${workspace_uid} enabled=${enabled} in channel (ID: ${id})",
 	"channel.opencode_go_workspace_refresh":   "Refreshed OpenCode Go workspace ${workspace_uid} in channel (ID: ${id})",
 	"channel.opencode_go_workspace_delete":    "Deleted OpenCode Go workspace ${workspace_uid} from channel (ID: ${id})",
@@ -68,6 +68,14 @@ var auditContentTemplates = map[string]string{
 	"subscription.user_plan_reset": "Reset active plan ${plan_id} subscriptions for user ${target_user_id}",
 }
 
+var openCodeGoIdentityAuditActions = map[string]struct{}{
+	"channel.opencode_go_identity_update":  {},
+	"channel.opencode_go_identity_status":  {},
+	"channel.opencode_go_cookie_replace":   {},
+	"channel.opencode_go_identity_refresh": {},
+	"channel.opencode_go_identity_delete":  {},
+}
+
 // auditContentEN 按 action 模板渲染英文兜底文本；未登记的 action 退回 action 本身。
 func auditContentEN(action string, params map[string]interface{}) string {
 	tmpl, ok := auditContentTemplates[action]
@@ -80,6 +88,22 @@ func auditContentEN(action string, params map[string]interface{}) string {
 		}
 		return ""
 	})
+}
+
+func sanitizeAuditParams(action string, params map[string]interface{}) map[string]interface{} {
+	if _, sensitive := openCodeGoIdentityAuditActions[action]; !sensitive {
+		return params
+	}
+	if _, present := params["identity_uid"]; !present {
+		return params
+	}
+	cleaned := make(map[string]interface{}, len(params)-1)
+	for key, value := range params {
+		if key != "identity_uid" {
+			cleaned[key] = value
+		}
+	}
+	return cleaned
 }
 
 // auditOperatorInfo 从上下文构建操作者身份信息（管理员 id/用户名/角色）。
@@ -117,6 +141,7 @@ func recordManageAuditFor(c *gin.Context, targetUserId int, action string, param
 	if params == nil {
 		params = map[string]interface{}{}
 	}
+	params = sanitizeAuditParams(action, params)
 	operatorUserId := c.GetInt("id")
 	if _, ok := params["target_user_id"]; !ok && targetUserId > 0 && targetUserId != operatorUserId {
 		params["target_user_id"] = targetUserId

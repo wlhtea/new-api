@@ -1,13 +1,14 @@
 package service
 
 import (
+	"errors"
 	"net/http"
 	"sync"
 	"testing"
 	"time"
 
-	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/model"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -213,6 +214,43 @@ func TestOpenCodeGoBulkFailureAutoDisablesWorkspace(t *testing.T) {
 	require.NotEqual(t, first.UID, selection.WorkspaceUID)
 }
 
+func TestOpenCodeGoBulkFailureBelowThresholdDoesNotAcquireMutationBarrier(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t,
+		db,
+		codec,
+		channel.Id,
+		"bulk-counter-no-barrier",
+		"workspace-bulk-counter-no-barrier",
+		"wrk_BULKCOUNTER",
+		[]string{"model-a"},
+	)
+	relayRelease := openCodeGoPoolMutations.beginRelay(channel.Id)
+	defer relayRelease()
+
+	result := make(chan error, 1)
+	go func() {
+		disabled, err := ObserveOpenCodeGoBulkProviderFailure(
+			channel.Id,
+			workspace.UID,
+			http.StatusForbidden,
+			"region blocked",
+			time.Unix(2_000_000_000, 0),
+		)
+		if err == nil && disabled {
+			err = errors.New("bulk failure unexpectedly reached the disable threshold")
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("below-threshold bulk counter waited on a relay lease")
+	}
+}
+
 func TestOpenCodeGoBulkFailureIgnoresTransientAndQuotaStatuses(t *testing.T) {
 	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
 	first := createEligibleOpenCodeGoWorkspace(t, db, codec, channel.Id, "one", "workspace-one", "wrk_ALPHA1", []string{"model-a"})
@@ -295,4 +333,34 @@ func TestOpenCodeGoPoolViewExposesInflight(t *testing.T) {
 	require.Len(t, view.Identities, 1)
 	require.Len(t, view.Identities[0].Workspaces, 1)
 	assert.Equal(t, int64(2), view.Identities[0].Workspaces[0].Inflight)
+}
+
+func TestListOpenCodeGoPoolModelsUsesDiscoveredInventoryNotEligibleSnapshot(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t, db, codec, channel.Id, "inventory", "workspace-inventory", "wrk_INVENTORY1",
+		[]string{"available-model", "temporarily-blocked-model"},
+	)
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspace{}).
+		Where("id = ?", workspace.ID).
+		Updates(map[string]interface{}{
+			"manual_enabled":  false,
+			"effective_state": model.OpenCodeGoStateRiskBlocked,
+		}).Error)
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspaceModel{}).
+		Where("workspace_id = ? AND model = ?", workspace.ID, "temporarily-blocked-model").
+		Update("state", model.OpenCodeGoModelRPMCooldown).Error)
+	require.NoError(t, db.Create(&model.OpenCodeGoWorkspaceModel{
+		WorkspaceID: workspace.ID,
+		Model:       "no-longer-discovered",
+		Discovered:  false,
+		State:       model.OpenCodeGoModelDisabled,
+	}).Error)
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+	_, err := SelectOpenCodeGoWorkspace(channel.Id, "available-model")
+	require.ErrorIs(t, err, ErrOpenCodeGoNoEligibleWorkspace)
+
+	models, err := ListOpenCodeGoPoolModels(channel.Id)
+	require.NoError(t, err)
+	require.Equal(t, []string{"available-model", "temporarily-blocked-model"}, models)
 }

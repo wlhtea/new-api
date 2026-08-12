@@ -74,6 +74,35 @@ func TestSystemTaskCreateAndActiveLifecycle(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestOpenCodeGoRefreshTaskResponseRedactsLegacyIdentityUIDs(t *testing.T) {
+	task := &SystemTask{
+		Type:  SystemTaskTypeOpenCodeGoRefresh,
+		Error: "refresh failed for 123e4567-e89b-42d3-a456-426614174000",
+		Result: `{
+			"results":[{"channel_id":7,"identity_uid":"123e4567-e89b-42d3-a456-426614174000","status":"error","error":"identity 123e4567-e89b-42d3-a456-426614174000 failed"}],
+			"lifecycle":{"results":[{"channel_id":7,"identity_uid":"123e4567-e89b-42d3-a456-426614174000"}]}
+		}`,
+	}
+
+	encoded, err := common.Marshal(task.ToResponse())
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "identity_uid")
+	assert.NotContains(t, string(encoded), "123e4567-e89b-42d3-a456-426614174000")
+	assert.Contains(t, string(encoded), `"status":"error"`)
+	assert.Contains(t, string(encoded), "[identity]")
+}
+
+func TestSystemTaskResponseKeepsIdentityUIDForUnrelatedTaskTypes(t *testing.T) {
+	task := &SystemTask{
+		Type:   SystemTaskTypeLogCleanup,
+		Result: `{"identity_uid":"unrelated-value"}`,
+	}
+
+	encoded, err := common.Marshal(task.ToResponse())
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"identity_uid":"unrelated-value"`)
+}
+
 func TestSystemTaskActiveKeyPreventsDuplicateActiveRun(t *testing.T) {
 	truncateTables(t)
 

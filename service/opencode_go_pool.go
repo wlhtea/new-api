@@ -51,14 +51,16 @@ var ErrOpenCodeGoStatefulResponsesAffinityRequired = errors.New("stateful OpenCo
 var ErrOpenCodeGoStatefulResponsesWorkspaceUnavailable = errors.New("the workspace that owns this stateful OpenCode Go Responses session is unavailable")
 
 type OpenCodeGoPoolSelection struct {
-	WorkspaceID            int64
-	WorkspaceUID           string
-	APIKey                 string
-	CanonicalWorkspaceUID  string
-	CandidateRank          int
-	FailoverActive         bool
-	FailoverLeaseExpiresAt time.Time
-	FailoverAttempt        *OpenCodeGoFailoverAttempt
+	WorkspaceID             int64
+	WorkspaceUID            string
+	IdentityUID             string
+	IdentityProxyGeneration OpenCodeGoIdentityProxyGeneration
+	APIKey                  string
+	CanonicalWorkspaceUID   string
+	CandidateRank           int
+	FailoverActive          bool
+	FailoverLeaseExpiresAt  time.Time
+	FailoverAttempt         *OpenCodeGoFailoverAttempt
 }
 
 type openCodeGoPoolCandidate struct {
@@ -77,13 +79,15 @@ type openCodeGoRankedCandidate struct {
 }
 
 type openCodeGoPoolSnapshot struct {
-	byModel        map[string][]openCodeGoPoolCandidate
-	candidateCount int
-	codec          *OpenCodeGoCredentialCodec
+	byModel                 map[string][]openCodeGoPoolCandidate
+	candidateCount          int
+	codec                   *OpenCodeGoCredentialCodec
+	identityProxyGeneration OpenCodeGoIdentityProxyGeneration
 }
 
 type openCodeGoPoolChannelState struct {
 	snapshot atomic.Pointer[openCodeGoPoolSnapshot]
+	rebuild  sync.Mutex
 	cursors  sync.Map
 	// inflight tracks per-workspace concurrent request counts. It is a
 	// per-node in-memory counter (same class as cursors), intentionally not
@@ -102,6 +106,8 @@ type openCodeGoBulkFailureCounter struct {
 }
 
 var openCodeGoPoolChannels sync.Map
+
+var listOpenCodeGoPoolIdentities = model.ListOpenCodeGoIdentities
 
 // PrepareOpenCodeGoPoolContainer removes pool-owned routing state from a newly
 // created channel. The administrator-owned model list and group are preserved;
@@ -137,69 +143,128 @@ func InitOpenCodeGoPools() {
 
 func RebuildOpenCodeGoPoolChannel(channelID int) error {
 	state := openCodeGoPoolStateForChannel(channelID)
-	emptySnapshot := &openCodeGoPoolSnapshot{byModel: make(map[string][]openCodeGoPoolCandidate)}
-	identities, err := model.ListOpenCodeGoIdentities(channelID)
-	if err != nil {
-		state.snapshot.Store(emptySnapshot)
-		return err
-	}
-	if len(identities) == 0 {
-		state.snapshot.Store(emptySnapshot)
-		updateOpenCodeGoChannelAvailability(channelID, false)
-		return nil
-	}
-
-	codec, err := NewConfiguredOpenCodeGoCredentialCodec()
-	if err != nil {
-		state.snapshot.Store(emptySnapshot)
-		updateOpenCodeGoChannelAvailability(channelID, false)
-		return err
-	}
-
-	now := time.Now().Unix()
-	snapshot := &openCodeGoPoolSnapshot{byModel: make(map[string][]openCodeGoPoolCandidate)}
-	for _, identity := range identities {
-		if identity.Status != model.OpenCodeGoIdentityStatusActive {
-			continue
+	state.rebuild.Lock()
+	defer state.rebuild.Unlock()
+	for {
+		generation := openCodeGoIdentityProxyClients.captureGeneration(channelID)
+		emptySnapshot := &openCodeGoPoolSnapshot{
+			byModel:                 make(map[string][]openCodeGoPoolCandidate),
+			identityProxyGeneration: generation,
 		}
-		for _, workspace := range identity.Workspaces {
-			if !isOpenCodeGoWorkspaceEligibleForSnapshot(workspace, now) {
+		identities, err := listOpenCodeGoPoolIdentities(channelID)
+		if err != nil {
+			if !publishOpenCodeGoPoolSnapshot(channelID, state, emptySnapshot) {
 				continue
 			}
-			candidate := openCodeGoPoolCandidate{
-				workspaceID:      workspace.ID,
-				workspaceUID:     workspace.UID,
-				identityUID:      identity.UID,
-				apiKeyCiphertext: workspace.APIKeyCiphertext,
-				quotaFactor:      openCodeGoQuotaFactor(workspace.QuotaWindows),
+			return err
+		}
+		if len(identities) == 0 {
+			if !publishOpenCodeGoPoolSnapshot(channelID, state, emptySnapshot) {
+				continue
 			}
-			added := false
-			seenModels := make(map[string]struct{})
-			for _, workspaceModel := range workspace.Models {
-				if !workspaceModel.Discovered || workspaceModel.State != model.OpenCodeGoModelAvailable || workspaceModel.DisabledUntil > now {
-					continue
-				}
-				modelID := strings.TrimSpace(workspaceModel.Model)
-				if modelID == "" {
-					continue
-				}
-				if _, exists := seenModels[modelID]; exists {
-					continue
-				}
-				seenModels[modelID] = struct{}{}
-				snapshot.byModel[modelID] = append(snapshot.byModel[modelID], candidate)
-				added = true
+			updateOpenCodeGoChannelAvailability(channelID, false)
+			return nil
+		}
+
+		codec, err := NewConfiguredOpenCodeGoCredentialCodec()
+		if err != nil {
+			if !publishOpenCodeGoPoolSnapshot(channelID, state, emptySnapshot) {
+				continue
 			}
-			if added {
-				snapshot.candidateCount++
+			updateOpenCodeGoChannelAvailability(channelID, false)
+			return err
+		}
+
+		now := time.Now().Unix()
+		snapshot := &openCodeGoPoolSnapshot{
+			byModel:                 make(map[string][]openCodeGoPoolCandidate),
+			identityProxyGeneration: generation,
+		}
+		for _, identity := range identities {
+			if identity.Status != model.OpenCodeGoIdentityStatusActive {
+				continue
+			}
+			for _, workspace := range identity.Workspaces {
+				if !isOpenCodeGoWorkspaceEligibleForSnapshot(workspace, now) {
+					continue
+				}
+				candidate := openCodeGoPoolCandidate{
+					workspaceID:      workspace.ID,
+					workspaceUID:     workspace.UID,
+					identityUID:      identity.UID,
+					apiKeyCiphertext: workspace.APIKeyCiphertext,
+					quotaFactor:      openCodeGoQuotaFactor(workspace.QuotaWindows),
+				}
+				added := false
+				seenModels := make(map[string]struct{})
+				for _, workspaceModel := range workspace.Models {
+					if !workspaceModel.Discovered || workspaceModel.State != model.OpenCodeGoModelAvailable || workspaceModel.DisabledUntil > now {
+						continue
+					}
+					modelID := strings.TrimSpace(workspaceModel.Model)
+					if modelID == "" {
+						continue
+					}
+					if _, exists := seenModels[modelID]; exists {
+						continue
+					}
+					seenModels[modelID] = struct{}{}
+					snapshot.byModel[modelID] = append(snapshot.byModel[modelID], candidate)
+					added = true
+				}
+				if added {
+					snapshot.candidateCount++
+				}
 			}
 		}
-	}
 
-	snapshot.codec = codec
+		snapshot.codec = codec
+		if !publishOpenCodeGoPoolSnapshot(channelID, state, snapshot) {
+			continue
+		}
+		updateOpenCodeGoChannelAvailability(channelID, snapshot.candidateCount > 0)
+		return nil
+	}
+}
+
+func publishOpenCodeGoPoolSnapshot(channelID int, state *openCodeGoPoolChannelState, snapshot *openCodeGoPoolSnapshot) bool {
+	openCodeGoIdentityProxyClients.generationMutex.Lock()
+	defer openCodeGoIdentityProxyClients.generationMutex.Unlock()
+	if state == nil || snapshot == nil || !openCodeGoIdentityProxyClients.generationMatchesLocked(channelID, &snapshot.identityProxyGeneration) {
+		return false
+	}
 	state.snapshot.Store(snapshot)
-	updateOpenCodeGoChannelAvailability(channelID, snapshot.candidateCount > 0)
-	return nil
+	return true
+}
+
+func refreshOpenCodeGoPoolSnapshotGenerationsLocked(cache *openCodeGoIdentityProxyClientCache) {
+	openCodeGoPoolChannels.Range(func(key, value any) bool {
+		channelID, ok := key.(int)
+		if !ok {
+			return true
+		}
+		state, ok := value.(*openCodeGoPoolChannelState)
+		if !ok || state == nil {
+			return true
+		}
+		snapshot := state.snapshot.Load()
+		if snapshot == nil {
+			return true
+		}
+		refreshed := *snapshot
+		if cache.invalidatingChannels[channelID] != 0 ||
+			snapshot.identityProxyGeneration.channelID != channelID ||
+			snapshot.identityProxyGeneration.channel != cache.channelGeneration[channelID] {
+			return true
+		}
+		refreshed.identityProxyGeneration = OpenCodeGoIdentityProxyGeneration{
+			channelID: channelID,
+			global:    cache.globalGeneration,
+			channel:   cache.channelGeneration[channelID],
+		}
+		state.snapshot.Store(&refreshed)
+		return true
+	})
 }
 
 func SelectOpenCodeGoWorkspace(channelID int, upstreamModel string) (*OpenCodeGoPoolSelection, error) {
@@ -212,6 +277,36 @@ func SelectOpenCodeGoWorkspaceWithAffinity(channelID int, upstreamModel string, 
 
 func SelectOpenCodeGoWorkspaceWithFailover(channelID int, upstreamModel string, options OpenCodeGoPoolSelectOptions) (*OpenCodeGoPoolSelection, error) {
 	return selectOpenCodeGoWorkspace(channelID, upstreamModel, options)
+}
+
+// ListOpenCodeGoPoolModels returns the persisted model inventory discovered
+// across the channel's workspaces. Temporary routing health and quota state do
+// not remove models from administrative discovery results.
+func ListOpenCodeGoPoolModels(channelID int) ([]string, error) {
+	var models []string
+	err := model.DB.Model(&model.OpenCodeGoWorkspaceModel{}).
+		Joins("JOIN open_code_go_workspaces ON open_code_go_workspaces.id = open_code_go_workspace_models.workspace_id").
+		Where("open_code_go_workspaces.channel_id = ?", channelID).
+		Where("open_code_go_workspace_models.discovered = ?", true).
+		Where("TRIM(open_code_go_workspace_models.model) <> ''").
+		Distinct("open_code_go_workspace_models.model").
+		Order("open_code_go_workspace_models.model asc").
+		Pluck("open_code_go_workspace_models.model", &models).Error
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	for _, modelID := range models {
+		if modelID = strings.TrimSpace(modelID); modelID != "" {
+			seen[modelID] = struct{}{}
+		}
+	}
+	models = make([]string, 0, len(seen))
+	for modelID := range seen {
+		models = append(models, modelID)
+	}
+	sort.Strings(models)
+	return models, nil
 }
 
 func selectOpenCodeGoWorkspace(channelID int, upstreamModel string, options OpenCodeGoPoolSelectOptions) (*OpenCodeGoPoolSelection, error) {
@@ -330,14 +425,16 @@ func selectOpenCodeGoWorkspace(channelID int, upstreamModel string, options Open
 		return nil, ErrOpenCodeGoSelectedCredentialUnavailable
 	}
 	return &OpenCodeGoPoolSelection{
-		WorkspaceID:            candidate.workspaceID,
-		WorkspaceUID:           candidate.workspaceUID,
-		APIKey:                 apiKey,
-		CanonicalWorkspaceUID:  canonicalWorkspaceUID,
-		CandidateRank:          index,
-		FailoverActive:         failoverActive,
-		FailoverLeaseExpiresAt: failoverLeaseExpiresAt,
-		FailoverAttempt:        failoverAttempt,
+		WorkspaceID:             candidate.workspaceID,
+		WorkspaceUID:            candidate.workspaceUID,
+		IdentityUID:             candidate.identityUID,
+		IdentityProxyGeneration: snapshot.identityProxyGeneration,
+		APIKey:                  apiKey,
+		CanonicalWorkspaceUID:   canonicalWorkspaceUID,
+		CandidateRank:           index,
+		FailoverActive:          failoverActive,
+		FailoverLeaseExpiresAt:  failoverLeaseExpiresAt,
+		FailoverAttempt:         failoverAttempt,
 	}, nil
 }
 
@@ -416,9 +513,11 @@ func preferredOpenCodeGoFailoverBackupExcluding(ranked []openCodeGoRankedCandida
 
 func RemoveOpenCodeGoPoolChannel(channelID int) {
 	openCodeGoPoolChannels.Delete(channelID)
+	InvalidateOpenCodeGoIdentityProxyChannel(channelID)
 }
 
 func ReloadOpenCodeGoPools() {
+	ResetOpenCodeGoIdentityProxyClientCache()
 	openCodeGoPoolChannels.Range(func(key, _ interface{}) bool {
 		openCodeGoPoolChannels.Delete(key)
 		return true

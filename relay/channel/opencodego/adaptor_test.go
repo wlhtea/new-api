@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +26,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type openCodeGoTestRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (roundTrip openCodeGoTestRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
 
 func newAdaptorTestContext() *gin.Context {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -248,6 +257,245 @@ func TestAdaptorUsesFixedURLsAndProtocolAuthentication(t *testing.T) {
 			assert.Equal(t, test.wantVersion, header.Get("anthropic-version") == "2023-06-01")
 			assert.Equal(t, adaptor.cacheIdentity, header.Get(cacheIdentityHeader))
 		})
+	}
+}
+
+func TestAdaptorResolvesRequestClientAfterIdentitySelection(t *testing.T) {
+	originalSelector := selectOpenCodeGoWorkspace
+	originalResolver := acquireOpenCodeGoRelayHTTPClient
+	selectOpenCodeGoWorkspace = func(_ int, _ string, _ service.OpenCodeGoPoolSelectOptions) (*service.OpenCodeGoPoolSelection, error) {
+		return &service.OpenCodeGoPoolSelection{
+			WorkspaceID:  1,
+			WorkspaceUID: "workspace-test",
+			IdentityUID:  "identity-test",
+			APIKey:       "test-account-key",
+		}, nil
+	}
+	resolvedChannelID := 0
+	resolvedIdentity := ""
+	resolvedWorkspace := ""
+	resolvedAPIKey := ""
+	resolvedModel := ""
+	var released atomic.Int32
+	acquireOpenCodeGoRelayHTTPClient = func(
+		channelID int,
+		identityUID string,
+		workspaceUID string,
+		apiKey string,
+		upstreamModel string,
+		_ service.OpenCodeGoIdentityProxyGeneration,
+	) (*http.Client, func(), error) {
+		resolvedChannelID = channelID
+		resolvedIdentity = identityUID
+		resolvedWorkspace = workspaceUID
+		resolvedAPIKey = apiKey
+		resolvedModel = upstreamModel
+		return &http.Client{Transport: openCodeGoTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			assert.Equal(t, "Bearer test-account-key", request.Header.Get("Authorization"))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+				Request:    request,
+			}, nil
+		})}, func() { released.Add(1) }, nil
+	}
+	t.Cleanup(func() {
+		selectOpenCodeGoWorkspace = originalSelector
+		acquireOpenCodeGoRelayHTTPClient = originalResolver
+	})
+
+	info := newAdaptorTestInfo("glm-5.2", false)
+	info.ChannelId = 41
+	info.ChannelSetting.Proxy = "http://static-template.invalid:8080"
+	info.ChannelOtherSettings.OpenCodeGo = &dto.OpenCodeGoConfig{
+		IdentityProxyEnabled:       true,
+		IdentityProxyCountry:       "CA",
+		IdentityProxyRotateMinutes: 30,
+	}
+	originalProxy := info.ChannelSetting.Proxy
+	c := newAdaptorTestContext()
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+	_, err := adaptor.ConvertOpenAIRequest(c, info, requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest))
+	require.NoError(t, err)
+
+	responseValue, err := adaptor.DoRequest(c, info, strings.NewReader(`{"model":"glm-5.2"}`))
+	require.NoError(t, err)
+	response, ok := responseValue.(*http.Response)
+	require.True(t, ok)
+	require.NoError(t, response.Body.Close())
+	adaptor.releaseInFlight()
+	assert.Equal(t, 41, resolvedChannelID)
+	assert.Equal(t, "identity-test", resolvedIdentity)
+	assert.Equal(t, "workspace-test", resolvedWorkspace)
+	assert.Equal(t, "test-account-key", resolvedAPIKey)
+	assert.Equal(t, "glm-5.2", resolvedModel)
+	assert.Equal(t, int32(1), released.Load())
+	assert.Equal(t, originalProxy, info.ChannelSetting.Proxy)
+}
+
+func TestAdaptorClientResolverFailureDoesNotSendRequest(t *testing.T) {
+	originalSelector := selectOpenCodeGoWorkspace
+	originalResolver := acquireOpenCodeGoRelayHTTPClient
+	originalObserver := observeOpenCodeGoTransportFailure
+	selectOpenCodeGoWorkspace = func(_ int, _ string, _ service.OpenCodeGoPoolSelectOptions) (*service.OpenCodeGoPoolSelection, error) {
+		return &service.OpenCodeGoPoolSelection{
+			WorkspaceID:  1,
+			WorkspaceUID: "workspace-resolver-failure",
+			IdentityUID:  "identity-resolver-failure",
+			APIKey:       "test-account-key",
+		}, nil
+	}
+	acquireOpenCodeGoRelayHTTPClient = func(
+		_ int,
+		_ string,
+		_ string,
+		_ string,
+		_ string,
+		_ service.OpenCodeGoIdentityProxyGeneration,
+	) (*http.Client, func(), error) {
+		return nil, nil, errors.New("request-local identity client unavailable")
+	}
+	observeOpenCodeGoTransportFailure = func(_ int, _ string, _ string, _ string, _ time.Time) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() {
+		selectOpenCodeGoWorkspace = originalSelector
+		acquireOpenCodeGoRelayHTTPClient = originalResolver
+		observeOpenCodeGoTransportFailure = originalObserver
+	})
+
+	info := newAdaptorTestInfo("glm-5.2", false)
+	info.ChannelId = 42
+	info.ChannelSetting.Proxy = "http://template_sid_1:secret@proxy.invalid:8080"
+	info.ChannelOtherSettings.OpenCodeGo = &dto.OpenCodeGoConfig{
+		IdentityProxyEnabled:       true,
+		IdentityProxyCountry:       "US",
+		IdentityProxyRotateMinutes: 10,
+	}
+	c := newAdaptorTestContext()
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+	_, err := adaptor.ConvertOpenAIRequest(c, info, requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest))
+	require.NoError(t, err)
+
+	response, err := adaptor.DoRequest(c, info, strings.NewReader(`{"model":"glm-5.2"}`))
+	require.ErrorContains(t, err, "request-local identity client unavailable")
+	assert.Nil(t, response)
+}
+
+func TestConcurrentAdaptorsKeepIdentityClientsRequestLocal(t *testing.T) {
+	originalSelector := selectOpenCodeGoWorkspace
+	originalResolver := acquireOpenCodeGoRelayHTTPClient
+	selections := map[string]service.OpenCodeGoPoolSelection{
+		"session-a": {
+			WorkspaceID:  1,
+			WorkspaceUID: "workspace-a",
+			IdentityUID:  "identity-a",
+			APIKey:       "account-key-a",
+		},
+		"session-b": {
+			WorkspaceID:  2,
+			WorkspaceUID: "workspace-b",
+			IdentityUID:  "identity-b",
+			APIKey:       "account-key-b",
+		},
+	}
+	selectOpenCodeGoWorkspace = func(_ int, _ string, options service.OpenCodeGoPoolSelectOptions) (*service.OpenCodeGoPoolSelection, error) {
+		selection, ok := selections[options.AffinityKey]
+		if !ok {
+			return nil, errors.New("unexpected affinity key")
+		}
+		return &selection, nil
+	}
+	acquireOpenCodeGoRelayHTTPClient = func(
+		_ int,
+		identityUID string,
+		workspaceUID string,
+		apiKey string,
+		_ string,
+		_ service.OpenCodeGoIdentityProxyGeneration,
+	) (*http.Client, func(), error) {
+		expectedAPIKey := map[string]string{
+			"identity-a": "account-key-a",
+			"identity-b": "account-key-b",
+		}[identityUID]
+		expectedWorkspace := map[string]string{
+			"identity-a": "workspace-a",
+			"identity-b": "workspace-b",
+		}[identityUID]
+		if expectedAPIKey == "" || workspaceUID != expectedWorkspace || apiKey != expectedAPIKey {
+			return nil, nil, errors.New("unexpected relay selection")
+		}
+		return &http.Client{Transport: openCodeGoTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Header.Get("Authorization") != "Bearer "+expectedAPIKey {
+				return nil, errors.New("identity client received another account's API key")
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(identityUID)),
+				Request:    request,
+			}, nil
+		})}, func() {}, nil
+	}
+	t.Cleanup(func() {
+		selectOpenCodeGoWorkspace = originalSelector
+		acquireOpenCodeGoRelayHTTPClient = originalResolver
+	})
+
+	type result struct {
+		session string
+		body    string
+		err     error
+	}
+	ready := make(chan struct{}, len(selections))
+	start := make(chan struct{})
+	results := make(chan result, len(selections))
+	var wait sync.WaitGroup
+	for session := range selections {
+		session := session
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			info := newAdaptorTestInfo("glm-5.2", false)
+			info.ChannelId = 43
+			c := newAdaptorTestContext()
+			c.Request.Header.Set(cacheIdentityHeader, session)
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+			adaptor.converted = true
+			ready <- struct{}{}
+			<-start
+			responseValue, err := adaptor.DoRequest(c, info, strings.NewReader(`{"model":"glm-5.2"}`))
+			defer adaptor.releaseInFlight()
+			if err != nil {
+				results <- result{session: session, err: err}
+				return
+			}
+			response := responseValue.(*http.Response)
+			body, readErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if readErr != nil {
+				err = readErr
+			} else if closeErr != nil {
+				err = closeErr
+			}
+			results <- result{session: session, body: string(body), err: err}
+		}()
+	}
+	for range selections {
+		<-ready
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	wantIdentity := map[string]string{"session-a": "identity-a", "session-b": "identity-b"}
+	for got := range results {
+		require.NoError(t, got.err)
+		assert.Equal(t, wantIdentity[got.session], got.body)
 	}
 }
 

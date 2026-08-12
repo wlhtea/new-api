@@ -27,6 +27,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
+	"gorm.io/gorm"
 )
 
 const (
@@ -333,6 +334,15 @@ func getFetchModelsResponseBody(method string, requestURL string, channel *model
 }
 
 func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
+	if channel == nil {
+		return nil, errors.New("channel is required")
+	}
+	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		if channel.Id <= 0 {
+			return nil, errors.New("OpenCode Go models are account-pool managed; save the channel and import an account first")
+		}
+		return service.ListOpenCodeGoPoolModels(channel.Id)
+	}
 	baseURL := constant.ChannelBaseURLs[channel.Type]
 	if channel.GetBaseURL() != "" {
 		baseURL = channel.GetBaseURL()
@@ -392,8 +402,6 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
 		} else {
 			url = fmt.Sprintf("%s/v1/models", baseURL)
 		}
-	case constant.ChannelTypeOpenCodeGo:
-		url = fmt.Sprintf("%s/models", strings.TrimRight(baseURL, "/"))
 	default:
 		url = fmt.Sprintf("%s/v1/models", baseURL)
 	}
@@ -463,14 +471,42 @@ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string)
 }
 
 func updateChannelUpstreamModelSettings(channel *model.Channel, settings dto.ChannelOtherSettings, updateModels bool) error {
-	channel.SetOtherSettings(settings)
-	updates := map[string]interface{}{
-		"settings": channel.OtherSettings,
+	var persistedSettings string
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		var current model.Channel
+		if err := model.LockForUpdate(tx).Where("id = ?", channel.Id).First(&current).Error; err != nil {
+			return err
+		}
+		currentSettings, err := current.DecodeOtherSettings()
+		if err != nil {
+			return fmt.Errorf("invalid channel settings: %w", err)
+		}
+
+		// Detection owns only its observation fields. Reloading under the row
+		// lock and merging this allowlist prevents a stale scan from replacing
+		// concurrently edited proxy, lifecycle, or protocol configuration.
+		currentSettings.UpstreamModelUpdateLastCheckTime = settings.UpstreamModelUpdateLastCheckTime
+		currentSettings.UpstreamModelUpdateLastDetectedModels = settings.UpstreamModelUpdateLastDetectedModels
+		currentSettings.UpstreamModelUpdateLastRemovedModels = settings.UpstreamModelUpdateLastRemovedModels
+		currentSettings.UpstreamModelUpdateIgnoredModels = settings.UpstreamModelUpdateIgnoredModels
+		encoded, err := common.Marshal(currentSettings)
+		if err != nil {
+			return err
+		}
+		persistedSettings = string(encoded)
+		updates := map[string]interface{}{
+			"settings": persistedSettings,
+		}
+		if updateModels {
+			updates["models"] = channel.Models
+		}
+		return tx.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(updates).Error
+	})
+	if err != nil {
+		return err
 	}
-	if updateModels {
-		updates["models"] = channel.Models
-	}
-	return model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(updates).Error
+	channel.OtherSettings = persistedSettings
+	return nil
 }
 
 func checkAndPersistChannelUpstreamModelUpdates(

@@ -85,11 +85,6 @@ func (service *OpenCodeGoLifecycleService) BatchSetChinaModels(
 	enabled bool,
 	source string,
 ) (*OpenCodeGoBatchSummary, error) {
-	scoped, err := service.scopedForChannel(channelID)
-	if err != nil {
-		return nil, err
-	}
-	service = scoped
 	workspaces, err := openCodeGoBatchTargetWorkspaces(channelID, workspaceUIDs)
 	if err != nil {
 		return nil, err
@@ -138,11 +133,6 @@ func (service *OpenCodeGoLifecycleService) BatchCancelSubscriptionRenewal(
 	workspaceUIDs []string,
 	source string,
 ) (*OpenCodeGoBatchSummary, error) {
-	scoped, err := service.scopedForChannel(channelID)
-	if err != nil {
-		return nil, err
-	}
-	service = scoped
 	workspaces, err := openCodeGoBatchTargetWorkspaces(channelID, workspaceUIDs)
 	if err != nil {
 		return nil, err

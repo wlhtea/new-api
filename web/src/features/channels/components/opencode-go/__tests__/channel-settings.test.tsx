@@ -83,6 +83,30 @@ type RenderedSettings = {
 
 let renderedSettings: RenderedSettings | null = null
 
+function getControlByLabel<T extends HTMLElement>(
+  host: HTMLElement,
+  label: string
+): T {
+  const labelElement = [
+    ...host.querySelectorAll<HTMLLabelElement>('label'),
+  ].find((candidate) => candidate.textContent?.trim() === label)
+  assert.ok(labelElement?.htmlFor)
+  const control = host.querySelector<T>(`[id="${labelElement.htmlFor}"]`)
+  assert.ok(control)
+  assert.equal(host.contains(control), true)
+  return control
+}
+
+function setInputValue(input: HTMLInputElement, value: string): void {
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLInputElement.prototype,
+    'value'
+  )?.set
+  assert.ok(setter)
+  setter.call(input, value)
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
 afterEach(async () => {
   if (renderedSettings) {
     await act(async () => renderedSettings?.root.unmount())
@@ -139,12 +163,21 @@ describe('OpenCode Go channel settings', () => {
       (control) =>
         control.getAttribute('aria-label') === 'Balance traffic by account load'
     )
-    const lifecycleSwitches = switches.filter(
+    const identityProxySwitch = switches.find(
       (control) =>
-        control !== genericFailoverSwitch && control !== loadAwareSwitch
+        control.getAttribute('aria-label') ===
+        'Use identity-scoped proxy sessions'
     )
-    const rewardLimit = host.querySelector<HTMLInputElement>(
-      'input[type="number"]'
+    const lifecycleSwitches = [
+      'Enable China-deployed models',
+      'Apply referral rewards',
+      'Cancel subscription renewal',
+    ].map((label) =>
+      switches.find((control) => control.getAttribute('aria-label') === label)
+    )
+    const rewardLimit = getControlByLabel<HTMLInputElement>(
+      host,
+      'Referral rewards per run'
     )
     assert.ok(genericFailoverSwitch)
     assert.equal(genericFailoverSwitch.hasAttribute('disabled'), false)
@@ -154,13 +187,18 @@ describe('OpenCode Go channel settings', () => {
     assert.equal(loadAwareSwitch.hasAttribute('disabled'), false)
     assert.notEqual(loadAwareSwitch.getAttribute('aria-disabled'), 'true')
     assert.equal(loadAwareSwitch.hasAttribute('data-disabled'), false)
+    assert.ok(identityProxySwitch)
+    assert.equal(identityProxySwitch.hasAttribute('disabled'), false)
+    assert.notEqual(identityProxySwitch.getAttribute('aria-disabled'), 'true')
+    assert.equal(identityProxySwitch.hasAttribute('data-disabled'), false)
     assert.equal(lifecycleSwitches.length, 3)
     assert.equal(
       lifecycleSwitches.every(
         (control) =>
-          control.disabled ||
-          control.getAttribute('aria-disabled') === 'true' ||
-          control.hasAttribute('data-disabled')
+          control &&
+          (control.disabled ||
+            control.getAttribute('aria-disabled') === 'true' ||
+            control.hasAttribute('data-disabled'))
       ),
       true
     )
@@ -173,5 +211,63 @@ describe('OpenCode Go channel settings', () => {
     assert.ok(openPoolButton)
     await act(async () => openPoolButton.click())
     assert.equal(openPolicyCount, 1)
+  })
+
+  test('infers the initial policy when identity proxy routing is enabled', async () => {
+    function Harness() {
+      const form = useForm({
+        defaultValues: {
+          ...CHANNEL_FORM_DEFAULT_VALUES,
+          proxy:
+            'http://account_custom_zone_GB_sid_template_time_20:secret@proxy.example:8080',
+        },
+      })
+      return (
+        <Form {...form}>
+          <OpenCodeGoChannelSettings lifecyclePolicyReadOnly />
+        </Form>
+      )
+    }
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const root = createRoot(host)
+    renderedSettings = { host, root }
+    await act(async () => root.render(<Harness />))
+
+    const identityProxySwitch = host.querySelector<HTMLButtonElement>(
+      '[role="switch"][aria-label="Use identity-scoped proxy sessions"]'
+    )
+    const country = getControlByLabel<HTMLInputElement>(host, 'Proxy country')
+    const rotation = getControlByLabel<HTMLInputElement>(
+      host,
+      'Rotation interval (minutes)'
+    )
+    assert.ok(identityProxySwitch)
+    assert.equal(country.disabled, true)
+    assert.equal(rotation.disabled, true)
+
+    await act(async () => identityProxySwitch.click())
+
+    assert.equal(identityProxySwitch.getAttribute('aria-checked'), 'true')
+    assert.equal(country.disabled, false)
+    assert.equal(rotation.disabled, false)
+    assert.equal(country.value, 'GB')
+    assert.equal(rotation.value, '20')
+
+    await act(async () => {
+      setInputValue(country, 'CA')
+      setInputValue(rotation, '30')
+    })
+    assert.equal(country.value, 'CA')
+    assert.equal(rotation.value, '30')
+
+    await act(async () => setInputValue(country, 'u\u017f'))
+    assert.equal(country.value, 'U\u017f')
+
+    await act(async () => identityProxySwitch.click())
+    await act(async () => identityProxySwitch.click())
+    assert.equal(country.value, 'U\u017f')
+    assert.equal(rotation.value, '30')
   })
 })

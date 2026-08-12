@@ -2,14 +2,50 @@ package channel
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+type clientResolverTestAdaptor struct {
+	Adaptor
+	requestURL  string
+	headerSetup atomic.Bool
+}
+
+type clientResolverTestTransport struct {
+	calls    atomic.Int32
+	response *http.Response
+	err      error
+}
+
+func (transport *clientResolverTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	transport.calls.Add(1)
+	if transport.response != nil {
+		transport.response.Request = request
+	}
+	return transport.response, transport.err
+}
+
+func (adaptor *clientResolverTestAdaptor) GetRequestURL(*relaycommon.RelayInfo) (string, error) {
+	return adaptor.requestURL, nil
+}
+
+func (adaptor *clientResolverTestAdaptor) SetupRequestHeader(
+	_ *gin.Context,
+	_ *http.Header,
+	_ *relaycommon.RelayInfo,
+) error {
+	adaptor.headerSetup.Store(true)
+	return nil
+}
 
 func TestNewUpstreamRequestInheritsDownstreamContext(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -48,6 +84,63 @@ func TestDownstreamRequestMethodReturnsMethod(t *testing.T) {
 	method, err := downstreamRequestMethod(c)
 	require.NoError(t, err)
 	require.Equal(t, http.MethodPost, method)
+}
+
+func TestDoApiRequestWithClientLeaseReleasesAfterResponseHeaders(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	adaptor := &clientResolverTestAdaptor{requestURL: "http://upstream.invalid/v1/chat/completions"}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	transport := &clientResolverTestTransport{response: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       http.NoBody,
+	}}
+	var released atomic.Int32
+
+	response, err := DoApiRequestWithClientLease(adaptor, c, info, strings.NewReader("{}"), func() (*http.Client, func(), error) {
+		return &http.Client{Transport: transport}, func() { released.Add(1) }, nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	require.Equal(t, int32(1), transport.calls.Load())
+	require.Equal(t, int32(1), released.Load())
+}
+
+func TestDoApiRequestWithClientLeaseReleasesLeaseReturnedWithResolverFailure(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	adaptor := &clientResolverTestAdaptor{requestURL: "http://upstream.invalid/v1/chat/completions"}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	var released atomic.Int32
+
+	response, err := DoApiRequestWithClientLease(adaptor, c, info, strings.NewReader("{}"), func() (*http.Client, func(), error) {
+		require.True(t, adaptor.headerSetup.Load(), "client resolution must follow account/header selection")
+		return nil, func() { released.Add(1) }, errors.New("identity client resolution failed")
+	})
+	require.ErrorContains(t, err, "identity client resolution failed")
+	require.Nil(t, response)
+	require.Equal(t, int32(1), released.Load())
+}
+
+func TestDoApiRequestWithClientLeaseReleasesAfterTransportFailure(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	adaptor := &clientResolverTestAdaptor{requestURL: "http://upstream.invalid/v1/chat/completions"}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	transport := &clientResolverTestTransport{err: errors.New("upstream transport failed")}
+	var released atomic.Int32
+
+	response, err := DoApiRequestWithClientLease(adaptor, c, info, strings.NewReader("{}"), func() (*http.Client, func(), error) {
+		return &http.Client{Transport: transport}, func() { released.Add(1) }, nil
+	})
+	require.Error(t, err)
+	require.Nil(t, response)
+	require.Equal(t, int32(1), transport.calls.Load())
+	require.Equal(t, int32(1), released.Load())
 }
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {

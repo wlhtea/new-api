@@ -239,8 +239,8 @@ export function getOpenCodeGoTaskResults(
   if (task.type === 'opencode_go_refresh') {
     const parsed = openCodeGoRefreshSummarySchema.safeParse(task.result)
     if (!parsed.success) return []
-    return parsed.data.results.map((result) => ({
-      key: result.identity_uid,
+    return parsed.data.results.map((result, index) => ({
+      key: `refresh-${index + 1}`,
       status: result.status,
       error: result.error,
     }))

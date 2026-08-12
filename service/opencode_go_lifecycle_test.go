@@ -348,6 +348,12 @@ func TestOpenCodeGoLifecyclePolicyDefaultsAndUpdatePreserveProtocolSettings(t *t
 	}
 	encoded, err := common.Marshal(settings)
 	require.NoError(t, err)
+	var encodedSettings map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &encodedSettings))
+	encodedSettings["future_root"] = map[string]any{"enabled": true}
+	encodedSettings["opencode_go"].(map[string]any)["future_nested"] = map[string]any{"mode": "keep"}
+	encoded, err = common.Marshal(encodedSettings)
+	require.NoError(t, err)
 	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("settings", string(encoded)).Error)
 
 	defaults, err := GetOpenCodeGoLifecyclePolicy(channel.Id)
@@ -378,6 +384,10 @@ func TestOpenCodeGoLifecyclePolicyDefaultsAndUpdatePreserveProtocolSettings(t *t
 	require.NotNil(t, persisted)
 	assert.Equal(t, relaydto.OpenCodeGoProtocolMessages, persisted.DefaultProtocol)
 	assert.Equal(t, relaydto.OpenCodeGoProtocolResponses, persisted.ModelProtocols["model-a"])
+	var persistedSettings map[string]any
+	require.NoError(t, common.Unmarshal([]byte(reloaded.OtherSettings), &persistedSettings))
+	assert.Equal(t, map[string]any{"enabled": true}, persistedSettings["future_root"])
+	assert.Equal(t, map[string]any{"mode": "keep"}, persistedSettings["opencode_go"].(map[string]any)["future_nested"])
 
 	zeroLimit, err := UpdateOpenCodeGoLifecyclePolicy(channel.Id, OpenCodeGoLifecyclePolicy{
 		ReferralRewardsMaxPerRun: 0,
@@ -431,6 +441,33 @@ func TestOpenCodeGoRefreshAutomationRunsOnlyAfterSuccessfulRefreshResults(t *tes
 	assert.Equal(t, 1, fake.enableCalls)
 }
 
+func TestOpenCodeGoRefreshAndLifecycleSummariesDoNotSerializeIdentityUID(t *testing.T) {
+	const identityUID = "123e4567-e89b-42d3-a456-426614174000"
+	summary := OpenCodeGoRefreshSummary{
+		Total:     1,
+		Processed: 1,
+		Succeeded: 1,
+		Results: []OpenCodeGoRefreshResult{{
+			ChannelID:   7,
+			IdentityUID: identityUID,
+			Status:      "refreshed",
+		}},
+		Lifecycle: OpenCodeGoLifecycleBatchSummary{
+			Enabled:    true,
+			Identities: 1,
+			Results: []OpenCodeGoLifecycleIdentityAutomationResult{{
+				ChannelID: 7,
+			}},
+		},
+	}
+
+	encoded, err := common.Marshal(summary)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "identity_uid")
+	assert.NotContains(t, string(encoded), identityUID)
+	assert.Contains(t, string(encoded), `"status":"refreshed"`)
+}
+
 func TestOpenCodeGoRefreshAutomationsScopeRuntimeByResultChannel(t *testing.T) {
 	db, firstChannel, codec := setupOpenCodeGoPoolTestDB(t)
 	secondChannel := &model.Channel{
@@ -448,7 +485,7 @@ func TestOpenCodeGoRefreshAutomationsScopeRuntimeByResultChannel(t *testing.T) {
 	secondWorkspace := createEligibleOpenCodeGoWorkspace(
 		t, db, codec, secondChannel.Id, "lifecycle-second", "workspace-lifecycle-second", "wrk_LIFESECOND2", []string{"model-a"},
 	)
-	enabled := true
+	enabled := false
 	require.NoError(t, db.Model(&model.OpenCodeGoWorkspace{}).
 		Where("id IN ?", []int64{firstWorkspace.ID, secondWorkspace.ID}).
 		Update("china_models_enabled", enabled).Error)
@@ -461,13 +498,24 @@ func TestOpenCodeGoRefreshAutomationsScopeRuntimeByResultChannel(t *testing.T) {
 	t.Setenv("OPENCODE_GO_LIFECYCLE_AUTOMATION_ENABLED", "true")
 
 	var factoryMutex sync.Mutex
-	factoryCalls := make(map[int]int)
+	factoryCalls := make(map[string]int)
 	root := &OpenCodeGoLifecycleService{
-		scopedFactory: func(channelID int) (*OpenCodeGoLifecycleService, error) {
+		codec: codec,
+		scopedFactory: func(channelID int, identityUID string) (*OpenCodeGoLifecycleService, error) {
 			factoryMutex.Lock()
-			factoryCalls[channelID]++
+			factoryCalls[fmt.Sprintf("%d:%s", channelID, identityUID)]++
 			factoryMutex.Unlock()
-			fake := &fakeOpenCodeGoLifecycleBackend{models: []string{"model-a"}}
+			workspaceID := firstWorkspace.UpstreamWorkspaceID
+			if channelID == secondChannel.Id {
+				workspaceID = secondWorkspace.UpstreamWorkspaceID
+			}
+			page := newOpenCodeGoLifecyclePage(workspaceID, 10, time.Unix(1_900_100_000, 0))
+			page.ChinaModelsEnabled = boolPtr(false)
+			fake := &fakeOpenCodeGoLifecycleBackend{
+				page:               page,
+				models:             []string{"model-a"},
+				enableChangesState: true,
+			}
 			return newOpenCodeGoLifecycleTestService(codec, fake, time.Unix(1_900_100_000, 0)), nil
 		},
 		now: time.Now,
@@ -483,7 +531,11 @@ func TestOpenCodeGoRefreshAutomationsScopeRuntimeByResultChannel(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 2, summary.Identities)
-	assert.Equal(t, map[int]int{firstChannel.Id: 1, secondChannel.Id: 1}, factoryCalls)
+	assert.Equal(t, 2, summary.Succeeded)
+	assert.Equal(t, map[string]int{
+		fmt.Sprintf("%d:%s", firstChannel.Id, "identity-lifecycle-first"):   1,
+		fmt.Sprintf("%d:%s", secondChannel.Id, "identity-lifecycle-second"): 1,
+	}, factoryCalls)
 }
 
 func TestOpenCodeGoEnableChinaModelsIsIdempotentAndReturnsFinishedOperation(t *testing.T) {

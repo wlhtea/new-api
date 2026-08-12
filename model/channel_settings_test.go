@@ -3,11 +3,37 @@ package model
 import (
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestChannelSettingGettersDoNotPersistMalformedJSON(t *testing.T) {
+	setupChannelStatusTest(t)
+
+	malformedSetting := `{invalid-setting`
+	malformedOtherSettings := `{invalid-settings`
+	channel := Channel{
+		Name:          "malformed channel settings",
+		Key:           "test-key",
+		Setting:       &malformedSetting,
+		OtherSettings: malformedOtherSettings,
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+
+	assert.Equal(t, dto.ChannelSettings{}, channel.GetSetting())
+	assert.Equal(t, dto.ChannelOtherSettings{}, channel.GetOtherSettings())
+
+	var persisted Channel
+	require.NoError(t, DB.First(&persisted, channel.Id).Error)
+	require.NotNil(t, persisted.Setting)
+	assert.Equal(t, malformedSetting, *persisted.Setting)
+	assert.Equal(t, malformedOtherSettings, persisted.OtherSettings)
+	assert.Equal(t, malformedSetting, *channel.Setting)
+	assert.Equal(t, malformedOtherSettings, channel.OtherSettings)
+}
 
 func TestChannelValidateSettingsRejectsInvalidHTTPTransport(t *testing.T) {
 	tests := []struct {
@@ -39,6 +65,112 @@ func TestChannelValidateSettingsRejectsInvalidHTTPTransport(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
+}
+
+func TestOpenCodeGoChannelValidateIdentityProxySettings(t *testing.T) {
+	tests := []struct {
+		name        string
+		proxy       string
+		config      *dto.OpenCodeGoConfig
+		wantErr     string
+		wantCountry string
+		wantMinutes int
+	}{
+		{name: "disabled without proxy", config: &dto.OpenCodeGoConfig{}},
+		{
+			name:        "enabled infers template policy",
+			proxy:       "http://account_custom_zone_GB_sid_1_time_20:secret@proxy.example:8080",
+			config:      &dto.OpenCodeGoConfig{IdentityProxyEnabled: true},
+			wantCountry: "GB",
+			wantMinutes: 20,
+		},
+		{
+			name:        "explicit policy overrides template",
+			proxy:       "http://account_custom_zone_GB_sid_1_time_20:secret@proxy.example:8080",
+			config:      &dto.OpenCodeGoConfig{IdentityProxyEnabled: true, IdentityProxyCountry: "ca", IdentityProxyRotateMinutes: 30},
+			wantCountry: "CA",
+			wantMinutes: 30,
+		},
+		{
+			name:        "enabled defaults missing optional template policy",
+			proxy:       "http://account_sid_1:secret@proxy.example:8080",
+			config:      &dto.OpenCodeGoConfig{IdentityProxyEnabled: true},
+			wantCountry: dto.OpenCodeGoIdentityProxyDefaultCountry,
+			wantMinutes: dto.OpenCodeGoIdentityProxyDefaultRotateMinutes,
+		},
+		{
+			name:    "enabled requires proxy",
+			config:  &dto.OpenCodeGoConfig{IdentityProxyEnabled: true, IdentityProxyCountry: "US", IdentityProxyRotateMinutes: 10},
+			wantErr: "identity proxy",
+		},
+		{
+			name:    "enabled rejects socks proxy",
+			proxy:   "socks5://account_sid_1:secret@proxy.example:1080",
+			config:  &dto.OpenCodeGoConfig{IdentityProxyEnabled: true, IdentityProxyCountry: "US", IdentityProxyRotateMinutes: 10},
+			wantErr: "http or https",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			channel := &Channel{Type: constant.ChannelTypeOpenCodeGo}
+			channel.SetSetting(dto.ChannelSettings{Proxy: test.proxy})
+			channel.SetOtherSettings(dto.ChannelOtherSettings{OpenCodeGo: test.config})
+			err := channel.ValidateSettings()
+			if test.wantErr != "" {
+				require.ErrorContains(t, err, test.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			if test.wantCountry != "" {
+				persisted := channel.GetOtherSettings().OpenCodeGo
+				require.NotNil(t, persisted)
+				assert.Equal(t, test.wantCountry, persisted.IdentityProxyCountry)
+				assert.Equal(t, test.wantMinutes, persisted.IdentityProxyRotateMinutes)
+			}
+		})
+	}
+}
+
+func TestOpenCodeGoChannelValidateIdentityProxyPreservesUnknownSettings(t *testing.T) {
+	setting := dto.ChannelSettings{Proxy: "http://account_sid_1:secret@proxy.example:8080"}
+	channel := &Channel{
+		Type: constant.ChannelTypeOpenCodeGo,
+		OtherSettings: `{
+			"future_root":{"enabled":true},
+			"opencode_go":{
+				"identity_proxy_enabled":true,
+				"identity_proxy_country":"us",
+				"future_nested":{"mode":"keep"}
+			}
+		}`,
+	}
+	channel.SetSetting(setting)
+
+	require.NoError(t, channel.ValidateSettings())
+	var persisted map[string]any
+	require.NoError(t, common.Unmarshal([]byte(channel.OtherSettings), &persisted))
+	assert.Equal(t, map[string]any{"enabled": true}, persisted["future_root"])
+	openCodeGo := persisted["opencode_go"].(map[string]any)
+	assert.Equal(t, map[string]any{"mode": "keep"}, openCodeGo["future_nested"])
+	assert.Equal(t, "US", openCodeGo["identity_proxy_country"])
+	assert.Equal(t, float64(dto.OpenCodeGoIdentityProxyDefaultRotateMinutes), openCodeGo["identity_proxy_rotate_minutes"])
+}
+
+func TestOpenCodeGoChannelValidateIdentityProxyRejectsExplicitZeroMinutes(t *testing.T) {
+	channel := &Channel{
+		Type: constant.ChannelTypeOpenCodeGo,
+		OtherSettings: `{
+			"opencode_go":{
+				"identity_proxy_enabled":true,
+				"identity_proxy_country":"US",
+				"identity_proxy_rotate_minutes":0
+			}
+		}`,
+	}
+	channel.SetSetting(dto.ChannelSettings{Proxy: "http://account_sid_1:secret@proxy.example:8080"})
+
+	require.ErrorContains(t, channel.ValidateSettings(), "identity_proxy_rotate_minutes")
 }
 
 func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(t *testing.T) {

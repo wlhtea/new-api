@@ -215,6 +215,11 @@ export const STATIC_I18N_KEYS = [
   // Channel Affinity section
   'Channel Affinity',
 
+  // OpenCode Go identity proxy validation
+  'Identity proxy routing requires a credentialed HTTP or HTTPS Proxy Address with exactly one valid sid component',
+  'Identity proxy country must contain exactly two ASCII letters',
+  'Identity proxy rotation must be between 1 and 180 minutes',
+
   // Channel type labels
   'Uncensored Seed Dance',
 

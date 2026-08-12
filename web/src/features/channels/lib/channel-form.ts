@@ -36,6 +36,17 @@ import {
 } from './advanced-custom'
 import { usesLegacyChannelKey } from './channel-type-config'
 import {
+  OPENCODE_GO_IDENTITY_PROXY_COUNTRY_ERROR,
+  OPENCODE_GO_IDENTITY_PROXY_DEFAULT_COUNTRY,
+  OPENCODE_GO_IDENTITY_PROXY_DEFAULT_ROTATE_MINUTES,
+  OPENCODE_GO_IDENTITY_PROXY_MAX_ROTATE_MINUTES,
+  OPENCODE_GO_IDENTITY_PROXY_MIN_ROTATE_MINUTES,
+  OPENCODE_GO_IDENTITY_PROXY_ROTATION_ERROR,
+  OPENCODE_GO_IDENTITY_PROXY_TEMPLATE_ERROR,
+  isOpenCodeGoIdentityProxyCountry,
+  parseOpenCodeGoIdentityProxyTemplate,
+} from './opencode-go-identity-proxy'
+import {
   parseOpenCodeGoProtocolOverrides,
   stringifyOpenCodeGoProtocolOverrides,
 } from './opencode-go-pool'
@@ -286,6 +297,13 @@ export const channelFormSchema = z
     upstream_model_update_auto_sync_enabled: z.boolean().optional(),
     upstream_model_update_ignored_models: z.string().optional(),
     // OpenCode Go settings (stored under settings.opencode_go)
+    opencode_go_identity_proxy_enabled: z.boolean().optional(),
+    opencode_go_identity_proxy_country: z
+      .string()
+      .default(OPENCODE_GO_IDENTITY_PROXY_DEFAULT_COUNTRY),
+    opencode_go_identity_proxy_rotate_minutes: z
+      .number()
+      .default(OPENCODE_GO_IDENTITY_PROXY_DEFAULT_ROTATE_MINUTES),
     opencode_go_default_protocol: z
       .enum(['', 'chat', 'messages', 'responses'])
       .optional(),
@@ -435,6 +453,42 @@ export const channelFormSchema = z
       )
     }
 
+    if (
+      data.type === CHANNEL_TYPE_OPENCODE_GO &&
+      data.opencode_go_identity_proxy_enabled === true
+    ) {
+      if (!parseOpenCodeGoIdentityProxyTemplate(data.proxy)) {
+        addRequiredIssue(
+          ctx,
+          'proxy',
+          OPENCODE_GO_IDENTITY_PROXY_TEMPLATE_ERROR
+        )
+      }
+      if (
+        !isOpenCodeGoIdentityProxyCountry(
+          data.opencode_go_identity_proxy_country
+        )
+      ) {
+        addRequiredIssue(
+          ctx,
+          'opencode_go_identity_proxy_country',
+          OPENCODE_GO_IDENTITY_PROXY_COUNTRY_ERROR
+        )
+      }
+      const rotateMinutes = data.opencode_go_identity_proxy_rotate_minutes
+      if (
+        !Number.isInteger(rotateMinutes) ||
+        rotateMinutes < OPENCODE_GO_IDENTITY_PROXY_MIN_ROTATE_MINUTES ||
+        rotateMinutes > OPENCODE_GO_IDENTITY_PROXY_MAX_ROTATE_MINUTES
+      ) {
+        addRequiredIssue(
+          ctx,
+          'opencode_go_identity_proxy_rotate_minutes',
+          OPENCODE_GO_IDENTITY_PROXY_ROTATION_ERROR
+        )
+      }
+    }
+
     const protocol = normalizeHttpProtocol(data.http_protocol)
     const shards = data.http2_connection_shards ?? 1
     if (shards < 1 || shards > MAX_HTTP2_CONNECTION_SHARDS) {
@@ -512,6 +566,11 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   upstream_model_update_check_enabled: false,
   upstream_model_update_auto_sync_enabled: false,
   upstream_model_update_ignored_models: '',
+  opencode_go_identity_proxy_enabled: false,
+  opencode_go_identity_proxy_country:
+    OPENCODE_GO_IDENTITY_PROXY_DEFAULT_COUNTRY,
+  opencode_go_identity_proxy_rotate_minutes:
+    OPENCODE_GO_IDENTITY_PROXY_DEFAULT_ROTATE_MINUTES,
   opencode_go_default_protocol: '',
   opencode_go_model_protocols: '',
   opencode_go_generic_failover_enabled: false,
@@ -589,6 +648,11 @@ export function transformChannelToFormDefaults(
   let upstreamModelUpdateCheckEnabled = false
   let upstreamModelUpdateAutoSyncEnabled = false
   let upstreamModelUpdateIgnoredModels = ''
+  let openCodeGoIdentityProxyEnabled = false
+  let openCodeGoIdentityProxyCountry =
+    OPENCODE_GO_IDENTITY_PROXY_DEFAULT_COUNTRY
+  let openCodeGoIdentityProxyRotateMinutes =
+    OPENCODE_GO_IDENTITY_PROXY_DEFAULT_ROTATE_MINUTES
   let openCodeGoDefaultProtocol: '' | 'chat' | 'messages' | 'responses' = ''
   let openCodeGoModelProtocols = ''
   let openCodeGoGenericFailoverEnabled = false
@@ -634,6 +698,17 @@ export function transformChannelToFormDefaults(
         typeof openCodeGo === 'object' &&
         !Array.isArray(openCodeGo)
       ) {
+        openCodeGoIdentityProxyEnabled =
+          openCodeGo.identity_proxy_enabled === true
+        if (typeof openCodeGo.identity_proxy_country === 'string') {
+          openCodeGoIdentityProxyCountry = openCodeGo.identity_proxy_country
+            .trim()
+            .toUpperCase()
+        }
+        if (typeof openCodeGo.identity_proxy_rotate_minutes === 'number') {
+          openCodeGoIdentityProxyRotateMinutes =
+            openCodeGo.identity_proxy_rotate_minutes
+        }
         if (
           openCodeGo.default_protocol === 'chat' ||
           openCodeGo.default_protocol === 'messages' ||
@@ -752,6 +827,10 @@ export function transformChannelToFormDefaults(
     upstream_model_update_check_enabled: upstreamModelUpdateCheckEnabled,
     upstream_model_update_auto_sync_enabled: upstreamModelUpdateAutoSyncEnabled,
     upstream_model_update_ignored_models: upstreamModelUpdateIgnoredModels,
+    opencode_go_identity_proxy_enabled: openCodeGoIdentityProxyEnabled,
+    opencode_go_identity_proxy_country: openCodeGoIdentityProxyCountry,
+    opencode_go_identity_proxy_rotate_minutes:
+      openCodeGoIdentityProxyRotateMinutes,
     opencode_go_default_protocol: openCodeGoDefaultProtocol,
     opencode_go_model_protocols: openCodeGoModelProtocols,
     opencode_go_generic_failover_enabled: openCodeGoGenericFailoverEnabled,
@@ -938,6 +1017,16 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
       existing && typeof existing === 'object' && !Array.isArray(existing)
         ? { ...existing }
         : {}
+    openCodeGo.identity_proxy_enabled =
+      formData.opencode_go_identity_proxy_enabled === true
+    openCodeGo.identity_proxy_country = String(
+      formData.opencode_go_identity_proxy_country ||
+        OPENCODE_GO_IDENTITY_PROXY_DEFAULT_COUNTRY
+    )
+      .trim()
+      .toUpperCase()
+    openCodeGo.identity_proxy_rotate_minutes =
+      formData.opencode_go_identity_proxy_rotate_minutes
     openCodeGo.model_protocols = parseOpenCodeGoProtocolOverrides(
       formData.opencode_go_model_protocols
     )

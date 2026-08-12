@@ -1,6 +1,7 @@
 package service
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -151,4 +152,113 @@ func TestApplyOpenCodeGoClassifiedFailureRejectsOlderWorkspaceObservation(t *tes
 	require.NoError(t, err)
 	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, after.EffectiveState)
 	assert.Equal(t, model.OpenCodeGoCredentialValid, after.CredentialStatus)
+}
+
+func TestRestrictiveOpenCodeGoHealthWriteKeepsRelayBlockedUntilRebuildCompletes(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	workspace := createEligibleOpenCodeGoWorkspace(
+		t,
+		db,
+		codec,
+		channel.Id,
+		"health-barrier",
+		"workspace-health-barrier",
+		"wrk_HEALTHBARRIER",
+		[]string{"model-a"},
+	)
+	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
+	classified, ok := ClassifyOpenCodeGoProviderFailure(OpenCodeGoProviderFailure{
+		StatusCode: http.StatusUnauthorized,
+		ErrorType:  "AuthError",
+		Message:    "Invalid API key",
+	}, time.Unix(1_900_000_100, 0))
+	require.True(t, ok)
+
+	rebuildStarted := make(chan struct{})
+	allowRebuild := make(chan struct{})
+	applyResult := make(chan error, 1)
+	go func() {
+		_, applyErr := applyOpenCodeGoClassifiedFailure(
+			channel.Id,
+			workspace.UID,
+			"model-a",
+			classified,
+			func(channelID int) error {
+				close(rebuildStarted)
+				<-allowRebuild
+				return RebuildOpenCodeGoPoolChannel(channelID)
+			},
+		)
+		applyResult <- applyErr
+	}()
+	<-rebuildStarted
+
+	relayAcquired := make(chan struct{}, 1)
+	go func() {
+		release := openCodeGoPoolMutations.beginRelay(channel.Id)
+		release()
+		relayAcquired <- struct{}{}
+	}()
+	select {
+	case <-relayAcquired:
+		t.Fatal("relay crossed the health commit-to-rebuild window")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(allowRebuild)
+	require.NoError(t, <-applyResult)
+	select {
+	case <-relayAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("relay lease did not resume after health rebuild")
+	}
+}
+
+func TestRestorativeOpenCodeGoHealthWriteDoesNotAcquireRestrictiveMutationBarrier(t *testing.T) {
+	_, channel, _ := setupOpenCodeGoPoolTestDB(t)
+	identity := model.OpenCodeGoIdentity{
+		UID:                   "identity-health-recovery-no-barrier",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie-health-recovery-no-barrier",
+		AuthCookieFingerprint: "fingerprint-health-recovery-no-barrier",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, model.DB.Create(&identity).Error)
+	workspace := seedOpenCodeGoHealthWorkspace(t, channel.Id, identity.ID, "workspace-health-recovery-no-barrier", "glm-5.2")
+	riskAt := time.Unix(1_900_000_100, 0)
+	require.NoError(t, model.DB.Model(&model.OpenCodeGoWorkspace{}).
+		Where("id = ?", workspace.ID).
+		Updates(map[string]interface{}{
+			"effective_state":    model.OpenCodeGoStateRiskBlocked,
+			"risk_detected_at":   riskAt.Unix(),
+			"health_observation": string(OpenCodeGoObservationRiskBlocked),
+			"health_observed_at": riskAt.UnixNano(),
+		}).Error)
+
+	relayRelease := openCodeGoPoolMutations.beginRelay(channel.Id)
+	defer relayRelease()
+	result := make(chan error, 1)
+	go func() {
+		_, applyErr := applyOpenCodeGoClassifiedFailure(
+			channel.Id,
+			workspace.UID,
+			"glm-5.2",
+			OpenCodeGoClassifiedFailure{
+				Scope: OpenCodeGoHealthScopeWorkspace,
+				Observation: OpenCodeGoHealthObservation{
+					Kind:            OpenCodeGoObservationRiskProbeSucceeded,
+					ObservedAt:      riskAt.Add(time.Minute),
+					HasUsableModels: true,
+				},
+			},
+			func(int) error { return nil },
+		)
+		result <- applyErr
+	}()
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("restorative health observation waited on a relay lease")
+	}
 }

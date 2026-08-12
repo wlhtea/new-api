@@ -35,7 +35,7 @@ type openCodeGoRiskProbeClient interface {
 	Probe(ctx context.Context, apiKey string, modelID string) (OpenCodeGoRiskProbeResponse, error)
 }
 
-type openCodeGoRiskProbeFactory func(channelID int) (openCodeGoRiskProbeClient, error)
+type openCodeGoRiskProbeFactory func(channelID int, identityUID string) (openCodeGoRiskProbeClient, error)
 
 type openCodeGoHTTPRiskProbeClient struct {
 	endpoint *url.URL
@@ -98,8 +98,8 @@ func NewConfiguredOpenCodeGoRiskRecheckService() (*OpenCodeGoRiskRecheckService,
 		return nil, err
 	}
 	return &OpenCodeGoRiskRecheckService{
-		probeFactory: func(channelID int) (openCodeGoRiskProbeClient, error) {
-			baseClient, err := getOpenCodeGoChannelHTTPClient(channelID)
+		probeFactory: func(channelID int, identityUID string) (openCodeGoRiskProbeClient, error) {
+			baseClient, err := GetOpenCodeGoIdentityHTTPClient(channelID, identityUID)
 			if err != nil {
 				return nil, err
 			}
@@ -123,7 +123,7 @@ func newOpenCodeGoRiskRecheckService(
 	}
 }
 
-func (service *OpenCodeGoRiskRecheckService) scopedForChannel(channelID int) (*OpenCodeGoRiskRecheckService, error) {
+func (service *OpenCodeGoRiskRecheckService) scopedForIdentity(channelID int, identityUID string) (*OpenCodeGoRiskRecheckService, error) {
 	if service == nil || service.codec == nil {
 		return nil, errors.New("OpenCode Go risk recheck service is not configured")
 	}
@@ -133,7 +133,7 @@ func (service *OpenCodeGoRiskRecheckService) scopedForChannel(channelID int) (*O
 	if service.probeFactory == nil {
 		return nil, errors.New("OpenCode Go risk recheck service is not configured")
 	}
-	probe, err := service.probeFactory(channelID)
+	probe, err := service.probeFactory(channelID, identityUID)
 	if err != nil {
 		return nil, err
 	}
@@ -220,12 +220,7 @@ func (service *OpenCodeGoRiskRecheckService) RecheckWorkspace(
 		WorkspaceUID: strings.TrimSpace(workspaceUID),
 		Status:       "failed",
 	}
-	scoped, err := service.scopedForChannel(channelID)
-	if err != nil {
-		return result, err
-	}
-	service = scoped
-	if service.probe == nil || service.codec == nil || service.now == nil {
+	if service == nil || service.codec == nil || service.now == nil {
 		return result, errors.New("OpenCode Go risk recheck service is not configured")
 	}
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
@@ -244,6 +239,14 @@ func (service *OpenCodeGoRiskRecheckService) RecheckWorkspace(
 	}
 	if identity == nil {
 		return result, gorm.ErrRecordNotFound
+	}
+	scoped, err := service.scopedForIdentity(channelID, identity.UID)
+	if err != nil {
+		return result, err
+	}
+	service = scoped
+	if service.probe == nil {
+		return result, errors.New("OpenCode Go risk recheck service is not configured")
 	}
 	unlock := lockOpenCodeGoIdentityOperation(fmt.Sprintf("%d:identity:%s", channelID, identity.UID))
 	defer unlock()
@@ -342,13 +345,29 @@ func (service *OpenCodeGoRiskRecheckService) RecheckWorkspace(
 	result.ErrorType = probeResponse.Failure.ErrorType
 	result.Error = probeResponse.Failure.Message
 	classified, classifiedOK := ClassifyOpenCodeGoProviderFailure(*probeResponse.Failure, observedAt)
+	restrictive := classifiedOK && isRestrictiveOpenCodeGoHealthObservation(classified.Observation.Kind)
+	releaseMutation := func() {}
+	if restrictive {
+		releaseMutation = BeginOpenCodeGoPoolMutation(channelID)
+	}
+	defer releaseMutation()
+	appliedRestrictive := false
 	if classifiedOK {
 		result.Blocked = classified.Observation.Kind == OpenCodeGoObservationRiskBlocked
-		if _, applyErr := applyOpenCodeGoClassifiedFailure(channelID, workspace.UID, modelID, classified, nil); applyErr != nil {
+		applied, applyErr := applyOpenCodeGoClassifiedFailureWithMutation(
+			channelID,
+			workspace.UID,
+			modelID,
+			classified,
+			nil,
+			restrictive,
+		)
+		if applyErr != nil {
 			return result, applyErr
 		}
+		appliedRestrictive = restrictive && applied
 	}
-	_, applyErr := applyOpenCodeGoClassifiedFailure(
+	appliedProbeFailure, applyErr := applyOpenCodeGoClassifiedFailureWithMutation(
 		channelID,
 		workspace.UID,
 		modelID,
@@ -360,10 +379,19 @@ func (service *OpenCodeGoRiskRecheckService) RecheckWorkspace(
 				Reason:     result.Error,
 			},
 		},
-		service.rebuild,
+		nil,
+		restrictive,
 	)
 	if applyErr != nil {
 		return result, applyErr
+	}
+	if appliedRestrictive {
+		InvalidateOpenCodeGoIdentityProxyChannel(channelID)
+	}
+	if (appliedRestrictive || appliedProbeFailure) && service.rebuild != nil {
+		if rebuildErr := service.rebuild(channelID); rebuildErr != nil {
+			return result, rebuildErr
+		}
 	}
 	if result.Blocked {
 		result.Status = "blocked"
@@ -380,14 +408,18 @@ func (service *OpenCodeGoRiskRecheckService) applyRiskProbeTransportFailure(
 	reason string,
 	observedAt time.Time,
 ) error {
-	_, modelErr := applyOpenCodeGoClassifiedFailure(
+	classified := ClassifyOpenCodeGoTransportFailure(reason, observedAt)
+	releaseMutation := BeginOpenCodeGoPoolMutation(channelID)
+	defer releaseMutation()
+	modelApplied, modelErr := applyOpenCodeGoClassifiedFailureWithMutation(
 		channelID,
 		workspace.UID,
 		modelID,
-		ClassifyOpenCodeGoTransportFailure(reason, observedAt),
+		classified,
 		nil,
+		true,
 	)
-	_, workspaceErr := applyOpenCodeGoClassifiedFailure(
+	workspaceApplied, workspaceErr := applyOpenCodeGoClassifiedFailureWithMutation(
 		channelID,
 		workspace.UID,
 		modelID,
@@ -399,9 +431,20 @@ func (service *OpenCodeGoRiskRecheckService) applyRiskProbeTransportFailure(
 				Reason:     reason,
 			},
 		},
-		service.rebuild,
+		nil,
+		true,
 	)
-	return errors.Join(modelErr, workspaceErr)
+	if err := errors.Join(modelErr, workspaceErr); err != nil {
+		return err
+	}
+	if !modelApplied && !workspaceApplied {
+		return nil
+	}
+	InvalidateOpenCodeGoIdentityProxyChannel(channelID)
+	if service.rebuild == nil {
+		return nil
+	}
+	return service.rebuild(channelID)
 }
 
 func (service *OpenCodeGoRiskRecheckService) RecheckRiskWorkspaces(
@@ -426,11 +469,6 @@ func (service *OpenCodeGoRiskRecheckService) RecheckRiskWorkspaces(
 	if len(targets) == 0 {
 		return summary, nil
 	}
-	scoped, err := service.scopedForChannel(channelID)
-	if err != nil {
-		return summary, err
-	}
-	service = scoped
 	concurrency = normalizeOpenCodeGoRiskRecheckConcurrency(concurrency, len(targets))
 
 	jobs := make(chan openCodeGoIndexedRiskTarget)

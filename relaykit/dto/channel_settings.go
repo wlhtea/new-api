@@ -1,9 +1,11 @@
 package dto
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -87,6 +89,7 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateIgnoredModels      []string              `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
 	AdvancedCustom                        *AdvancedCustomConfig `json:"advanced_custom,omitempty"`
 	OpenCodeGo                            *OpenCodeGoConfig     `json:"opencode_go,omitempty"`
+	unknownFields                         map[string]json.RawMessage
 }
 
 const (
@@ -101,6 +104,10 @@ const (
 	OpenCodeGoGenericFailoverMaxThreshold         = 10
 	OpenCodeGoGenericFailoverMaxWindowSeconds     = 5 * 60
 	OpenCodeGoGenericFailoverMaxLeaseSeconds      = 24 * 60 * 60
+	OpenCodeGoIdentityProxyDefaultCountry         = "US"
+	OpenCodeGoIdentityProxyDefaultRotateMinutes   = 10
+	OpenCodeGoIdentityProxyMinRotateMinutes       = 1
+	OpenCodeGoIdentityProxyMaxRotateMinutes       = 180
 )
 
 type OpenCodeGoConfig struct {
@@ -117,11 +124,143 @@ type OpenCodeGoConfig struct {
 	AutoApplyReferralRewards      *bool             `json:"auto_apply_referral_rewards,omitempty"`
 	ReferralRewardsMaxPerRun      *int              `json:"referral_rewards_max_per_run,omitempty"`
 	AutoCancelSubscriptionRenewal bool              `json:"auto_cancel_subscription_renewal,omitempty"`
+	IdentityProxyEnabled          bool              `json:"identity_proxy_enabled,omitempty"`
+	IdentityProxyCountry          string            `json:"identity_proxy_country,omitempty"`
+	IdentityProxyRotateMinutes    int               `json:"identity_proxy_rotate_minutes,omitempty"`
+	unknownFields                 map[string]json.RawMessage
+	identityProxyRotateMinutesSet bool
+}
+
+func (settings *ChannelOtherSettings) UnmarshalJSON(data []byte) error {
+	type alias ChannelOtherSettings
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	unknown, err := unknownJSONFields(data, reflect.TypeOf(decoded))
+	if err != nil {
+		return err
+	}
+	*settings = ChannelOtherSettings(decoded)
+	settings.unknownFields = unknown
+	return nil
+}
+
+func (settings ChannelOtherSettings) MarshalJSON() ([]byte, error) {
+	type alias ChannelOtherSettings
+	return marshalWithUnknownJSONFields(alias(settings), settings.unknownFields, nil)
+}
+
+func (config *OpenCodeGoConfig) UnmarshalJSON(data []byte) error {
+	type alias OpenCodeGoConfig
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	unknown, err := unknownJSONFields(data, reflect.TypeOf(decoded))
+	if err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	_, rotateMinutesSet := raw["identity_proxy_rotate_minutes"]
+	*config = OpenCodeGoConfig(decoded)
+	config.unknownFields = unknown
+	config.identityProxyRotateMinutesSet = rotateMinutesSet
+	return nil
+}
+
+func (config OpenCodeGoConfig) MarshalJSON() ([]byte, error) {
+	type alias OpenCodeGoConfig
+	force := map[string]json.RawMessage(nil)
+	if config.identityProxyRotateMinutesSet {
+		encoded, err := json.Marshal(config.IdentityProxyRotateMinutes)
+		if err != nil {
+			return nil, err
+		}
+		force = map[string]json.RawMessage{"identity_proxy_rotate_minutes": encoded}
+	}
+	return marshalWithUnknownJSONFields(alias(config), config.unknownFields, force)
+}
+
+func unknownJSONFields(data []byte, knownType reflect.Type) (map[string]json.RawMessage, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	for field := range GetJSONFieldNames(knownType) {
+		delete(raw, field)
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	return raw, nil
+}
+
+func marshalWithUnknownJSONFields(value any, unknown map[string]json.RawMessage, force map[string]json.RawMessage) ([]byte, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &merged); err != nil {
+		return nil, err
+	}
+	for key, raw := range unknown {
+		if _, known := merged[key]; !known {
+			merged[key] = raw
+		}
+	}
+	for key, raw := range force {
+		merged[key] = raw
+	}
+	return json.Marshal(merged)
+}
+
+func (c *OpenCodeGoConfig) IdentityProxyRotateMinutesWasSet() bool {
+	return c != nil && c.identityProxyRotateMinutesSet
+}
+
+// NormalizeIdentityProxy fills enabled-policy defaults and canonicalizes the
+// country code. It returns whether any persisted value changed.
+func (c *OpenCodeGoConfig) NormalizeIdentityProxy() bool {
+	if c == nil {
+		return false
+	}
+	originalCountry := c.IdentityProxyCountry
+	originalMinutes := c.IdentityProxyRotateMinutes
+	if c.IdentityProxyCountry != "" || c.IdentityProxyEnabled {
+		c.IdentityProxyCountry = normalizeIdentityProxyCountry(c.IdentityProxyCountry)
+	}
+	if c.IdentityProxyEnabled && c.IdentityProxyCountry == "" {
+		c.IdentityProxyCountry = OpenCodeGoIdentityProxyDefaultCountry
+	}
+	if c.IdentityProxyEnabled && c.IdentityProxyRotateMinutes == 0 && !c.identityProxyRotateMinutesSet {
+		c.IdentityProxyRotateMinutes = OpenCodeGoIdentityProxyDefaultRotateMinutes
+	}
+	return c.IdentityProxyCountry != originalCountry || c.IdentityProxyRotateMinutes != originalMinutes
 }
 
 func (c *OpenCodeGoConfig) Validate() error {
 	if c == nil {
 		return nil
+	}
+	normalized := *c
+	normalized.NormalizeIdentityProxy()
+	if normalized.IdentityProxyEnabled {
+		if !isASCIIAlphaCountry(normalized.IdentityProxyCountry) {
+			return fmt.Errorf("OpenCode Go identity_proxy_country must contain exactly two ASCII letters")
+		}
+		if normalized.IdentityProxyRotateMinutes < OpenCodeGoIdentityProxyMinRotateMinutes ||
+			normalized.IdentityProxyRotateMinutes > OpenCodeGoIdentityProxyMaxRotateMinutes {
+			return fmt.Errorf(
+				"OpenCode Go identity_proxy_rotate_minutes must be between %d and %d",
+				OpenCodeGoIdentityProxyMinRotateMinutes,
+				OpenCodeGoIdentityProxyMaxRotateMinutes,
+			)
+		}
 	}
 	if c.DefaultProtocol != "" {
 		if err := validateOpenCodeGoProtocol(c.DefaultProtocol); err != nil {
@@ -188,6 +327,36 @@ func (c *OpenCodeGoConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+func isASCIIAlphaCountry(country string) bool {
+	if len(country) != 2 {
+		return false
+	}
+	for _, char := range country {
+		if char < 'A' || char > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeIdentityProxyCountry(country string) string {
+	country = strings.TrimSpace(country)
+	if len(country) != 2 {
+		return country
+	}
+	bytes := []byte(country)
+	for index, char := range bytes {
+		switch {
+		case char >= 'A' && char <= 'Z':
+		case char >= 'a' && char <= 'z':
+			bytes[index] = char - ('a' - 'A')
+		default:
+			return country
+		}
+	}
+	return string(bytes)
 }
 
 func validateOpenCodeGoProtocol(protocol string) error {

@@ -39,16 +39,16 @@ type OpenCodeGoConsoleClient struct {
 	now           func() time.Time
 }
 
-func NewOpenCodeGoConsoleClient() *OpenCodeGoConsoleClient {
-	client, err := newOpenCodeGoConsoleClient(openCodeGoConsoleOrigin, openCodeGoInferenceOrigin, GetHttpClient())
-	if err != nil {
-		panic(err)
-	}
-	return client
-}
-
 func newOpenCodeGoChannelConsoleClient(channelID int) (*OpenCodeGoConsoleClient, error) {
 	baseClient, err := getOpenCodeGoChannelHTTPClient(channelID)
+	if err != nil {
+		return nil, err
+	}
+	return newOpenCodeGoConsoleClient(openCodeGoConsoleOrigin, openCodeGoInferenceOrigin, baseClient)
+}
+
+func newOpenCodeGoIdentityConsoleClient(channelID int, identityUID string) (*OpenCodeGoConsoleClient, error) {
+	baseClient, err := GetOpenCodeGoIdentityHTTPClient(channelID, identityUID)
 	if err != nil {
 		return nil, err
 	}

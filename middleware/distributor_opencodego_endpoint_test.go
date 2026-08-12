@@ -173,6 +173,47 @@ func TestDistributorAllowsSupportedSpecificOpenCodeGoChannel(t *testing.T) {
 	assert.True(t, nextCalled)
 }
 
+func TestDistributorFailsClosedWithoutOverwritingMalformedOpenCodeGoSettings(t *testing.T) {
+	fixture := setupDistributorEndpointGuardTest(t)
+	const malformedSettings = `{"opencode_go":{"identity_proxy_enabled":true}`
+	require.NoError(t, model.DB.Model(&model.Channel{}).
+		Where("id = ?", fixture.openCodeGoID).
+		Update("settings", malformedSettings).Error)
+	model.InitChannelCache()
+
+	status, selectedChannelID, nextCalled := runDistributorEndpointRequest(t, "/v1/messages", fixture.modelName, func(c *gin.Context) {
+		common.SetContextKey(c, constant.ContextKeyTokenSpecificChannelId, fmt.Sprintf("%d", fixture.openCodeGoID))
+	})
+
+	assert.Equal(t, http.StatusTooManyRequests, status)
+	assert.Zero(t, selectedChannelID)
+	assert.False(t, nextCalled)
+	persisted, err := model.GetChannelById(fixture.openCodeGoID, true)
+	require.NoError(t, err)
+	assert.Equal(t, malformedSettings, persisted.OtherSettings)
+}
+
+func TestDistributorFailsClosedWithoutOverwritingMalformedOpenCodeGoTransportSettings(t *testing.T) {
+	fixture := setupDistributorEndpointGuardTest(t)
+	const malformedSettings = `{"proxy":"http://proxy.example:8080"`
+	require.NoError(t, model.DB.Model(&model.Channel{}).
+		Where("id = ?", fixture.openCodeGoID).
+		Update("setting", malformedSettings).Error)
+	model.InitChannelCache()
+
+	status, selectedChannelID, nextCalled := runDistributorEndpointRequest(t, "/v1/messages", fixture.modelName, func(c *gin.Context) {
+		common.SetContextKey(c, constant.ContextKeyTokenSpecificChannelId, fmt.Sprintf("%d", fixture.openCodeGoID))
+	})
+
+	assert.Equal(t, http.StatusTooManyRequests, status)
+	assert.Zero(t, selectedChannelID)
+	assert.False(t, nextCalled)
+	persisted, err := model.GetChannelById(fixture.openCodeGoID, true)
+	require.NoError(t, err)
+	require.NotNil(t, persisted.Setting)
+	assert.Equal(t, malformedSettings, *persisted.Setting)
+}
+
 func TestDistributorSkipsUnsupportedOpenCodeGoAffinityHit(t *testing.T) {
 	fixture := setupDistributorEndpointGuardTest(t)
 

@@ -178,7 +178,6 @@ export const openCodeGoRefreshSummarySchema = z.object({
   results: z.array(
     z.object({
       channel_id: z.number().int().positive(),
-      identity_uid: z.string().min(1),
       status: z.string(),
       error: z.string().optional(),
     })

@@ -330,8 +330,7 @@ func UpdateOpenCodeGoIdentity(c *gin.Context) {
 		return
 	}
 	recordManageAudit(c, "channel.opencode_go_identity_update", map[string]interface{}{
-		"id":           channelID,
-		"identity_uid": identityUID,
+		"id": channelID,
 	})
 	writeOpenCodeGoPoolView(c, channelID)
 }
@@ -352,9 +351,8 @@ func SetOpenCodeGoIdentityEnabled(c *gin.Context) {
 		return
 	}
 	recordManageAudit(c, "channel.opencode_go_identity_status", map[string]interface{}{
-		"id":           channelID,
-		"identity_uid": identityUID,
-		"enabled":      *request.Enabled,
+		"id":      channelID,
+		"enabled": *request.Enabled,
 	})
 	writeOpenCodeGoPoolView(c, channelID)
 }
@@ -379,8 +377,7 @@ func ReplaceOpenCodeGoIdentityCookie(c *gin.Context) {
 		return
 	}
 	recordManageAudit(c, "channel.opencode_go_cookie_replace", map[string]interface{}{
-		"id":           channelID,
-		"identity_uid": identityUID,
+		"id": channelID,
 	})
 	writeOpenCodeGoPoolView(c, channelID)
 }
@@ -400,8 +397,7 @@ func RefreshOpenCodeGoIdentity(c *gin.Context) {
 		return
 	}
 	recordManageAudit(c, "channel.opencode_go_identity_refresh", map[string]interface{}{
-		"id":           channelID,
-		"identity_uid": identityUID,
+		"id": channelID,
 	})
 	writeOpenCodeGoPoolView(c, channelID)
 }
@@ -417,8 +413,7 @@ func DeleteOpenCodeGoIdentity(c *gin.Context) {
 		return
 	}
 	recordManageAudit(c, "channel.opencode_go_identity_delete", map[string]interface{}{
-		"id":           channelID,
-		"identity_uid": identityUID,
+		"id": channelID,
 	})
 	writeOpenCodeGoPoolView(c, channelID)
 }

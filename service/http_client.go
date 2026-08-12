@@ -428,6 +428,7 @@ func InvalidateProxyClient(rawProxyURL string) {
 // re-registered in the policy cache so concurrent GetHttpClient readers never race
 // a pointer replacement.
 func ResetProxyClientCache() {
+	ResetOpenCodeGoIdentityProxyClientCache()
 	defaultClient := httpClient
 	for _, client := range proxyClients.reset() {
 		client.CloseIdleConnections()

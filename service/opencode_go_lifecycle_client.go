@@ -47,15 +47,6 @@ type OpenCodeGoLifecycleClient struct {
 	billingClient *http.Client
 }
 
-func NewOpenCodeGoLifecycleClient() *OpenCodeGoLifecycleClient {
-	console := NewOpenCodeGoConsoleClient()
-	client, err := newOpenCodeGoLifecycleClient(console, "https://billing.stripe.com", GetHttpClient())
-	if err != nil {
-		panic(err)
-	}
-	return client
-}
-
 func newOpenCodeGoLifecycleClient(
 	console *OpenCodeGoConsoleClient,
 	billingOrigin string,

@@ -307,6 +307,9 @@ const SENSITIVE_FORM_FIELDS = [
   'upstream_model_update_check_enabled',
   'upstream_model_update_auto_sync_enabled',
   'upstream_model_update_ignored_models',
+  'opencode_go_identity_proxy_enabled',
+  'opencode_go_identity_proxy_country',
+  'opencode_go_identity_proxy_rotate_minutes',
 ] satisfies (keyof ChannelFormValues)[]
 
 function readAdvancedSettingsPreference(): boolean {
@@ -776,7 +779,9 @@ export function ChannelMutateDrawer({
   )
   const shouldPreviewUnsavedModels =
     !isEditing ||
-    (currentType === CHANNEL_TYPE_ADVANCED_CUSTOM && canEditSensitive)
+    ((currentType === CHANNEL_TYPE_ADVANCED_CUSTOM ||
+      currentType === CHANNEL_TYPE_OPENCODE_GO) &&
+      canEditSensitive)
   const {
     unlocked: doubaoApiEditUnlocked,
     handleClick: handleApiConfigSecretClick,
@@ -975,7 +980,10 @@ export function ChannelMutateDrawer({
     formErrors.key_mode ||
     formErrors.vertex_key_type ||
     formErrors.aws_key_type ||
-    formErrors.azure_responses_version
+    formErrors.azure_responses_version ||
+    formErrors.opencode_go_identity_proxy_enabled ||
+    formErrors.opencode_go_identity_proxy_country ||
+    formErrors.opencode_go_identity_proxy_rotate_minutes
   )
   const modelsHaveErrors = Boolean(
     formErrors.models || formErrors.group || formErrors.model_mapping
@@ -1489,8 +1497,13 @@ export function ChannelMutateDrawer({
       return
     }
 
-    // Advanced Custom may use a model discovery route with no authentication.
-    if (!isEditing && type !== CHANNEL_TYPE_ADVANCED_CUSTOM) {
+    // Advanced Custom may use an unauthenticated discovery route, while
+    // OpenCode Go discovery is backed by its saved account pool.
+    if (
+      !isEditing &&
+      type !== CHANNEL_TYPE_ADVANCED_CUSTOM &&
+      type !== CHANNEL_TYPE_OPENCODE_GO
+    ) {
       const key = form.getValues('key')
       if (!key?.trim()) {
         toast.error(t('Please enter API key first'))
@@ -1506,15 +1519,17 @@ export function ChannelMutateDrawer({
       throw new Error(t("You don't have necessary permission"))
     }
     const type = form.getValues('type')
-    const editingAdvancedCustom =
-      isEditing && type === CHANNEL_TYPE_ADVANCED_CUSTOM
-    if (editingAdvancedCustom && channelId === null) {
+    const editingFormPreview =
+      isEditing &&
+      (type === CHANNEL_TYPE_ADVANCED_CUSTOM ||
+        type === CHANNEL_TYPE_OPENCODE_GO)
+    if (editingFormPreview && channelId === null) {
       throw new Error(t('No channel selected'))
     }
     const response = await fetchModels({
       type,
       key: isEditing ? undefined : form.getValues('key'),
-      channel_id: editingAdvancedCustom ? channelId || undefined : undefined,
+      channel_id: editingFormPreview ? channelId || undefined : undefined,
       base_url: form.getValues('base_url') || '',
       advanced_custom: form.getValues('advanced_custom'),
       header_override: form.getValues('header_override'),
@@ -3333,9 +3348,7 @@ export function ChannelMutateDrawer({
                                 <FormItem className='space-y-3'>
                                   <div className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
                                     <div className='space-y-1'>
-                                      <FormLabel>
-                                        {t('Models *')}
-                                      </FormLabel>
+                                      <FormLabel>{t('Models *')}</FormLabel>
                                       <FormDescription>
                                         {currentType ===
                                         CHANNEL_TYPE_OPENCODE_GO
@@ -3404,8 +3417,26 @@ export function ChannelMutateDrawer({
                               )}
                             />
 
-                            {currentType !== CHANNEL_TYPE_OPENCODE_GO && (
+                            {MODEL_FETCHABLE_TYPES.has(currentType) && (
                               <Separator className='my-4' />
+                            )}
+
+                            {currentType === CHANNEL_TYPE_OPENCODE_GO && (
+                              <div className='flex flex-wrap gap-2'>
+                                <Button
+                                  type='button'
+                                  variant='outline'
+                                  size='sm'
+                                  onClick={handleFetchModels}
+                                  disabled={!isEditing || !canEditSensitive}
+                                >
+                                  <Sparkles
+                                    className='mr-2 h-4 w-4'
+                                    aria-hidden='true'
+                                  />
+                                  {t('Fetch from Upstream')}
+                                </Button>
+                              </div>
                             )}
 
                             {currentType !== CHANNEL_TYPE_OPENCODE_GO && (

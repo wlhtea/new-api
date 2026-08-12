@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -187,6 +188,245 @@ func TestOpenCodeGoChannelHTTPClientRejectsOtherChannelTypes(t *testing.T) {
 
 	_, err := getOpenCodeGoChannelHTTPClient(channel.Id)
 	require.EqualError(t, err, "channel is not an OpenCode Go channel")
+}
+
+func createOpenCodeGoRelayFenceFixture(
+	t *testing.T,
+) (*model.Channel, *OpenCodeGoCredentialCodec, model.OpenCodeGoIdentity, model.OpenCodeGoWorkspace, string, OpenCodeGoIdentityProxyGeneration) {
+	t.Helper()
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	now := time.Now().Unix()
+	identityUID := "identity-relay-fence"
+	workspaceUID := "workspace-relay-fence"
+	apiKey := "api-key-relay-fence"
+	cookieCiphertext, err := codec.Encrypt(OpenCodeGoCredentialAuthCookie, channel.Id, identityUID, "cookie-relay-fence")
+	require.NoError(t, err)
+	identity := model.OpenCodeGoIdentity{
+		UID:                   identityUID,
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  cookieCiphertext,
+		AuthCookieFingerprint: fmt.Sprintf("%064s", "relay-fence-cookie"),
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, db.Create(&identity).Error)
+	apiKeyCiphertext, err := codec.Encrypt(OpenCodeGoCredentialAPIKey, channel.Id, workspaceUID, apiKey)
+	require.NoError(t, err)
+	workspace := model.OpenCodeGoWorkspace{
+		UID:                 workspaceUID,
+		ChannelID:           channel.Id,
+		IdentityID:          identity.ID,
+		UpstreamWorkspaceID: "upstream-relay-fence",
+		APIKeyCiphertext:    apiKeyCiphertext,
+		APIKeyFingerprint:   fmt.Sprintf("%064s", "relay-fence-key"),
+		CredentialStatus:    model.OpenCodeGoCredentialValid,
+		MembershipStatus:    model.OpenCodeGoMembershipActive,
+		ManualEnabled:       true,
+		EffectiveState:      model.OpenCodeGoStateEligible,
+		QuotaSnapshotStatus: model.OpenCodeGoQuotaSnapshotComplete,
+		QuotaFetchedAt:      now,
+		QuotaNextRefreshAt:  now + 3600,
+		QuotaParserVersion:  OpenCodeGoSSRParserVersion,
+	}
+	require.NoError(t, db.Create(&workspace).Error)
+	for index, kind := range model.OpenCodeGoQuotaKinds {
+		require.NoError(t, db.Create(&model.OpenCodeGoQuotaWindow{
+			WorkspaceID:  workspace.ID,
+			Kind:         kind,
+			UsedPercent:  float64(10 + index),
+			ResetSeconds: int64((index + 1) * 3600),
+			ResetAt:      now + int64((index+1)*3600),
+			FetchedAt:    now,
+		}).Error)
+	}
+	require.NoError(t, db.Create(&model.OpenCodeGoWorkspaceModel{
+		WorkspaceID: workspace.ID,
+		Model:       "model-a",
+		Discovered:  true,
+		State:       model.OpenCodeGoModelAvailable,
+	}).Error)
+	return channel, codec, identity, workspace, apiKey, openCodeGoIdentityProxyClients.captureGeneration(channel.Id)
+}
+
+func TestAcquireOpenCodeGoRelayHTTPClientAcceptsCurrentDirectSelection(t *testing.T) {
+	channel, _, identity, workspace, apiKey, generation := createOpenCodeGoRelayFenceFixture(t)
+	client, release, err := AcquireOpenCodeGoRelayHTTPClient(
+		channel.Id,
+		identity.UID,
+		workspace.UID,
+		apiKey,
+		"model-a",
+		generation,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	require.NotNil(t, release)
+	release()
+	release()
+}
+
+func TestAcquireOpenCodeGoRelayHTTPClientRejectsDeletedOrDisabledOwnership(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*testing.T, int, model.OpenCodeGoIdentity, model.OpenCodeGoWorkspace)
+	}{
+		{
+			name: "disabled identity",
+			mutate: func(t *testing.T, channelID int, identity model.OpenCodeGoIdentity, _ model.OpenCodeGoWorkspace) {
+				require.NoError(t, model.DB.Model(&model.OpenCodeGoIdentity{}).
+					Where("id = ? AND channel_id = ?", identity.ID, channelID).
+					Update("status", model.OpenCodeGoIdentityStatusManualDisabled).Error)
+			},
+		},
+		{
+			name: "deleted identity",
+			mutate: func(t *testing.T, channelID int, identity model.OpenCodeGoIdentity, _ model.OpenCodeGoWorkspace) {
+				require.NoError(t, model.DeleteOpenCodeGoIdentity(channelID, identity.UID))
+			},
+		},
+		{
+			name: "disabled workspace",
+			mutate: func(t *testing.T, channelID int, _ model.OpenCodeGoIdentity, workspace model.OpenCodeGoWorkspace) {
+				require.NoError(t, model.DB.Model(&model.OpenCodeGoWorkspace{}).
+					Where("id = ? AND channel_id = ?", workspace.ID, channelID).
+					Update("manual_enabled", false).Error)
+			},
+		},
+		{
+			name: "deleted workspace",
+			mutate: func(t *testing.T, channelID int, _ model.OpenCodeGoIdentity, workspace model.OpenCodeGoWorkspace) {
+				require.NoError(t, model.DeleteOpenCodeGoWorkspace(channelID, workspace.UID))
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			channel, _, identity, workspace, apiKey, generation := createOpenCodeGoRelayFenceFixture(t)
+			testCase.mutate(t, channel.Id, identity, workspace)
+
+			client, release, err := AcquireOpenCodeGoRelayHTTPClient(
+				channel.Id,
+				identity.UID,
+				workspace.UID,
+				apiKey,
+				"model-a",
+				generation,
+			)
+			require.ErrorIs(t, err, ErrOpenCodeGoIdentityProxySelectionStale)
+			assert.Nil(t, client)
+			assert.Nil(t, release)
+			assert.NotContains(t, err.Error(), identity.UID)
+			assert.NotContains(t, err.Error(), apiKey)
+		})
+	}
+}
+
+func TestAcquireOpenCodeGoRelayHTTPClientRejectsDisabledOrDeletedChannel(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*testing.T, *model.Channel)
+	}{
+		{
+			name: "disabled channel",
+			mutate: func(t *testing.T, channel *model.Channel) {
+				require.NoError(t, model.DB.Model(&model.Channel{}).
+					Where("id = ?", channel.Id).
+					Update("status", common.ChannelStatusManuallyDisabled).Error)
+			},
+		},
+		{
+			name: "deleted channel",
+			mutate: func(t *testing.T, channel *model.Channel) {
+				require.NoError(t, channel.Delete())
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			channel, _, identity, workspace, apiKey, generation := createOpenCodeGoRelayFenceFixture(t)
+			testCase.mutate(t, channel)
+			client, release, err := AcquireOpenCodeGoRelayHTTPClient(
+				channel.Id,
+				identity.UID,
+				workspace.UID,
+				apiKey,
+				"model-a",
+				generation,
+			)
+			require.ErrorIs(t, err, ErrOpenCodeGoIdentityProxySelectionStale)
+			assert.Nil(t, client)
+			assert.Nil(t, release)
+			assert.NotContains(t, err.Error(), identity.UID)
+			assert.NotContains(t, err.Error(), apiKey)
+		})
+	}
+}
+
+func TestAcquireOpenCodeGoRelayHTTPClientRejectsChangedAPIKey(t *testing.T) {
+	channel, codec, identity, workspace, oldAPIKey, generation := createOpenCodeGoRelayFenceFixture(t)
+	newCiphertext, err := codec.Encrypt(OpenCodeGoCredentialAPIKey, channel.Id, workspace.UID, "api-key-replaced")
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.OpenCodeGoWorkspace{}).
+		Where("id = ?", workspace.ID).
+		Update("api_key_ciphertext", newCiphertext).Error)
+
+	client, release, err := AcquireOpenCodeGoRelayHTTPClient(
+		channel.Id,
+		identity.UID,
+		workspace.UID,
+		oldAPIKey,
+		"model-a",
+		generation,
+	)
+	require.ErrorIs(t, err, ErrOpenCodeGoIdentityProxySelectionStale)
+	assert.Nil(t, client)
+	assert.Nil(t, release)
+	assert.NotContains(t, err.Error(), oldAPIKey)
+	assert.NotContains(t, err.Error(), identity.UID)
+}
+
+func TestAcquireOpenCodeGoRelayHTTPClientLoadsCurrentChannelProxyPolicy(t *testing.T) {
+	channel, _, identity, workspace, apiKey, generation := createOpenCodeGoRelayFenceFixture(t)
+	previousCache := openCodeGoIdentityProxyClients
+	openCodeGoIdentityProxyClients = newOpenCodeGoIdentityProxyClientCache(4, time.Hour)
+	t.Cleanup(func() {
+		openCodeGoIdentityProxyClients.reset()
+		openCodeGoIdentityProxyClients = previousCache
+	})
+	generation = openCodeGoIdentityProxyClients.captureGeneration(channel.Id)
+	proxyTemplate := "http://current_zone_US_sid_1_time_10:current-password@current-proxy.invalid:18080"
+	setOpenCodeGoChannelHTTPSettings(t, channel.Id, dto.ChannelSettings{Proxy: proxyTemplate})
+	otherSettings := dto.ChannelOtherSettings{OpenCodeGo: &dto.OpenCodeGoConfig{
+		IdentityProxyEnabled:       true,
+		IdentityProxyCountry:       "CA",
+		IdentityProxyRotateMinutes: 10,
+	}}
+	encodedOtherSettings, err := common.Marshal(otherSettings)
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.Channel{}).
+		Where("id = ?", channel.Id).
+		Update("settings", string(encodedOtherSettings)).Error)
+
+	client, release, err := AcquireOpenCodeGoRelayHTTPClient(
+		channel.Id,
+		identity.UID,
+		workspace.UID,
+		apiKey,
+		"model-a",
+		generation,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, release)
+	defer release()
+	request, err := http.NewRequest(http.MethodGet, "http://upstream.invalid", nil)
+	require.NoError(t, err)
+	wrapper, ok := client.Transport.(*openCodeGoChannelRoundTripper)
+	require.True(t, ok)
+	transport, ok := wrapper.base.(*http.Transport)
+	require.True(t, ok)
+	derivedProxy, err := transport.Proxy(request)
+	require.NoError(t, err)
+	require.NotNil(t, derivedProxy)
+	assert.Equal(t, "current-proxy.invalid:18080", derivedProxy.Host)
+	assert.Contains(t, derivedProxy.User.Username(), "zone_CA")
+	assert.NotEqual(t, "current_zone_US_sid_1_time_10", derivedProxy.User.Username())
 }
 
 func TestOpenCodeGoChannelLifecycleRuntimeSharesOneTransport(t *testing.T) {

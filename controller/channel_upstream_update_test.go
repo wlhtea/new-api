@@ -187,6 +187,140 @@ func TestFetchOrdinaryOpenAIModelsKeepsExistingEmptyDataBehavior(t *testing.T) {
 	require.Empty(t, models)
 }
 
+func TestFetchOpenCodeGoModelsUsesSavedDiscoveredInventoryWithoutUpstream(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.OpenCodeGoIdentity{},
+		&model.OpenCodeGoWorkspace{},
+		&model.OpenCodeGoQuotaWindow{},
+		&model.OpenCodeGoWorkspaceModel{},
+	))
+
+	invalidBaseURL := "://identity-less-upstream-must-not-be-used"
+	channel := &model.Channel{
+		Type:    constant.ChannelTypeOpenCodeGo,
+		Name:    "saved OpenCode Go model inventory",
+		Status:  common.ChannelStatusEnabled,
+		Models:  "admin-only-model,temporarily-blocked-model",
+		Group:   "default",
+		BaseURL: &invalidBaseURL,
+	}
+	require.NoError(t, db.Create(channel).Error)
+	identity := &model.OpenCodeGoIdentity{
+		UID:                   "identity-model-inventory",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie-model-inventory",
+		AuthCookieFingerprint: "model-inventory-fingerprint",
+		Status:                model.OpenCodeGoIdentityStatusManualDisabled,
+	}
+	require.NoError(t, db.Create(identity).Error)
+	workspace := &model.OpenCodeGoWorkspace{
+		UID:                 "workspace-model-inventory",
+		ChannelID:           channel.Id,
+		IdentityID:          identity.ID,
+		UpstreamWorkspaceID: "wrk_MODELINVENTORY1",
+		ManualEnabled:       false,
+		EffectiveState:      model.OpenCodeGoStateRiskBlocked,
+	}
+	require.NoError(t, db.Create(workspace).Error)
+	require.NoError(t, db.Create([]model.OpenCodeGoWorkspaceModel{
+		{WorkspaceID: workspace.ID, Model: "discovered-model", Discovered: true, State: model.OpenCodeGoModelAvailable},
+		{WorkspaceID: workspace.ID, Model: "temporarily-blocked-model", Discovered: true, State: model.OpenCodeGoModelRPMCooldown},
+		{WorkspaceID: workspace.ID, Model: "removed-upstream-model", Discovered: false, State: model.OpenCodeGoModelDisabled},
+	}).Error)
+
+	models, err := fetchChannelUpstreamModelIDs(channel)
+	require.NoError(t, err)
+	require.Equal(t, []string{"discovered-model", "temporarily-blocked-model"}, models)
+
+	pendingAdd, pendingRemove, err := collectPendingUpstreamModelChanges(channel, dto.ChannelOtherSettings{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"discovered-model"}, pendingAdd)
+	require.Equal(t, []string{"admin-only-model"}, pendingRemove)
+}
+
+func TestFetchModelsOpenCodeGoSavedAndUnsavedUseAccountPoolRules(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.OpenCodeGoIdentity{},
+		&model.OpenCodeGoWorkspace{},
+		&model.OpenCodeGoQuotaWindow{},
+		&model.OpenCodeGoWorkspaceModel{},
+	))
+	invalidBaseURL := "://identity-less-upstream-must-not-be-used"
+	channel := &model.Channel{
+		Type:    constant.ChannelTypeOpenCodeGo,
+		Name:    "saved OpenCode Go preview",
+		Status:  common.ChannelStatusEnabled,
+		Models:  "administrator-model",
+		Group:   "default",
+		BaseURL: &invalidBaseURL,
+	}
+	require.NoError(t, db.Create(channel).Error)
+	identity := &model.OpenCodeGoIdentity{
+		UID:                   "identity-saved-preview",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie-saved-preview",
+		AuthCookieFingerprint: "saved-preview-fingerprint",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, db.Create(identity).Error)
+	workspace := &model.OpenCodeGoWorkspace{
+		UID:                 "workspace-saved-preview",
+		ChannelID:           channel.Id,
+		IdentityID:          identity.ID,
+		UpstreamWorkspaceID: "wrk_SAVEDPREVIEW1",
+	}
+	require.NoError(t, db.Create(workspace).Error)
+	require.NoError(t, db.Create(&model.OpenCodeGoWorkspaceModel{
+		WorkspaceID: workspace.ID,
+		Model:       "pool-discovered-model",
+		Discovered:  true,
+	}).Error)
+
+	tests := []struct {
+		name        string
+		request     fetchModelsRequest
+		wantSuccess bool
+		wantModels  []string
+		wantMessage string
+	}{
+		{
+			name:        "saved channel returns pool inventory",
+			request:     fetchModelsRequest{ChannelID: channel.Id, Type: constant.ChannelTypeOpenCodeGo, BaseURL: &invalidBaseURL},
+			wantSuccess: true,
+			wantModels:  []string{"pool-discovered-model"},
+		},
+		{
+			name:        "unsaved preview is rejected",
+			request:     fetchModelsRequest{Type: constant.ChannelTypeOpenCodeGo, BaseURL: &invalidBaseURL},
+			wantMessage: "account-pool managed",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body, err := common.Marshal(test.request)
+			require.NoError(t, err)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/fetch_models", bytes.NewReader(body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+
+			FetchModels(ctx)
+
+			var response struct {
+				Success bool     `json:"success"`
+				Message string   `json:"message"`
+				Data    []string `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			require.Equal(t, test.wantSuccess, response.Success)
+			require.Equal(t, test.wantModels, response.Data)
+			require.Contains(t, response.Message, test.wantMessage)
+		})
+	}
+}
+
 func TestFetchModelsAdvancedCustomCreatePreview(t *testing.T) {
 	receivedAuthorization := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -349,6 +483,72 @@ func TestFailedAdvancedCustomDetectionDoesNotStageFullRemoval(t *testing.T) {
 	require.Empty(t, persistedSettings.UpstreamModelUpdateLastDetectedModels)
 	require.Empty(t, persistedSettings.UpstreamModelUpdateLastRemovedModels)
 	require.Equal(t, "gpt-4.1,o3", reloaded.Models)
+}
+
+func TestUpdateChannelUpstreamModelSettingsMergesOwnedFieldsIntoCurrentSettings(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	oldLifecycleValue := false
+	staleSettings := dto.ChannelOtherSettings{
+		DisableTaskPollingSleep: false,
+		OpenCodeGo: &dto.OpenCodeGoConfig{
+			AutoEnableChinaModels:      &oldLifecycleValue,
+			IdentityProxyEnabled:       false,
+			IdentityProxyCountry:       "GB",
+			IdentityProxyRotateMinutes: 20,
+		},
+		UpstreamModelUpdateLastCheckTime:      1,
+		UpstreamModelUpdateLastDetectedModels: []string{"stale-add"},
+	}
+	channel := &model.Channel{
+		Type:   constant.ChannelTypeOpenCodeGo,
+		Name:   "upstream settings merge",
+		Status: common.ChannelStatusEnabled,
+		Models: "old-model",
+		Group:  "default",
+	}
+	channel.SetOtherSettings(staleSettings)
+	require.NoError(t, db.Create(channel).Error)
+
+	newLifecycleValue := true
+	currentSettings := staleSettings
+	currentSettings.DisableTaskPollingSleep = true
+	currentSettings.OpenCodeGo = &dto.OpenCodeGoConfig{
+		AutoEnableChinaModels:      &newLifecycleValue,
+		IdentityProxyEnabled:       true,
+		IdentityProxyCountry:       "US",
+		IdentityProxyRotateMinutes: 10,
+	}
+	encodedCurrent, err := common.Marshal(currentSettings)
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).
+		Update("settings", string(encodedCurrent)).Error)
+
+	ownedUpdate := staleSettings
+	ownedUpdate.UpstreamModelUpdateLastCheckTime = 42
+	ownedUpdate.UpstreamModelUpdateLastDetectedModels = []string{"new-add"}
+	ownedUpdate.UpstreamModelUpdateLastRemovedModels = []string{"new-remove"}
+	ownedUpdate.UpstreamModelUpdateIgnoredModels = []string{"ignored"}
+	channel.Models = "new-model"
+
+	require.NoError(t, updateChannelUpstreamModelSettings(channel, ownedUpdate, true))
+
+	reloaded, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	persisted := reloaded.GetOtherSettings()
+	assert.True(t, persisted.DisableTaskPollingSleep)
+	require.NotNil(t, persisted.OpenCodeGo)
+	require.NotNil(t, persisted.OpenCodeGo.AutoEnableChinaModels)
+	assert.True(t, *persisted.OpenCodeGo.AutoEnableChinaModels)
+	assert.True(t, persisted.OpenCodeGo.IdentityProxyEnabled)
+	assert.Equal(t, "US", persisted.OpenCodeGo.IdentityProxyCountry)
+	assert.Equal(t, 10, persisted.OpenCodeGo.IdentityProxyRotateMinutes)
+	assert.Equal(t, int64(42), persisted.UpstreamModelUpdateLastCheckTime)
+	assert.Equal(t, []string{"new-add"}, persisted.UpstreamModelUpdateLastDetectedModels)
+	assert.Equal(t, []string{"new-remove"}, persisted.UpstreamModelUpdateLastRemovedModels)
+	assert.Equal(t, []string{"ignored"}, persisted.UpstreamModelUpdateIgnoredModels)
+	assert.Equal(t, "new-model", reloaded.Models)
+	assert.Equal(t, reloaded.OtherSettings, channel.OtherSettings)
 }
 
 func TestFetchModelsUsesSharedChannelFetchBehavior(t *testing.T) {

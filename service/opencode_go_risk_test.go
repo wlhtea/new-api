@@ -199,7 +199,7 @@ func TestOpenCodeGoRiskBatchSerializesWorkspacesSharingIdentity(t *testing.T) {
 	assert.Equal(t, 1, fake.maxActive)
 }
 
-func TestOpenCodeGoRiskBatchCreatesOneChannelScopedProbe(t *testing.T) {
+func TestOpenCodeGoRiskBatchScopesEveryProbeToOwningIdentity(t *testing.T) {
 	_, channel, codec := setupOpenCodeGoPoolTestDB(t)
 	identity := model.OpenCodeGoIdentity{
 		UID:                   "identity-risk-scoped-batch",
@@ -213,10 +213,15 @@ func TestOpenCodeGoRiskBatchCreatesOneChannelScopedProbe(t *testing.T) {
 	seedOpenCodeGoRiskWorkspace(t, codec, channel.Id, identity.ID, "workspace-risk-scoped-two", "risk-scoped-key-two")
 	fake := &fakeOpenCodeGoRiskProbe{response: OpenCodeGoRiskProbeResponse{StatusCode: http.StatusOK}}
 	var factoryCalls atomic.Int32
+	var identitiesMutex sync.Mutex
+	identities := make([]string, 0, 2)
 	riskService := &OpenCodeGoRiskRecheckService{
-		probeFactory: func(gotChannelID int) (openCodeGoRiskProbeClient, error) {
+		probeFactory: func(gotChannelID int, identityUID string) (openCodeGoRiskProbeClient, error) {
 			assert.Equal(t, channel.Id, gotChannelID)
 			factoryCalls.Add(1)
+			identitiesMutex.Lock()
+			identities = append(identities, identityUID)
+			identitiesMutex.Unlock()
 			return fake, nil
 		},
 		codec:   codec,
@@ -234,7 +239,8 @@ func TestOpenCodeGoRiskBatchCreatesOneChannelScopedProbe(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 2, summary.Recovered)
-	assert.Equal(t, int32(1), factoryCalls.Load())
+	assert.Equal(t, int32(2), factoryCalls.Load())
+	assert.Equal(t, []string{identity.UID, identity.UID}, identities)
 	assert.Len(t, fake.apiKeys, 2)
 }
 

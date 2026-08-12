@@ -295,6 +295,11 @@ func (service *OpenCodeGoAccountPoolService) SetIdentityEnabled(channelID int, i
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return err
 	}
+	releaseMutation := func() {}
+	if !enabled {
+		releaseMutation = BeginOpenCodeGoPoolMutation(channelID)
+	}
+	defer releaseMutation()
 	changed := false
 	err := model.DB.Transaction(func(tx *gorm.DB) error {
 		var identity model.OpenCodeGoIdentity
@@ -338,6 +343,9 @@ func (service *OpenCodeGoAccountPoolService) SetIdentityEnabled(channelID int, i
 	if err != nil || !changed {
 		return err
 	}
+	if !enabled {
+		InvalidateOpenCodeGoIdentityProxyChannel(channelID)
+	}
 	return service.rebuildChannel(channelID)
 }
 
@@ -345,6 +353,11 @@ func (service *OpenCodeGoAccountPoolService) SetWorkspaceEnabled(channelID int, 
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return err
 	}
+	releaseMutation := func() {}
+	if !enabled {
+		releaseMutation = BeginOpenCodeGoPoolMutation(channelID)
+	}
+	defer releaseMutation()
 	changed := false
 	err := model.DB.Transaction(func(tx *gorm.DB) error {
 		var workspace model.OpenCodeGoWorkspace
@@ -396,6 +409,9 @@ func (service *OpenCodeGoAccountPoolService) SetWorkspaceEnabled(channelID int, 
 	if err != nil || !changed {
 		return err
 	}
+	if !enabled {
+		InvalidateOpenCodeGoIdentityProxyChannel(channelID)
+	}
 	return service.rebuildChannel(channelID)
 }
 
@@ -404,11 +420,6 @@ func (service *OpenCodeGoAccountPoolService) RefreshWorkspace(
 	channelID int,
 	workspaceUID string,
 ) (*model.OpenCodeGoWorkspace, error) {
-	scoped, err := service.scopedForChannel(channelID)
-	if err != nil {
-		return nil, err
-	}
-	service = scoped
 	workspace, err := model.GetOpenCodeGoWorkspace(channelID, workspaceUID)
 	if err != nil {
 		return nil, err
@@ -440,9 +451,12 @@ func (service *OpenCodeGoAccountPoolService) DeleteIdentity(channelID int, ident
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return err
 	}
+	releaseMutation := BeginOpenCodeGoPoolMutation(channelID)
+	defer releaseMutation()
 	if err := model.DeleteOpenCodeGoIdentity(channelID, identityUID); err != nil {
 		return err
 	}
+	InvalidateOpenCodeGoIdentityProxyIdentity(channelID, identityUID)
 	return service.rebuildChannel(channelID)
 }
 
@@ -450,9 +464,12 @@ func (service *OpenCodeGoAccountPoolService) DeleteWorkspace(channelID int, work
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return err
 	}
+	releaseMutation := BeginOpenCodeGoPoolMutation(channelID)
+	defer releaseMutation()
 	if err := model.DeleteOpenCodeGoWorkspace(channelID, workspaceUID); err != nil {
 		return err
 	}
+	InvalidateOpenCodeGoIdentityProxyChannel(channelID)
 	return service.rebuildChannel(channelID)
 }
 
@@ -460,15 +477,18 @@ func (service *OpenCodeGoAccountPoolService) DeleteNonMemberWorkspaces(channelID
 	if err := validateOpenCodeGoPoolChannel(channelID); err != nil {
 		return 0, err
 	}
+	releaseMutation := BeginOpenCodeGoPoolMutation(channelID)
+	defer releaseMutation()
 	count, err := model.DeleteOpenCodeGoNonMemberWorkspaces(channelID)
 	if err != nil {
 		return 0, err
 	}
+	InvalidateOpenCodeGoIdentityProxyChannel(channelID)
 	return count, service.rebuildChannel(channelID)
 }
 
 func (service *OpenCodeGoAccountPoolService) rebuildChannel(channelID int) error {
-	return ReconcileOpenCodeGoPoolChannel(channelID)
+	return service.rebuildPoolChannel(channelID)
 }
 
 func ReconcileOpenCodeGoPoolChannel(channelID int) error {

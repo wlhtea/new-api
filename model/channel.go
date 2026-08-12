@@ -1035,6 +1035,29 @@ func (channel *Channel) ValidateSettings() error {
 		}
 	}
 	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		identityProxyChanged := false
+		if channelOtherSettings.OpenCodeGo != nil && channelOtherSettings.OpenCodeGo.IdentityProxyEnabled {
+			template, err := dto.ParseOpenCodeGoIdentityProxyTemplate(channelParams.Proxy)
+			if err != nil {
+				return fmt.Errorf("invalid OpenCode Go identity proxy configuration: %w", err)
+			}
+			country, minutes := template.InferredPolicy()
+			if strings.TrimSpace(channelOtherSettings.OpenCodeGo.IdentityProxyCountry) == "" {
+				channelOtherSettings.OpenCodeGo.IdentityProxyCountry = country
+				identityProxyChanged = country != ""
+			}
+			if channelOtherSettings.OpenCodeGo.IdentityProxyRotateMinutes == 0 &&
+				!channelOtherSettings.OpenCodeGo.IdentityProxyRotateMinutesWasSet() {
+				channelOtherSettings.OpenCodeGo.IdentityProxyRotateMinutes = minutes
+				identityProxyChanged = identityProxyChanged || minutes != 0
+			}
+		}
+		if channelOtherSettings.OpenCodeGo != nil && channelOtherSettings.OpenCodeGo.NormalizeIdentityProxy() {
+			identityProxyChanged = true
+		}
+		if identityProxyChanged {
+			channel.SetOtherSettings(*channelOtherSettings)
+		}
 		if err := channelOtherSettings.OpenCodeGo.Validate(); err != nil {
 			return err
 		}
@@ -1048,11 +1071,23 @@ func (channel *Channel) GetSetting() dto.ChannelSettings {
 		err := common.Unmarshal([]byte(*channel.Setting), &setting)
 		if err != nil {
 			common.SysLog(fmt.Sprintf("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.Setting = nil // 清空设置以避免后续错误
-			_ = channel.Save()    // 保存修改
 		}
 	}
 	return setting
+}
+
+// DecodeSetting parses channel transport settings without mutating persisted
+// state when the stored JSON is invalid. Security-sensitive request paths use
+// this instead of the permissive getter so corruption fails closed.
+func (channel *Channel) DecodeSetting() (dto.ChannelSettings, error) {
+	setting := dto.ChannelSettings{}
+	if channel.Setting == nil || strings.TrimSpace(*channel.Setting) == "" {
+		return setting, nil
+	}
+	if err := common.Unmarshal([]byte(*channel.Setting), &setting); err != nil {
+		return dto.ChannelSettings{}, err
+	}
+	return setting, nil
 }
 
 func (channel *Channel) SetSetting(setting dto.ChannelSettings) {
@@ -1070,11 +1105,22 @@ func (channel *Channel) GetOtherSettings() dto.ChannelOtherSettings {
 		err := common.UnmarshalJsonStr(channel.OtherSettings, &setting)
 		if err != nil {
 			common.SysLog(fmt.Sprintf("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.OtherSettings = "{}" // 清空设置以避免后续错误
-			_ = channel.Save()           // 保存修改
 		}
 	}
 	return setting
+}
+
+// DecodeOtherSettings parses channel feature settings without mutating
+// persisted state when the stored JSON is invalid.
+func (channel *Channel) DecodeOtherSettings() (dto.ChannelOtherSettings, error) {
+	setting := dto.ChannelOtherSettings{}
+	if strings.TrimSpace(channel.OtherSettings) == "" {
+		return setting, nil
+	}
+	if err := common.UnmarshalJsonStr(channel.OtherSettings, &setting); err != nil {
+		return dto.ChannelOtherSettings{}, err
+	}
+	return setting, nil
 }
 
 func (channel *Channel) SetOtherSettings(setting dto.ChannelOtherSettings) {

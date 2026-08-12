@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -51,10 +52,9 @@ type OpenCodeGoLifecycleAutomationSummary struct {
 }
 
 type OpenCodeGoLifecycleIdentityAutomationResult struct {
-	ChannelID   int                                  `json:"channel_id"`
-	IdentityUID string                               `json:"identity_uid"`
-	Summary     OpenCodeGoLifecycleAutomationSummary `json:"summary"`
-	Error       string                               `json:"error,omitempty"`
+	ChannelID int                                  `json:"channel_id"`
+	Summary   OpenCodeGoLifecycleAutomationSummary `json:"summary"`
+	Error     string                               `json:"error,omitempty"`
 }
 
 type OpenCodeGoLifecycleBatchSummary struct {
@@ -70,7 +70,8 @@ type OpenCodeGoLifecycleService struct {
 	reader        openCodeGoLifecycleReader
 	mutator       openCodeGoLifecycleMutator
 	pool          *OpenCodeGoAccountPoolService
-	scopedFactory func(channelID int) (*OpenCodeGoLifecycleService, error)
+	codec         *OpenCodeGoCredentialCodec
+	scopedFactory func(channelID int, identityUID string) (*OpenCodeGoLifecycleService, error)
 	now           func() time.Time
 }
 
@@ -86,11 +87,24 @@ func NewConfiguredOpenCodeGoLifecycleService() (*OpenCodeGoLifecycleService, err
 		return nil, err
 	}
 	return &OpenCodeGoLifecycleService{
-		scopedFactory: func(channelID int) (*OpenCodeGoLifecycleService, error) {
-			return newOpenCodeGoChannelLifecycleService(channelID, codec)
+		codec: codec,
+		scopedFactory: func(channelID int, identityUID string) (*OpenCodeGoLifecycleService, error) {
+			return newOpenCodeGoIdentityLifecycleService(channelID, identityUID, codec)
 		},
 		now: time.Now,
 	}, nil
+}
+
+func newOpenCodeGoIdentityLifecycleService(
+	channelID int,
+	identityUID string,
+	codec *OpenCodeGoCredentialCodec,
+) (*OpenCodeGoLifecycleService, error) {
+	baseClient, err := GetOpenCodeGoIdentityHTTPClient(channelID, identityUID)
+	if err != nil {
+		return nil, err
+	}
+	return newOpenCodeGoLifecycleServiceWithClient(baseClient, codec)
 }
 
 func newOpenCodeGoChannelLifecycleService(
@@ -101,6 +115,13 @@ func newOpenCodeGoChannelLifecycleService(
 	if err != nil {
 		return nil, err
 	}
+	return newOpenCodeGoLifecycleServiceWithClient(baseClient, codec)
+}
+
+func newOpenCodeGoLifecycleServiceWithClient(
+	baseClient *http.Client,
+	codec *OpenCodeGoCredentialCodec,
+) (*OpenCodeGoLifecycleService, error) {
 	console, err := newOpenCodeGoConsoleClient(openCodeGoConsoleOrigin, openCodeGoInferenceOrigin, baseClient)
 	if err != nil {
 		return nil, err
@@ -122,11 +143,12 @@ func newOpenCodeGoLifecycleService(
 		reader:  reader,
 		mutator: mutator,
 		pool:    pool,
+		codec:   pool.codec,
 		now:     time.Now,
 	}
 }
 
-func (service *OpenCodeGoLifecycleService) scopedForChannel(channelID int) (*OpenCodeGoLifecycleService, error) {
+func (service *OpenCodeGoLifecycleService) scopedForIdentity(channelID int, identityUID string) (*OpenCodeGoLifecycleService, error) {
 	if service == nil {
 		return nil, errors.New("OpenCode Go lifecycle service is not configured")
 	}
@@ -136,7 +158,7 @@ func (service *OpenCodeGoLifecycleService) scopedForChannel(channelID int) (*Ope
 	if service.scopedFactory == nil {
 		return nil, errors.New("OpenCode Go lifecycle service is not configured")
 	}
-	scoped, err := service.scopedFactory(channelID)
+	scoped, err := service.scopedFactory(channelID, identityUID)
 	if err != nil {
 		return nil, err
 	}
@@ -246,18 +268,11 @@ func (service *OpenCodeGoLifecycleService) EnableChinaModels(
 	workspaceUID string,
 	source string,
 ) (*model.OpenCodeGoOperation, error) {
-	scoped, err := service.scopedForChannel(channelID)
+	scoped, target, unlock, err := service.scopedTarget(channelID, workspaceUID)
 	if err != nil {
 		return nil, err
 	}
 	service = scoped
-	if err := service.validate(); err != nil {
-		return nil, err
-	}
-	target, unlock, err := service.lockTarget(channelID, workspaceUID)
-	if err != nil {
-		return nil, err
-	}
 	defer unlock()
 
 	startedAt := service.now()
@@ -312,18 +327,11 @@ func (service *OpenCodeGoLifecycleService) DisableChinaModels(
 	workspaceUID string,
 	source string,
 ) (*model.OpenCodeGoOperation, error) {
-	scoped, err := service.scopedForChannel(channelID)
+	scoped, target, unlock, err := service.scopedTarget(channelID, workspaceUID)
 	if err != nil {
 		return nil, err
 	}
 	service = scoped
-	if err := service.validate(); err != nil {
-		return nil, err
-	}
-	target, unlock, err := service.lockTarget(channelID, workspaceUID)
-	if err != nil {
-		return nil, err
-	}
 	defer unlock()
 
 	startedAt := service.now()
@@ -380,19 +388,12 @@ func (service *OpenCodeGoLifecycleService) ApplyReferralRewards(
 	maxRewards int,
 ) (OpenCodeGoReferralApplySummary, error) {
 	summary := OpenCodeGoReferralApplySummary{}
-	scoped, err := service.scopedForChannel(channelID)
+	maxRewards = normalizeOpenCodeGoReferralRewardLimit(maxRewards)
+	scoped, target, unlock, err := service.scopedTarget(channelID, workspaceUID)
 	if err != nil {
 		return summary, err
 	}
 	service = scoped
-	if err := service.validate(); err != nil {
-		return summary, err
-	}
-	maxRewards = normalizeOpenCodeGoReferralRewardLimit(maxRewards)
-	target, unlock, err := service.lockTarget(channelID, workspaceUID)
-	if err != nil {
-		return summary, err
-	}
 	defer unlock()
 	if !openCodeGoWorkspaceHasExhaustedQuota(*target.workspace) {
 		return summary, nil
@@ -482,18 +483,11 @@ func (service *OpenCodeGoLifecycleService) CancelSubscriptionRenewal(
 	source string,
 ) (*model.OpenCodeGoOperation, OpenCodeGoSubscriptionCancellation, error) {
 	result := OpenCodeGoSubscriptionCancellation{}
-	scoped, err := service.scopedForChannel(channelID)
+	scoped, target, unlock, err := service.scopedTarget(channelID, workspaceUID)
 	if err != nil {
 		return nil, result, err
 	}
 	service = scoped
-	if err := service.validate(); err != nil {
-		return nil, result, err
-	}
-	target, unlock, err := service.lockTarget(channelID, workspaceUID)
-	if err != nil {
-		return nil, result, err
-	}
 	defer unlock()
 	operation, err := startOpenCodeGoOperation(
 		channelID,
@@ -569,11 +563,6 @@ func (service *OpenCodeGoLifecycleService) RunIdentityAutomations(
 	if !policy.AutomationEnabled {
 		return summary, nil
 	}
-	scoped, err := service.scopedForChannel(channelID)
-	if err != nil {
-		return summary, err
-	}
-	service = scoped
 	identity, err := model.GetOpenCodeGoIdentityPool(channelID, identityUID)
 	if err != nil {
 		return summary, err
@@ -651,9 +640,8 @@ func (service *OpenCodeGoLifecycleService) RunRefreshAutomations(
 			sanitizeOpenCodeGoLifecycleSource(source),
 		)
 		result := OpenCodeGoLifecycleIdentityAutomationResult{
-			ChannelID:   refresh.ChannelID,
-			IdentityUID: refresh.IdentityUID,
-			Summary:     identitySummary,
+			ChannelID: refresh.ChannelID,
+			Summary:   identitySummary,
 		}
 		summary.Identities++
 		summary.Attempted += identitySummary.Attempted
@@ -692,6 +680,29 @@ func (service *OpenCodeGoLifecycleService) validate() error {
 	return nil
 }
 
+func (service *OpenCodeGoLifecycleService) scopedTarget(
+	channelID int,
+	workspaceUID string,
+) (*OpenCodeGoLifecycleService, *openCodeGoLifecycleTarget, func(), error) {
+	if service == nil || service.codec == nil {
+		return nil, nil, nil, errors.New("OpenCode Go lifecycle service is not configured")
+	}
+	target, unlock, err := service.lockTarget(channelID, workspaceUID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	scoped, err := service.scopedForIdentity(channelID, target.identity.UID)
+	if err != nil {
+		unlock()
+		return nil, nil, nil, err
+	}
+	if err := scoped.validate(); err != nil {
+		unlock()
+		return nil, nil, nil, err
+	}
+	return scoped, target, unlock, nil
+}
+
 func (service *OpenCodeGoLifecycleService) lockTarget(
 	channelID int,
 	workspaceUID string,
@@ -727,7 +738,7 @@ func (service *OpenCodeGoLifecycleService) lockTarget(
 		unlock()
 		return nil, nil, gorm.ErrRecordNotFound
 	}
-	authCookie, err := service.pool.codec.Decrypt(
+	authCookie, err := service.codec.Decrypt(
 		OpenCodeGoCredentialAuthCookie,
 		channelID,
 		identity.UID,

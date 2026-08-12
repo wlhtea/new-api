@@ -740,12 +740,23 @@ func DeleteChannel(c *gin.Context) {
 	channelName := ""
 	channelProxy := ""
 	channelLookupFailed := false
+	isOpenCodeGo := false
 	if existing, err := model.GetChannelById(id, false); err == nil && existing != nil {
 		channelName = existing.Name
 		channelProxy = existing.GetSetting().Proxy
+		isOpenCodeGo = existing.Type == constant.ChannelTypeOpenCodeGo
 	} else {
 		channelLookupFailed = true
 	}
+	releaseMutation := func() {}
+	if isOpenCodeGo {
+		releaseMutation = service.BeginOpenCodeGoPoolMutation(id)
+	} else if channelLookupFailed {
+		// The row may be an OpenCode Go channel even when the diagnostic pre-read
+		// failed. Serialize the delete with every local relay in that rare path.
+		releaseMutation = service.BeginOpenCodeGoGlobalPoolMutation()
+	}
+	defer releaseMutation()
 	channel := model.Channel{Id: id}
 	err := channel.Delete()
 	if err != nil {
@@ -771,6 +782,8 @@ func DeleteChannel(c *gin.Context) {
 }
 
 func DeleteDisabledChannel(c *gin.Context) {
+	releaseMutation := service.BeginOpenCodeGoGlobalPoolMutation()
+	defer releaseMutation()
 	rows, err := model.DeleteDisabledChannel()
 	if err != nil {
 		common.ApiError(c, err)
@@ -814,12 +827,22 @@ func DisableTagChannels(c *gin.Context) {
 		})
 		return
 	}
+	releaseMutation := service.BeginOpenCodeGoGlobalPoolMutation()
+	defer releaseMutation()
+	openCodeGoChannelIDs, err := openCodeGoChannelIDsForTag(channelTag.Tag)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	err = model.DisableChannelByTag(channelTag.Tag)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	defer model.InitChannelCache()
+	for _, channelID := range openCodeGoChannelIDs {
+		service.RemoveOpenCodeGoPoolChannel(channelID)
+	}
 	recordManageAudit(c, "channel.tag_disable", map[string]interface{}{
 		"tag": channelTag.Tag,
 	})
@@ -840,12 +863,27 @@ func EnableTagChannels(c *gin.Context) {
 		})
 		return
 	}
+	releaseMutation := service.BeginOpenCodeGoGlobalPoolMutation()
+	defer releaseMutation()
+	openCodeGoChannelIDs, err := openCodeGoChannelIDsForTag(channelTag.Tag)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	err = model.EnableChannelByTag(channelTag.Tag)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	// Reconcile may update channel availability through the memory cache. Make
+	// the bulk-enabled status visible before rebuilding, then refresh again for
+	// any auto-disable decisions made by the pool.
 	model.InitChannelCache()
+	defer model.InitChannelCache()
+	if err := reconcileOpenCodeGoTagChannels(openCodeGoChannelIDs); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	recordManageAudit(c, "channel.tag_enable", map[string]interface{}{
 		"tag": channelTag.Tag,
 	})
@@ -900,12 +938,25 @@ func EditTagChannels(c *gin.Context) {
 		}
 		channelTag.HeaderOverride = common.GetPointer[string](trimmed)
 	}
+	releaseMutation := service.BeginOpenCodeGoGlobalPoolMutation()
+	defer releaseMutation()
+	openCodeGoChannelIDs, err := openCodeGoChannelIDsForTag(channelTag.Tag)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	err = model.EditChannelByTag(channelTag.Tag, channelTag.NewTag, channelTag.ModelMapping, channelTag.Models, channelTag.Groups, channelTag.Priority, channelTag.Weight, channelTag.ParamOverride, channelTag.HeaderOverride)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	defer model.InitChannelCache()
+	if channelTag.Models != nil || channelTag.Groups != nil || channelTag.ModelMapping != nil {
+		if err := reconcileOpenCodeGoTagChannels(openCodeGoChannelIDs); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
 	recordManageAudit(c, "channel.tag_edit", map[string]interface{}{
 		"tag": channelTag.Tag,
 	})
@@ -914,6 +965,33 @@ func EditTagChannels(c *gin.Context) {
 		"message": "",
 	})
 	return
+}
+
+func openCodeGoChannelIDsForTag(tag string) ([]int, error) {
+	channels, err := model.GetChannelsByTag(tag, false, false)
+	if err != nil {
+		return nil, err
+	}
+	channelIDs := make([]int, 0, len(channels))
+	for _, channel := range channels {
+		if channel != nil && channel.Type == constant.ChannelTypeOpenCodeGo {
+			channelIDs = append(channelIDs, channel.Id)
+		}
+	}
+	return channelIDs, nil
+}
+
+func reconcileOpenCodeGoTagChannels(channelIDs []int) error {
+	var reconcileErrors []error
+	for _, channelID := range channelIDs {
+		service.InvalidateOpenCodeGoIdentityProxyChannel(channelID)
+		if err := service.ReconcileOpenCodeGoPoolChannel(channelID); err != nil {
+			// A failed rebuild must not leave the pre-mutation routing snapshot live.
+			service.RemoveOpenCodeGoPoolChannel(channelID)
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile OpenCode Go channel %d: %w", channelID, err))
+		}
+	}
+	return errors.Join(reconcileErrors...)
 }
 
 type ChannelBatch struct {
@@ -931,6 +1009,8 @@ func DeleteChannelBatch(c *gin.Context) {
 		})
 		return
 	}
+	releaseMutation := service.BeginOpenCodeGoPoolMutations(channelBatch.Ids)
+	defer releaseMutation()
 	deletedCount, err := model.BatchDeleteChannels(channelBatch.Ids)
 	if err != nil {
 		common.ApiError(c, err)
@@ -1052,6 +1132,11 @@ func UpdateChannel(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgAuthInsufficientPrivilege)
 		return
 	}
+	releaseMutation := func() {}
+	if originChannel.Type == constant.ChannelTypeOpenCodeGo {
+		releaseMutation = service.BeginOpenCodeGoPoolMutation(channel.Id)
+	}
+	defer releaseMutation()
 
 	// If the request explicitly specifies a new MultiKeyMode, apply it on top of the original info.
 	if channel.MultiKeyMode != nil && *channel.MultiKeyMode != "" {
@@ -1145,6 +1230,7 @@ func UpdateChannel(c *gin.Context) {
 	}
 	defer model.InitChannelCache()
 	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		service.InvalidateOpenCodeGoIdentityProxyChannel(channel.Id)
 		if err := service.ReconcileOpenCodeGoPoolChannel(channel.Id); err != nil {
 			common.ApiError(c, err)
 			return
@@ -1152,6 +1238,8 @@ func UpdateChannel(c *gin.Context) {
 		if reconciled, reloadErr := model.GetChannelById(channel.Id, true); reloadErr == nil {
 			channel.Channel = *reconciled
 		}
+	} else if originChannel.Type == constant.ChannelTypeOpenCodeGo {
+		service.RemoveOpenCodeGoPoolChannel(channel.Id)
 	}
 	if proxyChanged {
 		service.InvalidateProxyClient(originProxy)
@@ -1204,11 +1292,21 @@ func UpdateChannelStatus(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	releaseMutation := func() {}
+	if channel.Type == constant.ChannelTypeOpenCodeGo {
+		releaseMutation = service.BeginOpenCodeGoPoolMutation(id)
+	}
+	defer releaseMutation()
 	changed := model.UpdateChannelStatus(id, "", req.Status, "manual operation")
 	if channel.Type == constant.ChannelTypeOpenCodeGo {
-		if err := service.ReconcileOpenCodeGoPoolChannel(id); err != nil {
-			common.ApiError(c, err)
-			return
+		if req.Status == common.ChannelStatusEnabled {
+			service.InvalidateOpenCodeGoIdentityProxyChannel(id)
+			if err := service.ReconcileOpenCodeGoPoolChannel(id); err != nil {
+				common.ApiError(c, err)
+				return
+			}
+		} else {
+			service.RemoveOpenCodeGoPoolChannel(id)
 		}
 	}
 	if changed {
@@ -1232,20 +1330,44 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
+	channels, err := model.GetChannelsByIds(req.Ids)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	channelsByID := make(map[int]*model.Channel, len(channels))
+	openCodeGoChannelIDs := make([]int, 0, len(channels))
+	for _, channel := range channels {
+		channelsByID[channel.Id] = channel
+		if channel.Type == constant.ChannelTypeOpenCodeGo {
+			openCodeGoChannelIDs = append(openCodeGoChannelIDs, channel.Id)
+		}
+	}
+	requestedIDs := make(map[int]struct{}, len(req.Ids))
+	for _, id := range req.Ids {
+		requestedIDs[id] = struct{}{}
+	}
+	if len(channelsByID) != len(requestedIDs) {
+		common.ApiError(c, gorm.ErrRecordNotFound)
+		return
+	}
+	releaseMutations := service.BeginOpenCodeGoPoolMutations(openCodeGoChannelIDs)
+	defer releaseMutations()
 	changedCount := 0
 	for _, id := range req.Ids {
-		channel, err := model.GetChannelById(id, false)
-		if err != nil {
-			common.ApiError(c, err)
-			return
-		}
+		channel := channelsByID[id]
 		if model.UpdateChannelStatus(id, "", req.Status, "manual batch operation") {
 			changedCount++
 		}
 		if channel.Type == constant.ChannelTypeOpenCodeGo {
-			if err := service.ReconcileOpenCodeGoPoolChannel(id); err != nil {
-				common.ApiError(c, err)
-				return
+			if req.Status == common.ChannelStatusEnabled {
+				service.InvalidateOpenCodeGoIdentityProxyChannel(id)
+				if err := service.ReconcileOpenCodeGoPoolChannel(id); err != nil {
+					common.ApiError(c, err)
+					return
+				}
+			} else {
+				service.RemoveOpenCodeGoPoolChannel(id)
 			}
 		}
 	}
@@ -1369,7 +1491,27 @@ func FetchModels(c *gin.Context) {
 	}
 
 	var channel *model.Channel
-	if req.Type == constant.ChannelTypeAdvancedCustom || req.ChannelID > 0 {
+	if req.Type == constant.ChannelTypeOpenCodeGo && req.ChannelID <= 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "OpenCode Go models are account-pool managed; save the channel and import an account first",
+		})
+		return
+	}
+	if req.ChannelID > 0 {
+		savedChannel, err := model.GetChannelById(req.ChannelID, true)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+		if savedChannel.Type == constant.ChannelTypeOpenCodeGo {
+			channel = savedChannel
+		}
+	}
+	if channel == nil && (req.Type == constant.ChannelTypeAdvancedCustom || req.ChannelID > 0) {
 		var err error
 		channel, err = buildAdvancedCustomModelPreviewChannel(req)
 		if err != nil {
@@ -1379,7 +1521,7 @@ func FetchModels(c *gin.Context) {
 			})
 			return
 		}
-	} else {
+	} else if channel == nil {
 		baseURL := ""
 		if req.BaseURL != nil {
 			baseURL = strings.TrimSpace(*req.BaseURL)
@@ -1424,6 +1566,8 @@ func BatchSetChannelTag(c *gin.Context) {
 		})
 		return
 	}
+	releaseMutation := service.BeginOpenCodeGoPoolMutations(channelBatch.Ids)
+	defer releaseMutation()
 	err = model.BatchSetChannelTag(channelBatch.Ids, channelBatch.Tag)
 	if err != nil {
 		common.ApiError(c, err)

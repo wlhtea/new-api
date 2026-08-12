@@ -25,30 +25,54 @@ import (
 )
 
 type Adaptor struct {
-	protocol              Protocol
-	protocolErr           error
-	cacheIdentity         string
-	affinityIdentity      string
-	affinitySource        string
-	bufferClaudeToolCall  bool
-	requestInputItems     int
-	requestToolCount      int
-	requestUpstreamStream bool
-	converted             bool
-	workspaceSelected     bool
-	selectedWorkspaceUID  string
-	statefulResponses     bool
-	failoverAttempt       *service.OpenCodeGoFailoverAttempt
-	namespaceTools        map[string]openCodeGoNamespaceTool
-	releaseOnce           sync.Once
-	releaseInFlightFn     func()
-	openai                openai.Adaptor
-	claude                claude.Adaptor
+	protocol                Protocol
+	protocolErr             error
+	cacheIdentity           string
+	affinityIdentity        string
+	affinitySource          string
+	bufferClaudeToolCall    bool
+	requestInputItems       int
+	requestToolCount        int
+	requestUpstreamStream   bool
+	converted               bool
+	workspaceSelected       bool
+	selectedWorkspaceUID    string
+	selectedIdentityUID     string
+	selectedProxyGeneration service.OpenCodeGoIdentityProxyGeneration
+	statefulResponses       bool
+	failoverAttempt         *service.OpenCodeGoFailoverAttempt
+	namespaceTools          map[string]openCodeGoNamespaceTool
+	releaseOnce             sync.Once
+	releaseInFlightFn       func()
+	openai                  openai.Adaptor
+	claude                  claude.Adaptor
 }
 
 var selectOpenCodeGoWorkspace = service.SelectOpenCodeGoWorkspaceWithFailover
 
-var doOpenCodeGoAPIRequest = channel.DoApiRequest
+var acquireOpenCodeGoRelayHTTPClient = service.AcquireOpenCodeGoRelayHTTPClient
+
+var doOpenCodeGoAPIRequest = func(
+	adaptor channel.Adaptor,
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	requestBody io.Reader,
+) (*http.Response, error) {
+	openCodeGoAdaptor, ok := adaptor.(*Adaptor)
+	if !ok {
+		return nil, errors.New("OpenCode Go request adaptor is invalid")
+	}
+	return channel.DoApiRequestWithClientLease(adaptor, c, info, requestBody, func() (*http.Client, func(), error) {
+		return acquireOpenCodeGoRelayHTTPClient(
+			info.ChannelId,
+			openCodeGoAdaptor.selectedIdentityUID,
+			openCodeGoAdaptor.selectedWorkspaceUID,
+			info.ApiKey,
+			info.UpstreamModelName,
+			openCodeGoAdaptor.selectedProxyGeneration,
+		)
+	})
+}
 
 var observeOpenCodeGoTransportFailure = service.ObserveOpenCodeGoTransportFailure
 
@@ -71,6 +95,8 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	a.converted = false
 	a.workspaceSelected = false
 	a.selectedWorkspaceUID = ""
+	a.selectedIdentityUID = ""
+	a.selectedProxyGeneration = service.OpenCodeGoIdentityProxyGeneration{}
 	a.statefulResponses = false
 	a.failoverAttempt = nil
 	a.releaseOnce = sync.Once{}
@@ -162,6 +188,8 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 		}
 		info.ApiKey = selection.APIKey
 		a.selectedWorkspaceUID = selection.WorkspaceUID
+		a.selectedIdentityUID = selection.IdentityUID
+		a.selectedProxyGeneration = selection.IdentityProxyGeneration
 		a.failoverAttempt = selection.FailoverAttempt
 		a.workspaceSelected = true
 		a.acquireInFlight(info.ChannelId, selection.WorkspaceUID)
