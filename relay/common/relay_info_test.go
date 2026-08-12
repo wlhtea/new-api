@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
@@ -12,6 +13,54 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRestoreUnwrittenStreamAttemptRestoresResponseState(t *testing.T) {
+	start := time.Now()
+	info := &RelayInfo{
+		StartTime:                      start,
+		FirstResponseTime:              start.Add(time.Second),
+		isFirstResponse:                false,
+		IsStream:                       true,
+		SendResponseCount:              3,
+		ReceivedResponseCount:          2,
+		StreamStatus:                   NewStreamStatus(),
+		StreamProtocolTerminalRequired: true,
+		ThinkingContentInfo: ThinkingContentInfo{
+			IsFirstThinkingContent: true,
+		},
+		ClaudeConvertInfo: &ClaudeConvertInfo{Index: 2},
+		ResponsesUsageInfo: &ResponsesUsageInfo{BuiltInTools: map[string]*BuildInToolInfo{
+			"web_search": {ToolName: "web_search", CallCount: 1},
+		}},
+	}
+	snapshot := info.SnapshotUnwrittenStreamAttempt()
+
+	info.IsStream = false
+	info.FirstResponseTime = start.Add(2 * time.Second)
+	info.isFirstResponse = false
+	info.SendResponseCount = 5
+	info.ReceivedResponseCount = 6
+	info.StreamStatus = NewStreamStatus()
+	info.StreamProtocolTerminalRequired = false
+	info.ThinkingContentInfo.HasSentThinkingContent = true
+	info.ClaudeConvertInfo.Done = true
+	info.ResponsesUsageInfo.BuiltInTools["web_search"].CallCount = 3
+
+	info.RestoreUnwrittenStreamAttempt(snapshot)
+
+	assert.True(t, info.IsStream)
+	assert.Equal(t, start.Add(time.Second), info.FirstResponseTime)
+	assert.False(t, info.isFirstResponse)
+	assert.Equal(t, 3, info.SendResponseCount)
+	assert.Equal(t, 2, info.ReceivedResponseCount)
+	assert.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamProtocolTerminalRequired)
+	assert.True(t, info.ThinkingContentInfo.IsFirstThinkingContent)
+	assert.False(t, info.ThinkingContentInfo.HasSentThinkingContent)
+	assert.Equal(t, 2, info.ClaudeConvertInfo.Index)
+	assert.False(t, info.ClaudeConvertInfo.Done)
+	assert.Equal(t, 1, info.ResponsesUsageInfo.BuiltInTools["web_search"].CallCount)
+}
 
 func TestRelayInfoGetFinalRequestRelayFormatPrefersExplicitFinal(t *testing.T) {
 	info := &RelayInfo{

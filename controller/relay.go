@@ -256,28 +256,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 
-		bodyStorage, bodyErr := common.GetBodyStorage(c)
-		if bodyErr != nil {
-			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
-			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
-				newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
-			} else {
-				newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		newAPIError = relaySelectedChannelWithOpenCodeGoRetry(c, relayFormat, relayInfo, channel.Type, func() *types.NewAPIError {
+			bodyStorage, bodyErr := common.GetBodyStorage(c)
+			if bodyErr != nil {
+				// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
+				if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
+					return types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
+				}
+				return types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
-			break
-		}
-		c.Request.Body = io.NopCloser(bodyStorage)
-
-		switch relayFormat {
-		case types.RelayFormatOpenAIRealtime:
-			newAPIError = relay.WssHelper(c, relayInfo)
-		case types.RelayFormatClaude:
-			newAPIError = relay.ClaudeHelper(c, relayInfo)
-		case types.RelayFormatGemini:
-			newAPIError = geminiRelayHandler(c, relayInfo)
-		default:
-			newAPIError = relayHandler(c, relayInfo)
-		}
+			c.Request.Body = io.NopCloser(bodyStorage)
+			return relaySelectedChannel(c, relayFormat, relayInfo)
+		})
 
 		if newAPIError == nil {
 			relayInfo.LastError = nil
@@ -303,6 +293,116 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		gopool.Go(func() {
 			perfmetrics.RecordRelaySample(relayInfo, false, 0)
 		})
+	}
+}
+
+func relaySelectedChannel(c *gin.Context, relayFormat types.RelayFormat, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	switch relayFormat {
+	case types.RelayFormatOpenAIRealtime:
+		return relay.WssHelper(c, relayInfo)
+	case types.RelayFormatClaude:
+		return relay.ClaudeHelper(c, relayInfo)
+	case types.RelayFormatGemini:
+		return geminiRelayHandler(c, relayInfo)
+	default:
+		return relayHandler(c, relayInfo)
+	}
+}
+
+func relaySelectedChannelWithOpenCodeGoRetry(
+	c *gin.Context,
+	relayFormat types.RelayFormat,
+	relayInfo *relaycommon.RelayInfo,
+	channelType int,
+	attempt func() *types.NewAPIError,
+) *types.NewAPIError {
+	if attempt == nil {
+		return nil
+	}
+	if channelType != constant.ChannelTypeOpenCodeGo {
+		return attempt()
+	}
+
+	service.BeginOpenCodeGoImmediateRetry(c)
+	defer service.EndOpenCodeGoImmediateRetry(c)
+	attemptSnapshot := relayInfo.SnapshotUnwrittenStreamAttempt()
+	claudeWebSearchRequests := c.GetInt("claude_web_search_requests")
+	geminiGoogleSearchCall := c.GetBool("gemini_google_search_call")
+
+	firstErr := service.NormalizeViolationFeeError(attempt())
+	if firstErr == nil {
+		return nil
+	}
+	if !shouldRetryOpenCodeGoImmediately(c, channelType, firstErr) {
+		if openCodeGoImmediateRetryEndedLocally(c) {
+			service.DiscardOpenCodeGoImmediateRetryFailover(c)
+		} else {
+			service.FlushOpenCodeGoImmediateRetryFailover(c)
+		}
+		return firstErr
+	}
+
+	logger.LogWarn(c, fmt.Sprintf(
+		"OpenCode Go transient upstream failure; retrying once on the selected workspace: status=%d error=%s",
+		firstErr.StatusCode,
+		common.LocalLogPreview(firstErr.Error()),
+	))
+	service.PrepareOpenCodeGoImmediateRetry(c)
+	resetOpenCodeGoRelayAttempt(c, relayInfo, attemptSnapshot, claudeWebSearchRequests, geminiGoogleSearchCall)
+	return service.NormalizeViolationFeeError(attempt())
+}
+
+func shouldRetryOpenCodeGoImmediately(c *gin.Context, channelType int, relayErr *types.NewAPIError) bool {
+	if !service.ShouldRetryOpenCodeGoRelayError(channelType, relayErr) || c == nil || c.Writer == nil || c.Writer.Written() {
+		return false
+	}
+	if c.Request == nil || c.Request.Context().Err() != nil {
+		return false
+	}
+	return service.ResponseBodyWriteError(c) == nil
+}
+
+func openCodeGoImmediateRetryEndedLocally(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil {
+		return true
+	}
+	return service.ResponseBodyWriteError(c) != nil
+}
+
+func resetOpenCodeGoRelayAttempt(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	attemptSnapshot relaycommon.UnwrittenStreamAttemptSnapshot,
+	claudeWebSearchRequests int,
+	geminiGoogleSearchCall bool,
+) {
+	if c != nil && c.Writer != nil && !c.Writer.Written() {
+		for _, name := range []string{
+			"Content-Type",
+			"Content-Length",
+			"Cache-Control",
+			"Connection",
+			"Transfer-Encoding",
+			"X-Accel-Buffering",
+			"X-Codex-Turn-State",
+			"X-Reasoning-Included",
+			"Retry-After",
+		} {
+			c.Writer.Header().Del(name)
+		}
+	}
+	if c != nil {
+		c.Set(common.UpstreamRequestIdKey, nil)
+		c.Set("claude_web_search_requests", claudeWebSearchRequests)
+		c.Set("gemini_google_search_call", geminiGoogleSearchCall)
+		service.ResetResponseBodyWriteError(c)
+		helper.ResetEventStreamHeaders(c)
+	}
+	if relayInfo != nil {
+		relayInfo.RestoreUnwrittenStreamAttempt(attemptSnapshot)
 	}
 }
 

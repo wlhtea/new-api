@@ -55,6 +55,19 @@ type ResponsesUsageInfo struct {
 	BuiltInTools map[string]*BuildInToolInfo
 }
 
+type UnwrittenStreamAttemptSnapshot struct {
+	isStream                       bool
+	firstResponseTime              time.Time
+	isFirstResponse                bool
+	sendResponseCount              int
+	receivedResponseCount          int
+	streamStatus                   *StreamStatus
+	streamProtocolTerminalRequired bool
+	thinkingContentInfo            ThinkingContentInfo
+	claudeConvertInfo              *ClaudeConvertInfo
+	responsesUsageInfo             *ResponsesUsageInfo
+}
+
 type ChannelMeta struct {
 	ChannelType          int
 	ChannelId            int
@@ -860,6 +873,71 @@ func (info *RelayInfo) SetFirstResponseTime() {
 
 func (info *RelayInfo) HasSendResponse() bool {
 	return info.FirstResponseTime.After(info.StartTime)
+}
+
+func (info *RelayInfo) SnapshotUnwrittenStreamAttempt() UnwrittenStreamAttemptSnapshot {
+	if info == nil {
+		return UnwrittenStreamAttemptSnapshot{}
+	}
+	return UnwrittenStreamAttemptSnapshot{
+		isStream:                       info.IsStream,
+		firstResponseTime:              info.FirstResponseTime,
+		isFirstResponse:                info.isFirstResponse,
+		sendResponseCount:              info.SendResponseCount,
+		receivedResponseCount:          info.ReceivedResponseCount,
+		streamStatus:                   info.StreamStatus,
+		streamProtocolTerminalRequired: info.StreamProtocolTerminalRequired,
+		thinkingContentInfo:            info.ThinkingContentInfo,
+		claudeConvertInfo:              cloneClaudeConvertInfo(info.ClaudeConvertInfo),
+		responsesUsageInfo:             cloneResponsesUsageInfo(info.ResponsesUsageInfo),
+	}
+}
+
+// RestoreUnwrittenStreamAttempt restores response-derived state before a relay
+// attempt is transparently replayed. Callers must first verify that no
+// downstream bytes were written.
+func (info *RelayInfo) RestoreUnwrittenStreamAttempt(snapshot UnwrittenStreamAttemptSnapshot) {
+	if info == nil {
+		return
+	}
+	info.IsStream = snapshot.isStream
+	info.FirstResponseTime = snapshot.firstResponseTime
+	info.isFirstResponse = snapshot.isFirstResponse
+	info.SendResponseCount = snapshot.sendResponseCount
+	info.ReceivedResponseCount = snapshot.receivedResponseCount
+	info.StreamStatus = snapshot.streamStatus
+	info.StreamProtocolTerminalRequired = snapshot.streamProtocolTerminalRequired
+	info.ThinkingContentInfo = snapshot.thinkingContentInfo
+	info.ClaudeConvertInfo = cloneClaudeConvertInfo(snapshot.claudeConvertInfo)
+	info.ResponsesUsageInfo = cloneResponsesUsageInfo(snapshot.responsesUsageInfo)
+}
+
+func cloneClaudeConvertInfo(source *ClaudeConvertInfo) *ClaudeConvertInfo {
+	if source == nil {
+		return nil
+	}
+	clone := *source
+	if source.Usage != nil {
+		usage := *source.Usage
+		clone.Usage = &usage
+	}
+	return &clone
+}
+
+func cloneResponsesUsageInfo(source *ResponsesUsageInfo) *ResponsesUsageInfo {
+	if source == nil {
+		return nil
+	}
+	clone := &ResponsesUsageInfo{BuiltInTools: make(map[string]*BuildInToolInfo, len(source.BuiltInTools))}
+	for name, tool := range source.BuiltInTools {
+		if tool == nil {
+			clone.BuiltInTools[name] = nil
+			continue
+		}
+		toolClone := *tool
+		clone.BuiltInTools[name] = &toolClone
+	}
+	return clone
 }
 
 type TaskRelayInfo struct {

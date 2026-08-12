@@ -176,15 +176,20 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 		common.SetContextKey(c, constant.ContextKeyOpenCodeGoAffinityKey, a.affinityIdentity)
 		loadAware := info != nil && info.ChannelOtherSettings.OpenCodeGo != nil &&
 			info.ChannelOtherSettings.OpenCodeGo.LoadAwareEnabled
-		selection, selectErr := selectOpenCodeGoWorkspace(info.ChannelId, info.UpstreamModelName, service.OpenCodeGoPoolSelectOptions{
-			AffinityKey: a.affinityIdentity,
-			Protocol:    string(protocol),
-			Stateful:    a.statefulResponses,
-			Failover:    service.ResolveOpenCodeGoFailoverPolicy(info.ChannelOtherSettings.OpenCodeGo),
-			LoadAware:   loadAware,
-		})
-		if selectErr != nil {
-			return selectErr
+		selection, replaying := service.OpenCodeGoImmediateRetrySelection(c)
+		if !replaying {
+			var selectErr error
+			selection, selectErr = selectOpenCodeGoWorkspace(info.ChannelId, info.UpstreamModelName, service.OpenCodeGoPoolSelectOptions{
+				AffinityKey: a.affinityIdentity,
+				Protocol:    string(protocol),
+				Stateful:    a.statefulResponses,
+				Failover:    service.ResolveOpenCodeGoFailoverPolicy(info.ChannelOtherSettings.OpenCodeGo),
+				LoadAware:   loadAware,
+			})
+			if selectErr != nil {
+				return selectErr
+			}
+			service.RememberOpenCodeGoImmediateRetrySelection(c, selection)
 		}
 		info.ApiKey = selection.APIKey
 		a.selectedWorkspaceUID = selection.WorkspaceUID
@@ -677,36 +682,48 @@ func (a *Adaptor) recordFailoverFailure(c *gin.Context, info *relaycommon.RelayI
 	if a == nil || a.failoverAttempt == nil || info == nil || openCodeGoCallerCancelled(c, nil) {
 		return
 	}
-	observation, err := observeOpenCodeGoFailoverFailure(a.failoverAttempt, openCodeGoHealthNow())
-	if err != nil {
+	attempt := a.failoverAttempt
+	observedAt := openCodeGoHealthNow()
+	channelID := info.ChannelId
+	upstreamModel := info.UpstreamModelName
+	protocol := a.protocol
+	workspaceUID := a.selectedWorkspaceUID
+	run := func() {
+		observation, err := observeOpenCodeGoFailoverFailure(attempt, observedAt)
+		if err != nil {
+			logger.LogWarn(c, fmt.Sprintf(
+				"OpenCode Go failover state update failed open: channel_id=%d model=%q protocol=%q error=%v",
+				channelID,
+				upstreamModel,
+				protocol,
+				err,
+			))
+			return
+		}
+		if observation.Action == service.OpenCodeGoFailoverActionNone ||
+			observation.Action == service.OpenCodeGoFailoverActionStale {
+			return
+		}
+		toRef := ""
+		if observation.Action == service.OpenCodeGoFailoverActionPromoted {
+			toRef = hashCacheIdentity("diagnostic-workspace", attempt.PreferredBackupWorkspaceUID())
+		}
 		logger.LogWarn(c, fmt.Sprintf(
-			"OpenCode Go failover state update failed open: channel_id=%d model=%q protocol=%q error=%v",
-			info.ChannelId,
-			info.UpstreamModelName,
-			a.protocol,
-			err,
+			"OpenCode Go failover observation: channel_id=%d model=%q protocol=%q reason=%s action=%s failure_count=%d from_ref=%s to_ref=%s",
+			channelID,
+			upstreamModel,
+			protocol,
+			reason,
+			observation.Action,
+			observation.FailureCount,
+			hashCacheIdentity("diagnostic-workspace", workspaceUID),
+			toRef,
 		))
+	}
+	if service.DeferOpenCodeGoImmediateRetryFailover(c, run) {
 		return
 	}
-	if observation.Action == service.OpenCodeGoFailoverActionNone ||
-		observation.Action == service.OpenCodeGoFailoverActionStale {
-		return
-	}
-	toRef := ""
-	if observation.Action == service.OpenCodeGoFailoverActionPromoted {
-		toRef = hashCacheIdentity("diagnostic-workspace", a.failoverAttempt.PreferredBackupWorkspaceUID())
-	}
-	logger.LogWarn(c, fmt.Sprintf(
-		"OpenCode Go failover observation: channel_id=%d model=%q protocol=%q reason=%s action=%s failure_count=%d from_ref=%s to_ref=%s",
-		info.ChannelId,
-		info.UpstreamModelName,
-		a.protocol,
-		reason,
-		observation.Action,
-		observation.FailureCount,
-		hashCacheIdentity("diagnostic-workspace", a.selectedWorkspaceUID),
-		toRef,
-	))
+	run()
 }
 
 func (a *Adaptor) recordFailoverSuccess(c *gin.Context, info *relaycommon.RelayInfo) {

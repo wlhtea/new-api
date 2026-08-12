@@ -18,7 +18,8 @@ const (
 var errOpenCodeGoUpstreamOrigin = errors.New("opencode go upstream-origin error")
 
 type openCodeGoUpstreamOriginError struct {
-	cause error
+	cause              error
+	upstreamStatusCode int
 }
 
 func (e *openCodeGoUpstreamOriginError) Error() string {
@@ -46,11 +47,21 @@ func MarkOpenCodeGoUpstreamRelayError(relayErr *types.NewAPIError) *types.NewAPI
 	if relayErr == nil || errors.Is(relayErr, errOpenCodeGoUpstreamOrigin) {
 		return relayErr
 	}
+	return markOpenCodeGoUpstreamRelayErrorWithStatus(relayErr, relayErr.StatusCode)
+}
+
+func markOpenCodeGoUpstreamRelayErrorWithStatus(relayErr *types.NewAPIError, upstreamStatusCode int) *types.NewAPIError {
+	if relayErr == nil || errors.Is(relayErr, errOpenCodeGoUpstreamOrigin) {
+		return relayErr
+	}
 	cause := relayErr.Err
 	if cause == nil {
 		cause = errors.New(relayErr.Error())
 	}
-	relayErr.Err = &openCodeGoUpstreamOriginError{cause: cause}
+	relayErr.Err = &openCodeGoUpstreamOriginError{
+		cause:              cause,
+		upstreamStatusCode: upstreamStatusCode,
+	}
 	return relayErr
 }
 
@@ -58,6 +69,14 @@ func MarkOpenCodeGoUpstreamRelayError(relayErr *types.NewAPIError) *types.NewAPI
 // marked at a type-62 upstream boundary.
 func IsOpenCodeGoUpstreamRelayError(err error) bool {
 	return errors.Is(err, errOpenCodeGoUpstreamOrigin)
+}
+
+func openCodeGoUpstreamRelayStatusCode(err error) (int, bool) {
+	var originErr *openCodeGoUpstreamOriginError
+	if !errors.As(err, &originErr) || originErr == nil || originErr.upstreamStatusCode <= 0 {
+		return 0, false
+	}
+	return originErr.upstreamStatusCode, true
 }
 
 // PublicOpenCodeGoRelayError replaces type-62 errors that name internal

@@ -66,3 +66,22 @@ func TestNormalizeViolationFeeErrorPreservesOpenCodeGoUpstreamOrigin(t *testing.
 		})
 	}
 }
+
+func TestNormalizeViolationFeeErrorPreservesRawOpenCodeGoUpstreamStatus(t *testing.T) {
+	upstreamErr := types.NewOpenAIError(
+		errors.New("provider rejected content: "+CSAMViolationMarker),
+		types.ErrorCodeBadResponse,
+		http.StatusServiceUnavailable,
+	)
+	MarkOpenCodeGoUpstreamRelayError(upstreamErr)
+	ResetStatusCode(upstreamErr, `{"503":400}`)
+
+	normalized := NormalizeViolationFeeError(upstreamErr)
+
+	require.NotNil(t, normalized)
+	statusCode, ok := openCodeGoUpstreamRelayStatusCode(normalized)
+	require.True(t, ok)
+	assert.Equal(t, http.StatusServiceUnavailable, statusCode)
+	assert.Equal(t, http.StatusBadRequest, normalized.StatusCode)
+	assert.False(t, ShouldRetryOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, normalized))
+}

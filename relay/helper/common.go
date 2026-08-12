@@ -14,6 +14,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const eventStreamHeadersSetKey = "event_stream_headers_set"
+
 func FlushWriter(c *gin.Context) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -44,18 +46,26 @@ func requestContextDone(c *gin.Context) bool {
 
 func SetEventStreamHeaders(c *gin.Context) {
 	// 检查是否已经设置过头部
-	if _, exists := c.Get("event_stream_headers_set"); exists {
+	if value, exists := c.Get(eventStreamHeadersSetKey); exists && value == true {
 		return
 	}
 
 	// 设置标志，表示头部已经设置过
-	c.Set("event_stream_headers_set", true)
+	c.Set(eventStreamHeadersSetKey, true)
 
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.Header().Set("Transfer-Encoding", "chunked")
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
+}
+
+// ResetEventStreamHeaders clears the pending SSE header marker before a relay
+// attempt that has not written any downstream bytes is replayed.
+func ResetEventStreamHeaders(c *gin.Context) {
+	if c != nil {
+		c.Set(eventStreamHeadersSetKey, false)
+	}
 }
 
 // renderEventData writes one SSE fragment and preserves the underlying writer

@@ -61,3 +61,15 @@ func TestClaudeDataPropagatesSecondEventWriteError(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, io.ErrClosedPipe), "error should retain the writer cause: %v", err)
 }
+
+func TestResetEventStreamHeadersAllowsAttemptToRestoreHeaders(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	SetEventStreamHeaders(c)
+	c.Writer.Header().Del("Content-Type")
+	ResetEventStreamHeaders(c)
+	SetEventStreamHeaders(c)
+
+	require.Equal(t, "text/event-stream", c.Writer.Header().Get("Content-Type"))
+}

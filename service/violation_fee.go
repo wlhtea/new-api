@@ -71,6 +71,9 @@ func NormalizeViolationFeeError(err *types.NewAPIError) *types.NewAPIError {
 }
 
 func preserveOpenCodeGoUpstreamOrigin(source, rebuilt *types.NewAPIError) *types.NewAPIError {
+	if upstreamStatusCode, ok := openCodeGoUpstreamRelayStatusCode(source); ok {
+		return markOpenCodeGoUpstreamRelayErrorWithStatus(rebuilt, upstreamStatusCode)
+	}
 	if IsOpenCodeGoUpstreamRelayError(source) {
 		return MarkOpenCodeGoUpstreamRelayError(rebuilt)
 	}
