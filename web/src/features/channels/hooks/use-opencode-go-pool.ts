@@ -84,10 +84,38 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
   const [bulkResults, setBulkResults] = useState<OpenCodeGoBulkResult[]>([])
   const [sensitiveBusyKey, setSensitiveBusyKey] = useState<string | null>(null)
   const handledTaskIdRef = useRef('')
+  const referralFenceRef = useRef(new Set<string>())
+
+  const applyReferralFences = (pool: OpenCodeGoPool): OpenCodeGoPool => {
+    if (referralFenceRef.current.size === 0) return pool
+
+    let changed = false
+    const identities = pool.identities.map((identity) => ({
+      ...identity,
+      workspaces: identity.workspaces.map((workspace) => {
+        if (!referralFenceRef.current.has(workspace.uid)) return workspace
+
+        if (
+          workspace.available_referral_rewards === 0 &&
+          !workspace.referral_reward_eligible
+        ) {
+          referralFenceRef.current.delete(workspace.uid)
+          return workspace
+        }
+
+        if (!workspace.referral_reward_eligible) return workspace
+        changed = true
+        return { ...workspace, referral_reward_eligible: false }
+      }),
+    }))
+
+    return changed ? { ...pool, identities } : pool
+  }
 
   const poolQuery = useQuery({
     queryKey: openCodeGoPoolQueryKeys.pool(channelId),
-    queryFn: () => getOpenCodeGoPool(channelId),
+    queryFn: async () =>
+      applyReferralFences(await getOpenCodeGoPool(channelId)),
     enabled: enabled && channelId > 0,
     staleTime: 10_000,
     retry: false,
@@ -106,6 +134,7 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
     setBulkResults([])
     setSensitiveBusyKey(null)
     handledTaskIdRef.current = ''
+    referralFenceRef.current.clear()
   }, [channelId])
 
   const ordinaryMutation = useMutation<
@@ -375,7 +404,31 @@ export function useOpenCodeGoPool(channelId: number, enabled: boolean) {
       `workspace:${workspaceUid}:referral`,
       () => applyOpenCodeGoReferralReward(channelId, workspaceUid),
       (result) => {
-        storePool(result.pool)
+        referralFenceRef.current.add(workspaceUid)
+        if (result.pool) {
+          storePool(applyReferralFences(result.pool))
+        } else {
+          queryClient.setQueryData<OpenCodeGoPool>(
+            openCodeGoPoolQueryKeys.pool(channelId),
+            (pool) => {
+              if (!pool) return pool
+              return {
+                ...pool,
+                identities: pool.identities.map((identity) => ({
+                  ...identity,
+                  workspaces: identity.workspaces.map((workspace) =>
+                    workspace.uid === workspaceUid
+                      ? { ...workspace, referral_reward_eligible: false }
+                      : workspace
+                  ),
+                })),
+              }
+            }
+          )
+          queryClient.invalidateQueries({
+            queryKey: openCodeGoPoolQueryKeys.pool(channelId),
+          })
+        }
         toast.success(
           t('Applied {{count}} referral rewards', {
             count: result.summary.applied,

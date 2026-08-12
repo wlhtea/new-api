@@ -96,6 +96,22 @@ func TestOpenCodeGoConsoleClientBlocksRedirectOutsideOrigin(t *testing.T) {
 	require.Zero(t, escapedCalls.Load())
 }
 
+func TestOpenCodeGoConsoleClientRejectsRedirectToDifferentWorkspace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/workspace/wrk_ALPHA1/go" {
+			http.Redirect(writer, request, "/workspace/wrk_OTHER1/go", http.StatusFound)
+			return
+		}
+		_, _ = writer.Write([]byte(openCodeGoCompleteSSRFixture("wrk_OTHER1", "sub_OTHER1")))
+	}))
+	defer server.Close()
+	client, err := newOpenCodeGoConsoleClient(server.URL, server.URL+"/zen/go/v1", server.Client())
+	require.NoError(t, err)
+
+	_, err = client.FetchWorkspacePage(context.Background(), "synthetic-cookie", "wrk_ALPHA1")
+	require.ErrorIs(t, err, ErrOpenCodeGoAuthenticationInvalid)
+}
+
 func TestOpenCodeGoConsoleClientRetainsSecondaryWorkspaceFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {

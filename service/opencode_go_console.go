@@ -206,7 +206,7 @@ func (client *OpenCodeGoConsoleClient) FetchWorkspacePage(
 	}
 	finalURL := response.Request.URL
 	finalWorkspaceID, ok := openCodeGoWorkspaceIDFromPath(finalURL.Path, true)
-	if !sameOpenCodeGoOrigin(finalURL, client.consoleBase) || !ok {
+	if !sameOpenCodeGoOrigin(finalURL, client.consoleBase) || !ok || !strings.EqualFold(workspaceID, finalWorkspaceID) {
 		return nil, fmt.Errorf("%w: workspace request ended outside the expected page", ErrOpenCodeGoAuthenticationInvalid)
 	}
 	document, err := readOpenCodeGoResponseBody(response.Body, openCodeGoConsoleBodyLimit)

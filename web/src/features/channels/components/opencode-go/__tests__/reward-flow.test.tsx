@@ -540,4 +540,63 @@ describe('OpenCode Go referral reward flow', () => {
       initialPool
     )
   })
+
+  test('treats verified apply without pool enrichment as success and disables retry', async () => {
+    const initialPool = poolFixture()
+    const request = deferred<{ data: unknown }>()
+    const stalePoolRequest = deferred<{ data: unknown }>()
+    let getCount = 0
+    apiClient.post = () => request.promise
+    const successMessages: React.ReactNode[] = []
+    const errorMessages: React.ReactNode[] = []
+    toastClient.success = (message) => successMessages.push(message)
+    toastClient.error = (message) => errorMessages.push(message)
+
+    await renderDrawer(initialPool)
+    apiClient.get = () => {
+      getCount += 1
+      return stalePoolRequest.promise
+    }
+    await openRewardConfirmation()
+    await act(async () => findConfirmButton().click())
+
+    await act(async () => {
+      request.resolve({
+        data: {
+          success: true,
+          data: {
+            summary: { attempted: 1, applied: 1 },
+            pool_refresh_required: true,
+          },
+        },
+      })
+      await request.promise
+      await Promise.resolve()
+    })
+
+    assert.deepEqual(successMessages, ['Applied 1 referral rewards'])
+    assert.deepEqual(errorMessages, [])
+
+    await act(async () =>
+      waitForCondition(
+        () => getCount === 1,
+        'pool reconciliation GET was not requested'
+      )
+    )
+    await act(async () => {
+      stalePoolRequest.resolve({
+        data: { success: true, data: initialPool },
+      })
+      await stalePoolRequest.promise
+      await Promise.resolve()
+    })
+
+    const cachedPool = renderedDrawer?.queryClient.getQueryData<OpenCodeGoPool>(
+      openCodeGoPoolQueryKeys.pool(62)
+    )
+    assert.equal(
+      cachedPool?.identities[0]?.workspaces[0]?.referral_reward_eligible,
+      false
+    )
+  })
 })

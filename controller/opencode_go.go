@@ -65,6 +65,8 @@ type openCodeGoReferralRewardLifecycle interface {
 	) (service.OpenCodeGoReferralApplySummary, error)
 }
 
+var getOpenCodeGoReferralPoolView = service.GetOpenCodeGoPoolView
+
 func GetOpenCodeGoPool(c *gin.Context) {
 	channelID, ok := openCodeGoChannelID(c)
 	if !ok {
@@ -166,16 +168,11 @@ func applyOpenCodeGoReferralReward(c *gin.Context, lifecycle openCodeGoReferralR
 	}
 	summary, err := lifecycle.ApplyReferralReward(c.Request.Context(), channelID, workspaceUID, "manual")
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, service.SanitizeOpenCodeGoLifecycleError(err))
 		return
 	}
 	if summary.Attempted != 1 || summary.Applied != 1 {
 		common.ApiError(c, errors.New("OpenCode Go referral reward was not applied and verified"))
-		return
-	}
-	view, err := service.GetOpenCodeGoPoolView(channelID)
-	if err != nil {
-		common.ApiError(c, err)
 		return
 	}
 	recordManageAudit(c, "channel.opencode_go_referral_apply", map[string]interface{}{
@@ -184,7 +181,19 @@ func applyOpenCodeGoReferralReward(c *gin.Context, lifecycle openCodeGoReferralR
 		"attempted":     summary.Attempted,
 		"applied":       summary.Applied,
 	})
-	common.ApiSuccess(c, gin.H{"summary": summary, "pool": view})
+	response := gin.H{"summary": summary, "pool_refresh_required": false}
+	if summary.PoolRefreshRequired {
+		response["pool_refresh_required"] = true
+		common.ApiSuccess(c, response)
+		return
+	}
+	view, err := getOpenCodeGoReferralPoolView(channelID)
+	if err != nil {
+		response["pool_refresh_required"] = true
+	} else {
+		response["pool"] = view
+	}
+	common.ApiSuccess(c, response)
 }
 
 func CancelOpenCodeGoSubscriptionRenewal(c *gin.Context) {

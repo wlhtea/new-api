@@ -8,6 +8,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 const (
@@ -58,8 +59,22 @@ func finishOpenCodeGoOperation(
 	err error,
 	now time.Time,
 ) error {
+	return finishOpenCodeGoOperationTx(model.DB, operation, status, result, err, now)
+}
+
+func finishOpenCodeGoOperationTx(
+	tx *gorm.DB,
+	operation *model.OpenCodeGoOperation,
+	status string,
+	result string,
+	err error,
+	now time.Time,
+) error {
 	if operation == nil || operation.ID <= 0 {
 		return errors.New("OpenCode Go operation is missing")
+	}
+	if tx == nil {
+		return errors.New("OpenCode Go operation database is missing")
 	}
 	if now.IsZero() {
 		now = time.Now()
@@ -70,7 +85,7 @@ func finishOpenCodeGoOperation(
 	}
 	resultValue := sanitizeOpenCodeGoOperationResult(result)
 	finishedAt := now.Unix()
-	updateErr := model.DB.Model(&model.OpenCodeGoOperation{}).
+	updateErr := tx.Model(&model.OpenCodeGoOperation{}).
 		Where("id = ?", operation.ID).
 		Updates(map[string]interface{}{
 			"status":      sanitizeOpenCodeGoOperationValue(status, 32),

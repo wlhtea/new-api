@@ -83,6 +83,49 @@ describe('OpenCode Go referral reward API', () => {
     ])
   })
 
+  test('accepts a verified result that requires a separate pool refresh', async () => {
+    apiClient.post = async () => ({
+      data: {
+        success: true,
+        data: {
+          summary: { attempted: 1, applied: 1 },
+          pool_refresh_required: true,
+        },
+      },
+    })
+
+    const result = await applyOpenCodeGoReferralReward(62, 'workspace-test')
+    assert.equal(result.pool, undefined)
+    assert.equal(result.pool_refresh_required, true)
+  })
+
+  test('does not replay the irreversible reward POST after a 401', async () => {
+    const originalAdapter = api.defaults.adapter
+    let attempts = 0
+    let sawSkipAuthRefresh = false
+    api.defaults.adapter = async (config) => {
+      attempts += 1
+      sawSkipAuthRefresh = config.skipAuthRefresh === true
+      return {
+        data: { success: false },
+        status: 401,
+        statusText: 'Unauthorized',
+        headers: {},
+        config,
+        request: {},
+      }
+    }
+
+    try {
+      await assert.rejects(applyOpenCodeGoReferralReward(62, 'workspace-test'))
+    } finally {
+      api.defaults.adapter = originalAdapter
+    }
+
+    assert.equal(attempts, 1)
+    assert.equal(sawSkipAuthRefresh, true)
+  })
+
   test('rejects zero and malformed success summaries', async () => {
     const summaries: unknown[] = [
       { attempted: 0, applied: 0 },

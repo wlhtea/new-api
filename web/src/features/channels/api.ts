@@ -87,7 +87,8 @@ const openCodeGoReferralMutationSchema = z.object({
     attempted: z.literal(1),
     applied: z.literal(1),
   }),
-  pool: openCodeGoPoolSchema,
+  pool: openCodeGoPoolSchema.optional(),
+  pool_refresh_required: z.boolean().default(false),
 })
 const openCodeGoCancellationMutationSchema = z.object({
   operation: openCodeGoOperationSchema,
@@ -1002,7 +1003,7 @@ export async function applyOpenCodeGoReferralReward(
   const res = await api.post(
     `/api/channel/${channelId}/opencode-go/workspaces/${encodeURIComponent(workspaceUid)}/referral-rewards/apply`,
     undefined,
-    channelActionConfig()
+    channelActionConfig({ skipAuthRefresh: true })
   )
   return requireOpenCodeGoData(
     openCodeGoReferralMutationSchema,

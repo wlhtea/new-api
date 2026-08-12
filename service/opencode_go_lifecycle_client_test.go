@@ -186,6 +186,40 @@ func TestOpenCodeGoLifecycleClientDoesNotFollowReferralMutationRedirects(t *test
 	assert.Zero(t, redirectedCalls.Load())
 }
 
+func TestOpenCodeGoLifecycleClientMutationBodyIsNotReplayable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_server" {
+			writer.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = writer.Write([]byte(`createServerReference("` + strings.Repeat("a", 64) + `");"go.referral.reward.apply"`))
+	}))
+	defer server.Close()
+	console, err := newOpenCodeGoConsoleClient(server.URL, server.URL+"/zen/go/v1", server.Client())
+	require.NoError(t, err)
+	client, err := newOpenCodeGoLifecycleClient(console, server.URL, server.Client())
+	require.NoError(t, err)
+
+	getBodyWasSet := false
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		getBodyWasSet = request.GetBody != nil
+		return &http.Response{StatusCode: http.StatusBadGateway, Body: http.NoBody, Header: make(http.Header), Request: request}, nil
+	})
+	httpClient := &http.Client{Transport: transport}
+	_, err = client.postConsoleServerActionBodyWithClient(
+		context.Background(), "synthetic-cookie", "wrk_TEST", strings.Repeat("a", 64),
+		[]string{"wrk_TEST", "ref_TEST"}, httpClient, "server-fn:1", true,
+	)
+	require.Error(t, err)
+	assert.False(t, getBodyWasSet)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
 func TestParseOpenCodeGoReferralApplyAmountRequiresPositiveExpectedResult(t *testing.T) {
 	valid := `;0x00000055;((self.$R=self.$R||{})["server-fn:1"]=[],($R=>$R[0]={amount:500})($R["server-fn:1"]))`
 	amount, err := parseOpenCodeGoReferralApplyAmount([]byte(valid))

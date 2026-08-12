@@ -22,6 +22,10 @@ const (
 
 var ErrOpenCodeGoReferralRewardUnavailable = errors.New("OpenCode Go referral reward is not currently available")
 
+func SanitizeOpenCodeGoLifecycleError(err error) string {
+	return sanitizeOpenCodeGoError(err)
+}
+
 type openCodeGoLifecycleReader interface {
 	FetchWorkspacePage(ctx context.Context, authCookie string, workspaceID string) (*OpenCodeGoConsolePage, error)
 }
@@ -35,8 +39,9 @@ type OpenCodeGoLifecyclePolicy struct {
 }
 
 type OpenCodeGoReferralApplySummary struct {
-	Attempted int `json:"attempted"`
-	Applied   int `json:"applied"`
+	Attempted           int  `json:"attempted"`
+	Applied             int  `json:"applied"`
+	PoolRefreshRequired bool `json:"-"`
 }
 
 type OpenCodeGoLifecycleAutomationResult struct {
@@ -421,7 +426,7 @@ func (service *OpenCodeGoLifecycleService) applyReferralRewards(
 	if requireExhaustedQuota && !openCodeGoWorkspaceHasExhaustedQuota(*target.workspace) {
 		return summary, nil
 	}
-	if !openCodeGoReferralRewardEligible(*target.identity, *target.workspace) {
+	if !openCodeGoReferralRewardEligibleAt(*target.identity, *target.workspace, service.now()) {
 		if requireExhaustedQuota {
 			return summary, nil
 		}
@@ -483,39 +488,50 @@ func (service *OpenCodeGoLifecycleService) applyReferralRewards(
 		if verifyErr != nil {
 			return summary, service.failOperation(operation, verifyErr)
 		}
-		persistErr := func() error {
+		if verifiedPage == nil || !strings.EqualFold(verifiedPage.WorkspaceID, target.workspace.UpstreamWorkspaceID) {
+			return summary, service.failOperation(operation, errors.New("OpenCode Go referral verification page is for another workspace"))
+		}
+		if _, verifyErr := validateOpenCodeGoReferralVerificationPage(verifiedPage, rewardID); verifyErr != nil {
+			return summary, service.failOperation(operation, verifyErr)
+		}
+		if verifiedPage.Quota.FetchedAt < target.workspace.LastSyncedAt ||
+			verifiedPage.Quota.FetchedAt < target.workspace.QuotaFetchedAt {
+			return summary, service.failOperation(operation, errors.New("OpenCode Go referral verification page is older than the stored snapshot"))
+		}
+		refreshedWorkspace, persistErr := func() (*model.OpenCodeGoWorkspace, error) {
 			releaseMutation := BeginOpenCodeGoPoolMutation(channelID)
 			defer releaseMutation()
-			if err := service.persistReferralVerification(channelID, workspaceUID, rewardID, verifiedPage); err != nil {
-				return err
+			refreshed, err := service.persistReferralVerificationAndFinishOperation(
+				channelID, workspaceUID, rewardID, verifiedPage, operation, amount,
+			)
+			if err != nil {
+				return nil, err
 			}
 			if service.pool.rebuild == nil {
-				return nil
+				return refreshed, nil
 			}
 			openCodeGoIdentityProxyClients.advanceSelectionGeneration(channelID)
-			return service.pool.rebuild(channelID)
+			// The provider mutation, post-state verification, local snapshot and
+			// success operation are already committed. A rebuild failure must not
+			// turn that irreversible success into a retryable claim failure.
+			_ = service.pool.rebuild(channelID)
+			return refreshed, nil
 		}()
 		if persistErr != nil {
-			return summary, service.failOperation(operation, persistErr)
-		}
-		if err := finishOpenCodeGoOperation(
-			operation,
-			OpenCodeGoOperationStatusSucceeded,
-			fmt.Sprintf("referral reward applied and verified (amount=%d)", amount),
-			nil,
-			service.now(),
-		); err != nil {
-			return summary, err
+			// The fresh provider read already proved this exact reward was applied.
+			// Local persistence failure cannot make the mutation retryable.
+			_ = finishOpenCodeGoOperation(
+				operation,
+				OpenCodeGoOperationStatusSucceeded,
+				fmt.Sprintf("referral reward applied and verified; local refresh required (amount=%d)", amount),
+				nil,
+				service.now(),
+			)
+			summary.Applied++
+			summary.PoolRefreshRequired = true
+			return summary, nil
 		}
 		summary.Applied++
-
-		refreshedWorkspace, loadErr := model.GetOpenCodeGoWorkspace(channelID, workspaceUID)
-		if loadErr != nil {
-			return summary, loadErr
-		}
-		if refreshedWorkspace == nil {
-			return summary, errors.New("OpenCode Go referral verification workspace is missing")
-		}
 		target.workspace = refreshedWorkspace
 	}
 	return summary, nil
@@ -813,14 +829,15 @@ func findOpenCodeGoIdentityWorkspace(identity *model.OpenCodeGoIdentity, workspa
 }
 
 func (service *OpenCodeGoLifecycleService) failOperation(operation *model.OpenCodeGoOperation, actionErr error) error {
+	safeErr := errors.New(sanitizeOpenCodeGoError(actionErr))
 	finishErr := finishOpenCodeGoOperation(
 		operation,
 		OpenCodeGoOperationStatusFailed,
 		"",
-		actionErr,
+		safeErr,
 		service.now(),
 	)
-	return errors.Join(actionErr, finishErr)
+	return errors.Join(safeErr, finishErr)
 }
 
 func (service *OpenCodeGoLifecycleService) persistChinaModelVerification(
@@ -855,12 +872,36 @@ func (service *OpenCodeGoLifecycleService) persistReferralVerification(
 	rewardID string,
 	page *OpenCodeGoConsolePage,
 ) error {
+	_, err := service.persistReferralVerificationTx(channelID, workspaceUID, rewardID, page, nil, 0)
+	return err
+}
+
+func (service *OpenCodeGoLifecycleService) persistReferralVerificationAndFinishOperation(
+	channelID int,
+	workspaceUID string,
+	rewardID string,
+	page *OpenCodeGoConsolePage,
+	operation *model.OpenCodeGoOperation,
+	amount int,
+) (*model.OpenCodeGoWorkspace, error) {
+	return service.persistReferralVerificationTx(channelID, workspaceUID, rewardID, page, operation, amount)
+}
+
+func (service *OpenCodeGoLifecycleService) persistReferralVerificationTx(
+	channelID int,
+	workspaceUID string,
+	rewardID string,
+	page *OpenCodeGoConsolePage,
+	operation *model.OpenCodeGoOperation,
+	amount int,
+) (*model.OpenCodeGoWorkspace, error) {
 	windows, err := validateOpenCodeGoReferralVerificationPage(page, rewardID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	observedAt := service.now()
-	return model.DB.Transaction(func(tx *gorm.DB) error {
+	var refreshed model.OpenCodeGoWorkspace
+	err = model.DB.Transaction(func(tx *gorm.DB) error {
 		var current model.OpenCodeGoWorkspace
 		if err := model.LockForUpdate(tx).
 			Where("channel_id = ? AND uid = ?", channelID, workspaceUID).
@@ -952,8 +993,33 @@ func (service *OpenCodeGoLifecycleService) persistReferralVerification(
 		if err := tx.Where("workspace_id = ?", current.ID).Delete(&model.OpenCodeGoQuotaWindow{}).Error; err != nil {
 			return err
 		}
-		return tx.Create(&windows).Error
+		if err := tx.Create(&windows).Error; err != nil {
+			return err
+		}
+		if operation != nil {
+			if amount <= 0 {
+				return errors.New("OpenCode Go referral action amount was invalid")
+			}
+			if err := finishOpenCodeGoOperationTx(
+				tx,
+				operation,
+				OpenCodeGoOperationStatusSucceeded,
+				fmt.Sprintf("referral reward applied and verified (amount=%d)", amount),
+				nil,
+				observedAt,
+			); err != nil {
+				return err
+			}
+		}
+		refreshed = candidate
+		refreshed.QuotaWindows = append([]model.OpenCodeGoQuotaWindow(nil), windows...)
+		refreshed.Models = append([]model.OpenCodeGoWorkspaceModel(nil), current.Models...)
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &refreshed, nil
 }
 
 func validateOpenCodeGoReferralVerificationPage(
@@ -1095,11 +1161,22 @@ func openCodeGoReferralRewardEligible(
 	identity model.OpenCodeGoIdentity,
 	workspace model.OpenCodeGoWorkspace,
 ) bool {
+	return openCodeGoReferralRewardEligibleAt(identity, workspace, time.Now())
+}
+
+func openCodeGoReferralRewardEligibleAt(
+	identity model.OpenCodeGoIdentity,
+	workspace model.OpenCodeGoWorkspace,
+	now time.Time,
+) bool {
+	if now.IsZero() {
+		now = time.Now()
+	}
 	if (identity.Status != model.OpenCodeGoIdentityStatusActive && identity.Status != model.OpenCodeGoIdentityStatusStale) ||
 		identity.AuthCookieCiphertext == "" ||
 		!workspace.ManualEnabled ||
 		workspace.MembershipStatus != model.OpenCodeGoMembershipActive ||
-		workspace.AvailableReferralRewards <= 0 ||
+		(workspace.SubscriptionEndsAt > 0 && workspace.SubscriptionEndsAt <= now.Unix()) ||
 		workspace.RiskDetectedAt > 0 ||
 		workspace.BulkFailureDetectedAt > 0 {
 		return false
@@ -1107,7 +1184,6 @@ func openCodeGoReferralRewardEligible(
 	switch workspace.EffectiveState {
 	case model.OpenCodeGoStateManualDisabled,
 		model.OpenCodeGoStateAuthError,
-		model.OpenCodeGoStateKeyError,
 		model.OpenCodeGoStateMembershipExpired,
 		model.OpenCodeGoStateRiskBlocked,
 		model.OpenCodeGoStateBulkDisabled:

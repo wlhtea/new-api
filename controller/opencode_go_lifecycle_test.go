@@ -63,6 +63,8 @@ func TestCancelOpenCodeGoSubscriptionRenewalRequiresExplicitConfirmation(t *test
 }
 
 func TestApplyOpenCodeGoReferralRewardOnlyAuditsVerifiedSingleApply(t *testing.T) {
+	originalPoolView := getOpenCodeGoReferralPoolView
+	t.Cleanup(func() { getOpenCodeGoReferralPoolView = originalPoolView })
 	tests := []struct {
 		name        string
 		summary     service.OpenCodeGoReferralApplySummary
@@ -79,6 +81,10 @@ func TestApplyOpenCodeGoReferralRewardOnlyAuditsVerifiedSingleApply(t *testing.T
 			summary:     service.OpenCodeGoReferralApplySummary{Attempted: 1, Applied: 1},
 			wantSuccess: true,
 			wantAudits:  1,
+		},
+		{
+			name: "service failure redacts upstream identifiers",
+			err:  errors.New("auth=synthetic-cookie sk-synthetic-key wrk_PRIVATE1 ref_PRIVATE1"),
 		},
 	}
 
@@ -122,6 +128,11 @@ func TestApplyOpenCodeGoReferralRewardOnlyAuditsVerifiedSingleApply(t *testing.T
 
 			require.Equal(t, http.StatusOK, response.Code)
 			assert.Contains(t, response.Body.String(), fmt.Sprintf(`"success":%t`, test.wantSuccess))
+			if test.name == "service failure redacts upstream identifiers" {
+				for _, forbidden := range []string{"synthetic-cookie", "sk-synthetic-key", "wrk_PRIVATE1", "ref_PRIVATE1"} {
+					assert.NotContains(t, response.Body.String(), forbidden)
+				}
+			}
 			assert.Equal(t, 1, fake.calls)
 			assert.Equal(t, channel.Id, fake.channelID)
 			assert.Equal(t, "workspace-test", fake.workspaceUID)
@@ -133,4 +144,78 @@ func TestApplyOpenCodeGoReferralRewardOnlyAuditsVerifiedSingleApply(t *testing.T
 			assert.Equal(t, test.wantAudits, auditCount)
 		})
 	}
+}
+
+func TestApplyOpenCodeGoReferralRewardKeepsVerifiedSuccessWhenPoolRefreshFails(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	originalPoolView := getOpenCodeGoReferralPoolView
+	getOpenCodeGoReferralPoolView = func(int) (*service.OpenCodeGoPoolView, error) {
+		return nil, errors.New("synthetic pool read failure")
+	}
+	t.Cleanup(func() { getOpenCodeGoReferralPoolView = originalPoolView })
+
+	fake := &fakeOpenCodeGoReferralRewardLifecycle{
+		summary: service.OpenCodeGoReferralApplySummary{Attempted: 1, Applied: 1},
+	}
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.POST("/channel/:id/opencode-go/workspaces/:workspace_uid/referral-rewards/apply", func(c *gin.Context) {
+		c.Set("id", 42)
+		applyOpenCodeGoReferralReward(c, fake)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/channel/62/opencode-go/workspaces/workspace-test/referral-rewards/apply", nil)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Contains(t, response.Body.String(), `"success":true`)
+	assert.Contains(t, response.Body.String(), `"pool_refresh_required":true`)
+	assert.NotContains(t, response.Body.String(), `"pool":`)
+	var auditCount int64
+	require.NoError(t, db.Model(&model.Log{}).
+		Where("type = ? AND other LIKE ?", model.LogTypeManage, `%channel.opencode_go_referral_apply%`).
+		Count(&auditCount).Error)
+	assert.Equal(t, int64(1), auditCount)
+}
+
+func TestApplyOpenCodeGoReferralRewardOmitsStalePoolWhenServiceRequiresRefresh(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	originalPoolView := getOpenCodeGoReferralPoolView
+	poolViewCalls := 0
+	getOpenCodeGoReferralPoolView = func(int) (*service.OpenCodeGoPoolView, error) {
+		poolViewCalls++
+		return &service.OpenCodeGoPoolView{}, nil
+	}
+	t.Cleanup(func() { getOpenCodeGoReferralPoolView = originalPoolView })
+
+	fake := &fakeOpenCodeGoReferralRewardLifecycle{
+		summary: service.OpenCodeGoReferralApplySummary{
+			Attempted:           1,
+			Applied:             1,
+			PoolRefreshRequired: true,
+		},
+	}
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.POST("/channel/:id/opencode-go/workspaces/:workspace_uid/referral-rewards/apply", func(c *gin.Context) {
+		c.Set("id", 42)
+		applyOpenCodeGoReferralReward(c, fake)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/channel/62/opencode-go/workspaces/workspace-test/referral-rewards/apply", nil)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Contains(t, response.Body.String(), `"success":true`)
+	assert.Contains(t, response.Body.String(), `"pool_refresh_required":true`)
+	assert.Equal(t, 1, strings.Count(response.Body.String(), `"pool_refresh_required"`), "the internal summary signal must not be serialized")
+	assert.NotContains(t, response.Body.String(), `"pool":`)
+	assert.Zero(t, poolViewCalls, "a locally stale pool must not be read into the success response")
+	var auditCount int64
+	require.NoError(t, db.Model(&model.Log{}).
+		Where("type = ? AND other LIKE ?", model.LogTypeManage, `%channel.opencode_go_referral_apply%`).
+		Count(&auditCount).Error)
+	assert.Equal(t, int64(1), auditCount)
 }

@@ -29,6 +29,7 @@ var openCodeGoWorkspaceIDPattern = regexp.MustCompile(`(?i)^wrk_[a-z0-9]+$`)
 var (
 	openCodeGoServerActionIDPattern   = regexp.MustCompile(`(?i)^[a-f0-9]{64}$`)
 	openCodeGoReferralRewardIDPattern = regexp.MustCompile(`(?i)^ref_[a-z0-9]+$`)
+	openCodeGoPendingRewardIDPattern  = regexp.MustCompile(`(?i)^ref_[a-z0-9]+:(inviter|invitee)$`)
 )
 
 type OpenCodeGoDiscoveredWorkspace struct {
@@ -130,8 +131,7 @@ func ParseOpenCodeGoConsolePage(document string, currentWorkspaceID string, fetc
 	}
 
 	page.Email = extractOpenCodeGoEmail(tokens)
-	page.ReferralCode, _ = findOpenCodeGoSSRStringProperty(tokens, "referralCode")
-	page.AvailableReferralRewardIDs, page.UsedReferralRewardIDs = extractOpenCodeGoReferralRewardIDs(tokens)
+	page.ReferralCode, page.AvailableReferralRewardIDs, page.UsedReferralRewardIDs = extractOpenCodeGoReferralSummary(tokens, currentWorkspaceID)
 	page.AvailableReferralRewards = len(page.AvailableReferralRewardIDs)
 	page.UsedReferralRewards = len(page.UsedReferralRewardIDs)
 	page.MembershipStatus, page.SubscriptionReference = parseOpenCodeGoMembership(tokens, visibleText)
@@ -166,7 +166,7 @@ func ParseOpenCodeGoAPIKeyPage(document string) (string, error) {
 	scriptSource, _, _ := extractOpenCodeGoConsoleHTML(doc)
 	tokens := lexOpenCodeGoSSR(scriptSource)
 	for index := 0; index+2 < len(tokens); index++ {
-		if tokens[index].kind != openCodeGoSSRTokenIdentifier || tokens[index].value != "key" || tokens[index+1].value != ":" || tokens[index+2].kind != openCodeGoSSRTokenString {
+		if tokens[index].kind != openCodeGoSSRTokenIdentifier || tokens[index].value != "key" || !openCodeGoSSRIsPunctuation(tokens[index+1], ":") || tokens[index+2].kind != openCodeGoSSRTokenString {
 			continue
 		}
 		candidate := tokens[index+2].value
@@ -466,7 +466,7 @@ func collectOpenCodeGoSSRObjects(tokens []openCodeGoSSRToken) []map[string]openC
 		if len(stack) == 0 || (token.kind != openCodeGoSSRTokenIdentifier && token.kind != openCodeGoSSRTokenString) {
 			continue
 		}
-		if index+2 >= len(tokens) || tokens[index+1].value != ":" || !isOpenCodeGoSSRScalar(tokens[index+2]) {
+		if index+2 >= len(tokens) || !openCodeGoSSRIsPunctuation(tokens[index+1], ":") || !isOpenCodeGoSSRScalar(tokens[index+2]) {
 			continue
 		}
 		stack[len(stack)-1].fields[token.value] = tokens[index+2]
@@ -484,7 +484,7 @@ func findOpenCodeGoSSRStringProperty(tokens []openCodeGoSSRToken, property strin
 
 func findOpenCodeGoSSRScalarProperty(tokens []openCodeGoSSRToken, property string) (openCodeGoSSRToken, bool) {
 	for index := 0; index+2 < len(tokens); index++ {
-		if tokens[index].kind != openCodeGoSSRTokenIdentifier || tokens[index].value != property || tokens[index+1].value != ":" {
+		if tokens[index].kind != openCodeGoSSRTokenIdentifier || tokens[index].value != property || !openCodeGoSSRIsPunctuation(tokens[index+1], ":") {
 			continue
 		}
 		if isOpenCodeGoSSRScalar(tokens[index+2]) {
@@ -541,24 +541,287 @@ func parseOpenCodeGoMembership(tokens []openCodeGoSSRToken, visibleText string) 
 	return model.OpenCodeGoMembershipUnknown, ""
 }
 
-func extractOpenCodeGoReferralRewardIDs(tokens []openCodeGoSSRToken) ([]string, []string) {
-	available := make(map[string]struct{})
-	used := make(map[string]struct{})
-	for _, object := range collectOpenCodeGoSSRObjects(tokens) {
-		id, hasID := object["id"]
-		source, hasSource := object["source"]
-		status, hasStatus := object["status"]
-		if !hasID || !hasSource || !hasStatus || id.kind != openCodeGoSSRTokenString || source.kind != openCodeGoSSRTokenString || status.kind != openCodeGoSSRTokenString {
+func extractOpenCodeGoReferralSummary(tokens []openCodeGoSSRToken, currentWorkspaceID string) (string, []string, []string) {
+	referralCode := ""
+	var availableRewardIDs []string
+	var usedRewardIDs []string
+	candidateCount := 0
+	for index := 0; index+2 < len(tokens); index++ {
+		if tokens[index].kind != openCodeGoSSRTokenIdentifier || tokens[index].value != "referralCode" || !openCodeGoSSRIsPunctuation(tokens[index+1], ":") {
 			continue
 		}
-		if !openCodeGoReferralRewardIDPattern.MatchString(id.value) || len(id.value) > 96 || (source.value != "inviter" && source.value != "invitee") {
+		belongs, certain := openCodeGoReferralSummaryBelongsToWorkspace(tokens, index, currentWorkspaceID)
+		if !certain {
+			return referralCode, nil, nil
+		}
+		if !belongs {
 			continue
+		}
+		candidateCount++
+		if candidateCount > 1 {
+			// Multiple named summaries are ambiguous even when the later one is
+			// malformed or otherwise empty. Keep only the display code.
+			return referralCode, nil, nil
+		}
+		if tokens[index+2].kind != openCodeGoSSRTokenString {
+			return referralCode, nil, nil
+		}
+		referralCode = tokens[index+2].value
+		rewardsIndex := findOpenCodeGoReferralRewardsProperty(tokens, index)
+		if rewardsIndex < 0 {
+			return referralCode, nil, nil
+		}
+		objects, ok := collectOpenCodeGoReferralObjectsAt(tokens, rewardsIndex+2)
+		if !ok {
+			return referralCode, nil, nil
+		}
+		available, used, valid := classifyOpenCodeGoReferralRewards(objects)
+		if !valid {
+			return referralCode, nil, nil
+		}
+		availableRewardIDs = available
+		usedRewardIDs = used
+	}
+	return referralCode, availableRewardIDs, usedRewardIDs
+}
+
+func openCodeGoReferralSummaryBelongsToWorkspace(tokens []openCodeGoSSRToken, propertyIndex int, currentWorkspaceID string) (bool, bool) {
+	starts := openCodeGoEnclosingObjectStarts(tokens, propertyIndex)
+	if len(starts) == 0 {
+		// Production hydration can stream the summary as top-level object fields;
+		// in that shape the requested console URL is the workspace boundary.
+		return true, true
+	}
+	bound := false
+	for _, start := range starts {
+		object, _, ok := parseOpenCodeGoSSRObjectAt(tokens, start)
+		if !ok {
+			return false, false
+		}
+		bindings := make([]openCodeGoSSRToken, 0, 2)
+		for _, key := range []string{"workspaceID", "workspaceId"} {
+			if value, exists := object[key]; exists {
+				if value.kind != openCodeGoSSRTokenString {
+					return false, false
+				}
+				bindings = append(bindings, value)
+			}
+		}
+		for _, value := range bindings {
+			bound = true
+			if !strings.EqualFold(value.value, currentWorkspaceID) {
+				return false, true
+			}
+		}
+	}
+	// An unbound object is acceptable only when it is the direct summary object.
+	// A nested unbound object has no reliable workspace boundary and must fail
+	// closed rather than borrowing the enclosing page's workspace.
+	return len(starts) == 1 || bound, true
+}
+
+func openCodeGoSSRIsPunctuation(token openCodeGoSSRToken, value string) bool {
+	return token.kind == openCodeGoSSRTokenPunctuation && token.value == value
+}
+
+func openCodeGoSSRIsArrayIndex(token openCodeGoSSRToken) bool {
+	if token.kind != openCodeGoSSRTokenNumber || token.value == "" {
+		return false
+	}
+	for index := 0; index < len(token.value); index++ {
+		if token.value[index] < '0' || token.value[index] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func openCodeGoEnclosingObjectStart(tokens []openCodeGoSSRToken, index int) int {
+	starts := openCodeGoEnclosingObjectStarts(tokens, index)
+	if len(starts) > 0 {
+		return starts[0]
+	}
+	return -1
+}
+
+func openCodeGoEnclosingObjectStarts(tokens []openCodeGoSSRToken, index int) []int {
+	depth := 0
+	starts := make([]int, 0, 2)
+	for cursor := index - 1; cursor >= 0; cursor-- {
+		if openCodeGoSSRIsPunctuation(tokens[cursor], "}") {
+			depth++
+			continue
+		}
+		if !openCodeGoSSRIsPunctuation(tokens[cursor], "{") {
+			continue
+		}
+		if depth == 0 {
+			starts = append(starts, cursor)
+			continue
+		}
+		depth--
+	}
+	return starts
+}
+
+func findOpenCodeGoReferralRewardsProperty(tokens []openCodeGoSSRToken, referralCodeIndex int) int {
+	objectStart := openCodeGoEnclosingObjectStart(tokens, referralCodeIndex)
+	if objectStart >= 0 {
+		_, objectEnd, ok := parseOpenCodeGoSSRObjectAt(tokens, objectStart)
+		if !ok {
+			return -1
+		}
+		return findOpenCodeGoReferralRewardsPropertyInRange(tokens, referralCodeIndex+3, objectEnd)
+	}
+	for index := referralCodeIndex + 3; index+2 < len(tokens); index++ {
+		if (tokens[index].kind == openCodeGoSSRTokenIdentifier && tokens[index].value == "referralCode") ||
+			openCodeGoSSRIsPunctuation(tokens[index], ";") || openCodeGoSSRIsPunctuation(tokens[index], "}") {
+			return -1
+		}
+		if tokens[index].kind == openCodeGoSSRTokenIdentifier && tokens[index].value == "rewards" && openCodeGoSSRIsPunctuation(tokens[index+1], ":") {
+			return index
+		}
+	}
+	return -1
+}
+
+func findOpenCodeGoReferralRewardsPropertyInRange(tokens []openCodeGoSSRToken, start int, end int) int {
+	depth := 0
+	for index := start; index+2 < end; index++ {
+		if openCodeGoSSRIsPunctuation(tokens[index], "{") || openCodeGoSSRIsPunctuation(tokens[index], "[") {
+			depth++
+		} else if openCodeGoSSRIsPunctuation(tokens[index], "}") || openCodeGoSSRIsPunctuation(tokens[index], "]") {
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth == 0 && tokens[index].kind == openCodeGoSSRTokenIdentifier && tokens[index].value == "rewards" && openCodeGoSSRIsPunctuation(tokens[index+1], ":") {
+			return index
+		}
+	}
+	return -1
+}
+
+func collectOpenCodeGoReferralObjectsAt(tokens []openCodeGoSSRToken, start int) ([]map[string]openCodeGoSSRToken, bool) {
+	if start >= len(tokens) {
+		return nil, false
+	}
+	if !openCodeGoSSRIsPunctuation(tokens[start], "[") {
+		if start+5 >= len(tokens) ||
+			tokens[start].kind != openCodeGoSSRTokenIdentifier || tokens[start].value != "$R" ||
+			!openCodeGoSSRIsPunctuation(tokens[start+1], "[") ||
+			!openCodeGoSSRIsArrayIndex(tokens[start+2]) ||
+			!openCodeGoSSRIsPunctuation(tokens[start+3], "]") ||
+			!openCodeGoSSRIsPunctuation(tokens[start+4], "=") ||
+			!openCodeGoSSRIsPunctuation(tokens[start+5], "[") {
+			return nil, false
+		}
+		start += 5
+	}
+	objects := make([]map[string]openCodeGoSSRToken, 0)
+	expectEntry := true
+	for index := start + 1; index < len(tokens); {
+		token := tokens[index]
+		if openCodeGoSSRIsPunctuation(token, "]") {
+			return objects, true
+		}
+		if !expectEntry {
+			if !openCodeGoSSRIsPunctuation(token, ",") {
+				return nil, false
+			}
+			expectEntry = true
+			index++
+			continue
+		}
+		if openCodeGoSSRIsPunctuation(token, ",") {
+			// Leading and repeated commas encode missing array members.
+			return nil, false
+		}
+		entryStart := index
+		if token.kind == openCodeGoSSRTokenIdentifier && token.value == "$R" {
+			// Official hydration stores each entry through a resolved slot:
+			// `$R[2] = { ... }`. Require the complete assignment shape.
+			if entryStart+4 >= len(tokens) ||
+				!openCodeGoSSRIsPunctuation(tokens[entryStart+1], "[") ||
+				!openCodeGoSSRIsArrayIndex(tokens[entryStart+2]) ||
+				!openCodeGoSSRIsPunctuation(tokens[entryStart+3], "]") ||
+				!openCodeGoSSRIsPunctuation(tokens[entryStart+4], "=") {
+				return nil, false
+			}
+			entryStart += 5
+		}
+		if entryStart >= len(tokens) || !openCodeGoSSRIsPunctuation(tokens[entryStart], "{") {
+			return nil, false
+		}
+		object, end, ok := parseOpenCodeGoSSRObjectAt(tokens, entryStart)
+		if !ok {
+			return nil, false
+		}
+		objects = append(objects, object)
+		expectEntry = false
+		index = end + 1
+	}
+	return nil, false
+}
+
+func classifyOpenCodeGoReferralRewards(objects []map[string]openCodeGoSSRToken) ([]string, []string, bool) {
+	available := make(map[string]struct{})
+	used := make(map[string]struct{})
+	seen := make(map[string]string)
+	for _, object := range objects {
+		id, hasID := object["id"]
+		status, hasStatus := object["status"]
+		if !hasID || !hasStatus || id.kind != openCodeGoSSRTokenString ||
+			status.kind != openCodeGoSSRTokenString || id.value == "" || len(id.value) > 96 {
+			return nil, nil, false
+		}
+		source, hasSource := object["source"]
+		if !hasSource || source.kind != openCodeGoSSRTokenString ||
+			(source.value != "inviter" && source.value != "invitee") {
+			return nil, nil, false
+		}
+		if status.value == "pending" {
+			if _, exists := seen[id.value]; exists {
+				return nil, nil, false
+			}
+			seen[id.value] = status.value
+			if !openCodeGoPendingRewardIDPattern.MatchString(id.value) {
+				return nil, nil, false
+			}
+			continue
+		}
+		if !openCodeGoReferralRewardIDPattern.MatchString(id.value) {
+			return nil, nil, false
 		}
 		switch status.value {
 		case "available":
+			if _, exists := seen[id.value]; exists {
+				return nil, nil, false
+			} else {
+				seen[id.value] = status.value
+			}
+			if _, exists := used[id.value]; exists {
+				return nil, nil, false
+			}
 			available[id.value] = struct{}{}
 		case "applied", "used":
+			if prior, exists := seen[id.value]; exists {
+				if prior == "available" || prior == "completed" || prior == status.value {
+					return nil, nil, false
+				}
+				// The provider has historically emitted one `used` and one
+				// `applied` row for the same completed reward. Treat that pair
+				// as one completed state, but reject any further duplicate.
+				seen[id.value] = "completed"
+			} else {
+				seen[id.value] = status.value
+			}
+			if _, exists := available[id.value]; exists {
+				return nil, nil, false
+			}
 			used[id.value] = struct{}{}
+		default:
+			return nil, nil, false
 		}
 	}
 	availableIDs := make([]string, 0, len(available))
@@ -571,7 +834,7 @@ func extractOpenCodeGoReferralRewardIDs(tokens []openCodeGoSSRToken) ([]string, 
 	}
 	sort.Strings(availableIDs)
 	sort.Strings(usedIDs)
-	return availableIDs, usedIDs
+	return availableIDs, usedIDs, true
 }
 
 func parseOpenCodeGoAuthoritativeQuota(tokens []openCodeGoSSRToken, fetchedAt time.Time) (*OpenCodeGoAuthoritativeQuotaSnapshot, error) {
@@ -617,7 +880,7 @@ func parseOpenCodeGoAuthoritativeQuota(tokens []openCodeGoSSRToken, fetchedAt ti
 
 func findOpenCodeGoSSRObjectProperty(tokens []openCodeGoSSRToken, property string) (map[string]openCodeGoSSRToken, bool) {
 	for index := 0; index+2 < len(tokens); index++ {
-		if tokens[index].kind != openCodeGoSSRTokenIdentifier || tokens[index].value != property || tokens[index+1].value != ":" {
+		if tokens[index].kind != openCodeGoSSRTokenIdentifier || tokens[index].value != property || !openCodeGoSSRIsPunctuation(tokens[index+1], ":") {
 			continue
 		}
 		limit := index + 14
@@ -625,11 +888,11 @@ func findOpenCodeGoSSRObjectProperty(tokens []openCodeGoSSRToken, property strin
 			limit = len(tokens)
 		}
 		for objectIndex := index + 2; objectIndex < limit; objectIndex++ {
-			if tokens[objectIndex].value == "{" {
+			if openCodeGoSSRIsPunctuation(tokens[objectIndex], "{") {
 				object, _, ok := parseOpenCodeGoSSRObjectAt(tokens, objectIndex)
 				return object, ok
 			}
-			if tokens[objectIndex].value == "," || tokens[objectIndex].value == ";" {
+			if openCodeGoSSRIsPunctuation(tokens[objectIndex], ",") || openCodeGoSSRIsPunctuation(tokens[objectIndex], ";") {
 				break
 			}
 		}
@@ -638,22 +901,21 @@ func findOpenCodeGoSSRObjectProperty(tokens []openCodeGoSSRToken, property strin
 }
 
 func parseOpenCodeGoSSRObjectAt(tokens []openCodeGoSSRToken, start int) (map[string]openCodeGoSSRToken, int, bool) {
-	if start >= len(tokens) || tokens[start].value != "{" {
+	if start >= len(tokens) || !openCodeGoSSRIsPunctuation(tokens[start], "{") {
 		return nil, start, false
 	}
 	object := make(map[string]openCodeGoSSRToken)
 	depth := 0
 	for index := start; index < len(tokens); index++ {
-		switch tokens[index].value {
-		case "{":
+		if openCodeGoSSRIsPunctuation(tokens[index], "{") {
 			depth++
-		case "}":
+		} else if openCodeGoSSRIsPunctuation(tokens[index], "}") {
 			depth--
 			if depth == 0 {
 				return object, index, true
 			}
 		}
-		if depth != 1 || index+2 >= len(tokens) || tokens[index+1].value != ":" || !isOpenCodeGoSSRScalar(tokens[index+2]) {
+		if depth != 1 || index+2 >= len(tokens) || !openCodeGoSSRIsPunctuation(tokens[index+1], ":") || !isOpenCodeGoSSRScalar(tokens[index+2]) {
 			continue
 		}
 		if tokens[index].kind == openCodeGoSSRTokenIdentifier || tokens[index].kind == openCodeGoSSRTokenString {

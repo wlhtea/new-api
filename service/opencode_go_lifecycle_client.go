@@ -1,10 +1,12 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	stdhtml "html"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -390,10 +392,13 @@ func (client *OpenCodeGoLifecycleClient) postConsoleServerActionBodyWithClient(
 		return nil, errors.New("OpenCode Go server action payload could not be encoded")
 	}
 	actionURL := client.console.consoleBase.ResolveReference(&url.URL{Path: "/_server"})
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, actionURL.String(), strings.NewReader(string(body)))
+	// Keep the mutation explicitly non-replayable. The reward endpoint is not
+	// idempotent, and net/http may replay requests that expose GetBody.
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, actionURL.String(), io.NopCloser(bytes.NewReader(body)))
 	if err != nil {
 		return nil, errors.New("OpenCode Go server action request could not be created")
 	}
+	request.GetBody = nil
 	client.setConsoleMutationHeaders(request, cookieHeader, workspaceID)
 	request.Header.Set("Accept", "*/*")
 	request.Header.Set("Content-Type", "application/json")
