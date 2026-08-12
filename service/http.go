@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 
 	"github.com/gin-gonic/gin"
@@ -56,18 +57,20 @@ func CloseResponseBodyGracefully(httpResponse *http.Response) {
 }
 
 // ShouldCopyUpstreamHeader checks whether a given upstream response header
-// should be copied to the client response. It returns false for Content-Length
-// (managed separately) and X-Oneapi-Request-Id (to preserve the local instance
-// ID). When the upstream header is X-Oneapi-Request-Id, the value is captured
-// into the Gin context for later logging.
+// should be copied to the client response. X-Oneapi-Request-Id is captured for
+// internal logging but never exposed. OpenCode Go response headers are entirely
+// upstream-controlled, so its public response headers are synthesized locally.
 func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
-	if strings.EqualFold(k, "Content-Length") {
-		return false
-	}
 	if strings.EqualFold(k, common.RequestIdKey) {
 		if c != nil && len(v) > 0 {
 			c.Set(common.UpstreamRequestIdKey, v[0])
 		}
+		return false
+	}
+	if c != nil && common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeOpenCodeGo {
+		return false
+	}
+	if strings.EqualFold(k, "Content-Length") {
 		return false
 	}
 	return true
@@ -91,6 +94,9 @@ func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
 			}
 			c.Writer.Header().Set(k, v[0])
 		}
+	}
+	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeOpenCodeGo {
+		c.Writer.Header().Set("Content-Type", gin.MIMEJSON)
 	}
 
 	// set Content-Length header manually BEFORE calling WriteHeader

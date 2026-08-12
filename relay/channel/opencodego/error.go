@@ -26,7 +26,7 @@ var observeOpenCodeGoProviderFailure = service.ObserveOpenCodeGoProviderFailure
 func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*types.NewAPIError, *channel.Non2xxResponseObservation) {
 	if resp == nil {
 		err := types.NewOpenAIError(errors.New("OpenCode Go returned no response"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
-		return err, &channel.Non2xxResponseObservation{Provider: ChannelName, StatusCode: http.StatusBadGateway, ErrorCode: string(types.ErrorCodeBadResponseStatusCode)}
+		return service.MarkOpenCodeGoUpstreamRelayError(err), &channel.Non2xxResponseObservation{Provider: ChannelName, StatusCode: http.StatusBadGateway, ErrorCode: string(types.ErrorCodeBadResponseStatusCode)}
 	}
 	defer a.releaseInFlight()
 	defer service.CloseResponseBodyGracefully(resp)
@@ -51,7 +51,7 @@ func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info
 			a.persistProviderFailure(c, info, failure, observation)
 		}
 		err := types.NewOpenAIError(errors.New("failed to read OpenCode Go error response"), types.ErrorCodeReadResponseBodyFailed, resp.StatusCode, types.ErrOptionWithSkipRetry())
-		return err, observation
+		return service.MarkOpenCodeGoUpstreamRelayError(err), observation
 	}
 	if len(body) > maxErrorBodyBytes {
 		body = body[:maxErrorBodyBytes]
@@ -91,7 +91,7 @@ func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info
 		LimitName:  limitName,
 	}
 	a.persistProviderFailure(c, info, failure, observation)
-	return err, observation
+	return service.MarkOpenCodeGoUpstreamRelayError(err), observation
 }
 
 func (a *Adaptor) logProviderFailureDiagnostics(c *gin.Context, statusCode int, info *relaycommon.RelayInfo) {

@@ -210,7 +210,22 @@ func sanitizeOpenCodeGoRetryAfter(value string) string {
 	if value == "" || len(value) > 128 || strings.ContainsAny(value, "\r\n") {
 		return ""
 	}
-	return value
+	deltaSeconds := true
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			deltaSeconds = false
+			break
+		}
+	}
+	if deltaSeconds {
+		if _, err := strconv.ParseUint(value, 10, 63); err == nil {
+			return value
+		}
+	}
+	if _, err := http.ParseTime(value); err == nil {
+		return value
+	}
+	return ""
 }
 
 func sanitizeOpenCodeGoLimitName(value string) string {

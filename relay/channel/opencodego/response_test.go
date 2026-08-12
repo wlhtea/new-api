@@ -75,6 +75,68 @@ func responseFixture(protocol Protocol, stream bool) string {
 	}
 }
 
+func privateErrorResponseFixture(protocol Protocol, stream bool) string {
+	privateError := `{"metadata":{"workspace":"wrk_private"},"detail":"Error from provider (Console Go): Endpoint is unavailable."}`
+	var payload string
+	switch protocol {
+	case ProtocolChat:
+		payload = `{"error":` + privateError + `}`
+	case ProtocolMessages:
+		payload = `{"type":"error","error":` + privateError + `}`
+	case ProtocolResponses:
+		if stream {
+			payload = `{"type":"response.failed","response":{"status":"failed","error":` + privateError + `}}`
+		} else {
+			payload = `{"error":` + privateError + `}`
+		}
+	default:
+		panic("unsupported private error fixture protocol")
+	}
+	if stream {
+		return "data: " + payload + "\n\n"
+	}
+	return payload
+}
+
+func topLevelPrivateErrorResponseFixture(stream bool) string {
+	payload := `{"type":"error","message":"Error from provider (Console Go): Endpoint is unavailable.","code":"work\u0073pace_unavailable","metadata":{"work\u0073pace":"wrk\u005fprivate"}}`
+	if stream {
+		return "data: " + payload + "\n\n"
+	}
+	return payload
+}
+
+func responsesRootPrivateErrorFixture(stream bool) string {
+	payload := `{"type":"response.failed","message":"Error from provider (Console Go): Endpoint is unavailable.","code":"work\u0073pace_unavailable","metadata":{"work\u0073pace":"wrk\u005fprivate"}}`
+	if stream {
+		return "data: " + payload + "\n\n"
+	}
+	return payload
+}
+
+func unknownUpstreamErrorResponseFixture(protocol Protocol, stream bool) string {
+	upstreamError := `{"type":"upstream_error","code":"shard_failure","message":"internal shard zen-primary failed"}`
+	var payload string
+	switch protocol {
+	case ProtocolChat:
+		payload = `{"error":` + upstreamError + `}`
+	case ProtocolMessages:
+		payload = `{"type":"error","error":` + upstreamError + `}`
+	case ProtocolResponses:
+		if stream {
+			payload = `{"type":"response.failed","response":{"status":"failed","error":` + upstreamError + `}}`
+		} else {
+			payload = `{"error":` + upstreamError + `}`
+		}
+	default:
+		panic("unsupported unknown upstream error fixture protocol")
+	}
+	if stream {
+		return "data: " + payload + "\n\n"
+	}
+	return payload
+}
+
 func responseTestInfo(protocol Protocol, client types.RelayFormat, stream bool) *relaycommon.RelayInfo {
 	model := map[Protocol]string{
 		ProtocolChat:      "glm-5.2",
@@ -240,6 +302,274 @@ func TestAdaptorResponseCompatibilityMatrix(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+func TestAdaptorDoesNotExposePrivateErrorsAcrossProtocolMatrix(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	protocols := []Protocol{ProtocolChat, ProtocolMessages, ProtocolResponses}
+	clients := []types.RelayFormat{
+		types.RelayFormatOpenAI,
+		types.RelayFormatClaude,
+		types.RelayFormatOpenAIResponses,
+	}
+	for _, stream := range []bool{false, true} {
+		for _, protocol := range protocols {
+			for _, client := range clients {
+				name := string(protocol) + "_to_" + string(client)
+				if stream {
+					name += "_stream"
+				} else {
+					name += "_json"
+				}
+				t.Run(name, func(t *testing.T) {
+					info := responseTestInfo(protocol, client, stream)
+					c, recorder := responseTestContext(client)
+					contentType := "application/json"
+					if stream {
+						contentType = "text/event-stream"
+					}
+					resp := &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{contentType}},
+						Body:       io.NopCloser(strings.NewReader(privateErrorResponseFixture(protocol, stream))),
+					}
+					adaptor := &Adaptor{}
+					adaptor.Init(info)
+
+					rawUsage, apiErr := adaptor.DoResponse(c, resp, info)
+
+					require.Nil(t, rawUsage)
+					require.NotNil(t, apiErr)
+					assert.Contains(t, apiErr.Error(), "Console Go")
+					assert.Contains(t, apiErr.Error(), "workspace")
+					assert.Empty(t, recorder.Body.String())
+					publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+					require.NotSame(t, apiErr, publicErr)
+					assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+					assert.Equal(t, service.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+				})
+			}
+		}
+	}
+}
+
+func TestAdaptorMarksUnknownUpstreamErrorsAcrossProtocolMatrix(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	protocols := []Protocol{ProtocolChat, ProtocolMessages, ProtocolResponses}
+	clients := []types.RelayFormat{
+		types.RelayFormatOpenAI,
+		types.RelayFormatClaude,
+		types.RelayFormatOpenAIResponses,
+	}
+	for _, stream := range []bool{false, true} {
+		for _, protocol := range protocols {
+			for _, client := range clients {
+				name := string(protocol) + "_to_" + string(client)
+				if stream {
+					name += "_stream"
+				} else {
+					name += "_json"
+				}
+				t.Run(name, func(t *testing.T) {
+					info := responseTestInfo(protocol, client, stream)
+					c, recorder := responseTestContext(client)
+					contentType := "application/json"
+					if stream {
+						contentType = "text/event-stream"
+					}
+					body := unknownUpstreamErrorResponseFixture(protocol, stream)
+					if stream {
+						body = " \t" + body
+					}
+					resp := &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{contentType}},
+						Body:       io.NopCloser(strings.NewReader(body)),
+					}
+					adaptor := &Adaptor{}
+					adaptor.Init(info)
+
+					rawUsage, apiErr := adaptor.DoResponse(c, resp, info)
+
+					require.Nil(t, rawUsage)
+					require.NotNil(t, apiErr)
+					assert.Contains(t, apiErr.Error(), "internal shard zen-primary failed")
+					assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+					assert.Empty(t, recorder.Body.String())
+					publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+					require.NotSame(t, apiErr, publicErr)
+					assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+					assert.Equal(t, service.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+				})
+			}
+		}
+	}
+}
+
+func TestResponseTransformStateDoesNotTreatAssistantTextAsUpstreamError(t *testing.T) {
+	payload := []byte(`{"id":"chat_1","choices":[{"message":{"role":"assistant","content":"internal shard zen-primary failed"}}]}`)
+	state := &responseTransformState{protocol: ProtocolChat}
+
+	transformed := state.transformJSON(payload, false)
+
+	assert.JSONEq(t, string(payload), string(transformed))
+	assert.False(t, state.sawUpstreamError)
+}
+
+func TestResponseTransformStateIgnoresEmptyErrorFields(t *testing.T) {
+	for _, protocol := range []Protocol{ProtocolChat, ProtocolMessages, ProtocolResponses} {
+		for _, emptyValue := range []string{"null", `{}`, `[]`, `""`, `"   "`} {
+			t.Run(string(protocol)+"_"+emptyValue, func(t *testing.T) {
+				payload := []byte(`{"id":"response_1","error":` + emptyValue + `,"choices":[]}`)
+				state := &responseTransformState{protocol: protocol}
+
+				transformed := state.transformJSON(payload, false)
+
+				assert.JSONEq(t, string(payload), string(transformed))
+				assert.False(t, state.sawUpstreamError)
+			})
+		}
+	}
+}
+
+func TestResponseTransformStateFailsClosedForExplicitEmptyErrorEvent(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		protocol Protocol
+		payload  string
+	}{
+		{name: "chat", protocol: ProtocolChat, payload: `{"type":"error","error":{}}`},
+		{name: "messages", protocol: ProtocolMessages, payload: `{"type":"error","error":null}`},
+		{name: "responses", protocol: ProtocolResponses, payload: `{"type":"response.failed","response":{"error":{}}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := &responseTransformState{protocol: test.protocol}
+
+			transformed := state.transformJSON([]byte(test.payload), false)
+
+			assert.True(t, state.sawUpstreamError)
+			assert.Contains(t, string(transformed), "upstream_error")
+		})
+	}
+}
+
+func TestAdaptorDoesNotExposeTopLevelPrivateErrorsAcrossProtocolMatrix(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	protocols := []Protocol{ProtocolChat, ProtocolMessages, ProtocolResponses}
+	clients := []types.RelayFormat{
+		types.RelayFormatOpenAI,
+		types.RelayFormatClaude,
+		types.RelayFormatOpenAIResponses,
+	}
+	for _, stream := range []bool{false, true} {
+		for _, protocol := range protocols {
+			for _, client := range clients {
+				name := string(protocol) + "_to_" + string(client)
+				if stream {
+					name += "_stream"
+				} else {
+					name += "_json"
+				}
+				t.Run(name, func(t *testing.T) {
+					info := responseTestInfo(protocol, client, stream)
+					c, recorder := responseTestContext(client)
+					contentType := "application/json"
+					if stream {
+						contentType = "text/event-stream"
+					}
+					resp := &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{contentType}},
+						Body:       io.NopCloser(strings.NewReader(topLevelPrivateErrorResponseFixture(stream))),
+					}
+					adaptor := &Adaptor{}
+					adaptor.Init(info)
+
+					rawUsage, apiErr := adaptor.DoResponse(c, resp, info)
+
+					require.Nil(t, rawUsage)
+					require.NotNil(t, apiErr)
+					assert.Contains(t, apiErr.Error(), "Console Go")
+					assert.Contains(t, apiErr.Error(), "workspace")
+					assert.Empty(t, recorder.Body.String())
+					publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+					require.NotSame(t, apiErr, publicErr)
+					assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+					assert.Equal(t, service.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+				})
+			}
+		}
+	}
+}
+
+func TestAdaptorDoesNotExposeResponsesRootPrivateErrorAcrossClientMatrix(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	clients := []types.RelayFormat{
+		types.RelayFormatOpenAI,
+		types.RelayFormatClaude,
+		types.RelayFormatOpenAIResponses,
+	}
+	for _, stream := range []bool{false, true} {
+		for _, client := range clients {
+			name := string(client)
+			if stream {
+				name += "_stream"
+			} else {
+				name += "_json"
+			}
+			t.Run(name, func(t *testing.T) {
+				info := responseTestInfo(ProtocolResponses, client, stream)
+				c, recorder := responseTestContext(client)
+				contentType := "application/json"
+				if stream {
+					contentType = "text/event-stream"
+				}
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{contentType}},
+					Body:       io.NopCloser(strings.NewReader(responsesRootPrivateErrorFixture(stream))),
+				}
+				adaptor := &Adaptor{}
+				adaptor.Init(info)
+
+				rawUsage, apiErr := adaptor.DoResponse(c, resp, info)
+
+				require.Nil(t, rawUsage)
+				require.NotNil(t, apiErr)
+				assert.Contains(t, apiErr.Error(), "Console Go")
+				assert.Contains(t, apiErr.Error(), "workspace")
+				assert.Empty(t, recorder.Body.String())
+				publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+				require.NotSame(t, apiErr, publicErr)
+				assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+				assert.Equal(t, service.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+			})
 		}
 	}
 }

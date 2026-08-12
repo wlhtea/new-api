@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -632,4 +633,45 @@ func TestStreamScannerHandler_StreamStatus_ReplacesPreInitialized(t *testing.T) 
 
 	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
 	assert.Equal(t, 0, info.StreamStatus.TotalErrorCount())
+}
+
+func TestStreamScannerHandlerOpenCodeGoUsesOnlyLocalSSEHeaders(t *testing.T) {
+	tests := []struct {
+		name               string
+		channelType        int
+		wantCodexExtension bool
+	}{
+		{name: "open_code_go", channelType: constant.ChannelTypeOpenCodeGo},
+		{name: "other_channel", channelType: constant.ChannelTypeOpenAI, wantCodexExtension: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c, resp, info := setupStreamTest(t, strings.NewReader("data: [DONE]\n"))
+			common.SetContextKey(c, constant.ContextKeyChannelType, test.channelType)
+			resp.Header = http.Header{
+				"Content-Type":         []string{"text/event-stream; workspace=wrk_private"},
+				"X-Codex-Turn-State":   []string{"internal-turn-state"},
+				"X-Reasoning-Included": []string{"workspace=wrk_private"},
+				"X-Internal-Shard":     []string{"zen-primary"},
+			}
+
+			StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+
+			header := c.Writer.Header()
+			assert.Equal(t, "text/event-stream", header.Get("Content-Type"))
+			assert.Equal(t, "no-cache", header.Get("Cache-Control"))
+			assert.Equal(t, "keep-alive", header.Get("Connection"))
+			assert.Equal(t, "chunked", header.Get("Transfer-Encoding"))
+			assert.Equal(t, "no", header.Get("X-Accel-Buffering"))
+			assert.Empty(t, header.Get("X-Internal-Shard"))
+			if test.wantCodexExtension {
+				assert.Equal(t, "internal-turn-state", header.Get("X-Codex-Turn-State"))
+				assert.Equal(t, "workspace=wrk_private", header.Get("X-Reasoning-Included"))
+			} else {
+				assert.Empty(t, header.Get("X-Codex-Turn-State"))
+				assert.Empty(t, header.Get("X-Reasoning-Included"))
+			}
+		})
+	}
 }

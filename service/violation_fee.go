@@ -45,7 +45,7 @@ func WrapAsViolationFeeGrokCSAM(err *types.NewAPIError) *types.NewAPIError {
 	oai := err.ToOpenAIError()
 	oai.Type = string(types.ErrorCodeViolationFeeGrokCSAM)
 	oai.Code = string(types.ErrorCodeViolationFeeGrokCSAM)
-	return types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+	return preserveOpenCodeGoUpstreamOrigin(err, types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry()))
 }
 
 // NormalizeViolationFeeError ensures:
@@ -64,10 +64,17 @@ func NormalizeViolationFeeError(err *types.NewAPIError) *types.NewAPIError {
 
 	if IsViolationFeeCode(err.GetErrorCode()) {
 		oai := err.ToOpenAIError()
-		return types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+		return preserveOpenCodeGoUpstreamOrigin(err, types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry()))
 	}
 
 	return err
+}
+
+func preserveOpenCodeGoUpstreamOrigin(source, rebuilt *types.NewAPIError) *types.NewAPIError {
+	if IsOpenCodeGoUpstreamRelayError(source) {
+		return MarkOpenCodeGoUpstreamRelayError(rebuilt)
+	}
+	return rebuilt
 }
 
 func shouldChargeViolationFee(err *types.NewAPIError) bool {
@@ -145,6 +152,9 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 		"upstream_error_type":  oai.Type,
 		"upstream_error_code":  fmt.Sprintf("%v", oai.Code),
 		"violation_fee_marker": CSAMViolationMarker,
+		"admin_info": map[string]any{
+			"channel_type": relayInfo.GetChannelType(),
+		},
 	}
 
 	model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{

@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/types"
 
@@ -114,10 +117,34 @@ func assignDisplayLogIds(logs []*Log, startIdx int) {
 }
 
 func formatUserLogs(logs []*Log, startIdx int) {
+	resolvedChannelTypes := resolveUserLogChannelTypes(logs)
 	for i := range logs {
 		logs[i].ChannelName = ""
 		var otherMap map[string]interface{}
 		otherMap, _ = common.StrToMap(logs[i].Other)
+		channelType, hasChannelType := userLogChannelType(otherMap)
+		if !hasChannelType {
+			channelType, hasChannelType = resolvedChannelTypes[logs[i].ChannelId]
+		}
+		if hasChannelType && channelType == constant.ChannelTypeOpenCodeGo {
+			logs[i].UpstreamRequestId = ""
+		} else if !hasChannelType {
+			// Historical rows may predate persisted channel attribution, and the
+			// referenced channel may since have been deleted. Keep correlation
+			// identifiers in storage/admin views, but fail closed in user views.
+			logs[i].UpstreamRequestId = ""
+		}
+		if userLogNeedsOpenCodeGoErrorProjection(logs[i], otherMap, channelType, hasChannelType) {
+			logs[i].Content = constant.OpenCodeGoPublicOverloadMessage
+			logs[i].ChannelId = 0
+			logs[i].UpstreamRequestId = ""
+			logs[i].Other = common.MapToJsonStr(map[string]interface{}{
+				"error_type":  constant.OpenCodeGoPublicRateLimitErrorCode,
+				"error_code":  constant.OpenCodeGoPublicRateLimitErrorCode,
+				"status_code": http.StatusTooManyRequests,
+			})
+			continue
+		}
 		if otherMap != nil {
 			// Affinity routing diagnostics are admin-only. Clear historical or
 			// malformed top-level copies before removing the stored admin payload.
@@ -133,6 +160,100 @@ func formatUserLogs(logs []*Log, startIdx int) {
 		logs[i].Other = common.MapToJsonStr(otherMap)
 	}
 	assignDisplayLogIds(logs, startIdx)
+}
+
+func resolveUserLogChannelTypes(logs []*Log) map[int]int {
+	resolved := make(map[int]int)
+	if DB == nil {
+		return resolved
+	}
+
+	channelIDs := make([]int, 0)
+	seen := make(map[int]struct{})
+	for _, log := range logs {
+		if log == nil || log.ChannelId <= 0 {
+			continue
+		}
+		other, _ := common.StrToMap(log.Other)
+		if _, ok := userLogChannelType(other); ok {
+			continue
+		}
+		if _, ok := seen[log.ChannelId]; ok {
+			continue
+		}
+		seen[log.ChannelId] = struct{}{}
+		channelIDs = append(channelIDs, log.ChannelId)
+	}
+	if len(channelIDs) == 0 {
+		return resolved
+	}
+
+	var channels []struct {
+		Id   int
+		Type int
+	}
+	if err := DB.Model(&Channel{}).
+		Select("id", "type").
+		Where("id IN ?", channelIDs).
+		Find(&channels).Error; err != nil {
+		return resolved
+	}
+	for _, channel := range channels {
+		resolved[channel.Id] = channel.Type
+	}
+	return resolved
+}
+
+func userLogNeedsOpenCodeGoErrorProjection(log *Log, other map[string]interface{}, channelType int, hasChannelType bool) bool {
+	if log == nil || log.Type != LogTypeError {
+		return false
+	}
+	if hasChannelType {
+		return channelType == constant.ChannelTypeOpenCodeGo
+	}
+	return userLogHasOpenCodeGoPrivateMarker(log.Content, log.ChannelName, log.UpstreamRequestId, log.Other)
+}
+
+func userLogChannelType(other map[string]interface{}) (int, bool) {
+	if other == nil {
+		return 0, false
+	}
+	if channelType, ok := parseUserLogChannelType(other["channel_type"]); ok {
+		return channelType, true
+	}
+	adminInfo, ok := other["admin_info"].(map[string]interface{})
+	if !ok {
+		return 0, false
+	}
+	return parseUserLogChannelType(adminInfo["channel_type"])
+}
+
+func parseUserLogChannelType(raw interface{}) (int, bool) {
+	switch value := raw.(type) {
+	case int:
+		return value, true
+	case int64:
+		return int(value), true
+	case float64:
+		if value == float64(int(value)) {
+			return int(value), true
+		}
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func userLogHasOpenCodeGoPrivateMarker(values ...string) bool {
+	for _, value := range values {
+		if constant.OpenCodeGoStringHasDistinctPrivateErrorMarker(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func GetLogByTokenId(tokenId int) (logs []*Log, err error) {

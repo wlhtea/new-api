@@ -11,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -28,6 +29,8 @@ type responseTransformState struct {
 	model                     string
 	protocol                  Protocol
 	namespaceTools            map[string]openCodeGoNamespaceTool
+	sawUpstreamError          bool
+	upstreamErrorPayload      json.RawMessage
 	estimatedInputTokens      int
 	sawStandardUsage          bool
 	sawPositiveStandardUsage  bool
@@ -109,6 +112,10 @@ func (r *transformingReadCloser) transformLine(line []byte) []byte {
 			content = content[:len(content)-1]
 		}
 	}
+	// The shared stream scanner trims surrounding whitespace before parsing.
+	// Apply the same rule here so an upstream error cannot bypass provenance
+	// marking with whitespace before the SSE data field.
+	content = bytes.TrimSpace(content)
 	if !bytes.HasPrefix(content, []byte("data:")) {
 		return line
 	}
@@ -131,6 +138,13 @@ func (r *transformingReadCloser) transformLine(line []byte) []byte {
 func (s *responseTransformState) transformJSON(data []byte, stream bool) []byte {
 	if len(data) == 0 || !gjson.ValidBytes(data) {
 		return data
+	}
+	if upstreamError := openCodeGoUpstreamErrorPayload(data, s.protocol); len(upstreamError) > 0 {
+		s.recordUpstreamError(upstreamError)
+		return openCodeGoErrorEnvelope(upstreamError, s.protocol, stream)
+	}
+	if privateTerminal := openCodeGoPrivateTerminalPayload(data, s.protocol); len(privateTerminal) > 0 {
+		return openCodeGoErrorEnvelope(privateTerminal, s.protocol, stream)
 	}
 	if isCostExtension(data) {
 		capturedFallback := s.captureFallbackUsage(data)
@@ -157,6 +171,216 @@ func (s *responseTransformState) transformJSON(data []byte, stream bool) []byte 
 	}
 	data = s.restoreOpenCodeGoNamespaceCalls(data)
 	return normalizeResponseModel(data, s.model)
+}
+
+func (s *responseTransformState) recordUpstreamError(payload json.RawMessage) {
+	if s == nil {
+		return
+	}
+	s.sawUpstreamError = true
+	if len(s.upstreamErrorPayload) != 0 {
+		return
+	}
+	s.upstreamErrorPayload = append(json.RawMessage(nil), canonicalOpenCodeGoError(payload)...)
+}
+
+func openCodeGoUpstreamErrorPayload(data []byte, protocol Protocol) json.RawMessage {
+	var envelope struct {
+		Type     string          `json:"type"`
+		Error    json.RawMessage `json:"error"`
+		Message  json.RawMessage `json:"message"`
+		Code     json.RawMessage `json:"code"`
+		Detail   json.RawMessage `json:"detail"`
+		Metadata json.RawMessage `json:"metadata"`
+		Response *struct {
+			Error             json.RawMessage `json:"error"`
+			IncompleteDetails json.RawMessage `json:"incomplete_details"`
+		} `json:"response"`
+	}
+	if common.Unmarshal(data, &envelope) != nil {
+		return nil
+	}
+
+	candidates := make([]json.RawMessage, 0, 2)
+	switch protocol {
+	case ProtocolChat, ProtocolMessages:
+		candidates = append(candidates, envelope.Error)
+		if envelope.Type == "error" && !openCodeGoRawPayloadPresent(envelope.Error) {
+			topLevel := openCodeGoTopLevelErrorPayload(
+				envelope.Type,
+				envelope.Message,
+				envelope.Code,
+				envelope.Detail,
+				envelope.Metadata,
+			)
+			if len(topLevel) == 0 {
+				topLevel = append(json.RawMessage(nil), data...)
+			}
+			candidates = append(candidates, topLevel)
+		}
+	case ProtocolResponses:
+		candidates = append(candidates, envelope.Error)
+		if envelope.Response != nil {
+			candidates = append(candidates, envelope.Response.Error)
+		}
+		switch envelope.Type {
+		case "error", "response.error", "response.failed":
+			if !openCodeGoRawPayloadPresent(envelope.Error) &&
+				(envelope.Response == nil || !openCodeGoRawPayloadPresent(envelope.Response.Error)) {
+				topLevel := openCodeGoTopLevelErrorPayload(
+					envelope.Type,
+					envelope.Message,
+					envelope.Code,
+					envelope.Detail,
+					envelope.Metadata,
+				)
+				if len(topLevel) == 0 {
+					topLevel = append(json.RawMessage(nil), data...)
+				}
+				candidates = append(candidates, topLevel)
+			}
+		}
+	}
+
+	for _, candidate := range candidates {
+		if openCodeGoRawPayloadPresent(candidate) {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func openCodeGoPrivateTerminalPayload(data []byte, protocol Protocol) json.RawMessage {
+	if protocol != ProtocolResponses {
+		return nil
+	}
+	var envelope struct {
+		Type     string          `json:"type"`
+		Message  json.RawMessage `json:"message"`
+		Code     json.RawMessage `json:"code"`
+		Detail   json.RawMessage `json:"detail"`
+		Metadata json.RawMessage `json:"metadata"`
+		Response *struct {
+			IncompleteDetails json.RawMessage `json:"incomplete_details"`
+		} `json:"response"`
+	}
+	if common.Unmarshal(data, &envelope) != nil {
+		return nil
+	}
+	switch envelope.Type {
+	case "response.incomplete", "response.cancelled", "response.canceled":
+	default:
+		return nil
+	}
+	candidates := make([]json.RawMessage, 0, 2)
+	if envelope.Response != nil {
+		candidates = append(candidates, envelope.Response.IncompleteDetails)
+	}
+	candidates = append(candidates, openCodeGoTopLevelErrorPayload(
+		envelope.Type,
+		envelope.Message,
+		envelope.Code,
+		envelope.Detail,
+		envelope.Metadata,
+	))
+	for _, candidate := range candidates {
+		if openCodeGoRawPayloadPresent(candidate) && service.OpenCodeGoErrorHasPrivateDetail(string(candidate)) {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func openCodeGoRawPayloadPresent(payload json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false
+	}
+	var decoded any
+	if common.Unmarshal(trimmed, &decoded) != nil {
+		return true
+	}
+	switch typed := decoded.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case map[string]any:
+		return len(typed) != 0
+	case []any:
+		return len(typed) != 0
+	default:
+		return true
+	}
+}
+
+func openCodeGoTopLevelErrorPayload(eventType string, fields ...json.RawMessage) json.RawMessage {
+	payload := map[string]any{"type": eventType}
+	names := []string{"message", "code", "detail", "metadata"}
+	for index, field := range fields {
+		trimmed := bytes.TrimSpace(field)
+		if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+			continue
+		}
+		var decoded any
+		if common.Unmarshal(trimmed, &decoded) == nil {
+			payload[names[index]] = decoded
+		}
+	}
+	if len(payload) == 1 {
+		return nil
+	}
+	encoded, err := common.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+func openCodeGoErrorEnvelope(upstreamError json.RawMessage, protocol Protocol, stream bool) []byte {
+	upstreamError = canonicalOpenCodeGoError(upstreamError)
+	internalError := map[string]any{
+		"message": string(upstreamError),
+		"type":    "upstream_error",
+		"code":    "upstream_error",
+	}
+	var envelope any
+	switch protocol {
+	case ProtocolMessages:
+		delete(internalError, "code")
+		envelope = map[string]any{"type": "error", "error": internalError}
+	case ProtocolResponses:
+		if stream {
+			envelope = map[string]any{
+				"type": "response.failed",
+				"response": map[string]any{
+					"status": "failed",
+					"error":  internalError,
+				},
+			}
+		} else {
+			envelope = map[string]any{"error": internalError}
+		}
+	default:
+		envelope = map[string]any{"error": internalError}
+	}
+	encoded, err := common.Marshal(envelope)
+	if err != nil {
+		return []byte(`{"error":{"message":"upstream error","type":"upstream_error","code":"upstream_error"}}`)
+	}
+	return encoded
+}
+
+func canonicalOpenCodeGoError(upstreamError json.RawMessage) json.RawMessage {
+	var decoded any
+	if common.Unmarshal(upstreamError, &decoded) != nil {
+		return upstreamError
+	}
+	canonical, err := common.Marshal(decoded)
+	if err != nil {
+		return upstreamError
+	}
+	return canonical
 }
 
 // restoreOpenCodeGoNamespaceCalls reverses the request lowering for native

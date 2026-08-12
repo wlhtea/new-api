@@ -1,11 +1,15 @@
 package model
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // TestFormatUserLogsStripsQuotaSaturation verifies the admin-only quota
@@ -73,4 +77,257 @@ func TestFormatUserLogsToleratesMissingOrMalformedAffinityData(t *testing.T) {
 	for i, log := range logs {
 		require.Equal(t, i+1, log.Id)
 	}
+}
+
+func TestFormatUserLogsHidesOpenCodeGoErrorDetails(t *testing.T) {
+	logs := []*Log{{
+		Type:              LogTypeError,
+		Content:           "status_code=503, Error from provider (Console Go): workspace wrk_private is unavailable",
+		ChannelId:         72,
+		ChannelName:       "OpenCode Go pool",
+		UpstreamRequestId: "wrk_upstream_private",
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"error_type":        "upstream_error",
+			"error_code":        "workspace_unavailable",
+			"status_code":       503,
+			"channel_id":        72,
+			"channel_name":      "OpenCode Go pool",
+			"channel_type":      constant.ChannelTypeOpenCodeGo,
+			"request_path":      "/v1/responses",
+			"private_extension": "workspace_secret",
+			"admin_info": map[string]interface{}{
+				"opencode_go_workspace_uid": "wrk_private",
+			},
+		}),
+	}}
+
+	formatUserLogs(logs, 0)
+
+	require.Equal(t, constant.OpenCodeGoPublicOverloadMessage, logs[0].Content)
+	require.Zero(t, logs[0].ChannelId)
+	require.Empty(t, logs[0].ChannelName)
+	require.Empty(t, logs[0].UpstreamRequestId)
+	parsed, err := common.StrToMap(logs[0].Other)
+	require.NoError(t, err)
+	require.Equal(t, constant.OpenCodeGoPublicRateLimitErrorCode, parsed["error_type"])
+	require.Equal(t, constant.OpenCodeGoPublicRateLimitErrorCode, parsed["error_code"])
+	require.Equal(t, float64(429), parsed["status_code"])
+	require.Len(t, parsed, 3, "the public error metadata must use an allowlist")
+	publicView := strings.ToLower(logs[0].Content + logs[0].ChannelName + logs[0].Other)
+	for _, marker := range []string{"opencode", "console go", "workspace", "wrk_"} {
+		require.NotContains(t, publicView, marker)
+	}
+}
+
+func TestFormatUserLogsPreservesOtherChannelErrors(t *testing.T) {
+	logs := []*Log{{
+		Type:      LogTypeError,
+		Content:   "workspace is unavailable",
+		ChannelId: 7,
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"channel_type": constant.ChannelTypeOpenAI,
+			"channel_id":   7,
+		}),
+	}}
+
+	formatUserLogs(logs, 0)
+
+	require.Equal(t, "workspace is unavailable", logs[0].Content)
+	require.Equal(t, 7, logs[0].ChannelId)
+	parsed, err := common.StrToMap(logs[0].Other)
+	require.NoError(t, err)
+	require.Equal(t, float64(constant.ChannelTypeOpenAI), parsed["channel_type"])
+}
+
+func TestFormatUserLogsPreservesUnclassifiedGenericChannelError(t *testing.T) {
+	log := &Log{
+		Type:      LogTypeError,
+		Content:   "upstream request failed",
+		ChannelId: 7,
+		Other:     `{"channel_id":7}`,
+	}
+
+	formatUserLogs([]*Log{log}, 0)
+
+	require.Equal(t, "upstream request failed", log.Content)
+	require.Equal(t, 7, log.ChannelId)
+	require.JSONEq(t, `{"channel_id":7}`, log.Other)
+}
+
+func TestFormatUserLogsHidesOpenCodeGoUpstreamRequestIdOnConsumeLogs(t *testing.T) {
+	raw := Log{
+		Type:              LogTypeConsume,
+		Content:           "request completed",
+		ChannelId:         72,
+		UpstreamRequestId: "internal-endpoint-request-id",
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"model_price": 0.004,
+			"admin_info": map[string]interface{}{
+				"channel_type": constant.ChannelTypeOpenCodeGo,
+			},
+		}),
+	}
+	public := raw
+
+	formatUserLogs([]*Log{&public}, 0)
+
+	require.Empty(t, public.UpstreamRequestId)
+	require.Equal(t, "internal-endpoint-request-id", raw.UpstreamRequestId)
+	require.Equal(t, "request completed", public.Content)
+	require.Equal(t, 72, public.ChannelId)
+	parsed, err := common.StrToMap(public.Other)
+	require.NoError(t, err)
+	require.Equal(t, 0.004, parsed["model_price"])
+	require.NotContains(t, parsed, "channel_type")
+	require.NotContains(t, parsed, "admin_info")
+}
+
+func TestFormatUserLogsResolvesHistoricalOpenCodeGoConsumeChannel(t *testing.T) {
+	previousDB := DB
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	t.Cleanup(func() { DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&Channel{}))
+	require.NoError(t, db.Create(&Channel{Id: 72, Type: constant.ChannelTypeOpenCodeGo, Key: ""}).Error)
+
+	log := &Log{
+		Type:              LogTypeConsume,
+		ChannelId:         72,
+		UpstreamRequestId: "historical-private-request-id",
+		Other:             `{"model_price":0.004}`,
+	}
+
+	formatUserLogs([]*Log{log}, 0)
+
+	require.Empty(t, log.UpstreamRequestId)
+}
+
+func TestFormatUserLogsFailsClosedForUnclassifiedHistoricalRequestId(t *testing.T) {
+	previousDB := DB
+	DB = nil
+	t.Cleanup(func() { DB = previousDB })
+	log := &Log{
+		Type:              LogTypeConsume,
+		ChannelId:         72,
+		UpstreamRequestId: "historical-private-request-id",
+		Other:             `{"model_price":0.004}`,
+	}
+
+	formatUserLogs([]*Log{log}, 0)
+
+	require.Empty(t, log.UpstreamRequestId)
+}
+
+func TestFormatUserLogsPreservesExplicitOtherChannelRequestId(t *testing.T) {
+	log := &Log{
+		Type:              LogTypeConsume,
+		ChannelId:         7,
+		UpstreamRequestId: "other-provider-request-id",
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"channel_type": constant.ChannelTypeOpenAI,
+		}),
+	}
+
+	formatUserLogs([]*Log{log}, 0)
+
+	require.Equal(t, "other-provider-request-id", log.UpstreamRequestId)
+}
+
+func TestUserLogChannelTypeUsesTopLevelBeforeAdminInfo(t *testing.T) {
+	channelType, ok := userLogChannelType(map[string]interface{}{
+		"channel_type": constant.ChannelTypeOpenAI,
+		"admin_info": map[string]interface{}{
+			"channel_type": constant.ChannelTypeOpenCodeGo,
+		},
+	})
+
+	require.True(t, ok)
+	require.Equal(t, constant.ChannelTypeOpenAI, channelType)
+}
+
+func TestUserLogChannelTypeFallsBackToAdminInfo(t *testing.T) {
+	channelType, ok := userLogChannelType(map[string]interface{}{
+		"admin_info": map[string]interface{}{
+			"channel_type": constant.ChannelTypeOpenCodeGo,
+		},
+	})
+
+	require.True(t, ok)
+	require.Equal(t, constant.ChannelTypeOpenCodeGo, channelType)
+}
+
+func TestUserLogChannelTypeFallsBackFromMalformedTopLevel(t *testing.T) {
+	channelType, ok := userLogChannelType(map[string]interface{}{
+		"channel_type": "private-workspace",
+		"admin_info": map[string]interface{}{
+			"channel_type": constant.ChannelTypeOpenCodeGo,
+		},
+	})
+
+	require.True(t, ok)
+	require.Equal(t, constant.ChannelTypeOpenCodeGo, channelType)
+}
+
+func TestFormatUserLogsHidesPrivateErrorWhenChannelMetadataIsMalformed(t *testing.T) {
+	tests := []struct {
+		name  string
+		other string
+	}{
+		{name: "missing", other: ""},
+		{name: "malformed", other: "not-json"},
+		{name: "null", other: "null"},
+		{name: "invalid channel type", other: `{"channel_type":"private-workspace"}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			log := &Log{
+				Type:              LogTypeError,
+				Content:           "setup requestheader failed: OpenCode Go workspace wrk_private is unavailable",
+				ChannelId:         72,
+				ChannelName:       "private pool",
+				UpstreamRequestId: "wrk_upstream_private",
+				Other:             test.other,
+			}
+
+			formatUserLogs([]*Log{log}, 0)
+
+			require.Equal(t, constant.OpenCodeGoPublicOverloadMessage, log.Content)
+			require.Zero(t, log.ChannelId)
+			require.Empty(t, log.ChannelName)
+			require.Empty(t, log.UpstreamRequestId)
+			parsed, err := common.StrToMap(log.Other)
+			require.NoError(t, err)
+			require.Equal(t, map[string]interface{}{
+				"error_type":  constant.OpenCodeGoPublicRateLimitErrorCode,
+				"error_code":  constant.OpenCodeGoPublicRateLimitErrorCode,
+				"status_code": float64(429),
+			}, parsed)
+		})
+	}
+}
+
+func TestFormatUserLogsPreservesRawOpenCodeGoErrorRecord(t *testing.T) {
+	raw := Log{
+		Type:              LogTypeError,
+		Content:           "Console Go workspace wrk_private is unavailable",
+		ChannelId:         72,
+		ChannelName:       "OpenCode Go pool",
+		UpstreamRequestId: "wrk_upstream_private",
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"channel_type": constant.ChannelTypeOpenCodeGo,
+			"private_key":  "workspace_secret",
+		}),
+	}
+	public := raw
+
+	formatUserLogs([]*Log{&public}, 0)
+
+	require.Equal(t, "Console Go workspace wrk_private is unavailable", raw.Content)
+	require.Equal(t, 72, raw.ChannelId)
+	require.Equal(t, "OpenCode Go pool", raw.ChannelName)
+	require.Equal(t, "wrk_upstream_private", raw.UpstreamRequestId)
+	require.Contains(t, raw.Other, "workspace_secret")
+	require.NotEqual(t, raw, public)
 }

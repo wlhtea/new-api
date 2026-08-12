@@ -1,9 +1,11 @@
 package openai
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -69,7 +71,16 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if oaiError := responsesResponse.GetOpenAIError(); responsesErrorHasDetails(oaiError) {
-		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+		responseErr := types.WithOpenAIError(*oaiError, resp.StatusCode)
+		if info.GetChannelType() == constant.ChannelTypeOpenCodeGo {
+			responseErr = service.MarkOpenCodeGoUpstreamRelayError(responseErr)
+		}
+		return nil, responseErr
+	}
+	if info.GetChannelType() == constant.ChannelTypeOpenCodeGo {
+		if rawError, present := rawResponsesError(responsesResponse.Error); present {
+			return nil, newRawOpenCodeGoResponsesError(rawError, resp.StatusCode)
+		}
 	}
 
 	// 写入新的 response body
@@ -115,7 +126,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
 	var streamErr *types.NewAPIError
-	strictOpenCodeGo := info != nil && info.ChannelType == constant.ChannelTypeOpenCodeGo
+	strictOpenCodeGo := info.GetChannelType() == constant.ChannelTypeOpenCodeGo
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		if streamErr != nil {
@@ -133,11 +144,8 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Stop(streamErr)
 			return
 		}
-		if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
-			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
-			sr.Stop(streamErr)
-			return
-		}
+		errorPayload := responsesErrorPayload(streamResponse.Type, data)
+		privateTerminalPayload := responsesPrivateTerminalPayload(streamResponse.Type, data)
 		switch streamResponse.Type {
 		case "response.completed", "response.done":
 			if info.StreamStatus != nil {
@@ -174,10 +182,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			} else {
 				streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResponse.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
 			}
-			if strictOpenCodeGo {
-				sr.Stop(streamErr)
-				return
-			}
 		case "response.failed":
 			if strictOpenCodeGo {
 				if streamResponse.Response != nil {
@@ -196,8 +200,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					}
 					streamErr = types.NewOpenAIError(fmt.Errorf("responses stream ended with %s", streamResponse.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
 				}
-				sr.Stop(streamErr)
-				return
 			}
 		case "response.incomplete", "response.cancelled", "response.canceled":
 			// `incomplete` commonly means a deterministic stop such as
@@ -205,8 +207,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			// Surface both without rotating the workspace.
 			if strictOpenCodeGo {
 				streamErr = types.NewOpenAIError(fmt.Errorf("responses stream ended with %s", streamResponse.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
-				sr.Stop(streamErr)
-				return
 			}
 			if !imageCommitted {
 				imageCounter.Reset()
@@ -232,6 +232,37 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				}
 			}
 		}
+		if strictOpenCodeGo && len(errorPayload) > 0 {
+			streamErr = newRawOpenCodeGoResponsesError(errorPayload, resp.StatusCode)
+			sr.Stop(streamErr)
+			return
+		}
+		if strictOpenCodeGo && responsesExplicitErrorEvent(streamResponse.Type) {
+			if streamErr == nil {
+				streamErr = types.NewOpenAIError(
+					fmt.Errorf("responses stream ended with %s", streamResponse.Type),
+					types.ErrorCodeBadResponse,
+					http.StatusInternalServerError,
+				)
+			}
+			streamErr = service.MarkOpenCodeGoUpstreamRelayError(streamErr)
+			sr.Stop(streamErr)
+			return
+		}
+		if strictOpenCodeGo && len(privateTerminalPayload) > 0 &&
+			service.OpenCodeGoErrorHasPrivateDetail(string(privateTerminalPayload)) {
+			streamErr = newRawOpenCodeGoResponsesError(privateTerminalPayload, resp.StatusCode)
+			sr.Stop(streamErr)
+			return
+		}
+		if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			sr.Stop(streamErr)
+			return
+		}
+		if streamErr != nil {
+			sr.Stop(streamErr)
+		}
 	})
 	if streamErr != nil {
 		return nil, streamErr
@@ -254,4 +285,190 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 
 	return usage, nil
+}
+
+func newRawOpenCodeGoResponsesError(payload []byte, statusCode int) *types.NewAPIError {
+	if statusCode < 100 || statusCode > 599 {
+		statusCode = http.StatusInternalServerError
+	}
+	payload = canonicalResponsesErrorPayload(payload)
+	openAIError := types.OpenAIError{}
+	if common.Unmarshal(payload, &openAIError) != nil || !openAIError.HasDetails() {
+		openAIError = types.OpenAIError{
+			Message: string(payload),
+			Type:    "upstream_error",
+			Code:    "upstream_error",
+		}
+	} else {
+		if strings.TrimSpace(openAIError.Message) == "" {
+			openAIError.Message = string(payload)
+		}
+		if strings.TrimSpace(openAIError.Type) == "" {
+			openAIError.Type = "upstream_error"
+		}
+		if openAIError.Code == nil || strings.TrimSpace(fmt.Sprint(openAIError.Code)) == "" {
+			openAIError.Code = "upstream_error"
+		}
+	}
+	return service.MarkOpenCodeGoUpstreamRelayError(
+		types.WithOpenAIError(openAIError, statusCode, types.ErrOptionWithSkipRetry()),
+	)
+}
+
+func rawResponsesError(errorField any) (json.RawMessage, bool) {
+	if errorField == nil {
+		return nil, false
+	}
+	raw, err := common.Marshal(errorField)
+	if err != nil {
+		return nil, false
+	}
+	return raw, responsesRawPayloadPresent(raw)
+}
+
+func responsesRawPayloadPresent(payload json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(payload))
+	if trimmed == "" || trimmed == "null" {
+		return false
+	}
+	var decoded any
+	if common.Unmarshal(payload, &decoded) != nil {
+		return true
+	}
+	switch typed := decoded.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case map[string]any:
+		return len(typed) != 0
+	case []any:
+		return len(typed) != 0
+	default:
+		return true
+	}
+}
+
+func responsesExplicitErrorEvent(eventType string) bool {
+	switch eventType {
+	case "error", "response.error", "response.failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalResponsesErrorPayload(payload []byte) []byte {
+	var decoded any
+	if common.Unmarshal(payload, &decoded) != nil {
+		return payload
+	}
+	canonical, err := common.Marshal(decoded)
+	if err != nil {
+		return payload
+	}
+	return canonical
+}
+
+func responsesErrorPayload(eventType, data string) json.RawMessage {
+	var envelope struct {
+		Type     string          `json:"type"`
+		Error    json.RawMessage `json:"error"`
+		Message  json.RawMessage `json:"message"`
+		Code     json.RawMessage `json:"code"`
+		Detail   json.RawMessage `json:"detail"`
+		Metadata json.RawMessage `json:"metadata"`
+		Response *struct {
+			Error             json.RawMessage `json:"error"`
+			IncompleteDetails json.RawMessage `json:"incomplete_details"`
+		} `json:"response"`
+	}
+	if common.UnmarshalJsonStr(data, &envelope) != nil {
+		return nil
+	}
+
+	candidates := make([]json.RawMessage, 0, 3)
+	switch eventType {
+	case "error", "response.error", "response.failed":
+		candidates = append(candidates, envelope.Error)
+		if envelope.Response != nil {
+			candidates = append(candidates, envelope.Response.Error)
+		}
+		if !responsesRawPayloadPresent(envelope.Error) &&
+			(envelope.Response == nil || !responsesRawPayloadPresent(envelope.Response.Error)) {
+			topLevel := responsesTopLevelErrorPayload(envelope.Type, envelope.Message, envelope.Code, envelope.Detail, envelope.Metadata)
+			if len(topLevel) > 0 {
+				candidates = append(candidates, topLevel)
+			}
+		}
+	case "response.incomplete", "response.cancelled", "response.canceled":
+		candidates = append(candidates, envelope.Error)
+		if envelope.Response != nil {
+			candidates = append(candidates, envelope.Response.Error)
+		}
+	case "":
+		candidates = append(candidates, envelope.Error)
+	default:
+		return nil
+	}
+
+	for _, candidate := range candidates {
+		if responsesRawPayloadPresent(candidate) {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func responsesPrivateTerminalPayload(eventType, data string) json.RawMessage {
+	switch eventType {
+	case "response.incomplete", "response.cancelled", "response.canceled":
+	default:
+		return nil
+	}
+	var envelope struct {
+		Type     string          `json:"type"`
+		Message  json.RawMessage `json:"message"`
+		Code     json.RawMessage `json:"code"`
+		Detail   json.RawMessage `json:"detail"`
+		Metadata json.RawMessage `json:"metadata"`
+		Response *struct {
+			IncompleteDetails json.RawMessage `json:"incomplete_details"`
+		} `json:"response"`
+	}
+	if common.UnmarshalJsonStr(data, &envelope) != nil {
+		return nil
+	}
+	if envelope.Response != nil {
+		trimmed := strings.TrimSpace(string(envelope.Response.IncompleteDetails))
+		if trimmed != "" && trimmed != "null" {
+			return envelope.Response.IncompleteDetails
+		}
+	}
+	return responsesTopLevelErrorPayload(
+		envelope.Type,
+		envelope.Message,
+		envelope.Code,
+		envelope.Detail,
+		envelope.Metadata,
+	)
+}
+
+func responsesTopLevelErrorPayload(eventType string, fields ...json.RawMessage) json.RawMessage {
+	payload := map[string]json.RawMessage{"type": json.RawMessage(strconv.Quote(eventType))}
+	names := []string{"message", "code", "detail", "metadata"}
+	for index, field := range fields {
+		trimmed := strings.TrimSpace(string(field))
+		if trimmed != "" && trimmed != "null" {
+			payload[names[index]] = field
+		}
+	}
+	if len(payload) == 1 {
+		return nil
+	}
+	encoded, err := common.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return encoded
 }

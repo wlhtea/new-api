@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -30,6 +31,57 @@ func (r errorReadCloser) Read([]byte) (int, error) {
 
 func (errorReadCloser) Close() error {
 	return nil
+}
+
+func TestHandleNon2xxResponseMarksEveryUpstreamErrorBranch(t *testing.T) {
+	tests := []struct {
+		name        string
+		response    *http.Response
+		wantMessage string
+	}{
+		{
+			name:        "missing response",
+			wantMessage: "OpenCode Go returned no response",
+		},
+		{
+			name: "body read failure",
+			response: &http.Response{
+				StatusCode: http.StatusBadGateway,
+				Header:     http.Header{},
+				Body:       errorReadCloser{err: io.ErrUnexpectedEOF},
+			},
+			wantMessage: "failed to read OpenCode Go error response",
+		},
+		{
+			name: "parsed upstream error with unknown internal name",
+			response: &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"internal shard zen-primary failed"}}`)),
+			},
+			wantMessage: "internal shard zen-primary failed",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			apiErr, observation := (&Adaptor{}).HandleNon2xxResponse(newAdaptorTestContext(), test.response, nil)
+
+			require.NotNil(t, apiErr)
+			require.NotNil(t, observation)
+			assert.Equal(t, test.wantMessage, apiErr.Error())
+			assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+
+			publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+			require.NotSame(t, apiErr, publicErr)
+			assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+			assert.Equal(t, service.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+			publicOpenAIError := publicErr.ToOpenAIError()
+			assert.Equal(t, service.OpenCodeGoPublicRateLimitErrorCode, publicOpenAIError.Type)
+			assert.Equal(t, service.OpenCodeGoPublicRateLimitErrorCode, publicOpenAIError.Code)
+			assert.Equal(t, test.wantMessage, apiErr.Error())
+		})
+	}
 }
 
 func TestHandleNon2xxResponseLogsOnlyPrivacySafeRequestShape(t *testing.T) {

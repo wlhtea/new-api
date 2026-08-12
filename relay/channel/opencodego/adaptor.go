@@ -478,7 +478,18 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		a.recordFailoverFailure(c, info, streamFailureReason)
 	}
 	if responseErr != nil {
+		if state.sawUpstreamError {
+			responseErr = service.MarkOpenCodeGoUpstreamRelayError(responseErr)
+		}
 		return nil, responseErr
+	}
+	if state.sawUpstreamError {
+		responseErr = types.WithOpenAIError(types.OpenAIError{
+			Message: string(state.upstreamErrorPayload),
+			Type:    "upstream_error",
+			Code:    "upstream_error",
+		}, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		return nil, service.MarkOpenCodeGoUpstreamRelayError(responseErr)
 	}
 	if writeErr := service.ResponseBodyWriteError(c); writeErr != nil {
 		return nil, types.NewOpenAIError(
@@ -541,12 +552,12 @@ func (a *Adaptor) openCodeGoStreamSettlementError(c *gin.Context, info *relaycom
 		)
 	}
 	if a.openCodeGoStreamIncomplete(c, info) {
-		return types.NewOpenAIError(
+		return service.MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
 			errors.New("OpenCode Go upstream stream ended before completion"),
 			types.ErrorCodeBadResponseBody,
 			http.StatusBadGateway,
 			types.ErrOptionWithSkipRetry(),
-		)
+		))
 	}
 	return nil
 }

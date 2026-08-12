@@ -35,19 +35,15 @@ import (
 )
 
 const (
-	groupUpstreamOverloadedMessage = "当前分组上游负载已饱和，请稍后再试"
-	rateLimitErrorCode             = "rate_limit_error"
+	groupUpstreamOverloadedMessage = service.OpenCodeGoPublicOverloadMessage
 )
 
-func publicRelayError(newAPIError *types.NewAPIError) *types.NewAPIError {
-	if newAPIError == nil || !errors.Is(newAPIError, service.ErrOpenCodeGoNoEligibleWorkspace) {
-		return newAPIError
+func publicRelayError(c *gin.Context, newAPIError *types.NewAPIError) *types.NewAPIError {
+	channelType := 0
+	if c != nil {
+		channelType = common.GetContextKeyInt(c, constant.ContextKeyChannelType)
 	}
-	return types.WithOpenAIError(types.OpenAIError{
-		Message: groupUpstreamOverloadedMessage,
-		Type:    rateLimitErrorCode,
-		Code:    rateLimitErrorCode,
-	}, http.StatusTooManyRequests, types.ErrOptionWithSkipRetry())
+	return service.PublicOpenCodeGoRelayError(channelType, newAPIError)
 }
 
 func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
@@ -93,7 +89,11 @@ func renderRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websock
 	if relayFormat != types.RelayFormatOpenAIRealtime && c.Writer.Written() {
 		return
 	}
-	newAPIError = publicRelayError(newAPIError)
+	publicError := publicRelayError(c, newAPIError)
+	if publicError != newAPIError {
+		clearUnwrittenEventStreamHeaders(c)
+	}
+	newAPIError = publicError
 	newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestID))
 	switch relayFormat {
 	case types.RelayFormatOpenAIRealtime:
@@ -107,6 +107,27 @@ func renderRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websock
 		c.JSON(newAPIError.StatusCode, gin.H{
 			"error": newAPIError.ToOpenAIError(),
 		})
+	}
+}
+
+func clearUnwrittenEventStreamHeaders(c *gin.Context) {
+	if c == nil || c.Writer == nil || c.Writer.Written() {
+		return
+	}
+	if !strings.HasPrefix(strings.ToLower(c.Writer.Header().Get("Content-Type")), "text/event-stream") {
+		return
+	}
+	for _, name := range []string{
+		"Content-Type",
+		"Content-Length",
+		"Cache-Control",
+		"Connection",
+		"Transfer-Encoding",
+		"X-Accel-Buffering",
+		"X-Codex-Turn-State",
+		"X-Reasoning-Included",
+	} {
+		c.Writer.Header().Del(name)
 	}
 }
 

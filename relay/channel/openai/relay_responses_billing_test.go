@@ -13,6 +13,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -195,6 +196,73 @@ func TestOaiResponsesHandlerIncompleteStatusCommitsZeroImageGeneration(t *testin
 	assert.Equal(t, 0, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
 }
 
+func TestOaiResponsesHandlerRejectsPrivateUnknownErrorShape(t *testing.T) {
+	body := `{"error":{"metadata":{"workspace":"wrk_private"},"detail":"Error from provider (Console Go): Endpoint is unavailable."}}`
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenCodeGo}}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+	}
+
+	usage, apiErr := OaiResponsesHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.Contains(t, apiErr.Error(), "Console Go")
+	assert.Contains(t, apiErr.Error(), "workspace")
+	assert.Empty(t, w.Body.String())
+	publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+	require.NotSame(t, apiErr, publicErr)
+	assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+}
+
+func TestOaiResponsesHandlerMarksUnknownOpenCodeGoError(t *testing.T) {
+	body := `{"error":{"type":"upstream_error","code":"shard_failure","message":"internal shard zen-primary failed"}}`
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenCodeGo}}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+	}
+
+	usage, apiErr := OaiResponsesHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, "internal shard zen-primary failed", apiErr.Error())
+	assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+	assert.Empty(t, w.Body.String())
+	publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+	require.NotSame(t, apiErr, publicErr)
+	assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+}
+
+func TestOaiResponsesHandlerKeepsPrivateWordsOutsideError(t *testing.T) {
+	body := `{"id":"resp_1","object":"response","status":"completed","metadata":{"topic":"workspace planning"},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OpenCode workspace guide"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenCodeGo}}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+	}
+
+	usage, apiErr := OaiResponsesHandler(c, info, resp)
+
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Contains(t, w.Body.String(), "OpenCode workspace guide")
+}
+
 func runResponsesImageBillingStream(t *testing.T, events ...string) *relaycommon.RelayInfo {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -315,4 +383,373 @@ func TestOaiResponsesStreamHandlerClassifiesCodeOnlyErrors(t *testing.T) {
 			assert.Equal(t, tt.upstream, info.StreamStatus.UpstreamFailureObserved())
 		})
 	}
+}
+
+func TestOaiResponsesStreamHandlerDoesNotWritePrivateOpenCodeGoErrorEvent(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "responses failed event",
+			body: `data: {"type":"response.failed","response":{"error":{"type":"upstream_error","code":"workspace_unavailable","message":"Error from provider (Console Go): Endpoint is unavailable.","metadata":{"workspace":"wrk_private"}}}}` + "\n\n",
+			want: "Console Go",
+		},
+		{
+			name: "top level error event",
+			body: `data: {"type":"error","error":{"type":"upstream_error","code":"workspace_unavailable","message":"Error from provider (Console Go): Endpoint is unavailable.","metadata":{"workspace":"wrk_private"}}}` + "\n\n",
+			want: "Console Go",
+		},
+		{
+			name: "untyped top level error",
+			body: `data: {"error":{"type":"upstream_error","code":"workspace_unavailable","message":"Error from provider (Console Go): Endpoint is unavailable.","metadata":{"workspace":"wrk_private"}}}` + "\n\n",
+			want: "Console Go",
+		},
+		{
+			name: "escaped private details",
+			body: `data: {"type":"error","error":{"type":"upstream_error","code":"work\u0073pace_unavailable","message":"Error from provider (Console G\u006f): Endpoint is unavailable.","metadata":{"work\u0073pace":"wrk\u005fprivate"}}}` + "\n\n",
+			want: "Console Go",
+		},
+		{
+			name: "metadata only private error",
+			body: `data: {"type":"response.failed","response":{"error":{"metadata":{"workspace":"wrk_private"},"detail":"Console Go internal channel unavailable"}}}` + "\n\n",
+			want: "Console Go",
+		},
+		{
+			name: "failed root fields",
+			body: `data: {"type":"response.failed","message":"Error from provider (Console Go): Endpoint is unavailable.","code":"workspace_unavailable","metadata":{"workspace":"wrk_private"}}` + "\n\n",
+			want: "Console Go",
+		},
+		{
+			name: "response error root fields",
+			body: `data: {"type":"response.error","detail":"Console Go workspace wrk_private is unavailable"}` + "\n\n",
+			want: "Console Go",
+		},
+		{
+			name: "cancelled root fields",
+			body: `data: {"type":"response.cancelled","message":"OpenCode workspace wrk_private endpoint is unavailable"}` + "\n\n",
+			want: "OpenCode",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			c.Set(common.RequestIdKey, "responses-private-error-test")
+			info := &relaycommon.RelayInfo{
+				DisablePing: true,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType:       constant.ChannelTypeOpenCodeGo,
+					UpstreamModelName: "gpt-test",
+				},
+			}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(test.body)),
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			}
+
+			_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+			require.NotNil(t, apiErr)
+			assert.Contains(t, apiErr.Error(), test.want)
+			assert.Empty(t, w.Body.String())
+			publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+			require.NotSame(t, apiErr, publicErr)
+			assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+			assert.Equal(t, service.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+		})
+	}
+}
+
+func TestOaiResponsesStreamHandlerDoesNotWriteUnknownOpenCodeGoErrorEvent(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := `data: {"type":"response.failed","response":{"error":{"type":"upstream_error","code":"shard_failure","message":"internal shard zen-primary failed"}}}` + "\n\n"
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenCodeGo,
+			UpstreamModelName: "gpt-test",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.NotNil(t, apiErr)
+	assert.Equal(t, "internal shard zen-primary failed", apiErr.Error())
+	assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+	assert.Empty(t, w.Body.String())
+	publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+	require.NotSame(t, apiErr, publicErr)
+	assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+}
+
+func TestOaiResponsesStreamHandlerIgnoresEmptyErrorPlaceholder(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.output_text.delta","delta":"public text","error":{}}`,
+		`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		"",
+	}, "\n\n")
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenCodeGo,
+			UpstreamModelName: "gpt-test",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiErr)
+	assert.Contains(t, w.Body.String(), "public text")
+}
+
+func TestOaiResponsesStreamHandlerFailsClosedForExplicitEmptyErrorEvent(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	for _, eventType := range []string{"error", "response.error", "response.failed"} {
+		t.Run(eventType, func(t *testing.T) {
+			body := `data: {"type":"` + eventType + `","error":{}}` + "\n\n"
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			info := &relaycommon.RelayInfo{
+				DisablePing: true,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType:       constant.ChannelTypeOpenCodeGo,
+					UpstreamModelName: "gpt-test",
+				},
+			}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			}
+
+			_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+			require.NotNil(t, apiErr)
+			assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+			assert.Empty(t, w.Body.String())
+		})
+	}
+}
+
+func TestOaiResponsesStreamHandlerDoesNotAppendUnknownErrorAfterDelta(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.output_text.delta","delta":"public text"}`,
+		`data: {"type":"response.error","response":{"error":{"type":"upstream_error","code":"shard_failure","message":"internal shard zen-primary failed"}}}`,
+		"",
+	}, "\n\n")
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenCodeGo,
+			UpstreamModelName: "gpt-test",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.NotNil(t, apiErr)
+	assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+	responseBody := w.Body.String()
+	assert.Contains(t, responseBody, "public text")
+	assert.NotContains(t, responseBody, "internal shard")
+	assert.NotContains(t, responseBody, "zen-primary")
+}
+
+func TestOaiResponsesStreamHandlerDoesNotTreatNormalOutputAsPrivateError(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := `data: {"type":"response.incomplete","response":{"status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"workspace planning"}]}],"incomplete_details":{"reason":"max_output_tokens"}}}` + "\n\n"
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenCodeGo,
+			UpstreamModelName: "gpt-test",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.NotNil(t, apiErr)
+	assert.Contains(t, w.Body.String(), "workspace planning")
+	assert.Same(t, apiErr, service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr))
+}
+
+func TestOaiResponsesStreamHandlerRejectsPrivateIncompleteDetails(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := `data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"workspace_unavailable"}}}` + "\n\n"
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenCodeGo,
+			UpstreamModelName: "gpt-test",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.NotNil(t, apiErr)
+	assert.Contains(t, apiErr.Error(), "workspace_unavailable")
+	assert.Empty(t, w.Body.String())
+	require.NotSame(t, apiErr, service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr))
+}
+
+func TestOaiResponsesStreamHandlerDoesNotAppendPrivateOpenCodeGoErrorAfterDelta(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.output_text.delta","delta":"public text"}`,
+		`data: {"type":"response.failed","response":{"error":{"type":"upstream_error","code":"workspace_unavailable","message":"Error from provider (Console Go): Endpoint is unavailable.","metadata":{"workspace":"wrk_private"}}}}`,
+		"",
+	}, "\n\n")
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Set(common.RequestIdKey, "responses-private-error-after-delta-test")
+	info := &relaycommon.RelayInfo{
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenCodeGo,
+			UpstreamModelName: "gpt-test",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.NotNil(t, apiErr)
+	assert.True(t, w.Flushed)
+	responseBody := strings.ToLower(w.Body.String())
+	assert.Contains(t, responseBody, "public text")
+	for _, marker := range []string{"opencode", "console go", "workspace", "wrk_", "endpoint is unavailable"} {
+		assert.NotContains(t, responseBody, marker)
+	}
+}
+
+func TestOaiResponsesStreamHandlerKeepsOtherChannelErrorEventBehavior(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := `data: {"type":"response.error","response":{"error":{"code":"workspace_unavailable","message":"workspace is unavailable"}}}` + "\n\n"
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Set(common.RequestIdKey, "responses-other-channel-error-test")
+	info := &relaycommon.RelayInfo{
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenAI,
+			UpstreamModelName: "gpt-test",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.NotNil(t, apiErr)
+	assert.True(t, w.Flushed)
+	assert.Contains(t, w.Body.String(), "workspace is unavailable")
 }

@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
@@ -63,6 +63,11 @@ func TestProcessChannelErrorPersistsOpenCodeGoAffinity(t *testing.T) {
 	common.SetContextKey(c, constant.ContextKeyOpenCodeGoAffinitySource, "opencode-session")
 	common.SetContextKey(c, constant.ContextKeyOpenCodeGoAffinityKey, "private-affinity-key")
 
+	internalErr := service.MarkOpenCodeGoUpstreamRelayError(relaytypes.NewOpenAIError(
+		fmt.Errorf("internal shard zen-primary failed"),
+		relaytypes.ErrorCodeBadResponseStatusCode,
+		http.StatusBadGateway,
+	))
 	processChannelError(
 		c,
 		*relaytypes.NewChannelError(
@@ -73,15 +78,14 @@ func TestProcessChannelErrorPersistsOpenCodeGoAffinity(t *testing.T) {
 			"",
 			false,
 		),
-		relaytypes.NewOpenAIError(
-			errors.New("upstream request failed"),
-			relaytypes.ErrorCodeBadResponseStatusCode,
-			http.StatusBadGateway,
-		),
+		internalErr,
 	)
 
 	var stored model.Log
 	require.NoError(t, db.Where("type = ?", model.LogTypeError).First(&stored).Error)
+	require.Contains(t, stored.Content, "internal shard zen-primary failed")
+	require.Equal(t, "internal shard zen-primary failed", internalErr.Error())
+	require.True(t, service.IsOpenCodeGoUpstreamRelayError(internalErr))
 	other, err := common.StrToMap(stored.Other)
 	require.NoError(t, err)
 	adminInfo, ok := other["admin_info"].(map[string]interface{})

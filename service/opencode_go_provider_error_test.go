@@ -90,6 +90,30 @@ func TestParseOpenCodeGoRetryAfterSupportsHTTPDateAndBoundsValues(t *testing.T) 
 	assert.False(t, ok)
 }
 
+func TestParseOpenCodeGoProviderFailureRejectsPrivateRetryAfterText(t *testing.T) {
+	httpDate := time.Date(2030, time.January, 2, 3, 5, 20, 0, time.UTC).Format(http.TimeFormat)
+	for _, test := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "delta seconds", value: "321", want: "321"},
+		{name: "http date", value: httpDate, want: httpDate},
+		{name: "private text", value: "workspace=wrk_private", want: ""},
+		{name: "signed seconds", value: "+30", want: ""},
+		{name: "newline", value: "30\r\nworkspace=wrk_private", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			failure := ParseOpenCodeGoProviderFailure(
+				http.StatusTooManyRequests,
+				http.Header{"Retry-After": []string{test.value}},
+				nil,
+			)
+			assert.Equal(t, test.want, failure.RetryAfter)
+		})
+	}
+}
+
 func TestParseOpenCodeGoProviderFailurePreservesSafeValidationPath(t *testing.T) {
 	tests := []struct {
 		name string
