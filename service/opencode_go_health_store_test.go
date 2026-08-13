@@ -53,7 +53,7 @@ func seedOpenCodeGoHealthWorkspace(
 	return workspace
 }
 
-func TestApplyOpenCodeGoClassifiedFailureUpdatesOnlySelectedWorkspaceModel(t *testing.T) {
+func TestObserveOpenCodeGoProviderFailureDoesNotCoolSelectedWorkspaceModel(t *testing.T) {
 	_, channel, _ := setupOpenCodeGoPoolTestDB(t)
 	identity := model.OpenCodeGoIdentity{
 		UID:                   "identity-health-a",
@@ -67,29 +67,15 @@ func TestApplyOpenCodeGoClassifiedFailureUpdatesOnlySelectedWorkspaceModel(t *te
 	unrelated := seedOpenCodeGoHealthWorkspace(t, channel.Id, identity.ID, "workspace-health-b", "glm-5.2")
 
 	now := time.Unix(1_900_000_100, 0)
-	classified, ok := ClassifyOpenCodeGoProviderFailure(OpenCodeGoProviderFailure{
+	applied, err := ObserveOpenCodeGoProviderFailure(channel.Id, selected.UID, "glm-5.2", OpenCodeGoProviderFailure{
 		StatusCode: 429,
 		ErrorType:  "RateLimitError",
 		ErrorCode:  "rate_limit",
 		Message:    "rate limited",
 		RetryAfter: "90",
 	}, now)
-	require.True(t, ok)
-	rebuilds := 0
-	applied, err := applyOpenCodeGoClassifiedFailure(
-		channel.Id,
-		selected.UID,
-		"glm-5.2",
-		classified,
-		func(gotChannelID int) error {
-			rebuilds++
-			assert.Equal(t, channel.Id, gotChannelID)
-			return nil
-		},
-	)
 	require.NoError(t, err)
-	require.True(t, applied)
-	assert.Equal(t, 1, rebuilds)
+	assert.False(t, applied)
 
 	selectedAfter, err := model.GetOpenCodeGoWorkspace(channel.Id, selected.UID)
 	require.NoError(t, err)
@@ -98,13 +84,130 @@ func TestApplyOpenCodeGoClassifiedFailureUpdatesOnlySelectedWorkspaceModel(t *te
 	for _, entry := range selectedAfter.Models {
 		states[entry.Model] = entry.State
 	}
-	assert.Equal(t, model.OpenCodeGoModelRPMCooldown, states["glm-5.2"])
+	assert.Equal(t, model.OpenCodeGoModelAvailable, states["glm-5.2"])
 	assert.Equal(t, model.OpenCodeGoModelAvailable, states["kimi-k2.5"])
 
 	unrelatedAfter, err := model.GetOpenCodeGoWorkspace(channel.Id, unrelated.UID)
 	require.NoError(t, err)
 	require.Len(t, unrelatedAfter.Models, 1)
 	assert.Equal(t, model.OpenCodeGoModelAvailable, unrelatedAfter.Models[0].State)
+}
+
+func TestObserveOpenCodeGoProviderFailureDoesNotChangeWorkspaceForNonAuthSignals(t *testing.T) {
+	_, channel, _ := setupOpenCodeGoPoolTestDB(t)
+	identity := model.OpenCodeGoIdentity{
+		UID:                   "identity-health-non-auth",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie-non-auth",
+		AuthCookieFingerprint: "fingerprint-health-non-auth",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, model.DB.Create(&identity).Error)
+	workspace := seedOpenCodeGoHealthWorkspace(t, channel.Id, identity.ID, "workspace-health-non-auth", "glm-5.2")
+	now := time.Unix(1_900_000_100, 0)
+	for _, failure := range []OpenCodeGoProviderFailure{
+		{StatusCode: http.StatusBadRequest, ErrorType: "AuthError", Message: "invalid request"},
+		{StatusCode: http.StatusUnauthorized, ErrorType: "ModelError", Message: "model unavailable"},
+		{StatusCode: http.StatusForbidden, ErrorType: "RegionError", Message: "region unavailable"},
+		{StatusCode: http.StatusRequestTimeout, ErrorType: "upstream_error", Message: "request timeout"},
+		{StatusCode: http.StatusTooEarly, ErrorType: "upstream_error", Message: "too early"},
+		{StatusCode: http.StatusTooManyRequests, ErrorType: "GoUsageLimitError", LimitName: "weekly"},
+		{StatusCode: http.StatusInternalServerError, ErrorType: "AuthError", Message: "credential rejected"},
+	} {
+		applied, err := ObserveOpenCodeGoProviderFailure(channel.Id, workspace.UID, "glm-5.2", failure, now)
+		require.NoError(t, err)
+		assert.False(t, applied)
+		now = now.Add(time.Second)
+	}
+	transportApplied, err := ObserveOpenCodeGoTransportFailure(channel.Id, workspace.UID, "glm-5.2", "connection reset", now)
+	require.NoError(t, err)
+	assert.False(t, transportApplied)
+
+	after, err := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, model.OpenCodeGoStateEligible, after.EffectiveState)
+	assert.Equal(t, model.OpenCodeGoCredentialValid, after.CredentialStatus)
+	require.Len(t, after.Models, 1)
+	assert.Equal(t, model.OpenCodeGoModelAvailable, after.Models[0].State)
+}
+
+func TestClearLegacyOpenCodeGoModelCooldowns(t *testing.T) {
+	_, channel, _ := setupOpenCodeGoPoolTestDB(t)
+	identity := model.OpenCodeGoIdentity{
+		UID:                   "identity-health-legacy-cooldowns",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie-legacy-cooldowns",
+		AuthCookieFingerprint: "fingerprint-health-legacy-cooldowns",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, model.DB.Create(&identity).Error)
+	workspace := seedOpenCodeGoHealthWorkspace(
+		t,
+		channel.Id,
+		identity.ID,
+		"workspace-health-legacy-cooldowns",
+		"region-model",
+		"model-model",
+		"rpm-model",
+		"transport-model",
+		"undiscovered-model",
+	)
+	legacy := map[string]struct {
+		state       string
+		observation OpenCodeGoHealthObservationKind
+	}{
+		"region-model":    {state: model.OpenCodeGoModelRegionBlocked, observation: OpenCodeGoObservationRegionBlocked},
+		"model-model":     {state: model.OpenCodeGoModelDisabled, observation: OpenCodeGoObservationModelBlocked},
+		"rpm-model":       {state: model.OpenCodeGoModelRPMCooldown, observation: OpenCodeGoObservationRPMThrottled},
+		"transport-model": {state: model.OpenCodeGoModelTransient, observation: OpenCodeGoObservationTransientFailure},
+	}
+	for modelID, legacyState := range legacy {
+		observation := string(legacyState.observation)
+		if modelID == "region-model" {
+			// Older rows may predate persisted observation metadata.
+			observation = ""
+		}
+		require.NoError(t, model.DB.Model(&model.OpenCodeGoWorkspaceModel{}).
+			Where("workspace_id = ? AND model = ?", workspace.ID, modelID).
+			Updates(map[string]interface{}{
+				"state":              legacyState.state,
+				"disabled_until":     int64(2_000_000_000),
+				"last_error_code":    "legacy_error",
+				"last_error":         "legacy relay failure",
+				"health_observation": observation,
+				"health_observed_at": int64(1_900_000_000),
+			}).Error)
+	}
+	require.NoError(t, model.DB.Model(&model.OpenCodeGoWorkspaceModel{}).
+		Where("workspace_id = ? AND model = ?", workspace.ID, "undiscovered-model").
+		Updates(map[string]interface{}{
+			"discovered":         false,
+			"state":              model.OpenCodeGoModelDisabled,
+			"disabled_until":     int64(2_000_000_000),
+			"last_error":         "not an error cooldown",
+			"health_observation": "",
+		}).Error)
+
+	require.NoError(t, clearLegacyOpenCodeGoModelCooldowns())
+	after, err := model.GetOpenCodeGoWorkspace(channel.Id, workspace.UID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	states := make(map[string]model.OpenCodeGoWorkspaceModel, len(after.Models))
+	for _, entry := range after.Models {
+		states[entry.Model] = entry
+	}
+	for modelID := range legacy {
+		entry := states[modelID]
+		assert.Equal(t, model.OpenCodeGoModelAvailable, entry.State)
+		assert.Zero(t, entry.DisabledUntil)
+		assert.Empty(t, entry.LastErrorCode)
+		assert.Empty(t, entry.LastError)
+		assert.Empty(t, entry.HealthObservation)
+		assert.Zero(t, entry.HealthObservedAt)
+	}
+	assert.Equal(t, model.OpenCodeGoModelDisabled, states["undiscovered-model"].State)
+	assert.False(t, states["undiscovered-model"].Discovered)
 }
 
 func TestApplyOpenCodeGoClassifiedFailureRejectsOlderWorkspaceObservation(t *testing.T) {

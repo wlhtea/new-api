@@ -20,11 +20,7 @@ const (
 	OpenCodeGoHealthScopeWorkspace OpenCodeGoHealthScope = "workspace"
 	OpenCodeGoHealthScopeModel     OpenCodeGoHealthScope = "model"
 
-	openCodeGoDefaultRPMCooldown       = time.Minute
-	openCodeGoDefaultTransientCooldown = 30 * time.Second
-	openCodeGoDefaultRegionCooldown    = 30 * time.Minute
-	openCodeGoDefaultModelCooldown     = 15 * time.Minute
-	openCodeGoMaxRetryAfter            = 31 * 24 * time.Hour
+	openCodeGoMaxRetryAfter = 31 * 24 * time.Hour
 )
 
 type OpenCodeGoProviderFailure struct {
@@ -245,7 +241,11 @@ func ClassifyOpenCodeGoProviderFailure(
 	failure OpenCodeGoProviderFailure,
 	observedAt time.Time,
 ) (OpenCodeGoClassifiedFailure, bool) {
-	if observedAt.IsZero() || failure.StatusCode == 499 {
+	// Health decisions must use the raw provider status, never a public or
+	// channel-mapped status. Only an upstream 401/403 can change workspace
+	// availability, and relay failures never create model cooldowns.
+	if observedAt.IsZero() ||
+		(failure.StatusCode != http.StatusUnauthorized && failure.StatusCode != http.StatusForbidden) {
 		return OpenCodeGoClassifiedFailure{}, false
 	}
 
@@ -261,11 +261,6 @@ func ClassifyOpenCodeGoProviderFailure(
 		observation.Kind = kind
 		return OpenCodeGoClassifiedFailure{Scope: OpenCodeGoHealthScopeWorkspace, Observation: observation}, true
 	}
-	modelScope := func(kind OpenCodeGoHealthObservationKind, fallback time.Duration) (OpenCodeGoClassifiedFailure, bool) {
-		observation.Kind = kind
-		observation.Deadline = openCodeGoFailureDeadline(observedAt, failure.RetryAfter, fallback)
-		return OpenCodeGoClassifiedFailure{Scope: OpenCodeGoHealthScopeModel, Observation: observation}, true
-	}
 	quota := func(kind string) (OpenCodeGoClassifiedFailure, bool) {
 		observation.Kind = OpenCodeGoObservationQuotaExhausted
 		observation.QuotaKind = kind
@@ -279,7 +274,7 @@ func ClassifyOpenCodeGoProviderFailure(
 			return workspace(OpenCodeGoObservationRiskBlocked)
 		}
 		if openCodeGoAuthErrorIsModelScoped(message) {
-			return modelScope(OpenCodeGoObservationModelBlocked, openCodeGoDefaultModelCooldown)
+			return OpenCodeGoClassifiedFailure{}, false
 		}
 		return workspace(OpenCodeGoObservationCredentialFailure)
 	case "creditserror":
@@ -290,33 +285,14 @@ func ClassifyOpenCodeGoProviderFailure(
 		return quota(openCodeGoQuotaKindForLimitName(failure.LimitName))
 	case "blackusagelimiterror":
 		return quota("")
-	case "regionerror":
-		return modelScope(OpenCodeGoObservationRegionBlocked, openCodeGoDefaultRegionCooldown)
-	case "modelerror":
-		return modelScope(OpenCodeGoObservationModelBlocked, openCodeGoDefaultModelCooldown)
-	case "ratelimiterror", "freeusagelimiterror":
-		return modelScope(OpenCodeGoObservationRPMThrottled, openCodeGoDefaultRPMCooldown)
+	case "regionerror", "modelerror", "ratelimiterror", "freeusagelimiterror":
+		return OpenCodeGoClassifiedFailure{}, false
 	}
 
-	switch {
-	case failure.StatusCode == http.StatusUnauthorized:
+	if failure.StatusCode == http.StatusUnauthorized {
 		return workspace(OpenCodeGoObservationCredentialFailure)
-	case failure.StatusCode == http.StatusForbidden:
-		return modelScope(OpenCodeGoObservationRegionBlocked, openCodeGoDefaultRegionCooldown)
-	case failure.StatusCode == http.StatusTooManyRequests:
-		return modelScope(OpenCodeGoObservationRPMThrottled, openCodeGoDefaultRPMCooldown)
-	case failure.StatusCode == http.StatusRequestTimeout,
-		failure.StatusCode == http.StatusTooEarly:
-		return modelScope(OpenCodeGoObservationTransientFailure, openCodeGoDefaultTransientCooldown)
-	case failure.StatusCode >= http.StatusInternalServerError:
-		// A provider-wide 5xx does not prove that the selected account or model is
-		// unhealthy. Cooling the account here shrinks the affinity candidate set;
-		// when every account observes the same outage, New API removes the model
-		// ability and turns subsequent upstream failures into local 503s.
-		return OpenCodeGoClassifiedFailure{}, false
-	default:
-		return OpenCodeGoClassifiedFailure{}, false
 	}
+	return OpenCodeGoClassifiedFailure{}, false
 }
 
 func openCodeGoAuthErrorIsRiskBlocked(message string) bool {
@@ -326,14 +302,10 @@ func openCodeGoAuthErrorIsRiskBlocked(message string) bool {
 }
 
 func ClassifyOpenCodeGoTransportFailure(message string, observedAt time.Time) OpenCodeGoClassifiedFailure {
+	_ = message
 	return OpenCodeGoClassifiedFailure{
-		Scope: OpenCodeGoHealthScopeModel,
 		Observation: OpenCodeGoHealthObservation{
-			Kind:       OpenCodeGoObservationTransientFailure,
 			ObservedAt: observedAt,
-			Reason:     message,
-			ErrorCode:  "transport_error",
-			Deadline:   observedAt.Add(openCodeGoDefaultTransientCooldown),
 		},
 	}
 }

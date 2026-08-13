@@ -82,6 +82,9 @@ func applyOpenCodeGoClassifiedFailureWithMutation(
 	if classified.Observation.ObservedAt.IsZero() {
 		return false, errors.New("OpenCode Go health observation time is required")
 	}
+	if classified.Observation.Kind == "" {
+		return false, nil
+	}
 	if classified.Scope == OpenCodeGoHealthScopeModel && (upstreamModel == "" || len(upstreamModel) > 191) {
 		return false, errors.New("OpenCode Go model health observation target is invalid")
 	}

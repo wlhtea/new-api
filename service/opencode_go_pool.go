@@ -129,6 +129,9 @@ func PrepareOpenCodeGoPoolContainer(channel *model.Channel) {
 }
 
 func InitOpenCodeGoPools() {
+	if err := clearLegacyOpenCodeGoModelCooldowns(); err != nil {
+		common.SysError("failed to clear legacy OpenCode Go model cooldowns: " + err.Error())
+	}
 	channelIDs, err := model.ListOpenCodeGoChannelIDs()
 	if err != nil {
 		common.SysError("failed to list OpenCode Go account pools: " + err.Error())
@@ -139,6 +142,25 @@ func InitOpenCodeGoPools() {
 			common.SysError(fmt.Sprintf("failed to rebuild OpenCode Go account pool: channel_id=%d error=%v", channelID, err))
 		}
 	}
+}
+
+func clearLegacyOpenCodeGoModelCooldowns() error {
+	return model.DB.Model(&model.OpenCodeGoWorkspaceModel{}).
+		Where("discovered = ? AND state IN ?", true, []string{
+			model.OpenCodeGoModelRegionBlocked,
+			model.OpenCodeGoModelRPMCooldown,
+			model.OpenCodeGoModelTransient,
+			model.OpenCodeGoModelDisabled,
+		}).
+		Updates(map[string]interface{}{
+			"state":              model.OpenCodeGoModelAvailable,
+			"disabled_until":     int64(0),
+			"last_error_code":    "",
+			"last_error":         "",
+			"health_observation": "",
+			"health_observed_at": int64(0),
+			"updated_at":         common.GetTimestamp(),
+		}).Error
 }
 
 func RebuildOpenCodeGoPoolChannel(channelID int) error {

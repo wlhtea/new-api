@@ -31,24 +31,31 @@ func TestClassifyOpenCodeGoProviderFailureMatrix(t *testing.T) {
 		{name: "fraud wording requires 401", failure: OpenCodeGoProviderFailure{StatusCode: 403, ErrorType: "AuthError", Message: "This account has found to be committing fraud or is in breach of terms of services and has been blocked."}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
 		{name: "fraud wording requires AuthError", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "Error", Message: "This account has found to be committing fraud or is in breach of terms of services and has been blocked."}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
 		{name: "invalid key is not risk", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "Invalid API key"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
-		{name: "auth model denial", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "Model alpha-test is not supported"}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationModelBlocked, wantDelay: openCodeGoDefaultModelCooldown},
+		{name: "auth model denial does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "AuthError", Message: "Model alpha-test is not supported"}, wantOK: false},
 		{name: "credits", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "CreditsError"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationQuotaExhausted},
 		{name: "monthly", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "MonthlyLimitError"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationQuotaExhausted, wantQuota: model.OpenCodeGoQuotaMonthly},
 		{name: "user monthly", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "UserLimitError"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationQuotaExhausted, wantQuota: model.OpenCodeGoQuotaMonthly},
-		{name: "go rolling", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "GoUsageLimitError", LimitName: "5 hour", RetryAfter: "90"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationQuotaExhausted, wantQuota: model.OpenCodeGoQuotaRolling, wantDelay: 90 * time.Second},
-		{name: "go weekly", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "GoUsageLimitError", LimitName: "weekly"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationQuotaExhausted, wantQuota: model.OpenCodeGoQuotaWeekly},
-		{name: "go monthly", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "GoUsageLimitError", LimitName: "monthly"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationQuotaExhausted, wantQuota: model.OpenCodeGoQuotaMonthly},
-		{name: "black quota", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "BlackUsageLimitError", RetryAfter: "120"}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationQuotaExhausted, wantDelay: 2 * time.Minute},
-		{name: "region", failure: OpenCodeGoProviderFailure{StatusCode: 403, ErrorType: "RegionError"}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationRegionBlocked, wantDelay: openCodeGoDefaultRegionCooldown},
-		{name: "model", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "ModelError"}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationModelBlocked, wantDelay: openCodeGoDefaultModelCooldown},
-		{name: "rpm", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "RateLimitError", RetryAfter: "17"}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationRPMThrottled, wantDelay: 17 * time.Second},
-		{name: "free rpm", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "FreeUsageLimitError"}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationRPMThrottled, wantDelay: openCodeGoDefaultRPMCooldown},
+		{name: "go rolling does not change workspace availability", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "GoUsageLimitError", LimitName: "5 hour", RetryAfter: "90"}, wantOK: false},
+		{name: "go weekly does not change workspace availability", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "GoUsageLimitError", LimitName: "weekly"}, wantOK: false},
+		{name: "go monthly does not change workspace availability", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "GoUsageLimitError", LimitName: "monthly"}, wantOK: false},
+		{name: "black quota does not change workspace availability", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "BlackUsageLimitError", RetryAfter: "120"}, wantOK: false},
+		{name: "region error does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 403, ErrorType: "RegionError"}, wantOK: false},
+		{name: "model error does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "ModelError"}, wantOK: false},
+		{name: "401 rate limit does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 401, ErrorType: "RateLimitError", RetryAfter: "17"}, wantOK: false},
+		{name: "rpm does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "RateLimitError", RetryAfter: "17"}, wantOK: false},
+		{name: "free rpm does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 429, ErrorType: "FreeUsageLimitError"}, wantOK: false},
 		{name: "unknown 401", failure: OpenCodeGoProviderFailure{StatusCode: 401}, wantOK: true, wantScope: OpenCodeGoHealthScopeWorkspace, wantKind: OpenCodeGoObservationCredentialFailure},
-		{name: "unknown 403", failure: OpenCodeGoProviderFailure{StatusCode: 403}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationRegionBlocked, wantDelay: openCodeGoDefaultRegionCooldown},
-		{name: "unknown 429", failure: OpenCodeGoProviderFailure{StatusCode: 429}, wantOK: true, wantScope: OpenCodeGoHealthScopeModel, wantKind: OpenCodeGoObservationRPMThrottled, wantDelay: openCodeGoDefaultRPMCooldown},
+		{name: "unknown 403 is not enough health evidence", failure: OpenCodeGoProviderFailure{StatusCode: 403}, wantOK: false},
+		{name: "unknown 429 does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 429}, wantOK: false},
+		{name: "request timeout does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 408}, wantOK: false},
+		{name: "too early does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 425}, wantOK: false},
 		{name: "upstream 500", failure: OpenCodeGoProviderFailure{StatusCode: 500}, wantOK: false},
 		{name: "caller abort", failure: OpenCodeGoProviderFailure{StatusCode: 499, ErrorType: "error"}},
 		{name: "client request error", failure: OpenCodeGoProviderFailure{StatusCode: 400, ErrorType: "invalid_request_error"}},
+		{name: "400 auth error does not change workspace availability", failure: OpenCodeGoProviderFailure{StatusCode: 400, ErrorType: "AuthError", Message: "invalid request"}, wantOK: false},
+		{name: "400 credits error does not change workspace availability", failure: OpenCodeGoProviderFailure{StatusCode: 400, ErrorType: "CreditsError"}, wantOK: false},
+		{name: "400 region error does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 400, ErrorType: "RegionError"}, wantOK: false},
+		{name: "400 model error does not cool model", failure: OpenCodeGoProviderFailure{StatusCode: 400, ErrorType: "ModelError"}, wantOK: false},
 	}
 
 	for _, test := range tests {
@@ -166,10 +173,10 @@ func TestParseOpenCodeGoProviderFailurePreservesSafeValidationPath(t *testing.T)
 	}
 }
 
-func TestClassifyOpenCodeGoTransportFailureIsModelScoped(t *testing.T) {
+func TestClassifyOpenCodeGoTransportFailureDoesNotChangeHealth(t *testing.T) {
 	now := time.Unix(1_900_000_000, 0)
 	classified := ClassifyOpenCodeGoTransportFailure("connection reset", now)
-	assert.Equal(t, OpenCodeGoHealthScopeModel, classified.Scope)
-	assert.Equal(t, OpenCodeGoObservationTransientFailure, classified.Observation.Kind)
-	assert.Equal(t, now.Add(openCodeGoDefaultTransientCooldown), classified.Observation.Deadline)
+	assert.Empty(t, classified.Scope)
+	assert.Empty(t, classified.Observation.Kind)
+	assert.Equal(t, now, classified.Observation.ObservedAt)
 }
