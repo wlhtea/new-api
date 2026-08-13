@@ -262,11 +262,10 @@ func (c *responsesChatContext) appendItem(item map[string]any) error {
 }
 
 // responsesReasoningItemText extracts the reasoning text from a Responses
-// `reasoning` input item, accepting both the standard `summary[]` shape
-// (summary_text.text) and the compatible `content[]` shape. It mirrors the
-// response-side normalization in ExtractReasoningTextFromResponses.
+// `reasoning` input item. Prefer full reasoning_text content when available,
+// then fall back to the shorter summary_text representation.
 func responsesReasoningItemText(item map[string]any) string {
-	for _, key := range []string{"summary", "content"} {
+	for _, key := range []string{"content", "summary"} {
 		if text := responsesReasoningPartsText(item[key]); text != "" {
 			return text
 		}

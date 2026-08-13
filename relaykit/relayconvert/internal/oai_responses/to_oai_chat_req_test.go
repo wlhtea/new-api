@@ -419,6 +419,27 @@ func TestResponsesRequestToChatCompletionsRequestReasoningItem(t *testing.T) {
 			},
 		},
 		{
+			name: "full reasoning content takes precedence over summary",
+			input: []map[string]any{
+				{
+					"type":    "reasoning",
+					"id":      "rs_1",
+					"summary": []map[string]any{{"type": "summary_text", "text": "short summary"}},
+					"content": []map[string]any{{"type": "reasoning_text", "text": "full reasoning"}},
+				},
+				{"role": "assistant", "content": []map[string]any{{"type": "output_text", "text": "answer"}}},
+			},
+			want: []struct {
+				role          string
+				content       string
+				reasoning     string
+				reasoningSet  bool
+				toolCallNames []string
+			}{
+				{role: "assistant", content: "answer", reasoning: "full reasoning", reasoningSet: true},
+			},
+		},
+		{
 			name: "reasoning before function_call merges into assistant turn",
 			input: []map[string]any{
 				{"role": "user", "content": "hi"},

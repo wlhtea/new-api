@@ -199,6 +199,14 @@ func responsesInputContentToClaudeMediaMessages(c context.Context, content any) 
 					Text: kitutil.GetPointer(text),
 				})
 			}
+		case "refusal":
+			refusal := kitutil.Interface2String(contentPart["refusal"])
+			if refusal != "" {
+				parts = append(parts, dto.ClaudeMediaMessage{
+					Type: "text",
+					Text: kitutil.GetPointer(refusal),
+				})
+			}
 		case "input_image", "input_file", "input_audio", "input_video":
 			source := ContentPartToFileSource(contentPart)
 			if source == nil {

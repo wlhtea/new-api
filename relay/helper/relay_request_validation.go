@@ -270,21 +270,6 @@ func presentStringField(object map[string]any, field, path string) (string, erro
 	return stringValue, nil
 }
 
-func optionalStringField(object map[string]any, field, path string) (string, bool, error) {
-	value, found := object[field]
-	if !found {
-		return "", false, nil
-	}
-	if value == nil {
-		return "", true, nil
-	}
-	stringValue, ok := value.(string)
-	if !ok {
-		return "", true, newClientRequestValidationError(http.StatusBadRequest, "%s must be a string", path)
-	}
-	return stringValue, true, nil
-}
-
 func requiredObjectArrayField(object map[string]any, field, path string) ([]any, error) {
 	value, found := object[field]
 	if !found || value == nil {
@@ -340,6 +325,37 @@ func requireArray(object map[string]any, field, path string) ([]any, error) {
 	return result, nil
 }
 
+func validateArrayOfObjects(value any, path string, validate func(map[string]any, string) error) error {
+	items, ok := value.([]any)
+	if !ok {
+		return newClientRequestValidationError(http.StatusBadRequest, "%s must be an array", path)
+	}
+	for index, rawItem := range items {
+		itemPath := fmt.Sprintf("%s[%d]", path, index)
+		item, ok := rawItem.(map[string]any)
+		if !ok || item == nil {
+			return newClientRequestValidationError(http.StatusBadRequest, "%s must be an object", itemPath)
+		}
+		if err := validate(item, itemPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateNumberArray(value any, path string) error {
+	items, ok := value.([]any)
+	if !ok {
+		return newClientRequestValidationError(http.StatusBadRequest, "%s must be an array", path)
+	}
+	for index, item := range items {
+		if _, ok := item.(float64); !ok {
+			return newClientRequestValidationError(http.StatusBadRequest, "%s[%d] must be a number", path, index)
+		}
+	}
+	return nil
+}
+
 func validateStringOrObjectArray(value any, path string, validatePart func(map[string]any, string) error) error {
 	return validateStringOrObjectArrayWithTypes(value, path, validatePart)
 }
@@ -352,6 +368,10 @@ func validateStringOrObjectArrayWithTypes(value any, path string, validatePart f
 	if !ok {
 		return newClientRequestValidationError(http.StatusBadRequest, "%s must be a string or array", path)
 	}
+	return validateObjectArrayWithTypes(parts, path, validatePart, allowedTypes...)
+}
+
+func validateObjectArrayWithTypes(parts []any, path string, validatePart func(map[string]any, string) error, allowedTypes ...string) error {
 	for index, rawPart := range parts {
 		partPath := fmt.Sprintf("%s[%d]", path, index)
 		part, ok := rawPart.(map[string]any)
@@ -371,7 +391,7 @@ func validateStringOrObjectArrayWithTypes(value any, path string, validatePart f
 				}
 			}
 			if !allowed {
-				return newClientRequestValidationError(http.StatusBadRequest, "%s.type is unsupported for this message role", partPath)
+				return newClientRequestValidationError(http.StatusBadRequest, "%s.type is unsupported in this context", partPath)
 			}
 		}
 		if err := validatePart(part, partPath); err != nil {
@@ -399,7 +419,12 @@ func validateClaudeContentPart(part map[string]any, path string) error {
 			_, err = requireObject(part, "input", path+".input")
 		}
 	case "tool_result", "web_search_tool_result":
-		_, err = requiredStringField(part, "tool_use_id", path+".tool_use_id")
+		if _, err = requiredStringField(part, "tool_use_id", path+".tool_use_id"); err != nil {
+			return err
+		}
+		if content, found := part["content"]; found && content != nil {
+			err = validateStringOrObjectArrayWithTypes(content, path+".content", validateClaudeContentPart, "text", "input_text", "image", "document")
+		}
 	case "thinking":
 		_, err = requiredStringField(part, "thinking", path+".thinking")
 	case "redacted_thinking":
@@ -476,12 +501,15 @@ func validateChatFile(file map[string]any, path string) error {
 }
 
 func validateChatContentPart(part map[string]any, path string) error {
+	if _, found := part["prompt_cache_breakpoint"]; found {
+		return newClientRequestValidationError(http.StatusBadRequest, "%s.prompt_cache_breakpoint is not supported by this gateway", path)
+	}
 	partType, err := requiredStringField(part, "type", path+".type")
 	if err != nil {
 		return err
 	}
 	switch partType {
-	case "text", "input_text":
+	case "text":
 		_, err = requiredStringField(part, "text", path+".text")
 	case "image_url":
 		imageURL, fieldErr := requirePresent(part, "image_url", path+".image_url")
@@ -591,11 +619,18 @@ func validateResponsesContentPart(part map[string]any, path string) error {
 		return err
 	}
 	switch partType {
-	case "input_text", "output_text", "text":
-		_, err = requiredStringField(part, "text", path+".text")
+	case "input_text", "text":
+		_, err = presentStringField(part, "text", path+".text")
+	case "output_text":
+		if _, err = presentStringField(part, "text", path+".text"); err != nil {
+			return err
+		}
+		err = validateResponsesOutputTextMetadata(part, path)
 	case "refusal":
-		_, err = requiredStringField(part, "refusal", path+".refusal")
+		_, err = presentStringField(part, "refusal", path+".refusal")
 	case "summary_text":
+		_, err = presentStringField(part, "text", path+".text")
+	case "reasoning_text":
 		_, err = presentStringField(part, "text", path+".text")
 	case "input_image":
 		err = validateResponsesImagePart(part, path)
@@ -611,7 +646,111 @@ func validateResponsesContentPart(part map[string]any, path string) error {
 	return err
 }
 
+func validateResponsesOutputTextMetadata(part map[string]any, path string) error {
+	annotations, err := requireArray(part, "annotations", path+".annotations")
+	if err != nil {
+		return err
+	}
+	if err := validateArrayOfObjects(annotations, path+".annotations", validateResponsesAnnotation); err != nil {
+		return err
+	}
+	logprobs, err := requireArray(part, "logprobs", path+".logprobs")
+	if err != nil {
+		return err
+	}
+	return validateArrayOfObjects(logprobs, path+".logprobs", validateResponsesLogprob)
+}
+
+func validateResponsesAnnotation(annotation map[string]any, path string) error {
+	annotationType, err := requiredStringField(annotation, "type", path+".type")
+	if err != nil {
+		return err
+	}
+	switch annotationType {
+	case "file_citation":
+		if _, err := requiredStringField(annotation, "file_id", path+".file_id"); err != nil {
+			return err
+		}
+		if _, err := requiredStringField(annotation, "filename", path+".filename"); err != nil {
+			return err
+		}
+		return validateRequiredNumberField(annotation, "index", path+".index")
+	case "url_citation":
+		for _, field := range []string{"url", "title"} {
+			if _, err := requiredStringField(annotation, field, path+"."+field); err != nil {
+				return err
+			}
+		}
+		for _, field := range []string{"start_index", "end_index"} {
+			if err := validateRequiredNumberField(annotation, field, path+"."+field); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "container_file_citation":
+		for _, field := range []string{"container_id", "file_id", "filename"} {
+			if _, err := requiredStringField(annotation, field, path+"."+field); err != nil {
+				return err
+			}
+		}
+		for _, field := range []string{"start_index", "end_index"} {
+			if err := validateRequiredNumberField(annotation, field, path+"."+field); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "file_path":
+		if _, err := requiredStringField(annotation, "file_id", path+".file_id"); err != nil {
+			return err
+		}
+		return validateRequiredNumberField(annotation, "index", path+".index")
+	default:
+		return newClientRequestValidationError(http.StatusBadRequest, "%s.type is unsupported", path)
+	}
+}
+
+func validateRequiredNumberField(object map[string]any, field, path string) error {
+	value, found := object[field]
+	if !found || value == nil {
+		return newClientRequestValidationError(http.StatusBadRequest, "%s is required", path)
+	}
+	if _, ok := value.(float64); !ok {
+		return newClientRequestValidationError(http.StatusBadRequest, "%s must be a number", path)
+	}
+	return nil
+}
+
+func validateResponsesLogprob(logprob map[string]any, path string) error {
+	if _, err := presentStringField(logprob, "token", path+".token"); err != nil {
+		return err
+	}
+	if err := validateNumberArray(logprob["bytes"], path+".bytes"); err != nil {
+		return err
+	}
+	if err := validateRequiredNumberField(logprob, "logprob", path+".logprob"); err != nil {
+		return err
+	}
+	topLogprobs, err := requireArray(logprob, "top_logprobs", path+".top_logprobs")
+	if err != nil {
+		return err
+	}
+	return validateArrayOfObjects(topLogprobs, path+".top_logprobs", func(item map[string]any, itemPath string) error {
+		if _, err := presentStringField(item, "token", itemPath+".token"); err != nil {
+			return err
+		}
+		if err := validateNumberArray(item["bytes"], itemPath+".bytes"); err != nil {
+			return err
+		}
+		return validateRequiredNumberField(item, "logprob", itemPath+".logprob")
+	})
+}
+
 func validateClaudeRawRequest(raw map[string]any) error {
+	if system, found := raw["system"]; found && system != nil {
+		if err := validateStringOrObjectArrayWithTypes(system, "system", validateClaudeContentPart, "text", "input_text"); err != nil {
+			return err
+		}
+	}
 	messages, err := requiredObjectArrayField(raw, "messages", "messages")
 	if err != nil {
 		return err
@@ -658,11 +797,11 @@ func validateChatToolCalls(message map[string]any, index int) error {
 		if _, err := requiredStringField(tool, "id", toolPath+".id"); err != nil {
 			return err
 		}
-		toolType, typePresent, err := optionalStringField(tool, "type", toolPath+".type")
+		toolType, err := requiredStringField(tool, "type", toolPath+".type")
 		if err != nil {
 			return err
 		}
-		if typePresent && toolType != "" && toolType != "function" {
+		if toolType != "function" {
 			return newClientRequestValidationError(http.StatusBadRequest, "%s.type is unsupported", toolPath)
 		}
 		function, err := requireObject(tool, "function", toolPath+".function")
@@ -672,7 +811,7 @@ func validateChatToolCalls(message map[string]any, index int) error {
 		if _, err := requiredStringField(function, "name", toolPath+".function.name"); err != nil {
 			return err
 		}
-		if _, _, err := optionalStringField(function, "arguments", toolPath+".function.arguments"); err != nil {
+		if _, err := presentStringField(function, "arguments", toolPath+".function.arguments"); err != nil {
 			return err
 		}
 	}
@@ -710,7 +849,7 @@ func validateChatRawRequest(raw map[string]any) error {
 			if err != nil {
 				return err
 			}
-			if err := validateStringOrObjectArrayWithTypes(content, contentPath, validateChatContentPart, "text", "input_text"); err != nil {
+			if err := validateStringOrObjectArrayWithTypes(content, contentPath, validateChatContentPart, "text"); err != nil {
 				return err
 			}
 		case "user":
@@ -719,15 +858,33 @@ func validateChatRawRequest(raw map[string]any) error {
 			if err != nil {
 				return err
 			}
-			if err := validateStringOrObjectArrayWithTypes(content, contentPath, validateChatContentPart, "text", "input_text", "image_url", "input_audio", "file", "video_url"); err != nil {
+			if err := validateStringOrObjectArrayWithTypes(content, contentPath, validateChatContentPart, "text", "image_url", "input_audio", "file", "video_url"); err != nil {
 				return err
 			}
 		case "assistant":
+			if _, found := message["name"]; found {
+				return newClientRequestValidationError(http.StatusBadRequest, "messages[%d].name is not supported for assistant messages", index)
+			}
+			for _, unsupportedField := range []string{"refusal", "function_call", "audio"} {
+				if value, found := message[unsupportedField]; found && value != nil {
+					return newClientRequestValidationError(http.StatusBadRequest, "messages[%d].%s is not supported by this gateway", index, unsupportedField)
+				}
+			}
 			if message["content"] == nil && message["tool_calls"] == nil && message["reasoning_content"] == nil && message["reasoning"] == nil {
 				return newClientRequestValidationError(http.StatusBadRequest, "messages[%d] requires content, tool_calls, or reasoning", index)
 			}
 			if content := message["content"]; content != nil {
-				if err := validateStringOrObjectArrayWithTypes(content, fmt.Sprintf("messages[%d].content", index), validateChatContentPart, "text", "input_text"); err != nil {
+				switch typed := content.(type) {
+				case string:
+					if typed == "" && message["tool_calls"] == nil && message["reasoning_content"] == nil && message["reasoning"] == nil {
+						return newClientRequestValidationError(http.StatusBadRequest, "messages[%d].content must not be empty", index)
+					}
+				case []any:
+					if len(typed) == 0 {
+						return newClientRequestValidationError(http.StatusBadRequest, "messages[%d].content must not be empty", index)
+					}
+				}
+				if err := validateStringOrObjectArrayWithTypes(content, fmt.Sprintf("messages[%d].content", index), validateChatContentPart, "text"); err != nil {
 					return err
 				}
 			}
@@ -745,7 +902,7 @@ func validateChatRawRequest(raw map[string]any) error {
 			if err != nil {
 				return err
 			}
-			if err := validateStringOrObjectArrayWithTypes(content, contentPath, validateChatContentPart, "text", "input_text"); err != nil {
+			if err := validateStringOrObjectArrayWithTypes(content, contentPath, validateChatContentPart, "text"); err != nil {
 				return err
 			}
 		case "function":
@@ -757,7 +914,7 @@ func validateChatRawRequest(raw map[string]any) error {
 			if err != nil {
 				return err
 			}
-			if err := validateStringOrObjectArrayWithTypes(content, contentPath, validateChatContentPart, "text", "input_text"); err != nil {
+			if err := validateStringOrObjectArrayWithTypes(content, contentPath, validateChatContentPart, "text"); err != nil {
 				return err
 			}
 		default:
@@ -809,34 +966,50 @@ func validateResponsesRawRequest(raw map[string]any) error {
 			if err != nil {
 				return err
 			}
-			allowedTypes := []string{"input_text", "text"}
-			switch role {
-			case "user":
-				allowedTypes = append(allowedTypes, "input_image", "input_file", "input_audio", "input_video")
-			case "assistant":
-				allowedTypes = []string{"output_text", "text", "refusal"}
+			if role == "assistant" && responsesAssistantMessageIsOutputReplay(item, content) {
+				if err := validateResponsesOutputMessage(item, itemType, index); err != nil {
+					return err
+				}
+				continue
 			}
+			allowedTypes := []string{"input_text", "text", "input_image", "input_file", "input_audio", "input_video"}
 			if err := validateStringOrObjectArrayWithTypes(content, contentPath, validateResponsesContentPart, allowedTypes...); err != nil {
 				return err
 			}
 		case "reasoning":
-			for _, field := range []string{"summary", "content"} {
-				if item[field] == nil {
-					continue
+			if _, err := requiredStringField(item, "id", fmt.Sprintf("input[%d].id", index)); err != nil {
+				return err
+			}
+			summaryPath := fmt.Sprintf("input[%d].summary", index)
+			summary, err := requireArray(item, "summary", summaryPath)
+			if err != nil {
+				return err
+			}
+			if err := validateObjectArrayWithTypes(summary, summaryPath, validateResponsesContentPart, "summary_text"); err != nil {
+				return err
+			}
+			if _, found := item["content"]; found {
+				contentPath := fmt.Sprintf("input[%d].content", index)
+				content, err := requireArray(item, "content", contentPath)
+				if err != nil {
+					return err
 				}
-				parts, ok := item[field].([]any)
+				if err := validateObjectArrayWithTypes(content, contentPath, validateResponsesContentPart, "reasoning_text"); err != nil {
+					return err
+				}
+			}
+			if encryptedContent, found := item["encrypted_content"]; found && encryptedContent != nil {
+				if _, ok := encryptedContent.(string); !ok {
+					return newClientRequestValidationError(http.StatusBadRequest, "input[%d].encrypted_content must be a string or null", index)
+				}
+			}
+			if rawStatus, found := item["status"]; found {
+				status, ok := rawStatus.(string)
 				if !ok {
-					return newClientRequestValidationError(http.StatusBadRequest, "input[%d].%s must be an array", index, field)
+					return newClientRequestValidationError(http.StatusBadRequest, "input[%d].status must be a string", index)
 				}
-				for partIndex, rawPart := range parts {
-					partPath := fmt.Sprintf("input[%d].%s[%d]", index, field, partIndex)
-					part, ok := rawPart.(map[string]any)
-					if !ok || part == nil {
-						return newClientRequestValidationError(http.StatusBadRequest, "%s must be an object", partPath)
-					}
-					if err := validateResponsesContentPart(part, partPath); err != nil {
-						return err
-					}
+				if status != "in_progress" && status != "completed" && status != "incomplete" {
+					return newClientRequestValidationError(http.StatusBadRequest, "input[%d].status is unsupported", index)
 				}
 			}
 		case "function_call", "custom_tool_call":
@@ -887,6 +1060,56 @@ func validateResponsesRawRequest(raw map[string]any) error {
 		}
 	}
 	return nil
+}
+
+func responsesAssistantMessageIsOutputReplay(item map[string]any, content any) bool {
+	if _, found := item["id"]; found {
+		return true
+	}
+	if _, found := item["status"]; found {
+		return true
+	}
+	parts, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]any)
+		if !ok || part == nil {
+			continue
+		}
+		partType, _ := part["type"].(string)
+		if partType == "output_text" || partType == "refusal" {
+			return true
+		}
+	}
+	return false
+}
+
+func validateResponsesOutputMessage(item map[string]any, itemType string, index int) error {
+	path := fmt.Sprintf("input[%d]", index)
+	if rawType, found := item["type"]; !found || rawType == nil {
+		return newClientRequestValidationError(http.StatusBadRequest, "%s.type is required for an output message", path)
+	}
+	if itemType != "message" {
+		return newClientRequestValidationError(http.StatusBadRequest, "%s.type must be message for an output message", path)
+	}
+	if _, err := requiredStringField(item, "id", path+".id"); err != nil {
+		return err
+	}
+	status, err := requiredStringField(item, "status", path+".status")
+	if err != nil {
+		return err
+	}
+	if status != "in_progress" && status != "completed" && status != "incomplete" {
+		return newClientRequestValidationError(http.StatusBadRequest, "%s.status is unsupported", path)
+	}
+	contentPath := path + ".content"
+	content, err := requireArray(item, "content", contentPath)
+	if err != nil {
+		return err
+	}
+	return validateObjectArrayWithTypes(content, contentPath, validateResponsesContentPart, "output_text", "refusal")
 }
 
 func validateAdditionalResponsesTool(tool map[string]any, path string, allowCustom bool) error {

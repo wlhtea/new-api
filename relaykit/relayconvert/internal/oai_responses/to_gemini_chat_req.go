@@ -219,6 +219,12 @@ func responsesContentPartToGeminiParts(c context.Context, part map[string]any) (
 			return nil, nil
 		}
 		return []dto.GeminiPart{{Text: text}}, nil
+	case "refusal":
+		refusal := kitutil.Interface2String(part["refusal"])
+		if refusal == "" {
+			return nil, nil
+		}
+		return []dto.GeminiPart{{Text: refusal}}, nil
 	case "input_image", "input_file", "input_audio", "input_video":
 		source := ContentPartToFileSource(part)
 		if source == nil {
