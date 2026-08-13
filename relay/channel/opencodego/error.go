@@ -156,8 +156,7 @@ func (a *Adaptor) persistProviderFailure(c *gin.Context, info *relaycommon.Relay
 	if disabled, bulkErr := service.ObserveOpenCodeGoBulkProviderFailure(
 		info.ChannelId,
 		a.selectedWorkspaceUID,
-		observation.StatusCode,
-		observation.Message,
+		failure,
 		observedAt,
 	); bulkErr != nil {
 		common.SysError(fmt.Sprintf(

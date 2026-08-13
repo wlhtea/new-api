@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -597,14 +596,19 @@ func OpenCodeGoWorkspaceInFlight(channelID int, workspaceUID string) int64 {
 	return 0
 }
 
-// ObserveOpenCodeGoBulkProviderFailure counts persistent per-workspace provider
-// failures (HTTP 401/403: credential, region, or auth - not transient 5xx and
-// not quota, which have their own flow). When a workspace accumulates the
-// threshold within the window, it is auto-disabled as a workspace-level
-// `bulk_failure` health observation and removed from the pool, awaiting manual
-// verification (re-enable or delete).
-func ObserveOpenCodeGoBulkProviderFailure(channelID int, workspaceUID string, statusCode int, reason string, observedAt time.Time) (bool, error) {
-	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
+// ObserveOpenCodeGoBulkProviderFailure counts only persistent credential or
+// explicit risk evidence. Model/region/quota/rate-limit and transport signals
+// must never be promoted to account-level bulk disable evidence.
+func ObserveOpenCodeGoBulkProviderFailure(channelID int, workspaceUID string, failure OpenCodeGoProviderFailure, observedAt time.Time) (bool, error) {
+	classified, ok := ClassifyOpenCodeGoProviderFailure(failure, observedAt)
+	if !ok || classified.Scope != OpenCodeGoHealthScopeWorkspace {
+		return false, nil
+	}
+	switch classified.Observation.Kind {
+	case OpenCodeGoObservationCredentialFailure, OpenCodeGoObservationRiskBlocked:
+		// These are the only provider observations eligible for the repeated
+		// account-level safeguard.
+	default:
 		return false, nil
 	}
 	workspaceUID = strings.TrimSpace(workspaceUID)
@@ -637,7 +641,7 @@ func ObserveOpenCodeGoBulkProviderFailure(channelID int, workspaceUID string, st
 			Observation: OpenCodeGoHealthObservation{
 				Kind:       OpenCodeGoObservationBulkFailure,
 				ObservedAt: observedAt,
-				Reason:     reason,
+				Reason:     classified.Observation.Reason,
 				ErrorCode:  "bulk_provider_failure",
 			},
 		},

@@ -195,7 +195,11 @@ func TestOpenCodeGoBulkFailureAutoDisablesWorkspace(t *testing.T) {
 
 	now := time.Unix(2_000_000_000, 0)
 	for range openCodeGoBulkFailureThreshold {
-		disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, http.StatusForbidden, "region blocked", now)
+		disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, OpenCodeGoProviderFailure{
+			StatusCode: http.StatusUnauthorized,
+			ErrorType:  "AuthError",
+			Message:    "Invalid API key",
+		}, now)
 		require.NoError(t, err)
 		if disabled {
 			break
@@ -234,8 +238,11 @@ func TestOpenCodeGoBulkFailureBelowThresholdDoesNotAcquireMutationBarrier(t *tes
 		disabled, err := ObserveOpenCodeGoBulkProviderFailure(
 			channel.Id,
 			workspace.UID,
-			http.StatusForbidden,
-			"region blocked",
+			OpenCodeGoProviderFailure{
+				StatusCode: http.StatusUnauthorized,
+				ErrorType:  "AuthError",
+				Message:    "Invalid API key",
+			},
 			time.Unix(2_000_000_000, 0),
 		)
 		if err == nil && disabled {
@@ -257,10 +264,16 @@ func TestOpenCodeGoBulkFailureIgnoresTransientAndQuotaStatuses(t *testing.T) {
 	require.NoError(t, RebuildOpenCodeGoPoolChannel(channel.Id))
 
 	now := time.Unix(2_000_000_000, 0)
-	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable} {
-		disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, status, "transient", now)
+	for _, failure := range []OpenCodeGoProviderFailure{
+		{StatusCode: http.StatusForbidden, ErrorType: "RegionError", Message: "region blocked"},
+		{StatusCode: http.StatusUnauthorized, ErrorType: "ModelError", Message: "model blocked"},
+		{StatusCode: http.StatusTooManyRequests, ErrorType: "RateLimitError", Message: "rate limited"},
+		{StatusCode: http.StatusInternalServerError, ErrorType: "AuthError", Message: "transient"},
+		{StatusCode: http.StatusServiceUnavailable, ErrorType: "upstream_error", Message: "transient"},
+	} {
+		disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, failure, now)
 		require.NoError(t, err)
-		require.False(t, disabled, "status %d must not auto-disable", status)
+		require.False(t, disabled, "failure %#v must not auto-disable", failure)
 		now = now.Add(time.Minute)
 	}
 	workspace, err := model.GetOpenCodeGoWorkspace(channel.Id, first.UID)
@@ -277,12 +290,20 @@ func TestOpenCodeGoBulkFailureWindowResetsStaleCount(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0)
 	// Two failures, then a long gap resets the window before the threshold is met.
 	for range openCodeGoBulkFailureThreshold - 1 {
-		_, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, http.StatusForbidden, "region blocked", now)
+		_, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, OpenCodeGoProviderFailure{
+			StatusCode: http.StatusUnauthorized,
+			ErrorType:  "AuthError",
+			Message:    "Invalid API key",
+		}, now)
 		require.NoError(t, err)
 		now = now.Add(time.Minute)
 	}
 	now = now.Add(openCodeGoBulkFailureWindow + time.Minute)
-	disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, http.StatusForbidden, "region blocked", now)
+	disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, OpenCodeGoProviderFailure{
+		StatusCode: http.StatusUnauthorized,
+		ErrorType:  "AuthError",
+		Message:    "Invalid API key",
+	}, now)
 	require.NoError(t, err)
 	require.False(t, disabled)
 	workspace, err := model.GetOpenCodeGoWorkspace(channel.Id, first.UID)
@@ -298,11 +319,19 @@ func TestOpenCodeGoBulkDisabledRecoversOnlyByManualEnable(t *testing.T) {
 
 	now := time.Unix(2_000_000_000, 0)
 	for range openCodeGoBulkFailureThreshold - 1 {
-		_, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, http.StatusForbidden, "region blocked", now)
+		_, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, OpenCodeGoProviderFailure{
+			StatusCode: http.StatusUnauthorized,
+			ErrorType:  "AuthError",
+			Message:    "Invalid API key",
+		}, now)
 		require.NoError(t, err)
 		now = now.Add(time.Minute)
 	}
-	disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, http.StatusForbidden, "region blocked", now)
+	disabled, err := ObserveOpenCodeGoBulkProviderFailure(channel.Id, first.UID, OpenCodeGoProviderFailure{
+		StatusCode: http.StatusUnauthorized,
+		ErrorType:  "AuthError",
+		Message:    "Invalid API key",
+	}, now)
 	require.NoError(t, err)
 	require.True(t, disabled)
 
