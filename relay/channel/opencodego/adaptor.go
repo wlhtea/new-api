@@ -453,7 +453,14 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		estimatedInputTokens: info.GetEstimatePromptTokens(),
 	}
 	if err := prepareResponseForRelay(resp, state, info.IsStream && !a.bufferClaudeToolCall); err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+		// The body is read from the selected OpenCode Go upstream. A read
+		// failure is therefore a bad-gateway condition, not a gateway bug.
+		return nil, service.MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
+			err,
+			types.ErrorCodeReadResponseBodyFailed,
+			http.StatusBadGateway,
+			types.ErrOptionWithSkipRetry(),
+		))
 	}
 
 	upstreamModel := info.UpstreamModelName
@@ -504,13 +511,34 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 			usage, responseErr = openai.OaiResponsesToChatHandler(c, info, resp)
 		}
 	default:
-		responseErr = types.NewOpenAIError(fmt.Errorf("unsupported OpenCode Go protocol %q", protocol), types.ErrorCodeBadResponse, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+		responseErr = service.MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
+			fmt.Errorf("unsupported OpenCode Go protocol %q", protocol),
+			types.ErrorCodeBadResponse,
+			http.StatusBadGateway,
+			types.ErrOptionWithSkipRetry(),
+		))
 	}
 	streamFailureReason := a.openCodeGoStreamFailureReason(c, info, responseErr)
 	if streamFailureReason != "" {
 		a.recordFailoverFailure(c, info, streamFailureReason)
 	}
 	if responseErr != nil {
+		if !openCodeGoCallerCancelled(c, responseErr) &&
+			service.ResponseBodyWriteError(c) == nil &&
+			!a.openCodeGoStreamHasLocalErrors(info) {
+			switch responseErr.GetErrorCode() {
+			case types.ErrorCodeReadResponseBodyFailed,
+				types.ErrorCodeBadResponseBody,
+				types.ErrorCodeEmptyResponse:
+				responseErr.StatusCode = http.StatusBadGateway
+				responseErr = service.MarkOpenCodeGoUpstreamRelayError(responseErr)
+			default:
+				if info.StreamStatus != nil && info.StreamStatus.UpstreamFailureObserved() {
+					responseErr.StatusCode = http.StatusBadGateway
+					responseErr = service.MarkOpenCodeGoUpstreamRelayError(responseErr)
+				}
+			}
+		}
 		if state.sawUpstreamError {
 			responseErr = service.MarkOpenCodeGoUpstreamRelayError(responseErr)
 		}

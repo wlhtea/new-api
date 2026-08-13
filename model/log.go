@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -135,13 +136,14 @@ func formatUserLogs(logs []*Log, startIdx int) {
 			logs[i].UpstreamRequestId = ""
 		}
 		if userLogNeedsOpenCodeGoErrorProjection(logs[i], otherMap, channelType, hasChannelType) {
-			logs[i].Content = constant.OpenCodeGoPublicOverloadMessage
+			projection := classifyUserLogOpenCodeGoError(logs[i], otherMap)
+			logs[i].Content = projection.Message
 			logs[i].ChannelId = 0
 			logs[i].UpstreamRequestId = ""
 			logs[i].Other = common.MapToJsonStr(map[string]interface{}{
-				"error_type":  constant.OpenCodeGoPublicRateLimitErrorCode,
-				"error_code":  constant.OpenCodeGoPublicRateLimitErrorCode,
-				"status_code": http.StatusTooManyRequests,
+				"error_type":  projection.Type,
+				"error_code":  projection.Code,
+				"status_code": projection.StatusCode,
 			})
 			continue
 		}
@@ -160,6 +162,82 @@ func formatUserLogs(logs []*Log, startIdx int) {
 		logs[i].Other = common.MapToJsonStr(otherMap)
 	}
 	assignDisplayLogIds(logs, startIdx)
+}
+
+func classifyUserLogOpenCodeGoError(log *Log, other map[string]interface{}) constant.OpenCodeGoPublicError {
+	if log == nil {
+		return constant.ClassifyOpenCodeGoPublicError(http.StatusBadGateway, "", "", "")
+	}
+	statusCode := userLogStatusCode(other, log.Content)
+	errorType := userLogStringValue(other, "error_type")
+	errorCode := userLogStringValue(other, "error_code")
+	projection := constant.ClassifyOpenCodeGoPublicError(statusCode, errorType, errorCode, log.Content)
+	// Historical records without a structured status were previously all
+	// exposed as overloads. Keep those records private, but preserve the
+	// request/upstream distinction whenever a status was persisted.
+	if statusCode == http.StatusInternalServerError &&
+		projection.StatusCode == http.StatusInternalServerError {
+		projection = constant.ClassifyOpenCodeGoPublicError(http.StatusBadGateway, errorType, errorCode, log.Content)
+	}
+	return projection
+}
+
+func userLogStatusCode(other map[string]interface{}, content string) int {
+	if other != nil {
+		if status, ok := parseUserLogInt(other["status_code"]); ok && status >= 100 && status <= 599 {
+			return status
+		}
+	}
+	lower := strings.ToLower(content)
+	const prefix = "status_code="
+	index := strings.Index(lower, prefix)
+	if index >= 0 {
+		value := lower[index+len(prefix):]
+		end := 0
+		for end < len(value) && value[end] >= '0' && value[end] <= '9' {
+			end++
+		}
+		if end > 0 {
+			if status, err := strconv.Atoi(value[:end]); err == nil && status >= 100 && status <= 599 {
+				return status
+			}
+		}
+	}
+	return http.StatusInternalServerError
+}
+
+func userLogStringValue(other map[string]interface{}, key string) string {
+	if other == nil {
+		return ""
+	}
+	value, ok := other[key]
+	if !ok || value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return fmt.Sprint(value)
+}
+
+func parseUserLogInt(value interface{}) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case float64:
+		if typed == float64(int(typed)) {
+			return int(typed), true
+		}
+	case json.Number:
+		parsed, err := strconv.Atoi(typed.String())
+		return parsed, err == nil
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
+		return parsed, err == nil
+	}
+	return 0, false
 }
 
 func resolveUserLogChannelTypes(logs []*Log) map[int]int {

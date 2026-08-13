@@ -266,8 +266,8 @@ func TestHandleNon2xxResponseCountsOnlyGenericFailoverStatuses(t *testing.T) {
 	}{
 		{status: http.StatusInternalServerError, body: `{"type":"upstream_error","message":"temporary"}`, want: 1},
 		{status: http.StatusUnprocessableEntity, body: `{"type":"invalid_request_error","message":"bad input"}`, want: 1},
-		// The error body cannot turn a raw 5xx into authoritative account
-		// evidence; health classification is restricted to raw 401/403.
+		// An AuthError body on a 5xx response is not authoritative account
+		// evidence; only 401/403 may classify credential/workspace health.
 		{status: http.StatusInternalServerError, body: `{"type":"AuthError","message":"credential rejected"}`, want: 2},
 		{status: http.StatusGatewayTimeout, body: `{"type":"upstream_error","message":"temporary"}`, want: 3},
 	} {

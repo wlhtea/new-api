@@ -19,28 +19,28 @@ import (
 
 func messagesToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
-		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+		return nil, markOpenCodeGoUpstreamResponseError(types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusBadGateway))
 	}
 	defer service.CloseResponseBodyGracefully(resp)
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+		return nil, markOpenCodeGoUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
 	}
 	var claudeResponse dto.ClaudeResponse
 	if err := common.Unmarshal(body, &claudeResponse); err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		return nil, markOpenCodeGoUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-		return nil, types.WithClaudeError(*claudeError, resp.StatusCode)
+		return nil, markOpenCodeGoUpstreamResponseError(types.WithClaudeError(*claudeError, resp.StatusCode))
 	}
 
 	result, err := relayconvert.ConvertResponse(c, info, types.RelayFormatOpenAIResponses, &claudeResponse)
 	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		return nil, markOpenCodeGoUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
 	}
 	response, ok := result.Value.(*dto.OpenAIResponsesResponse)
 	if !ok {
-		return nil, types.NewOpenAIError(fmt.Errorf("expected OpenAI responses response, got %T", result.Value), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		return nil, markOpenCodeGoUpstreamResponseError(types.NewOpenAIError(fmt.Errorf("expected OpenAI responses response, got %T", result.Value), types.ErrorCodeBadResponseBody, http.StatusBadGateway))
 	}
 	usage := result.Usage
 	if !hasMessagesToResponsesUsage(usage) {
@@ -57,7 +57,7 @@ func messagesToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, res
 
 func messagesToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
-		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+		return nil, markOpenCodeGoUpstreamResponseError(types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusBadGateway))
 	}
 	state, err := relayconvert.NewResponseStreamState(types.RelayFormatClaude, types.RelayFormatOpenAIResponses, relayconvert.ResponseStreamOptions{
 		ID:      helper.GetResponseID(c),
@@ -104,7 +104,7 @@ func messagesToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInf
 			if info.StreamStatus != nil {
 				info.StreamStatus.MarkUpstreamFailure()
 			}
-			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+			streamErr = markOpenCodeGoUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
 			sr.Stop(streamErr)
 			return
 		}
@@ -112,7 +112,7 @@ func messagesToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInf
 			if info.StreamStatus != nil && relaycommon.IsTransientProviderStreamError(claudeError.Type, "", claudeError.Message, resp.StatusCode) {
 				info.StreamStatus.MarkUpstreamFailure()
 			}
-			streamErr = types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+			streamErr = markOpenCodeGoUpstreamResponseError(types.WithClaudeError(*claudeError, resp.StatusCode))
 			sr.Stop(streamErr)
 			return
 		}
@@ -125,7 +125,7 @@ func messagesToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInf
 		}
 		results, err := relayconvert.ConvertStreamResponseChunk(c, info, state, &claudeResponse)
 		if err != nil {
-			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+			streamErr = markOpenCodeGoUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
 			sr.Stop(streamErr)
 			return
 		}
@@ -164,6 +164,10 @@ func messagesToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInf
 		}
 	}
 	return usage, nil
+}
+
+func markOpenCodeGoUpstreamResponseError(err *types.NewAPIError) *types.NewAPIError {
+	return service.MarkOpenCodeGoUpstreamRelayError(err)
 }
 
 func hasMessagesToResponsesUsage(usage *dto.Usage) bool {

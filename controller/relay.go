@@ -164,11 +164,23 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	request, err := helper.GetAndValidateRequest(c, relayFormat)
 	if err != nil {
+		// A client disconnect/cancel can surface while the reusable request
+		// body is being read. It is not malformed input and must not be
+		// reported as a retryable client 400.
+		if errors.Is(err, context.Canceled) {
+			newAPIError = types.NewOpenAIError(
+				context.Canceled,
+				types.ErrorCodeBadResponse,
+				499,
+				types.ErrOptionWithSkipRetry(),
+			)
+			return
+		}
 		// Map "request body too large" to 413 so clients can handle it correctly
 		if common.IsRequestBodyTooLargeError(err) || errors.Is(err, common.ErrRequestBodyTooLarge) {
 			newAPIError = types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
 		} else {
-			newAPIError = types.NewError(err, types.ErrorCodeInvalidRequest)
+			newAPIError = types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
 		return
 	}

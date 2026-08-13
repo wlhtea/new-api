@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -174,4 +175,147 @@ func TestPublicOpenCodeGoRelayErrorAlwaysHidesPoolSentinel(t *testing.T) {
 	require.NotSame(t, internalErr, publicErr)
 	assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
 	assert.ErrorIs(t, internalErr, ErrOpenCodeGoNoEligibleWorkspace)
+}
+
+func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
+	marked := func(statusCode int, message string) *types.NewAPIError {
+		return MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
+			errors.New(message),
+			types.ErrorCodeBadResponse,
+			statusCode,
+			types.ErrOptionWithSkipRetry(),
+		))
+	}
+	tests := []struct {
+		name       string
+		err        *types.NewAPIError
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "client request body",
+			err: types.NewOpenAIError(
+				errors.New("invalid JSON request body"),
+				types.ErrorCodeInvalidRequest,
+				http.StatusInternalServerError,
+			),
+			wantStatus: http.StatusBadRequest,
+			wantCode:   constant.OpenCodeGoPublicInvalidRequestCode,
+		},
+		{
+			name: "client parameter override",
+			err: types.NewOpenAIError(
+				errors.New("channel parameter override is invalid"),
+				types.ErrorCodeChannelParamOverrideInvalid,
+				http.StatusInternalServerError,
+			),
+			wantStatus: http.StatusBadRequest,
+			wantCode:   constant.OpenCodeGoPublicInvalidRequestCode,
+		},
+		{
+			name: "marked client request despite mapped 503",
+			err: MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
+				errors.New("request rejected"),
+				types.ErrorCodeInvalidRequest,
+				http.StatusServiceUnavailable,
+			)),
+			wantStatus: http.StatusBadRequest,
+			wantCode:   constant.OpenCodeGoPublicInvalidRequestCode,
+		},
+		{
+			name: "caller canceled",
+			err: types.NewOpenAIError(
+				fmt.Errorf("request context done: %w", context.Canceled),
+				types.ErrorCodeBadResponse,
+				http.StatusInternalServerError,
+			),
+			wantStatus: 499,
+			wantCode:   constant.OpenCodeGoPublicRequestCanceledCode,
+		},
+		{
+			name: "stale selected workspace",
+			err: types.NewOpenAIError(
+				fmt.Errorf("resolve request HTTP client failed: %w", ErrOpenCodeGoIdentityProxySelectionStale),
+				types.ErrorCodeDoRequestFailed,
+				http.StatusInternalServerError,
+			),
+			wantStatus: http.StatusTooManyRequests,
+			wantCode:   constant.OpenCodeGoPublicRateLimitErrorCode,
+		},
+		{
+			name: "internal protocol configuration",
+			err: types.NewOpenAIError(
+				errors.New("OpenCode Go protocol is not configured"),
+				types.ErrorCodeInvalidRequest,
+				http.StatusBadRequest,
+			),
+			wantStatus: http.StatusTooManyRequests,
+			wantCode:   constant.OpenCodeGoPublicRateLimitErrorCode,
+		},
+		{
+			name: "upstream transport failure",
+			err: types.NewOpenAIError(
+				errors.New("upstream error: do request failed"),
+				types.ErrorCodeDoRequestFailed,
+				http.StatusInternalServerError,
+			),
+			wantStatus: http.StatusTooManyRequests,
+			wantCode:   constant.OpenCodeGoPublicRateLimitErrorCode,
+		},
+		{
+			name:       "upstream stream incomplete",
+			err:        marked(http.StatusBadGateway, "OpenCode Go upstream stream ended before completion"),
+			wantStatus: http.StatusTooManyRequests,
+			wantCode:   constant.OpenCodeGoPublicRateLimitErrorCode,
+		},
+		{
+			name: "upstream JSON truncated",
+			err: types.NewOpenAIError(
+				errors.New("unexpected end of JSON input"),
+				types.ErrorCodeBadResponseBody,
+				http.StatusInternalServerError,
+			),
+			wantStatus: http.StatusTooManyRequests,
+			wantCode:   constant.OpenCodeGoPublicRateLimitErrorCode,
+		},
+		{name: "marked upstream 500", err: marked(http.StatusInternalServerError, "provider failed"), wantStatus: http.StatusTooManyRequests, wantCode: constant.OpenCodeGoPublicRateLimitErrorCode},
+		{name: "marked upstream 502", err: marked(http.StatusBadGateway, "provider failed"), wantStatus: http.StatusTooManyRequests, wantCode: constant.OpenCodeGoPublicRateLimitErrorCode},
+		{name: "marked upstream 503", err: marked(http.StatusServiceUnavailable, "provider failed"), wantStatus: http.StatusTooManyRequests, wantCode: constant.OpenCodeGoPublicRateLimitErrorCode},
+		{name: "marked upstream 504", err: marked(http.StatusGatewayTimeout, "provider failed"), wantStatus: http.StatusTooManyRequests, wantCode: constant.OpenCodeGoPublicRateLimitErrorCode},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			originalStatus := test.err.StatusCode
+			originalMessage := test.err.Error()
+
+			publicErr := PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, test.err)
+
+			require.NotSame(t, test.err, publicErr)
+			assert.Equal(t, test.wantStatus, publicErr.StatusCode)
+			assert.Equal(t, test.wantCode, fmt.Sprint(publicErr.ToOpenAIError().Code))
+			assert.Equal(t, originalStatus, test.err.StatusCode)
+			assert.Equal(t, originalMessage, test.err.Error())
+		})
+	}
+}
+
+func TestPublicOpenCodeGoRelayErrorKeepsUnmarkedLocalFailure(t *testing.T) {
+	localErr := types.NewOpenAIError(
+		errors.New("request setup failed"),
+		types.ErrorCodeDoRequestFailed,
+		http.StatusInternalServerError,
+	)
+
+	assert.Same(t, localErr, PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, localErr))
+}
+
+func TestPublicOpenCodeGoRelayErrorDoesNotProjectStaleSentinelForOtherChannel(t *testing.T) {
+	otherErr := types.NewOpenAIError(
+		ErrOpenCodeGoIdentityProxySelectionStale,
+		types.ErrorCodeDoRequestFailed,
+		http.StatusInternalServerError,
+	)
+
+	assert.Same(t, otherErr, PublicOpenCodeGoRelayError(constant.ChannelTypeOpenAI, otherErr))
 }
