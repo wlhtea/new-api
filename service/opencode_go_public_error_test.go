@@ -187,10 +187,11 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 		))
 	}
 	tests := []struct {
-		name       string
-		err        *types.NewAPIError
-		wantStatus int
-		wantCode   string
+		name        string
+		err         *types.NewAPIError
+		wantStatus  int
+		wantCode    string
+		wantMessage string
 	}{
 		{
 			name: "client request body",
@@ -221,6 +222,28 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 			)),
 			wantStatus: http.StatusBadRequest,
 			wantCode:   constant.OpenCodeGoPublicInvalidRequestCode,
+		},
+		{
+			name: "provider invalid request keeps actionable safe detail",
+			err: MarkOpenCodeGoUpstreamRelayError(types.WithOpenAIError(types.OpenAIError{
+				Message: "Error from provider (Console Go): Upstream request failed: [invalid_request_error] Failed to deserialize the JSON body: messages[0].role is required",
+				Type:    "invalid_request_error",
+				Code:    "invalid_request_error",
+			}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())),
+			wantStatus:  http.StatusBadRequest,
+			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
+			wantMessage: "Failed to deserialize the JSON body: messages[0].role is required",
+		},
+		{
+			name: "provider invalid request hides private detail",
+			err: MarkOpenCodeGoUpstreamRelayError(types.WithOpenAIError(types.OpenAIError{
+				Message: "invalid request for workspace wrk_private",
+				Type:    "invalid_request_error",
+				Code:    "invalid_request_error",
+			}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())),
+			wantStatus:  http.StatusBadRequest,
+			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
+			wantMessage: constant.OpenCodeGoPublicInvalidRequestMessage,
 		},
 		{
 			name: "caller canceled",
@@ -294,6 +317,9 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 			require.NotSame(t, test.err, publicErr)
 			assert.Equal(t, test.wantStatus, publicErr.StatusCode)
 			assert.Equal(t, test.wantCode, fmt.Sprint(publicErr.ToOpenAIError().Code))
+			if test.wantMessage != "" {
+				assert.Equal(t, test.wantMessage, publicErr.Error())
+			}
 			assert.Equal(t, originalStatus, test.err.StatusCode)
 			assert.Equal(t, originalMessage, test.err.Error())
 		})

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -121,6 +122,7 @@ func PublicOpenCodeGoRelayError(channelType int, relayErr *types.NewAPIError) *t
 			constant.OpenCodeGoPublicInvalidRequestCode,
 			relayErr.Error(),
 		)
+		projection.Message = openCodeGoPublicClientRequestMessage(relayErr)
 	}
 	// Explicit client request classifications remain 400 even when they were
 	// reported by the upstream. Every other marked upstream error is collapsed
@@ -148,7 +150,74 @@ func openCodeGoRelayErrorIsExplicitClientRequest(relayErr *types.NewAPIError) bo
 		types.ErrorCodeChannelHeaderOverrideInvalid:
 		return true
 	}
-	return false
+	errorType, errorCode := openCodeGoRelayErrorClassification(relayErr)
+	return constant.IsOpenCodeGoClientRequestError(errorType, errorCode, relayErr.Error())
+}
+
+func openCodeGoPublicClientRequestMessage(relayErr *types.NewAPIError) string {
+	if relayErr == nil {
+		return constant.OpenCodeGoPublicInvalidRequestMessage
+	}
+	message := strings.TrimSpace(relayErr.ToOpenAIError().Message)
+	for _, prefix := range []string{
+		"Error from provider (Console Go):",
+		"Error from provider (OpenCode Go):",
+		"Upstream request failed:",
+		"[invalid_request_error]",
+		"[invalid_request]",
+		"[validation_error]",
+		"[bad_request]",
+		"[bad_request_body]",
+	} {
+		message = trimOpenCodeGoPublicPrefix(message, prefix)
+	}
+	if message == "" || OpenCodeGoErrorHasPrivateDetail(message) {
+		return constant.OpenCodeGoPublicInvalidRequestMessage
+	}
+	return message
+}
+
+func trimOpenCodeGoPublicPrefix(value, prefix string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= len(prefix) && strings.EqualFold(value[:len(prefix)], prefix) {
+		return strings.TrimSpace(value[len(prefix):])
+	}
+	return value
+}
+
+func openCodeGoRelayErrorClassification(relayErr *types.NewAPIError) (string, string) {
+	if relayErr == nil {
+		return "", ""
+	}
+	errorType := string(relayErr.GetErrorType())
+	errorCode := string(relayErr.GetErrorCode())
+	switch typed := relayErr.RelayError.(type) {
+	case types.OpenAIError:
+		if typed.Type != "" {
+			errorType = typed.Type
+		}
+		if typed.Code != nil && fmt.Sprint(typed.Code) != "" {
+			errorCode = fmt.Sprint(typed.Code)
+		}
+	case *types.OpenAIError:
+		if typed != nil {
+			if typed.Type != "" {
+				errorType = typed.Type
+			}
+			if typed.Code != nil && fmt.Sprint(typed.Code) != "" {
+				errorCode = fmt.Sprint(typed.Code)
+			}
+		}
+	case types.ClaudeError:
+		if typed.Type != "" {
+			errorType, errorCode = typed.Type, typed.Type
+		}
+	case *types.ClaudeError:
+		if typed != nil && typed.Type != "" {
+			errorType, errorCode = typed.Type, typed.Type
+		}
+	}
+	return errorType, errorCode
 }
 
 func newOpenCodeGoPublicRelayError(projection constant.OpenCodeGoPublicError) *types.NewAPIError {
@@ -163,36 +232,7 @@ func openCodeGoPublicErrorProjection(relayErr *types.NewAPIError) constant.OpenC
 	if relayErr == nil {
 		return constant.ClassifyOpenCodeGoPublicError(http.StatusBadGateway, "", "", "")
 	}
-	errorType := string(relayErr.GetErrorType())
-	errorCode := string(relayErr.GetErrorCode())
-	switch typed := relayErr.RelayError.(type) {
-	case types.OpenAIError:
-		if typed.Type != "" {
-			errorType = typed.Type
-		}
-		if typed.Code != nil && fmt.Sprint(typed.Code) != "" {
-			errorCode = fmt.Sprint(typed.Code)
-		}
-	case *types.OpenAIError:
-		if typed != nil {
-			if typed.Type != "" {
-				errorType = typed.Type
-			}
-			if typed.Code != nil && fmt.Sprint(typed.Code) != "" {
-				errorCode = fmt.Sprint(typed.Code)
-			}
-		}
-	case types.ClaudeError:
-		if typed.Type != "" {
-			errorType = typed.Type
-			errorCode = typed.Type
-		}
-	case *types.ClaudeError:
-		if typed != nil && typed.Type != "" {
-			errorType = typed.Type
-			errorCode = typed.Type
-		}
-	}
+	errorType, errorCode := openCodeGoRelayErrorClassification(relayErr)
 	statusCode := relayErr.StatusCode
 	if upstreamStatusCode, ok := openCodeGoUpstreamRelayStatusCode(relayErr); ok {
 		statusCode = upstreamStatusCode
@@ -204,34 +244,7 @@ func openCodeGoRelayErrorProjectionCandidate(relayErr *types.NewAPIError) bool {
 	if relayErr == nil {
 		return false
 	}
-	errorType := string(relayErr.GetErrorType())
-	errorCode := string(relayErr.GetErrorCode())
-	switch typed := relayErr.RelayError.(type) {
-	case types.OpenAIError:
-		if typed.Type != "" {
-			errorType = typed.Type
-		}
-		if typed.Code != nil && fmt.Sprint(typed.Code) != "" {
-			errorCode = fmt.Sprint(typed.Code)
-		}
-	case *types.OpenAIError:
-		if typed != nil {
-			if typed.Type != "" {
-				errorType = typed.Type
-			}
-			if typed.Code != nil && fmt.Sprint(typed.Code) != "" {
-				errorCode = fmt.Sprint(typed.Code)
-			}
-		}
-	case types.ClaudeError:
-		if typed.Type != "" {
-			errorType, errorCode = typed.Type, typed.Type
-		}
-	case *types.ClaudeError:
-		if typed != nil && typed.Type != "" {
-			errorType, errorCode = typed.Type, typed.Type
-		}
-	}
+	errorType, errorCode := openCodeGoRelayErrorClassification(relayErr)
 	return constant.IsOpenCodeGoPublicErrorCandidate(relayErr.StatusCode, errorType, errorCode, relayErr.Error())
 }
 

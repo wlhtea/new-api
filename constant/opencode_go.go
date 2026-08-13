@@ -110,7 +110,7 @@ func ClassifyOpenCodeGoPublicError(statusCode int, errorType, errorCode, message
 	if openCodeGoErrorMessageContains(message, openCodeGoInternalFailureMarkers) {
 		return openCodeGoPublicOverload()
 	}
-	if openCodeGoErrorClassificationContains(typeCode, openCodeGoClientErrorMarkers) {
+	if IsOpenCodeGoClientRequestError(errorType, errorCode, message) {
 		return openCodeGoPublicInvalidRequest()
 	}
 	if statusCode == http.StatusBadRequest || statusCode == http.StatusRequestEntityTooLarge ||
@@ -130,6 +130,16 @@ func ClassifyOpenCodeGoPublicError(statusCode int, errorType, errorCode, message
 	// error must cross the private-to-public boundary. Fail closed so an
 	// unknown upstream payload never exposes provider details.
 	return openCodeGoPublicOverload()
+}
+
+// IsOpenCodeGoClientRequestError reports whether the provider explicitly
+// classified a failure as invalid client input. A raw 400 alone is not enough:
+// policy and other upstream failures can also use that status.
+func IsOpenCodeGoClientRequestError(errorType, errorCode, message string) bool {
+	typeCode := strings.ToLower(strings.Join([]string{errorType, errorCode}, " "))
+	message = strings.ToLower(message)
+	return !openCodeGoErrorMessageContains(message, openCodeGoInternalFailureMarkers) &&
+		openCodeGoErrorClassificationContains(typeCode, openCodeGoClientErrorMarkers)
 }
 
 func openCodeGoPublicInvalidRequest() OpenCodeGoPublicError {
