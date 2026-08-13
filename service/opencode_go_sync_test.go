@@ -1108,6 +1108,21 @@ func TestSanitizeOpenCodeGoErrorRedactsIdentityUID(t *testing.T) {
 	assert.Contains(t, sanitized, "[identity]")
 }
 
+func TestSanitizeOpenCodeGoErrorRedactsBillingPortalSession(t *testing.T) {
+	const portalSession = "bps_PRIVATE123"
+	const portalPathToken = "opaque-private-path-token"
+
+	sanitized := sanitizeOpenCodeGoError(fmt.Errorf(
+		"billing failed for %s at https://billing.example/p/session/%s?return=true",
+		portalSession,
+		portalPathToken,
+	))
+
+	assert.NotContains(t, sanitized, portalSession)
+	assert.NotContains(t, sanitized, portalPathToken)
+	assert.Contains(t, sanitized, "[portal-session]")
+}
+
 func TestRefreshOpenCodeGoWorkspaceRefreshesItsOwningIdentityOnce(t *testing.T) {
 	_, channel, codec := setupOpenCodeGoPoolTestDB(t)
 	fetchedAt := int64(1_900_000_000)

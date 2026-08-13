@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-gonic/gin"
@@ -34,7 +35,34 @@ func SetUpLogger(server *gin.Engine) {
 			param.Latency,
 			param.ClientIP,
 			param.Method,
-			param.Path,
+			sanitizeAccessLogPath(param.Path),
 		)
 	}))
+}
+
+func sanitizeAccessLogPath(path string) string {
+	if !strings.Contains(path, "/opencode-go/") {
+		return path
+	}
+	segments := strings.Split(path, "/")
+	for index := 0; index+2 < len(segments); index++ {
+		if segments[index] != "opencode-go" || (segments[index+1] != "workspaces" && segments[index+1] != "identities") {
+			continue
+		}
+		identifier := segments[index+2]
+		if identifier == "" || isOpenCodeGoCollectionAction(identifier) {
+			continue
+		}
+		segments[index+2] = common.OpenCodeGoDiagnosticRef("access-"+segments[index+1], identifier)
+	}
+	return strings.Join(segments, "/")
+}
+
+func isOpenCodeGoCollectionAction(segment string) bool {
+	switch segment {
+	case "import", "non-members", "batch-china-models", "batch-cancel-renewal":
+		return true
+	default:
+		return false
+	}
 }

@@ -1,11 +1,7 @@
 package opencodego
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -21,7 +17,6 @@ const (
 	claudeCodeSessionHeader  = "x-claude-code-session-id"
 	cacheIdentityMaxLength   = 64
 	cacheIdentityPrefix      = "ocg_"
-	cacheIdentityDomain      = "new-api/opencode-go/cache-identity/v1"
 	claudeMetadataSessionKey = "session_id"
 )
 
@@ -175,8 +170,5 @@ func isValidCacheIdentity(value string) bool {
 }
 
 func hashCacheIdentity(source string, value string) string {
-	h := hmac.New(sha256.New, []byte(common.CryptoSecret))
-	_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s", cacheIdentityDomain, source, value)
-	digest := h.Sum(nil)
-	return cacheIdentityPrefix + base64.RawURLEncoding.EncodeToString(digest[:16])
+	return common.OpenCodeGoDiagnosticRef(source, value)
 }

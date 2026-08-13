@@ -18,7 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func GetAndValidateRequest(c *gin.Context, format types.RelayFormat) (request dto.Request, err error) {
+func getAndValidateRequestUncached(c *gin.Context, format types.RelayFormat) (request dto.Request, err error) {
 	relayMode := relayconstant.Path2RelayMode(c.Request.URL.Path)
 
 	switch format {
@@ -136,6 +136,10 @@ func GetAndValidateResponsesRequest(c *gin.Context) (*dto.OpenAIResponsesRequest
 	if err != nil {
 		return nil, err
 	}
+	return validateResponsesRequest(request)
+}
+
+func validateResponsesRequest(request *dto.OpenAIResponsesRequest) (*dto.OpenAIResponsesRequest, error) {
 	if request.Model == "" {
 		return nil, errors.New("model is required")
 	}
@@ -292,6 +296,10 @@ func GetAndValidateClaudeRequest(c *gin.Context) (textRequest *dto.ClaudeRequest
 	if err != nil {
 		return nil, err
 	}
+	return validateClaudeRequest(textRequest)
+}
+
+func validateClaudeRequest(textRequest *dto.ClaudeRequest) (*dto.ClaudeRequest, error) {
 	if textRequest.Messages == nil || len(textRequest.Messages) == 0 {
 		return nil, errors.New("field messages is required")
 	}
@@ -315,6 +323,10 @@ func GetAndValidateTextRequest(c *gin.Context, relayMode int) (*dto.GeneralOpenA
 	if err != nil {
 		return nil, err
 	}
+	return validateTextRequest(c, textRequest, relayMode)
+}
+
+func validateTextRequest(c *gin.Context, textRequest *dto.GeneralOpenAIRequest, relayMode int) (*dto.GeneralOpenAIRequest, error) {
 
 	if relayMode == relayconstant.RelayModeModerations && textRequest.Model == "" {
 		textRequest.Model = "text-moderation-latest"

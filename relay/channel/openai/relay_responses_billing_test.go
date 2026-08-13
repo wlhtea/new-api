@@ -642,7 +642,10 @@ func TestOaiResponsesStreamHandlerDoesNotTreatNormalOutputAsPrivateError(t *test
 
 	require.NotNil(t, apiErr)
 	assert.Contains(t, w.Body.String(), "workspace planning")
-	assert.Same(t, apiErr, service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr))
+	publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+	require.NotSame(t, apiErr, publicErr)
+	assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+	assert.Equal(t, constant.OpenCodeGoPublicRateLimitErrorCode, string(publicErr.GetErrorCode()))
 }
 
 func TestOaiResponsesStreamHandlerRejectsPrivateIncompleteDetails(t *testing.T) {
