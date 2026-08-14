@@ -7,8 +7,14 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	gosqlite "github.com/glebarez/go-sqlite"
 	"gorm.io/gorm"
 )
+
+var openCodeGoHealthTransactionRetryDelays = [...]time.Duration{
+	10 * time.Millisecond,
+	25 * time.Millisecond,
+}
 
 func ObserveOpenCodeGoProviderFailure(
 	channelID int,
@@ -95,78 +101,14 @@ func applyOpenCodeGoClassifiedFailureWithMutation(
 	}
 	defer releaseMutation()
 
-	applied := false
-	err := model.DB.Transaction(func(tx *gorm.DB) error {
-		var workspace model.OpenCodeGoWorkspace
-		query := model.LockForUpdate(tx).
-			Where("channel_id = ? AND uid = ?", channelID, workspaceUID).
-			Preload("QuotaWindows").
-			Preload("Models")
-		if err := query.First(&workspace).Error; err != nil {
-			return err
-		}
-
-		switch classified.Scope {
-		case OpenCodeGoHealthScopeWorkspace:
-			candidate := workspace
-			if classified.Observation.Kind == OpenCodeGoObservationCredentialFailure {
-				candidate.CredentialStatus = model.OpenCodeGoCredentialError
-			}
-			next, changed, err := ReduceOpenCodeGoWorkspaceHealth(
-				workspace,
-				candidate,
-				workspace.QuotaWindows,
-				classified.Observation,
-			)
-			if err != nil || !changed {
-				return err
-			}
-			if classified.Observation.Kind == OpenCodeGoObservationRiskBlocked && next.EffectiveState == model.OpenCodeGoStateManualDisabled {
-				next.LastError = firstNonEmptyOpenCodeGoMessage(next.LastError, next.StateReason)
-			} else {
-				next.LastError = firstNonEmptyOpenCodeGoMessage(next.StateReason, next.LastError)
-			}
-			result := tx.Model(&model.OpenCodeGoWorkspace{}).
-				Where("id = ? AND COALESCE(health_observed_at, 0) <= ?", workspace.ID, classified.Observation.ObservedAt.UnixNano()).
-				Updates(openCodeGoWorkspaceHealthUpdates(next))
-			if result.Error != nil {
-				return result.Error
-			}
-			applied = result.RowsAffected == 1
-			return nil
-		case OpenCodeGoHealthScopeModel:
-			var entry model.OpenCodeGoWorkspaceModel
-			if err := model.LockForUpdate(tx).
-				Where("workspace_id = ? AND model = ?", workspace.ID, upstreamModel).
-				First(&entry).Error; err != nil {
-				return err
-			}
-			next, changed, err := ReduceOpenCodeGoModelHealth(entry, classified.Observation)
-			if err != nil || !changed {
-				return err
-			}
-			result := tx.Model(&model.OpenCodeGoWorkspaceModel{}).
-				Where("id = ? AND COALESCE(health_observed_at, 0) <= ?", entry.ID, classified.Observation.ObservedAt.UnixNano()).
-				Updates(map[string]interface{}{
-					"state":              next.State,
-					"disabled_until":     next.DisabledUntil,
-					"last_error_code":    next.LastErrorCode,
-					"last_error":         next.LastError,
-					"health_observation": next.HealthObservation,
-					"health_observed_at": next.HealthObservedAt,
-					"updated_at":         common.GetTimestamp(),
-				})
-			if result.Error != nil {
-				return result.Error
-			}
-			applied = result.RowsAffected == 1
-			return nil
-		default:
-			return errors.New("unsupported OpenCode Go health observation scope")
-		}
-	})
+	applied, err := persistOpenCodeGoHealthWithRetry(
+		channelID,
+		workspaceUID,
+		upstreamModel,
+		classified,
+	)
 	if err != nil || !applied {
-		return applied, err
+		return false, err
 	}
 	if restrictive && !mutationAlreadyHeld {
 		InvalidateOpenCodeGoIdentityProxyChannel(channelID)
@@ -178,6 +120,123 @@ func applyOpenCodeGoClassifiedFailureWithMutation(
 		return true, err
 	}
 	return true, nil
+}
+
+func persistOpenCodeGoHealthWithRetry(
+	channelID int,
+	workspaceUID string,
+	upstreamModel string,
+	classified OpenCodeGoClassifiedFailure,
+) (bool, error) {
+	for attempt := 0; ; attempt++ {
+		applied := false
+		err := model.DB.Transaction(func(tx *gorm.DB) error {
+			return applyOpenCodeGoHealthTransaction(
+				tx,
+				channelID,
+				workspaceUID,
+				upstreamModel,
+				classified,
+				&applied,
+			)
+		})
+		if err == nil {
+			return applied, nil
+		}
+		if !isRetryableOpenCodeGoSQLiteLockError(err) || attempt == len(openCodeGoHealthTransactionRetryDelays) {
+			return false, err
+		}
+		time.Sleep(openCodeGoHealthTransactionRetryDelays[attempt])
+	}
+}
+
+func applyOpenCodeGoHealthTransaction(
+	tx *gorm.DB,
+	channelID int,
+	workspaceUID string,
+	upstreamModel string,
+	classified OpenCodeGoClassifiedFailure,
+	applied *bool,
+) error {
+	var workspace model.OpenCodeGoWorkspace
+	query := model.LockForUpdate(tx).
+		Where("channel_id = ? AND uid = ?", channelID, workspaceUID).
+		Preload("QuotaWindows").
+		Preload("Models")
+	if err := query.First(&workspace).Error; err != nil {
+		return err
+	}
+
+	switch classified.Scope {
+	case OpenCodeGoHealthScopeWorkspace:
+		candidate := workspace
+		if classified.Observation.Kind == OpenCodeGoObservationCredentialFailure {
+			candidate.CredentialStatus = model.OpenCodeGoCredentialError
+		}
+		next, changed, err := ReduceOpenCodeGoWorkspaceHealth(
+			workspace,
+			candidate,
+			workspace.QuotaWindows,
+			classified.Observation,
+		)
+		if err != nil || !changed {
+			return err
+		}
+		if classified.Observation.Kind == OpenCodeGoObservationRiskBlocked && next.EffectiveState == model.OpenCodeGoStateManualDisabled {
+			next.LastError = firstNonEmptyOpenCodeGoMessage(next.LastError, next.StateReason)
+		} else {
+			next.LastError = firstNonEmptyOpenCodeGoMessage(next.StateReason, next.LastError)
+		}
+		result := tx.Model(&model.OpenCodeGoWorkspace{}).
+			Where("id = ? AND COALESCE(health_observed_at, 0) <= ?", workspace.ID, classified.Observation.ObservedAt.UnixNano()).
+			Updates(openCodeGoWorkspaceHealthUpdates(next))
+		if result.Error != nil {
+			return result.Error
+		}
+		*applied = result.RowsAffected == 1
+		return nil
+	case OpenCodeGoHealthScopeModel:
+		var entry model.OpenCodeGoWorkspaceModel
+		if err := model.LockForUpdate(tx).
+			Where("workspace_id = ? AND model = ?", workspace.ID, upstreamModel).
+			First(&entry).Error; err != nil {
+			return err
+		}
+		next, changed, err := ReduceOpenCodeGoModelHealth(entry, classified.Observation)
+		if err != nil || !changed {
+			return err
+		}
+		result := tx.Model(&model.OpenCodeGoWorkspaceModel{}).
+			Where("id = ? AND COALESCE(health_observed_at, 0) <= ?", entry.ID, classified.Observation.ObservedAt.UnixNano()).
+			Updates(map[string]interface{}{
+				"state":              next.State,
+				"disabled_until":     next.DisabledUntil,
+				"last_error_code":    next.LastErrorCode,
+				"last_error":         next.LastError,
+				"health_observation": next.HealthObservation,
+				"health_observed_at": next.HealthObservedAt,
+				"updated_at":         common.GetTimestamp(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		*applied = result.RowsAffected == 1
+		return nil
+	default:
+		return errors.New("unsupported OpenCode Go health observation scope")
+	}
+}
+
+func isRetryableOpenCodeGoSQLiteLockError(err error) bool {
+	if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		return false
+	}
+	var sqliteErr *gosqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	baseCode := sqliteErr.Code() & 0xff
+	return baseCode == 5 || baseCode == 6
 }
 
 func isRestrictiveOpenCodeGoHealthObservation(kind OpenCodeGoHealthObservationKind) bool {

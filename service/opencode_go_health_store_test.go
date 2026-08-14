@@ -1,13 +1,20 @@
 package service
 
 import (
+	"fmt"
 	"net/http"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func seedOpenCodeGoHealthWorkspace(
@@ -255,6 +262,265 @@ func TestApplyOpenCodeGoClassifiedFailureRejectsOlderWorkspaceObservation(t *tes
 	require.NoError(t, err)
 	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, after.EffectiveState)
 	assert.Equal(t, model.OpenCodeGoCredentialValid, after.CredentialStatus)
+}
+
+func TestApplyOpenCodeGoClassifiedFailureRetriesSQLiteReadWriteContention(t *testing.T) {
+	dsn := fmt.Sprintf(
+		"file:%s?_pragma=busy_timeout(1000)",
+		filepath.ToSlash(filepath.Join(t.TempDir(), "health-contention.db")),
+	)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	require.NoError(t, db.AutoMigrate(
+		&model.OpenCodeGoWorkspace{},
+		&model.OpenCodeGoQuotaWindow{},
+		&model.OpenCodeGoWorkspaceModel{},
+	))
+
+	previousDB := model.DB
+	previousDatabaseType := common.MainDatabaseType()
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.SetMainDatabaseType(previousDatabaseType)
+		require.NoError(t, sqlDB.Close())
+	})
+
+	workspace := model.OpenCodeGoWorkspace{
+		UID:                 "workspace-health-contention",
+		ChannelID:           771,
+		IdentityID:          1,
+		UpstreamWorkspaceID: "synthetic-health-contention",
+		APIKeyCiphertext:    "encrypted-fixture",
+		CredentialStatus:    model.OpenCodeGoCredentialValid,
+		MembershipStatus:    model.OpenCodeGoMembershipActive,
+		ManualEnabled:       true,
+		EffectiveState:      model.OpenCodeGoStateEligible,
+		QuotaSnapshotStatus: model.OpenCodeGoQuotaSnapshotComplete,
+		QuotaFetchedAt:      time.Unix(1_900_000_000, 0).Unix(),
+	}
+	require.NoError(t, db.Create(&workspace).Error)
+	require.NoError(t, db.Create(&model.OpenCodeGoWorkspaceModel{
+		WorkspaceID: workspace.ID,
+		Model:       "glm-5.2",
+		Discovered:  true,
+		State:       model.OpenCodeGoModelAvailable,
+	}).Error)
+
+	locker := db.Begin()
+	require.NoError(t, locker.Error)
+	require.NoError(t, locker.Exec(
+		"UPDATE open_code_go_workspaces SET updated_at = updated_at WHERE id = ?",
+		workspace.ID,
+	).Error)
+
+	releaseLock := make(chan struct{})
+	var releaseLockOnce sync.Once
+	release := func() { releaseLockOnce.Do(func() { close(releaseLock) }) }
+	lockReleased := make(chan struct{})
+	go func() {
+		<-releaseLock
+		_ = locker.Rollback().Error
+		close(lockReleased)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-lockReleased:
+		default:
+			release()
+			<-lockReleased
+		}
+	})
+	time.AfterFunc(25*time.Millisecond, release)
+
+	observedAt := time.Unix(1_900_000_100, 0)
+	classified, ok := ClassifyOpenCodeGoProviderFailure(OpenCodeGoProviderFailure{
+		StatusCode: http.StatusUnauthorized,
+		ErrorType:  "AuthError",
+		Message:    "This account has found to be committing fraud or is in breach of terms of services and has been blocked.",
+	}, observedAt)
+	require.True(t, ok)
+	rebuilds := 0
+	applied, err := applyOpenCodeGoClassifiedFailure(
+		workspace.ChannelID,
+		workspace.UID,
+		"glm-5.2",
+		classified,
+		func(int) error {
+			rebuilds++
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.Equal(t, 1, rebuilds)
+
+	var after model.OpenCodeGoWorkspace
+	require.NoError(t, db.First(&after, workspace.ID).Error)
+	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, after.EffectiveState)
+	assert.Equal(t, string(OpenCodeGoObservationRiskBlocked), after.HealthObservation)
+	assert.Equal(t, observedAt.UnixNano(), after.HealthObservedAt)
+
+	older, ok := ClassifyOpenCodeGoProviderFailure(OpenCodeGoProviderFailure{
+		StatusCode: http.StatusUnauthorized,
+		ErrorType:  "AuthError",
+		Message:    "Invalid API key",
+	}, observedAt.Add(-time.Second))
+	require.True(t, ok)
+	applied, err = applyOpenCodeGoClassifiedFailure(
+		workspace.ChannelID,
+		workspace.UID,
+		"glm-5.2",
+		older,
+		func(int) error {
+			rebuilds++
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.Equal(t, 1, rebuilds)
+	require.NoError(t, db.First(&after, workspace.ID).Error)
+	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, after.EffectiveState)
+	assert.Equal(t, observedAt.UnixNano(), after.HealthObservedAt)
+}
+
+func TestApplyOpenCodeGoClassifiedFailureRetryRejectsConcurrentNewerObservation(t *testing.T) {
+	dsn := fmt.Sprintf(
+		"file:%s?_pragma=busy_timeout(1000)",
+		filepath.ToSlash(filepath.Join(t.TempDir(), "health-cas-retry.db")),
+	)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	require.NoError(t, db.AutoMigrate(
+		&model.OpenCodeGoWorkspace{},
+		&model.OpenCodeGoQuotaWindow{},
+		&model.OpenCodeGoWorkspaceModel{},
+	))
+	var journalMode string
+	require.NoError(t, db.Raw("PRAGMA journal_mode=WAL").Scan(&journalMode).Error)
+	require.Equal(t, "wal", journalMode)
+
+	previousDB := model.DB
+	previousDatabaseType := common.MainDatabaseType()
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.SetMainDatabaseType(previousDatabaseType)
+		require.NoError(t, sqlDB.Close())
+	})
+
+	workspace := model.OpenCodeGoWorkspace{
+		UID:                 "workspace-health-cas-retry",
+		ChannelID:           772,
+		IdentityID:          1,
+		UpstreamWorkspaceID: "synthetic-health-cas-retry",
+		APIKeyCiphertext:    "encrypted-fixture",
+		CredentialStatus:    model.OpenCodeGoCredentialValid,
+		MembershipStatus:    model.OpenCodeGoMembershipActive,
+		ManualEnabled:       true,
+		EffectiveState:      model.OpenCodeGoStateEligible,
+		QuotaSnapshotStatus: model.OpenCodeGoQuotaSnapshotComplete,
+		QuotaFetchedAt:      time.Unix(1_900_000_000, 0).Unix(),
+	}
+	require.NoError(t, db.Create(&workspace).Error)
+	require.NoError(t, db.Create(&model.OpenCodeGoWorkspaceModel{
+		WorkspaceID: workspace.ID,
+		Model:       "glm-5.2",
+		Discovered:  true,
+		State:       model.OpenCodeGoModelAvailable,
+	}).Error)
+
+	firstWorkspaceRead := make(chan struct{})
+	continueFirstTransaction := make(chan struct{})
+	var continueFirstTransactionOnce sync.Once
+	continueTransaction := func() {
+		continueFirstTransactionOnce.Do(func() { close(continueFirstTransaction) })
+	}
+	t.Cleanup(continueTransaction)
+	var workspaceReads atomic.Int32
+	const callbackName = "test:observe-opencode-go-health-workspace-read"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Error != nil || tx.Statement.Table != "open_code_go_workspaces" {
+			return
+		}
+		if workspaceReads.Add(1) == 1 {
+			close(firstWorkspaceRead)
+			<-continueFirstTransaction
+		}
+	}))
+
+	olderAt := time.Unix(1_900_000_100, 0)
+	classified, ok := ClassifyOpenCodeGoProviderFailure(OpenCodeGoProviderFailure{
+		StatusCode: http.StatusUnauthorized,
+		ErrorType:  "AuthError",
+		Message:    "Invalid API key",
+	}, olderAt)
+	require.True(t, ok)
+
+	type applyResult struct {
+		applied bool
+		err     error
+	}
+	result := make(chan applyResult, 1)
+	var rebuilds atomic.Int32
+	go func() {
+		applied, applyErr := applyOpenCodeGoClassifiedFailure(
+			workspace.ChannelID,
+			workspace.UID,
+			"glm-5.2",
+			classified,
+			func(int) error {
+				rebuilds.Add(1)
+				return nil
+			},
+		)
+		result <- applyResult{applied: applied, err: applyErr}
+	}()
+
+	select {
+	case <-firstWorkspaceRead:
+	case <-time.After(time.Second):
+		t.Fatal("health transaction did not read the workspace")
+	}
+	newerAt := olderAt.Add(time.Second)
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspace{}).
+		Where("id = ?", workspace.ID).
+		Updates(map[string]interface{}{
+			"effective_state":      model.OpenCodeGoStateRiskBlocked,
+			"state_reason":         "newer concurrent risk observation",
+			"health_observation":   string(OpenCodeGoObservationRiskBlocked),
+			"health_observed_at":   newerAt.UnixNano(),
+			"risk_detected_at":     newerAt.Unix(),
+			"risk_last_checked_at": newerAt.Unix(),
+			"last_error":           "newer concurrent risk observation",
+		}).Error)
+	continueTransaction()
+
+	var outcome applyResult
+	select {
+	case outcome = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("health transaction retry did not finish")
+	}
+	require.NoError(t, outcome.err)
+	assert.False(t, outcome.applied)
+	assert.Equal(t, int32(2), workspaceReads.Load())
+	assert.Zero(t, rebuilds.Load())
+
+	var after model.OpenCodeGoWorkspace
+	require.NoError(t, db.First(&after, workspace.ID).Error)
+	assert.Equal(t, model.OpenCodeGoStateRiskBlocked, after.EffectiveState)
+	assert.Equal(t, string(OpenCodeGoObservationRiskBlocked), after.HealthObservation)
+	assert.Equal(t, newerAt.UnixNano(), after.HealthObservedAt)
 }
 
 func TestRestrictiveOpenCodeGoHealthWriteKeepsRelayBlockedUntilRebuildCompletes(t *testing.T) {
