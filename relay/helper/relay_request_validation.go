@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/sjson"
 )
 
 const cachedValidatedRequestKey = "relay_helper_cached_validated_request"
@@ -23,6 +24,26 @@ type cachedValidatedRequest struct {
 	path    string
 	model   string
 	request dto.Request
+}
+
+type responsesRequestNormalization struct {
+	outputMessageStatusIndices []int
+}
+
+func (n *responsesRequestNormalization) apply(request *dto.OpenAIResponsesRequest) error {
+	if n == nil || request == nil || len(n.outputMessageStatusIndices) == 0 {
+		return nil
+	}
+	normalizedInput := request.Input
+	for _, index := range n.outputMessageStatusIndices {
+		var err error
+		normalizedInput, err = sjson.SetBytes(normalizedInput, fmt.Sprintf("%d.status", index), "completed")
+		if err != nil {
+			return fmt.Errorf("normalize input[%d].status: %w", index, err)
+		}
+	}
+	request.Input = normalizedInput
+	return nil
 }
 
 type ClientRequestValidationError struct {
@@ -212,12 +233,16 @@ func parseAndCacheStrictRelayRequest(c *gin.Context, format types.RelayFormat) (
 		}
 		request, err = validateTextRequest(c, typed, relayconstant.RelayModeChatCompletions)
 	case types.RelayFormatOpenAIResponses:
-		if err := validateResponsesRawRequest(raw); err != nil {
+		normalization := &responsesRequestNormalization{}
+		if err := validateResponsesRawRequest(raw, normalization); err != nil {
 			return nil, err
 		}
 		typed := &dto.OpenAIResponsesRequest{}
 		if err := common.Unmarshal(body, typed); err != nil {
 			return nil, newClientRequestValidationError(http.StatusBadRequest, "request body does not match the Responses schema")
+		}
+		if err := normalization.apply(typed); err != nil {
+			return nil, err
 		}
 		request, err = validateResponsesRequest(typed)
 	default:
@@ -940,7 +965,7 @@ func validateChatRawRequest(raw map[string]any) error {
 	return nil
 }
 
-func validateResponsesRawRequest(raw map[string]any) error {
+func validateResponsesRawRequest(raw map[string]any, normalization *responsesRequestNormalization) error {
 	input, found := raw["input"]
 	if !found || input == nil {
 		return newClientRequestValidationError(http.StatusBadRequest, "input is required")
@@ -985,6 +1010,9 @@ func validateResponsesRawRequest(raw map[string]any) error {
 			if role == "assistant" && responsesAssistantMessageIsOutputReplay(item, content) {
 				if err := validateResponsesOutputMessage(item, itemType, index); err != nil {
 					return err
+				}
+				if _, found := item["status"]; !found && normalization != nil {
+					normalization.outputMessageStatusIndices = append(normalization.outputMessageStatusIndices, index)
 				}
 				continue
 			}
@@ -1113,12 +1141,14 @@ func validateResponsesOutputMessage(item map[string]any, itemType string, index 
 	if _, err := requiredStringField(item, "id", path+".id"); err != nil {
 		return err
 	}
-	status, err := requiredStringField(item, "status", path+".status")
-	if err != nil {
-		return err
-	}
-	if status != "in_progress" && status != "completed" && status != "incomplete" {
-		return newClientRequestValidationError(http.StatusBadRequest, "%s.status is unsupported", path)
+	if _, found := item["status"]; found {
+		status, err := requiredStringField(item, "status", path+".status")
+		if err != nil {
+			return err
+		}
+		if status != "in_progress" && status != "completed" && status != "incomplete" {
+			return newClientRequestValidationError(http.StatusBadRequest, "%s.status is unsupported", path)
+		}
 	}
 	contentPath := path + ".content"
 	content, err := requireArray(item, "content", contentPath)

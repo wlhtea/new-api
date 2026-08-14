@@ -12,6 +12,8 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -113,6 +115,48 @@ func TestPreValidateRelayRequestPassesOtherPathsAndCachesTargetModel(t *testing.
 			require.Equal(t, http.StatusNoContent, recorder.Code)
 		})
 	}
+}
+
+func TestPreValidateRelayRequestCachesNormalizedCodexOutputReplay(t *testing.T) {
+	engine := gin.New()
+	engine.Use(BodyStorageCleanup(), PreValidateRelayRequest())
+	engine.POST("/v1/responses", func(c *gin.Context) {
+		request, err := helper.GetAndValidateRequest(c, types.RelayFormatOpenAIResponses)
+		require.NoError(t, err)
+		responsesRequest, ok := request.(*dto.OpenAIResponsesRequest)
+		require.True(t, ok)
+
+		var input []map[string]any
+		require.NoError(t, common.Unmarshal(responsesRequest.Input, &input))
+		require.Equal(t, "completed", input[1]["status"])
+
+		converted, err := service.ConvertRequest(c, nil, types.RelayFormatOpenAI, responsesRequest)
+		require.NoError(t, err)
+		chatRequest, ok := converted.Value.(*dto.GeneralOpenAIRequest)
+		require.True(t, ok)
+		require.Len(t, chatRequest.Messages, 3)
+		require.Equal(t, []string{"user", "assistant", "user"}, []string{
+			chatRequest.Messages[0].Role,
+			chatRequest.Messages[1].Role,
+			chatRequest.Messages[2].Role,
+		})
+		require.Equal(t, "Hello", chatRequest.Messages[1].StringContent())
+		c.Status(http.StatusNoContent)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{
+		"model":"kimi-k3",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello","annotations":[],"logprobs":[]}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"do you love me?"}]}
+		]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
 }
 
 func TestPreValidateRelayRequestPreparesTokenAffinityBeforeDistribution(t *testing.T) {

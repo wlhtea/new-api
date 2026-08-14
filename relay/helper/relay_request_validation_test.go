@@ -201,8 +201,10 @@ func TestGetAndValidateRequestRejectsProtocolFieldErrors(t *testing.T) {
 		{name: "responses message content wrong type", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"role":"user","content":42}]}`, wantDetail: "input[0].content"},
 		{name: "responses user output content is unsupported", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"role":"user","content":[{"type":"output_text","text":"answer"}]}]}`, wantDetail: "input[0].content[0].type"},
 		{name: "responses incomplete output message missing id", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"answer"}]}]}`, wantDetail: "input[0].id"},
-		{name: "responses incomplete output message missing status", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"no"}]}]}`, wantDetail: "input[0].status"},
 		{name: "responses output message requires explicit type", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}`, wantDetail: "input[0].type"},
+		{name: "responses output message status null", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":null,"role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}`, wantDetail: "input[0].status"},
+		{name: "responses output message status wrong type", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":42,"role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}`, wantDetail: "input[0].status"},
+		{name: "responses output message status empty", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}`, wantDetail: "input[0].status"},
 		{name: "responses output message status unsupported", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"future","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}`, wantDetail: "input[0].status"},
 		{name: "responses output message only permits output content", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"input_text","text":"answer"}]}]}`, wantDetail: "input[0].content[0].type"},
 		{name: "responses output message content must be array", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":"answer"}]}`, wantDetail: "input[0].content"},
@@ -439,6 +441,32 @@ func TestGetAndValidateRequestPreservesCompatibilityAndCachesTypedRequest(t *tes
 			require.Same(t, first, second)
 		})
 	}
+}
+
+func TestGetAndValidateRequestNormalizesCodexOutputReplayStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c := newRelayValidationContext(t, "/v1/responses", []byte(`{
+		"model":"kimi-k3",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello","annotations":[],"logprobs":[]}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"do you love me?"}]}
+		]
+	}`))
+
+	request, err := GetAndValidateRequest(c, types.RelayFormatOpenAIResponses)
+	require.NoError(t, err)
+	responsesRequest, ok := request.(*dto.OpenAIResponsesRequest)
+	require.True(t, ok)
+
+	var input []map[string]any
+	require.NoError(t, common.Unmarshal(responsesRequest.Input, &input))
+	require.Len(t, input, 3)
+	require.Equal(t, "completed", input[1]["status"])
+
+	cached, err := GetAndValidateRequest(c, types.RelayFormatOpenAIResponses)
+	require.NoError(t, err)
+	require.Same(t, request, cached)
 }
 
 func TestProtocolValidationCompatibilityPairs(t *testing.T) {
