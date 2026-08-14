@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/glebarez/sqlite"
@@ -630,4 +632,40 @@ func TestRestorativeOpenCodeGoHealthWriteDoesNotAcquireRestrictiveMutationBarrie
 	case <-time.After(time.Second):
 		t.Fatal("restorative health observation waited on a relay lease")
 	}
+}
+
+func TestIsRetryableOpenCodeGoHealthLockError(t *testing.T) {
+	previousType := common.MainDatabaseType()
+	t.Cleanup(func() { common.SetMainDatabaseType(previousType) })
+
+	common.SetMainDatabaseType(common.DatabaseTypeMySQL)
+	t.Run("mysql deadlock and lock wait timeout are retryable", func(t *testing.T) {
+		for _, number := range []uint16{1205, 1213} {
+			err := &mysqldriver.MySQLError{Number: number, Message: "lock contention"}
+			assert.True(t, isRetryableOpenCodeGoHealthLockError(err), "errno %d should be retryable", number)
+			wrapped := fmt.Errorf("persist health: %w", err)
+			assert.True(t, isRetryableOpenCodeGoHealthLockError(wrapped), "wrapped errno %d should be retryable", number)
+		}
+	})
+	t.Run("mysql other errors are terminal", func(t *testing.T) {
+		for _, number := range []uint16{1045, 1062, 1452, 2002} {
+			err := &mysqldriver.MySQLError{Number: number, Message: "other failure"}
+			assert.False(t, isRetryableOpenCodeGoHealthLockError(err), "errno %d should not be retryable", number)
+		}
+		assert.False(t, isRetryableOpenCodeGoHealthLockError(errors.New("generic error")))
+	})
+
+	t.Run("sqlite remains sqlite-only and other types are not misclassified", func(t *testing.T) {
+		common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+		// gosqlite errors carry their code in unexported fields, so the SQLite
+		// busy/locked path is exercised by the contention integration test
+		// instead; here we only verify cross-driver isolation.
+		assert.False(t, isRetryableOpenCodeGoHealthLockError(&mysqldriver.MySQLError{Number: 1213}))
+		assert.False(t, isRetryableOpenCodeGoHealthLockError(errors.New("generic error")))
+	})
+
+	t.Run("other database types never retry", func(t *testing.T) {
+		common.SetMainDatabaseType(common.DatabaseTypePostgreSQL)
+		assert.False(t, isRetryableOpenCodeGoHealthLockError(&mysqldriver.MySQLError{Number: 1213}))
+	})
 }

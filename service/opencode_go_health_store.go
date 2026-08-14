@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	gosqlite "github.com/glebarez/go-sqlite"
@@ -143,7 +144,7 @@ func persistOpenCodeGoHealthWithRetry(
 		if err == nil {
 			return applied, nil
 		}
-		if !isRetryableOpenCodeGoSQLiteLockError(err) || attempt == len(openCodeGoHealthTransactionRetryDelays) {
+		if !isRetryableOpenCodeGoHealthLockError(err) || attempt == len(openCodeGoHealthTransactionRetryDelays) {
 			return false, err
 		}
 		time.Sleep(openCodeGoHealthTransactionRetryDelays[attempt])
@@ -227,16 +228,38 @@ func applyOpenCodeGoHealthTransaction(
 	}
 }
 
-func isRetryableOpenCodeGoSQLiteLockError(err error) bool {
-	if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+// MySQL lock-wait and deadlock errnos that are safe to retry. InnoDB surfaces
+// the same row contention as the SQLite busy/locked codes handled below.
+const (
+	openCodeGoMySQLLockWaitTimeoutErrno = 1205 // ER_LOCK_WAIT_TIMEOUT
+	openCodeGoMySQLDeadlockErrno        = 1213 // ER_LOCK_DEADLOCK
+)
+
+// isRetryableOpenCodeGoHealthLockError reports whether a health-persistence
+// transaction failure is transient row contention that is safe to retry within
+// the bounded retry window. SQLite reports busy/locked as error codes 5 and 6;
+// MySQL InnoDB reports the same contention as lock-wait timeout (1205) or
+// deadlock (1213). Every other error is terminal so the observation is not
+// silently dropped after pointless retries.
+func isRetryableOpenCodeGoHealthLockError(err error) bool {
+	switch common.MainDatabaseType() {
+	case common.DatabaseTypeSQLite:
+		var sqliteErr *gosqlite.Error
+		if !errors.As(err, &sqliteErr) {
+			return false
+		}
+		baseCode := sqliteErr.Code() & 0xff
+		return baseCode == 5 || baseCode == 6
+	case common.DatabaseTypeMySQL:
+		var mysqlErr *mysqldriver.MySQLError
+		if !errors.As(err, &mysqlErr) {
+			return false
+		}
+		return mysqlErr.Number == openCodeGoMySQLLockWaitTimeoutErrno ||
+			mysqlErr.Number == openCodeGoMySQLDeadlockErrno
+	default:
 		return false
 	}
-	var sqliteErr *gosqlite.Error
-	if !errors.As(err, &sqliteErr) {
-		return false
-	}
-	baseCode := sqliteErr.Code() & 0xff
-	return baseCode == 5 || baseCode == 6
 }
 
 func isRestrictiveOpenCodeGoHealthObservation(kind OpenCodeGoHealthObservationKind) bool {
