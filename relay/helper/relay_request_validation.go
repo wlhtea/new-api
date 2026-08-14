@@ -26,20 +26,32 @@ type cachedValidatedRequest struct {
 	request dto.Request
 }
 
+type responsesRequestDefault struct {
+	path  string
+	value any
+}
+
 type responsesRequestNormalization struct {
-	outputMessageStatusIndices []int
+	defaults []responsesRequestDefault
+}
+
+func (n *responsesRequestNormalization) addDefault(path string, value any) {
+	if n == nil {
+		return
+	}
+	n.defaults = append(n.defaults, responsesRequestDefault{path: path, value: value})
 }
 
 func (n *responsesRequestNormalization) apply(request *dto.OpenAIResponsesRequest) error {
-	if n == nil || request == nil || len(n.outputMessageStatusIndices) == 0 {
+	if n == nil || request == nil || len(n.defaults) == 0 {
 		return nil
 	}
 	normalizedInput := request.Input
-	for _, index := range n.outputMessageStatusIndices {
+	for _, defaultValue := range n.defaults {
 		var err error
-		normalizedInput, err = sjson.SetBytes(normalizedInput, fmt.Sprintf("%d.status", index), "completed")
+		normalizedInput, err = sjson.SetBytes(normalizedInput, defaultValue.path, defaultValue.value)
 		if err != nil {
-			return fmt.Errorf("normalize input[%d].status: %w", index, err)
+			return fmt.Errorf("normalize Responses input path %s: %w", defaultValue.path, err)
 		}
 	}
 	request.Input = normalizedInput
@@ -1008,11 +1020,11 @@ func validateResponsesRawRequest(raw map[string]any, normalization *responsesReq
 				return err
 			}
 			if role == "assistant" && responsesAssistantMessageIsOutputReplay(item, content) {
-				if err := validateResponsesOutputMessage(item, itemType, index); err != nil {
+				if err := validateResponsesOutputMessage(item, itemType, index, normalization); err != nil {
 					return err
 				}
 				if _, found := item["status"]; !found && normalization != nil {
-					normalization.outputMessageStatusIndices = append(normalization.outputMessageStatusIndices, index)
+					normalization.addDefault(fmt.Sprintf("%d.status", index), "completed")
 				}
 				continue
 			}
@@ -1130,7 +1142,7 @@ func responsesAssistantMessageIsOutputReplay(item map[string]any, content any) b
 	return false
 }
 
-func validateResponsesOutputMessage(item map[string]any, itemType string, index int) error {
+func validateResponsesOutputMessage(item map[string]any, itemType string, index int, normalization *responsesRequestNormalization) error {
 	path := fmt.Sprintf("input[%d]", index)
 	if rawType, found := item["type"]; !found || rawType == nil {
 		return newClientRequestValidationError(http.StatusBadRequest, "%s.type is required for an output message", path)
@@ -1154,6 +1166,21 @@ func validateResponsesOutputMessage(item map[string]any, itemType string, index 
 	content, err := requireArray(item, "content", contentPath)
 	if err != nil {
 		return err
+	}
+	if normalization != nil {
+		for partIndex, rawPart := range content {
+			part, ok := rawPart.(map[string]any)
+			if !ok || part == nil || part["type"] != "output_text" {
+				continue
+			}
+			for _, field := range []string{"annotations", "logprobs"} {
+				if _, found := part[field]; found {
+					continue
+				}
+				part[field] = []any{}
+				normalization.addDefault(fmt.Sprintf("%d.content.%d.%s", index, partIndex, field), []any{})
+			}
+		}
 	}
 	return validateObjectArrayWithTypes(content, contentPath, validateResponsesContentPart, "output_text", "refusal")
 }

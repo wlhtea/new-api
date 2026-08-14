@@ -129,6 +129,9 @@ func TestPreValidateRelayRequestCachesNormalizedCodexOutputReplay(t *testing.T) 
 		var input []map[string]any
 		require.NoError(t, common.Unmarshal(responsesRequest.Input, &input))
 		require.Equal(t, "completed", input[1]["status"])
+		outputText := input[1]["content"].([]any)[0].(map[string]any)
+		require.Equal(t, []any{}, outputText["annotations"])
+		require.Equal(t, []any{}, outputText["logprobs"])
 
 		converted, err := service.ConvertRequest(c, nil, types.RelayFormatOpenAI, responsesRequest)
 		require.NoError(t, err)
@@ -149,7 +152,7 @@ func TestPreValidateRelayRequestCachesNormalizedCodexOutputReplay(t *testing.T) 
 		"model":"kimi-k3",
 		"input":[
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
-			{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello","annotations":[],"logprobs":[]}]},
+			{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello"}]},
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"do you love me?"}]}
 		]
 	}`))

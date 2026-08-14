@@ -208,8 +208,8 @@ func TestGetAndValidateRequestRejectsProtocolFieldErrors(t *testing.T) {
 		{name: "responses output message status unsupported", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"future","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}`, wantDetail: "input[0].status"},
 		{name: "responses output message only permits output content", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"input_text","text":"answer"}]}]}`, wantDetail: "input[0].content[0].type"},
 		{name: "responses output message content must be array", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":"answer"}]}`, wantDetail: "input[0].content"},
-		{name: "responses output text requires annotations", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","logprobs":[]}]}]}`, wantDetail: "input[0].content[0].annotations"},
-		{name: "responses output text requires logprobs", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[]}]}]}`, wantDetail: "input[0].content[0].logprobs"},
+		{name: "responses output annotations null", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":null,"logprobs":[]}]}]}`, wantDetail: "input[0].content[0].annotations"},
+		{name: "responses output logprobs null", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[],"logprobs":null}]}]}`, wantDetail: "input[0].content[0].logprobs"},
 		{name: "responses output annotations must be array", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":{},"logprobs":[]}]}]}`, wantDetail: "input[0].content[0].annotations"},
 		{name: "responses output logprobs must be array", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[],"logprobs":{}}]}]}`, wantDetail: "input[0].content[0].logprobs"},
 		{name: "responses output annotation must be object", path: "/v1/responses", format: types.RelayFormatOpenAIResponses, body: `{"model":"test-model","input":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[42],"logprobs":[]}]}]}`, wantDetail: "input[0].content[0].annotations[0]"},
@@ -443,13 +443,13 @@ func TestGetAndValidateRequestPreservesCompatibilityAndCachesTypedRequest(t *tes
 	}
 }
 
-func TestGetAndValidateRequestNormalizesCodexOutputReplayStatus(t *testing.T) {
+func TestGetAndValidateRequestNormalizesCodexOutputReplayDefaults(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c := newRelayValidationContext(t, "/v1/responses", []byte(`{
 		"model":"kimi-k3",
 		"input":[
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
-			{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello","annotations":[],"logprobs":[]}]},
+			{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello"}]},
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"do you love me?"}]}
 		]
 	}`))
@@ -463,6 +463,9 @@ func TestGetAndValidateRequestNormalizesCodexOutputReplayStatus(t *testing.T) {
 	require.NoError(t, common.Unmarshal(responsesRequest.Input, &input))
 	require.Len(t, input, 3)
 	require.Equal(t, "completed", input[1]["status"])
+	outputText := input[1]["content"].([]any)[0].(map[string]any)
+	require.Equal(t, []any{}, outputText["annotations"])
+	require.Equal(t, []any{}, outputText["logprobs"])
 
 	cached, err := GetAndValidateRequest(c, types.RelayFormatOpenAIResponses)
 	require.NoError(t, err)
