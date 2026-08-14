@@ -151,7 +151,7 @@ func TestGetAndValidateRequestRejectsProtocolFieldErrors(t *testing.T) {
 		{name: "messages must be array", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":{}}`, wantDetail: "messages must be an array"},
 		{name: "messages must not be empty", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[]}`, wantDetail: "messages must not be empty"},
 		{name: "messages item must be object", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":["hello"]}`, wantDetail: "messages[0] must be an object"},
-		{name: "messages role unsupported", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"system","content":"hello"}]}`, wantDetail: "messages[0].role"},
+		{name: "messages role unsupported", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"developer","content":"hello"}]}`, wantDetail: "messages[0].role"},
 		{name: "messages content wrong type", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"user","content":42}]}`, wantDetail: "messages[0].content"},
 		{name: "messages content item must be object", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"user","content":["hello"]}]}`, wantDetail: "messages[0].content[0]"},
 		{name: "messages content type missing", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"user","content":[{"text":"hello"}]}]}`, wantDetail: "messages[0].content[0].type"},
@@ -160,6 +160,8 @@ func TestGetAndValidateRequestRejectsProtocolFieldErrors(t *testing.T) {
 		{name: "messages tool use input must be object", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":"{}"}]}]}`, wantDetail: "messages[0].content[0].input"},
 		{name: "messages tool result missing id", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"user","content":[{"type":"tool_result","content":"ok"}]}]}`, wantDetail: "messages[0].content[0].tool_use_id"},
 		{name: "messages tool result content wrong type", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":42}]}]}`, wantDetail: "messages[0].content[0].content"},
+		{name: "messages system media is unsupported", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"system","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]},{"role":"user","content":"hello"}]}`, wantDetail: "messages[0].content[0].type"},
+		{name: "messages system only", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"system","content":"rules"}]}`, wantDetail: "at least one user or assistant"},
 		{name: "messages system wrong type", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","system":42,"messages":[{"role":"user","content":"hello"}]}`, wantDetail: "system"},
 		{name: "messages system block type unsupported", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","system":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}],"messages":[{"role":"user","content":"hello"}]}`, wantDetail: "system[0].type"},
 		{name: "messages content type unsupported", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"user","content":[{"type":"future_private_block"}]}]}`, wantDetail: "messages[0].content[0].type"},
@@ -243,6 +245,60 @@ func TestGetAndValidateRequestRejectsProtocolFieldErrors(t *testing.T) {
 			validationErr, ok := AsClientRequestValidationError(err)
 			require.True(t, ok)
 			require.Equal(t, http.StatusBadRequest, validationErr.StatusCode)
+		})
+	}
+}
+
+func TestClaudeMessageSystemIsNormalizedIntoTopLevelSystem(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		wantSystem    []string
+		wantStringSys string
+		wantMessages  []string
+	}{
+		{
+			name:          "string message system",
+			body:          `{"model":"test-model","messages":[{"role":"system","content":"rules"},{"role":"user","content":"hello"}]}`,
+			wantStringSys: "rules",
+			wantMessages:  []string{"user"},
+		},
+		{
+			name:         "block message system",
+			body:         `{"model":"test-model","messages":[{"role":"user","content":"hello"},{"role":"system","content":[{"type":"text","text":"middle"},{"type":"input_text","text":"last"}]},{"role":"assistant","content":"ok"}]}`,
+			wantSystem:   []string{"middle", "last"},
+			wantMessages: []string{"user", "assistant"},
+		},
+		{
+			name:         "top-level and message systems preserve order",
+			body:         `{"model":"test-model","system":[{"type":"text","text":"top"}],"messages":[{"role":"user","content":"hello"},{"role":"system","content":"middle"},{"role":"system","content":[{"type":"text","text":"last"}]},{"role":"assistant","content":"ok"}]}`,
+			wantSystem:   []string{"top", "middle", "last"},
+			wantMessages: []string{"user", "assistant"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := GetAndValidateRequest(newRelayValidationContext(t, "/v1/messages", []byte(test.body)), types.RelayFormatClaude)
+			require.NoError(t, err)
+			claudeRequest, ok := request.(*dto.ClaudeRequest)
+			require.True(t, ok)
+			require.Len(t, claudeRequest.Messages, len(test.wantMessages))
+			for index, role := range test.wantMessages {
+				require.Equal(t, role, claudeRequest.Messages[index].Role)
+			}
+
+			if test.wantStringSys != "" {
+				require.True(t, claudeRequest.IsStringSystem())
+				require.Equal(t, test.wantStringSys, claudeRequest.GetStringSystem())
+				return
+			}
+
+			systemParts := claudeRequest.ParseSystem()
+			require.Len(t, systemParts, len(test.wantSystem))
+			for index, want := range test.wantSystem {
+				require.Equal(t, want, systemParts[index].GetText())
+			}
 		})
 	}
 }

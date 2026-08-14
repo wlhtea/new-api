@@ -309,12 +309,100 @@ func validateClaudeRequest(textRequest *dto.ClaudeRequest) (*dto.ClaudeRequest, 
 	if exceedsMaxTokensLimit(textRequest.MaxTokens, textRequest.MaxTokensToSample) {
 		return nil, errors.New("max_tokens is invalid")
 	}
+	if err := normalizeClaudeSystemMessages(textRequest); err != nil {
+		return nil, err
+	}
 
 	//if textRequest.Stream {
 	//	relayInfo.IsStream = true
 	//}
 
 	return textRequest, nil
+}
+
+// normalizeClaudeSystemMessages accepts Claude Code's message-level system
+// entries and moves them into the Anthropic top-level system field. The
+// upstream Messages schema only permits user/assistant message roles.
+func normalizeClaudeSystemMessages(request *dto.ClaudeRequest) error {
+	if request == nil {
+		return errors.New("request is nil")
+	}
+
+	messages := make([]dto.ClaudeMessage, 0, len(request.Messages))
+	systemContents := make([]any, 0)
+	for index, message := range request.Messages {
+		switch message.Role {
+		case "user", "assistant":
+			messages = append(messages, message)
+		case "system":
+			if message.Content == nil {
+				return fmt.Errorf("messages[%d].content is required", index)
+			}
+			systemContents = append(systemContents, message.Content)
+		default:
+			return fmt.Errorf("messages[%d].role must be user, assistant, or system", index)
+		}
+	}
+	if len(messages) == 0 {
+		return errors.New("field messages must contain at least one user or assistant message")
+	}
+
+	if len(systemContents) > 0 {
+		mergedSystem, err := mergeClaudeSystemContents(request.System, systemContents)
+		if err != nil {
+			return err
+		}
+		request.System = mergedSystem
+	}
+	request.Messages = messages
+	return nil
+}
+
+func mergeClaudeSystemContents(existing any, additions []any) (any, error) {
+	if existing == nil && len(additions) == 1 {
+		switch content := additions[0].(type) {
+		case string, []any:
+			return content, nil
+		}
+	}
+
+	parts := make([]any, 0)
+	if existing != nil {
+		if err := appendClaudeSystemParts(&parts, existing); err != nil {
+			return nil, err
+		}
+	}
+	for _, content := range additions {
+		if err := appendClaudeSystemParts(&parts, content); err != nil {
+			return nil, err
+		}
+	}
+	return parts, nil
+}
+
+func appendClaudeSystemParts(parts *[]any, content any) error {
+	switch typed := content.(type) {
+	case string:
+		*parts = append(*parts, map[string]any{"type": "text", "text": typed})
+	case []any:
+		for _, part := range typed {
+			if _, ok := part.(map[string]any); !ok {
+				return errors.New("system must be a string or array of objects")
+			}
+			*parts = append(*parts, part)
+		}
+	case []dto.ClaudeMediaMessage:
+		for _, part := range typed {
+			*parts = append(*parts, part)
+		}
+	case []map[string]any:
+		for _, part := range typed {
+			*parts = append(*parts, part)
+		}
+	default:
+		return errors.New("system must be a string or array of objects")
+	}
+	return nil
 }
 
 func GetAndValidateTextRequest(c *gin.Context, relayMode int) (*dto.GeneralOpenAIRequest, error) {

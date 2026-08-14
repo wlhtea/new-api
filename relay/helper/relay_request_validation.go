@@ -755,6 +755,7 @@ func validateClaudeRawRequest(raw map[string]any) error {
 	if err != nil {
 		return err
 	}
+	hasConversationMessage := false
 	for index := range messages {
 		message, err := objectAt(messages, index, "messages")
 		if err != nil {
@@ -764,17 +765,32 @@ func validateClaudeRawRequest(raw map[string]any) error {
 		if err != nil {
 			return err
 		}
-		if role != "user" && role != "assistant" {
-			return newClientRequestValidationError(http.StatusBadRequest, "messages[%d].role must be user or assistant", index)
+		switch role {
+		case "user", "assistant":
+			hasConversationMessage = true
+			contentPath := fmt.Sprintf("messages[%d].content", index)
+			content, err := requirePresent(message, "content", contentPath)
+			if err != nil {
+				return err
+			}
+			if err := validateStringOrObjectArray(content, contentPath, validateClaudeContentPart); err != nil {
+				return err
+			}
+		case "system":
+			contentPath := fmt.Sprintf("messages[%d].content", index)
+			content, err := requirePresent(message, "content", contentPath)
+			if err != nil {
+				return err
+			}
+			if err := validateStringOrObjectArrayWithTypes(content, contentPath, validateClaudeContentPart, "text", "input_text"); err != nil {
+				return err
+			}
+		default:
+			return newClientRequestValidationError(http.StatusBadRequest, "messages[%d].role must be user, assistant, or system", index)
 		}
-		contentPath := fmt.Sprintf("messages[%d].content", index)
-		content, err := requirePresent(message, "content", contentPath)
-		if err != nil {
-			return err
-		}
-		if err := validateStringOrObjectArray(content, contentPath, validateClaudeContentPart); err != nil {
-			return err
-		}
+	}
+	if !hasConversationMessage {
+		return newClientRequestValidationError(http.StatusBadRequest, "messages must contain at least one user or assistant message")
 	}
 	return nil
 }
