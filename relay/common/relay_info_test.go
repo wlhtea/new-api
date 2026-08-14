@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -13,6 +14,43 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestOpenCodeChannelTypesSupportStreaming(t *testing.T) {
+	assert.True(t, streamSupportedChannels[constant.ChannelTypeOpenCodeGo])
+	assert.True(t, streamSupportedChannels[constant.ChannelTypeOpenCodeAPIKey])
+}
+
+func TestOpenCodeStreamReadyForFinalization(t *testing.T) {
+	assert.True(t, OpenCodeStreamReadyForFinalization(nil))
+	assert.True(t, OpenCodeStreamReadyForFinalization(&RelayInfo{
+		ChannelMeta: &ChannelMeta{ChannelType: constant.ChannelTypeOpenAI},
+	}))
+
+	for _, channelType := range []int{
+		constant.ChannelTypeOpenCodeGo,
+		constant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(constant.ChannelTypeNames[channelType], func(t *testing.T) {
+			chatInfo := &RelayInfo{ChannelMeta: &ChannelMeta{ChannelType: channelType}}
+			assert.False(t, OpenCodeStreamReadyForFinalization(chatInfo))
+			chatInfo.StreamStatus = NewStreamStatus()
+			assert.False(t, OpenCodeStreamReadyForFinalization(chatInfo))
+			chatInfo.StreamStatus.MarkDoneSentinel()
+			assert.True(t, OpenCodeStreamReadyForFinalization(chatInfo))
+
+			protocolInfo := &RelayInfo{
+				ChannelMeta:                    &ChannelMeta{ChannelType: channelType},
+				StreamStatus:                   NewStreamStatus(),
+				StreamProtocolTerminalRequired: true,
+			}
+			assert.False(t, OpenCodeStreamReadyForFinalization(protocolInfo))
+			protocolInfo.StreamStatus.MarkDoneSentinel()
+			assert.False(t, OpenCodeStreamReadyForFinalization(protocolInfo))
+			protocolInfo.StreamStatus.MarkProtocolTerminal()
+			assert.True(t, OpenCodeStreamReadyForFinalization(protocolInfo))
+		})
+	}
+}
 
 func TestRestoreUnwrittenStreamAttemptRestoresResponseState(t *testing.T) {
 	start := time.Now()

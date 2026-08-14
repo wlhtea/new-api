@@ -169,12 +169,13 @@ func Distribute() func(c *gin.Context) {
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
 		if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil &&
-			channel != nil && channel.Type == constant.ChannelTypeOpenCodeGo {
+			channel != nil && constant.IsOpenCodeChannelType(channel.Type) {
 			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, setupErr.MaskSensitiveError(), setupErr.GetErrorCode())
 			return
 		}
 		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
+		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest &&
+			!common.GetContextKeyBool(c, constant.ContextKeyRelayFailed) {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
@@ -453,12 +454,12 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelCreateTime, channel.CreatedTime)
 	var channelSetting dto.ChannelSettings
 	var channelOtherSettings dto.ChannelOtherSettings
-	if channel.Type == constant.ChannelTypeOpenCodeGo {
+	if constant.IsOpenCodeChannelType(channel.Type) {
 		var err error
 		channelSetting, err = channel.DecodeSetting()
 		if err != nil {
 			return types.NewError(
-				errors.New("OpenCode Go channel HTTP settings are invalid"),
+				errors.New("OpenCode channel HTTP settings are invalid"),
 				types.ErrorCodeGetChannelFailed,
 				types.ErrOptionWithSkipRetry(),
 			)
@@ -466,7 +467,7 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		channelOtherSettings, err = channel.DecodeOtherSettings()
 		if err != nil {
 			return types.NewError(
-				errors.New("OpenCode Go channel identity proxy settings are invalid"),
+				errors.New("OpenCode channel settings are invalid"),
 				types.ErrorCodeGetChannelFailed,
 				types.ErrOptionWithSkipRetry(),
 			)

@@ -208,23 +208,38 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 	return nil, errors.New("channel not found")
 }
 
-// IsOpenCodeGoSupportedRequestPath reports whether requestPath is one of the
-// inference endpoints implemented by OpenCode Go. Keep this exact: prefix
-// matching would accidentally admit endpoints such as /v1/responses/compact.
-func IsOpenCodeGoSupportedRequestPath(requestPath string) bool {
+// IsOpenCodeSupportedRequestPath reports whether requestPath is one of the
+// public inference endpoints shared by both OpenCode channel types. Keep this
+// exact: prefix matching would accidentally admit endpoints such as
+// /v1/responses/compact.
+func IsOpenCodeSupportedRequestPath(requestPath string) bool {
 	switch requestPath {
-	case "/v1/chat/completions", "/pg/chat/completions", "/v1/messages", "/v1/responses":
+	case "/v1/chat/completions", "/v1/messages", "/v1/responses":
 		return true
 	default:
 		return false
 	}
 }
 
+// IsOpenCodeGoSupportedRequestPath includes the playground path supported by
+// the Type-62 account pool. The ordinary Type-63 API-key channel deliberately
+// remains limited to the three public /v1 endpoints above.
+func IsOpenCodeGoSupportedRequestPath(requestPath string) bool {
+	return requestPath == "/pg/chat/completions" || IsOpenCodeSupportedRequestPath(requestPath)
+}
+
 // ChannelTypeSupportsRequestPath applies endpoint restrictions that depend
 // only on channel type. Callers that do not have a model (for example, an
 // origin-task lookup) can still enforce the OpenCode Go boundary with it.
 func ChannelTypeSupportsRequestPath(channelType int, requestPath string) bool {
-	return channelType != constant.ChannelTypeOpenCodeGo || IsOpenCodeGoSupportedRequestPath(requestPath)
+	switch channelType {
+	case constant.ChannelTypeOpenCodeGo:
+		return IsOpenCodeGoSupportedRequestPath(requestPath)
+	case constant.ChannelTypeOpenCodeAPIKey:
+		return IsOpenCodeSupportedRequestPath(requestPath)
+	default:
+		return true
+	}
 }
 
 // ChannelSupportsRequestPath applies all channel-selection endpoint rules.

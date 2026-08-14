@@ -213,6 +213,7 @@ func applyFetchModelsHeaderOverrides(channel *model.Channel, key string, headers
 	info := &relaycommon.RelayInfo{
 		IsChannelTest: true,
 		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:     channel.Type,
 			ApiKey:          key,
 			HeadersOverride: channel.GetHeaderOverride(),
 		},
@@ -498,6 +499,24 @@ func validateChannel(channel *model.Channel, isAdd bool) error {
 			return fmt.Errorf("OpenCode Go channel base URL is fixed at %s", fixedBaseURL)
 		}
 	}
+	if channel.Type == constant.ChannelTypeOpenCodeAPIKey {
+		trimmedKey := strings.TrimSpace(channel.Key)
+		if isAdd && trimmedKey == "" {
+			return fmt.Errorf("OpenCode API Key channel requires a non-empty API key")
+		}
+		if trimmedKey != "" && strings.ContainsAny(trimmedKey, "\r\n") {
+			return fmt.Errorf("OpenCode API Key channels store exactly one API key per row")
+		}
+		channel.Key = trimmedKey
+		configuredBaseURL := ""
+		if channel.BaseURL != nil {
+			configuredBaseURL = strings.TrimRight(strings.TrimSpace(*channel.BaseURL), "/")
+		}
+		fixedBaseURL := strings.TrimRight(constant.ChannelBaseURLs[constant.ChannelTypeOpenCodeAPIKey], "/")
+		if configuredBaseURL != "" && configuredBaseURL != fixedBaseURL {
+			return fmt.Errorf("OpenCode API Key channel base URL is fixed at %s", fixedBaseURL)
+		}
+	}
 
 	// 如果是添加操作，检查 channel 和 key 是否为空
 	if isAdd {
@@ -591,6 +610,153 @@ type AddChannelRequest struct {
 	Channel                   *model.Channel        `json:"channel"`
 }
 
+const (
+	openCodeAPIKeyBatchMode     = "opencode_api_key_batch"
+	openCodeAPIKeyBatchMaxBytes = 4 << 20
+	openCodeAPIKeyBatchMaxLines = 10_000
+)
+
+type openCodeAPIKeyBatchEntry struct {
+	Key   string
+	Proxy string
+	Line  int
+}
+
+func normalizeOpenCodeAPIKeyBatchProxy(rawProxy string) (string, error) {
+	proxy := strings.TrimSpace(rawProxy)
+	if proxy == "" {
+		return "", nil
+	}
+
+	// A literal pipe is valid batch data after the first separator when it is
+	// part of proxy userinfo. Persist its escaped form so normal channel setting
+	// validation and runtime URL parsing retain the credential byte exactly.
+	schemeEnd := strings.Index(proxy, "://")
+	if schemeEnd >= 0 {
+		authorityStart := schemeEnd + len("://")
+		authorityEnd := len(proxy)
+		if suffix := strings.IndexAny(proxy[authorityStart:], "/?#"); suffix >= 0 {
+			authorityEnd = authorityStart + suffix
+		}
+		if userinfoEnd := strings.LastIndex(proxy[authorityStart:authorityEnd], "@"); userinfoEnd >= 0 {
+			userinfoEnd += authorityStart
+			userinfo := strings.ReplaceAll(proxy[authorityStart:userinfoEnd], "|", "%7C")
+			proxy = proxy[:authorityStart] + userinfo + proxy[userinfoEnd:]
+		}
+	}
+
+	if _, err := common.ParseProxyURLStrict(proxy); err != nil {
+		return "", err
+	}
+	return proxy, nil
+}
+
+func openCodeAPIKeyBatchLineError(line int, problem string) error {
+	return fmt.Errorf("OpenCode API key batch line %d %s", line, problem)
+}
+
+// parseOpenCodeAPIKeyBatch keeps account credentials and proxy settings bound
+// to one source line. A key-only line is valid when no proxy is required.
+func parseOpenCodeAPIKeyBatch(raw string) ([]openCodeAPIKeyBatchEntry, error) {
+	if len(raw) > openCodeAPIKeyBatchMaxBytes {
+		return nil, fmt.Errorf("OpenCode API key batch exceeds the %d byte limit", openCodeAPIKeyBatchMaxBytes)
+	}
+	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+	if len(lines) > openCodeAPIKeyBatchMaxLines {
+		return nil, fmt.Errorf("OpenCode API key batch exceeds the %d line limit", openCodeAPIKeyBatchMaxLines)
+	}
+	entries := make([]openCodeAPIKeyBatchEntry, 0, len(lines))
+	seenKeys := make(map[string]int, len(lines))
+
+	for index, rawLine := range lines {
+		line := index + 1
+		value := strings.TrimSpace(rawLine)
+		if value == "" {
+			return nil, openCodeAPIKeyBatchLineError(line, "is empty")
+		}
+
+		key, proxy, _ := strings.Cut(value, "|")
+		key = strings.TrimSpace(key)
+		proxy = strings.TrimSpace(proxy)
+		if key == "" {
+			return nil, openCodeAPIKeyBatchLineError(line, "is missing an API key")
+		}
+		if firstLine, duplicate := seenKeys[key]; duplicate {
+			return nil, openCodeAPIKeyBatchLineError(line, fmt.Sprintf("duplicates the API key from line %d", firstLine))
+		}
+		proxy, err := normalizeOpenCodeAPIKeyBatchProxy(proxy)
+		if err != nil {
+			return nil, openCodeAPIKeyBatchLineError(line, "has an invalid proxy URL")
+		}
+
+		seenKeys[key] = line
+		entries = append(entries, openCodeAPIKeyBatchEntry{
+			Key:   key,
+			Proxy: proxy,
+			Line:  line,
+		})
+	}
+
+	return entries, nil
+}
+
+func cloneOpenCodeAPIKeyBatchTemplate(template *model.Channel) (*model.Channel, error) {
+	encoded, err := common.Marshal(template)
+	if err != nil {
+		return nil, fmt.Errorf("failed to clone OpenCode API key channel template: %w", err)
+	}
+	cloned := &model.Channel{}
+	if err := common.Unmarshal(encoded, cloned); err != nil {
+		return nil, fmt.Errorf("failed to clone OpenCode API key channel template: %w", err)
+	}
+	return cloned, nil
+}
+
+func openCodeAPIKeyBatchChannelName(name string, ordinal int) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Sprintf("%03d", ordinal)
+	}
+	return fmt.Sprintf("%s %03d", name, ordinal)
+}
+
+func buildOpenCodeAPIKeyBatchChannels(template *model.Channel, entries []openCodeAPIKeyBatchEntry) ([]model.Channel, error) {
+	if template == nil {
+		return nil, fmt.Errorf("channel cannot be empty")
+	}
+
+	// Pair-batch proxies replace the template proxy, while retaining the other
+	// ordinary transport settings for every imported channel.
+	templateSettings, err := template.DecodeSetting()
+	if err != nil {
+		return nil, fmt.Errorf("channel setting format error: %w", err)
+	}
+
+	channels := make([]model.Channel, 0, len(entries))
+	for index, entry := range entries {
+		localChannel, err := cloneOpenCodeAPIKeyBatchTemplate(template)
+		if err != nil {
+			return nil, err
+		}
+		localChannel.Id = 0
+		localChannel.Keys = nil
+		localChannel.Key = entry.Key
+		localChannel.Name = openCodeAPIKeyBatchChannelName(template.Name, index+1)
+		localChannel.ChannelInfo = model.ChannelInfo{}
+
+		settings := templateSettings
+		settings.Proxy = entry.Proxy
+		localChannel.SetSetting(settings)
+
+		if err := validateChannel(localChannel, true); err != nil {
+			return nil, openCodeAPIKeyBatchLineError(entry.Line, "is invalid")
+		}
+		channels = append(channels, *localChannel)
+	}
+
+	return channels, nil
+}
+
 func getVertexArrayKeys(keys string) ([]string, error) {
 	if keys == "" {
 		return nil, nil
@@ -630,9 +796,39 @@ func AddChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if addChannelRequest.Channel != nil &&
+		addChannelRequest.Channel.Type == constant.ChannelTypeOpenCodeAPIKey &&
+		addChannelRequest.Mode != "single" && addChannelRequest.Mode != openCodeAPIKeyBatchMode {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "OpenCode API Key channels only support single or opencode_api_key_batch creation",
+		})
+		return
+	}
+
+	validationChannel := addChannelRequest.Channel
+	if addChannelRequest.Channel != nil &&
+		addChannelRequest.Channel.Type == constant.ChannelTypeOpenCodeAPIKey &&
+		addChannelRequest.Mode == openCodeAPIKeyBatchMode {
+		// The pair-batch mode owns proxy values per line. Do not let a stale
+		// shared proxy form field affect validation or get copied into rows.
+		batchValidationChannel := *addChannelRequest.Channel
+		batchSettings, settingsErr := batchValidationChannel.DecodeSetting()
+		if settingsErr != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": fmt.Sprintf("渠道额外设置[channel setting] 格式错误：%s", settingsErr),
+			})
+			return
+		}
+		batchSettings.Proxy = ""
+		batchValidationChannel.SetSetting(batchSettings)
+		batchValidationChannel.Key = "batch-entry"
+		validationChannel = &batchValidationChannel
+	}
 
 	// 使用统一的校验函数
-	if err := validateChannel(addChannelRequest.Channel, true); err != nil {
+	if err := validateChannel(validationChannel, true); err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": err.Error(),
@@ -641,6 +837,45 @@ func AddChannel(c *gin.Context) {
 	}
 
 	addChannelRequest.Channel.CreatedTime = common.GetTimestamp()
+	if addChannelRequest.Channel.Type == constant.ChannelTypeOpenCodeAPIKey {
+		switch addChannelRequest.Mode {
+		case "single":
+			addChannelRequest.Channel.Key = strings.TrimSpace(addChannelRequest.Channel.Key)
+			addChannelRequest.Channel.Keys = nil
+			addChannelRequest.Channel.ChannelInfo = model.ChannelInfo{}
+		case openCodeAPIKeyBatchMode:
+			entries, err := parseOpenCodeAPIKeyBatch(addChannelRequest.Channel.Key)
+			if err != nil {
+				c.JSON(http.StatusOK, gin.H{
+					"success": false,
+					"message": err.Error(),
+				})
+				return
+			}
+			channels, err := buildOpenCodeAPIKeyBatchChannels(addChannelRequest.Channel, entries)
+			if err != nil {
+				c.JSON(http.StatusOK, gin.H{
+					"success": false,
+					"message": err.Error(),
+				})
+				return
+			}
+			if err := model.BatchInsertChannels(channels); err != nil {
+				common.ApiError(c, err)
+				return
+			}
+			recordManageAudit(c, "channel.create", map[string]interface{}{
+				"type":  addChannelRequest.Channel.Type,
+				"count": len(channels),
+				"tag":   addChannelRequest.Channel.GetTag(),
+			})
+			c.JSON(http.StatusOK, gin.H{
+				"success": true,
+				"message": "",
+			})
+			return
+		}
+	}
 	if addChannelRequest.Channel.Type == constant.ChannelTypeOpenCodeGo && addChannelRequest.Mode != "single" {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -1109,8 +1344,8 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	if channel.Type != originChannel.Type &&
-		(channel.Type == constant.ChannelTypeOpenCodeGo || originChannel.Type == constant.ChannelTypeOpenCodeGo) {
-		common.ApiError(c, errors.New("OpenCode Go channel type cannot be changed after creation"))
+		(constant.IsOpenCodeChannelType(channel.Type) || constant.IsOpenCodeChannelType(originChannel.Type)) {
+		common.ApiError(c, errors.New("OpenCode channel type cannot be changed after creation"))
 		return
 	}
 	if channel.Type == constant.ChannelTypeOpenCodeGo {
@@ -1126,6 +1361,14 @@ func UpdateChannel(c *gin.Context) {
 
 	// Always copy the original ChannelInfo so that fields like IsMultiKey and MultiKeySize are retained.
 	channel.ChannelInfo = originChannel.ChannelInfo
+	// OpenCode API Key rows are one-key ordinary channels. Normalize legacy or
+	// hand-crafted rows that may still carry multi-key metadata so the relay
+	// never routes them through positional key selection.
+	if channel.Type == constant.ChannelTypeOpenCodeAPIKey {
+		channel.ChannelInfo = model.ChannelInfo{}
+		channel.MultiKeyMode = nil
+		channel.KeyMode = nil
+	}
 
 	if channelHasSensitiveChanges(&channel, originChannel, requestData) &&
 		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
@@ -1507,7 +1750,7 @@ func FetchModels(c *gin.Context) {
 			})
 			return
 		}
-		if savedChannel.Type == constant.ChannelTypeOpenCodeGo {
+		if constant.IsOpenCodeChannelType(savedChannel.Type) {
 			channel = savedChannel
 		}
 	}
@@ -1735,6 +1978,17 @@ func ManageMultiKeys(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "渠道不存在",
+		})
+		return
+	}
+
+	// Type 63 deliberately binds one key and one proxy to each channel row.
+	// Reject stale or hand-crafted multi-key metadata before any positional
+	// management action can expose or mutate it.
+	if channel.Type == constant.ChannelTypeOpenCodeAPIKey {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "OpenCode API Key 渠道不支持多密钥管理",
 		})
 		return
 	}

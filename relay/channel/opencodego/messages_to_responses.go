@@ -139,6 +139,9 @@ func messagesToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInf
 	if streamErr != nil {
 		return nil, streamErr
 	}
+	if !relaycommon.OpenCodeStreamReadyForFinalization(info) {
+		return state.Usage(), nil
+	}
 
 	if claudeInfo.Usage != nil {
 		state.SetUsage(relayconvert.UsageFromClaudeUsage(claudeInfo.Usage))

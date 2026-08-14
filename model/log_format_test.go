@@ -1,6 +1,7 @@
 package model
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 
@@ -330,4 +331,156 @@ func TestFormatUserLogsPreservesRawOpenCodeGoErrorRecord(t *testing.T) {
 	require.Equal(t, "wrk_upstream_private", raw.UpstreamRequestId)
 	require.Contains(t, raw.Other, "workspace_secret")
 	require.NotEqual(t, raw, public)
+}
+
+func TestFormatUserLogsProjectsOpenCodeAPIKeyWithoutMutatingStoredRecord(t *testing.T) {
+	raw := Log{
+		Type:              LogTypeError,
+		Content:           "Console Go endpoint failed for workspace wrk_private",
+		ChannelId:         81,
+		ChannelName:       "OpenCode API Key account",
+		UpstreamRequestId: "upstream-private-request",
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"channel_type": constant.ChannelTypeOpenCodeAPIKey,
+			"error_type":   "upstream_error",
+			"error_code":   "server_error",
+			"status_code":  http.StatusBadGateway,
+			"admin_info": map[string]interface{}{
+				"proxy": "socks5://private.example:1080",
+			},
+		}),
+	}
+	public := raw
+
+	formatUserLogs([]*Log{&public}, 0)
+
+	require.Equal(t, constant.OpenCodeGoPublicOverloadMessage, public.Content)
+	require.Zero(t, public.ChannelId)
+	require.Empty(t, public.ChannelName)
+	require.Empty(t, public.UpstreamRequestId)
+	publicOther, err := common.StrToMap(public.Other)
+	require.NoError(t, err)
+	require.Equal(t, map[string]interface{}{
+		"error_type":  constant.OpenCodeGoPublicRateLimitErrorCode,
+		"error_code":  constant.OpenCodeGoPublicRateLimitErrorCode,
+		"status_code": float64(http.StatusTooManyRequests),
+	}, publicOther)
+
+	require.Contains(t, raw.Content, "Console Go")
+	require.Equal(t, 81, raw.ChannelId)
+	require.Equal(t, "upstream-private-request", raw.UpstreamRequestId)
+	require.Contains(t, raw.Other, "private.example")
+}
+
+func TestFormatUserLogsKeepsOnlySafeExplicitOpenCodeClientDetails(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		errorCode   string
+		wantStatus  int
+		wantCode    string
+		wantContent string
+	}{
+		{
+			name:        "safe explicit client error",
+			content:     "status_code=400, Error from provider (Console Go): Upstream request failed: [invalid_request_error] messages[0].role is required",
+			errorCode:   "invalid_request_error",
+			wantStatus:  http.StatusBadRequest,
+			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
+			wantContent: "messages[0].role is required",
+		},
+		{
+			name:        "private explicit client error",
+			content:     "status_code=400, invalid request for workspace wrk_private",
+			errorCode:   "invalid_request_error",
+			wantStatus:  http.StatusBadRequest,
+			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
+			wantContent: constant.OpenCodeGoPublicInvalidRequestMessage,
+		},
+		{
+			name:        "credential explicit client error",
+			content:     "status_code=400, invalid request: Authorization: Bearer private-upstream-token; proxy socks5://proxy-user:proxy-password@10.0.0.8:1080",
+			errorCode:   "invalid_request_error",
+			wantStatus:  http.StatusBadRequest,
+			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
+			wantContent: constant.OpenCodeGoPublicInvalidRequestMessage,
+		},
+		{
+			name:        "ambiguous upstream 400",
+			content:     "status_code=400, operator-managed credential was rejected",
+			errorCode:   "upstream_error",
+			wantStatus:  http.StatusTooManyRequests,
+			wantCode:    constant.OpenCodeGoPublicRateLimitErrorCode,
+			wantContent: constant.OpenCodeGoPublicOverloadMessage,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			log := &Log{
+				Type:      LogTypeError,
+				Content:   test.content,
+				ChannelId: 81,
+				Other: common.MapToJsonStr(map[string]interface{}{
+					"channel_type": constant.ChannelTypeOpenCodeAPIKey,
+					"error_type":   "openai_error",
+					"error_code":   test.errorCode,
+					"status_code":  http.StatusBadRequest,
+				}),
+			}
+
+			formatUserLogs([]*Log{log}, 0)
+
+			require.Equal(t, test.wantContent, log.Content)
+			publicOther, err := common.StrToMap(log.Other)
+			require.NoError(t, err)
+			require.Equal(t, float64(test.wantStatus), publicOther["status_code"])
+			require.Equal(t, test.wantCode, publicOther["error_type"])
+			require.Equal(t, test.wantCode, publicOther["error_code"])
+		})
+	}
+}
+
+func TestFormatUserLogsUsesRawUpstreamStatusForOpenCodeClientProjection(t *testing.T) {
+	tests := []struct {
+		name               string
+		upstreamStatusCode int
+		wantStatus         int
+	}{
+		{name: "raw 400 preserves safe client detail", upstreamStatusCode: http.StatusBadRequest, wantStatus: http.StatusBadRequest},
+		{name: "raw 422 preserves safe client detail", upstreamStatusCode: http.StatusUnprocessableEntity, wantStatus: http.StatusBadRequest},
+		{name: "raw 401 fails closed", upstreamStatusCode: http.StatusUnauthorized, wantStatus: http.StatusTooManyRequests},
+		{name: "raw 429 fails closed", upstreamStatusCode: http.StatusTooManyRequests, wantStatus: http.StatusTooManyRequests},
+		{name: "raw 200 envelope fails closed", upstreamStatusCode: http.StatusOK, wantStatus: http.StatusTooManyRequests},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			log := &Log{
+				Type:      LogTypeError,
+				Content:   "messages[0].role is required",
+				ChannelId: 81,
+				Other: common.MapToJsonStr(map[string]interface{}{
+					"channel_type": constant.ChannelTypeOpenCodeAPIKey,
+					"error_type":   "invalid_request_error",
+					"error_code":   "invalid_request_error",
+					"status_code":  http.StatusBadRequest,
+					"admin_info": map[string]interface{}{
+						"upstream_status_code": test.upstreamStatusCode,
+					},
+				}),
+			}
+
+			formatUserLogs([]*Log{log}, 0)
+
+			other, err := common.StrToMap(log.Other)
+			require.NoError(t, err)
+			require.Equal(t, float64(test.wantStatus), other["status_code"])
+			if test.wantStatus == http.StatusBadRequest {
+				require.Equal(t, "messages[0].role is required", log.Content)
+			} else {
+				require.Equal(t, constant.OpenCodeGoPublicOverloadMessage, log.Content)
+			}
+		})
+	}
 }

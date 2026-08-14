@@ -46,7 +46,7 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		return types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
 	}
 	adaptor.Init(info)
-	if info.ChannelType == constant.ChannelTypeOpenCodeGo &&
+	if constant.IsOpenCodeChannelType(info.ChannelType) &&
 		(model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled) {
 		return types.NewErrorWithStatusCode(
 			fmt.Errorf("OpenCode Go does not allow pass-through request bodies"),
@@ -198,7 +198,11 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 			}
 		}
 
-		logger.LogDebug(c, "requestBody: %s", jsonData)
+		if constant.IsOpenCodeChannelType(info.GetChannelType()) {
+			logger.LogDebug(c, "upstream request body omitted (bytes=%d)", len(jsonData))
+		} else {
+			logger.LogDebug(c, "requestBody: %s", jsonData)
+		}
 		body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())

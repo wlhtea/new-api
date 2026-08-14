@@ -44,6 +44,40 @@ var openCodeGoClientErrorMarkers = []string{
 	"channel:header_override_invalid",
 }
 
+// openCodeGoUpstreamOperatorErrorMarkers are classifications controlled by
+// the upstream/operator rather than the caller. Some providers attach one of
+// these codes to an otherwise client-looking type such as
+// invalid_request_error, so they must win over the client allowlist.
+var openCodeGoUpstreamOperatorErrorMarkers = []string{
+	"authentication",
+	"authorization",
+	"auth_error",
+	"autherror",
+	"invalid_api_key",
+	"invalid api key",
+	"invalid_token",
+	"invalid token",
+	"unauthorized",
+	"forbidden",
+	"credential",
+	"access_denied",
+	"access denied",
+	"policy",
+	"violation",
+	"moderation",
+	"safety",
+	"blocked",
+	"rate_limit",
+	"rate-limit",
+	"ratelimit",
+	"too_many_requests",
+	"usage_limit",
+	"usagelimit",
+	"quota",
+	"credit",
+	"overload",
+}
+
 var openCodeGoRateLimitMarkers = []string{
 	"rate_limit",
 	"ratelimit",
@@ -110,6 +144,9 @@ func ClassifyOpenCodeGoPublicError(statusCode int, errorType, errorCode, message
 	if openCodeGoErrorMessageContains(message, openCodeGoInternalFailureMarkers) {
 		return openCodeGoPublicOverload()
 	}
+	if IsOpenCodeGoUpstreamOperatorErrorClassification(errorType, errorCode) {
+		return openCodeGoPublicOverload()
+	}
 	if IsOpenCodeGoClientRequestError(errorType, errorCode, message) {
 		return openCodeGoPublicInvalidRequest()
 	}
@@ -132,14 +169,38 @@ func ClassifyOpenCodeGoPublicError(statusCode int, errorType, errorCode, message
 	return openCodeGoPublicOverload()
 }
 
-// IsOpenCodeGoClientRequestError reports whether the provider explicitly
-// classified a failure as invalid client input. A raw 400 alone is not enough:
-// policy and other upstream failures can also use that status.
-func IsOpenCodeGoClientRequestError(errorType, errorCode, message string) bool {
+// IsOpenCodeGoExplicitClientRequestError reports whether a provider explicitly
+// classified a failure as invalid client input. Credential, policy, quota, and
+// rate-limit classifications veto the allowlist even when type/code also
+// contains a client-error marker.
+func IsOpenCodeGoExplicitClientRequestError(errorType, errorCode, message string) bool {
 	typeCode := strings.ToLower(strings.Join([]string{errorType, errorCode}, " "))
 	message = strings.ToLower(message)
 	return !openCodeGoErrorMessageContains(message, openCodeGoInternalFailureMarkers) &&
+		!IsOpenCodeGoUpstreamOperatorErrorClassification(errorType, errorCode) &&
 		openCodeGoErrorClassificationContains(typeCode, openCodeGoClientErrorMarkers)
+}
+
+// IsOpenCodeGoClientRequestError is retained for callers that only need the
+// non-conflicting explicit classification. Upstream callers must additionally
+// use IsOpenCodeGoSafeUpstreamClientRequestError with the raw upstream status.
+func IsOpenCodeGoClientRequestError(errorType, errorCode, message string) bool {
+	return IsOpenCodeGoExplicitClientRequestError(errorType, errorCode, message)
+}
+
+// IsOpenCodeGoUpstreamOperatorErrorClassification reports classifications
+// owned by the upstream/operator, which must never be exposed as a user 400.
+func IsOpenCodeGoUpstreamOperatorErrorClassification(errorType, errorCode string) bool {
+	typeCode := strings.ToLower(strings.Join([]string{errorType, errorCode}, " "))
+	return openCodeGoErrorClassificationContains(typeCode, openCodeGoUpstreamOperatorErrorMarkers)
+}
+
+// IsOpenCodeGoSafeUpstreamClientRequestError is the strict public boundary for
+// marked upstream errors. HTTP-200 envelopes and every other non-400/422
+// upstream status fail closed even when their type/code looks client-related.
+func IsOpenCodeGoSafeUpstreamClientRequestError(statusCode int, errorType, errorCode, message string) bool {
+	return (statusCode == http.StatusBadRequest || statusCode == http.StatusUnprocessableEntity) &&
+		IsOpenCodeGoExplicitClientRequestError(errorType, errorCode, message)
 }
 
 func openCodeGoPublicInvalidRequest() OpenCodeGoPublicError {
@@ -233,7 +294,7 @@ func OpenCodeGoStringHasDistinctPrivateErrorMarker(value string) bool {
 			return true
 		}
 	}
-	collapsed := strings.NewReplacer(" ", "", "_", "", "-", "").Replace(normalized)
+	collapsed := strings.NewReplacer(" ", "", "_", "", "-", "", ".", "", "/", "").Replace(normalized)
 	for _, marker := range []string{"opencode", "consolego", "workspace"} {
 		if strings.Contains(collapsed, marker) {
 			return true

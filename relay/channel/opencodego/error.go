@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -23,9 +24,17 @@ const (
 
 var observeOpenCodeGoProviderFailure = service.ObserveOpenCodeGoProviderFailure
 
+func openCodeUpstreamErrorOptions(c *gin.Context, info *relaycommon.RelayInfo) []types.NewAPIErrorOptions {
+	if info == nil || constant.IsOpenCodeGoPoolChannelType(info.GetChannelType()) ||
+		(c != nil && c.Writer != nil && c.Writer.Written()) {
+		return []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
+	}
+	return nil
+}
+
 func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*types.NewAPIError, *channel.Non2xxResponseObservation) {
 	if resp == nil {
-		err := types.NewOpenAIError(errors.New("OpenCode Go returned no response"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		err := types.NewOpenAIError(errors.New("OpenCode Go returned no response"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway, openCodeUpstreamErrorOptions(c, info)...)
 		return service.MarkOpenCodeGoUpstreamRelayError(err), &channel.Non2xxResponseObservation{Provider: ChannelName, StatusCode: http.StatusBadGateway, ErrorCode: string(types.ErrorCodeBadResponseStatusCode)}
 	}
 	defer a.releaseInFlight()
@@ -50,7 +59,7 @@ func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info
 		if !openCodeGoCallerCancelled(c, readErr) {
 			a.persistProviderFailure(c, info, failure, observation)
 		}
-		err := types.NewOpenAIError(errors.New("failed to read OpenCode Go error response"), types.ErrorCodeReadResponseBodyFailed, resp.StatusCode, types.ErrOptionWithSkipRetry())
+		err := types.NewOpenAIError(errors.New("failed to read OpenCode Go error response"), types.ErrorCodeReadResponseBodyFailed, resp.StatusCode, openCodeUpstreamErrorOptions(c, info)...)
 		return service.MarkOpenCodeGoUpstreamRelayError(err), observation
 	}
 	if len(body) > maxErrorBodyBytes {
@@ -80,7 +89,7 @@ func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info
 		Code:     errorCode,
 		Metadata: metadata,
 	}
-	err := types.WithOpenAIError(openAIError, resp.StatusCode, types.ErrOptionWithSkipRetry())
+	err := types.WithOpenAIError(openAIError, resp.StatusCode, openCodeUpstreamErrorOptions(c, info)...)
 	observation := &channel.Non2xxResponseObservation{
 		Provider:   ChannelName,
 		StatusCode: resp.StatusCode,

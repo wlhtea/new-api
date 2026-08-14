@@ -231,6 +231,9 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	if err != nil {
 		return nil, err
 	}
+	if !relaycommon.OpenCodeStreamReadyForFinalization(info) {
+		return claudeInfo.Usage, nil
+	}
 
 	if finalErr := HandleStreamFinalResponse(c, info, claudeInfo); finalErr != nil {
 		if info.StreamStatus != nil {
@@ -306,7 +309,11 @@ func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayI
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
-	logger.LogDebug(c, "responseBody: %s", responseBody)
+	if constant.IsOpenCodeChannelType(info.GetChannelType()) {
+		logger.LogDebug(c, "upstream response body omitted (bytes=%d)", len(responseBody))
+	} else {
+		logger.LogDebug(c, "responseBody: %s", responseBody)
+	}
 	handleErr := HandleClaudeResponseData(c, info, claudeInfo, resp, responseBody)
 	if handleErr != nil {
 		return nil, handleErr

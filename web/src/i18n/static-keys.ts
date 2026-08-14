@@ -104,6 +104,14 @@ export const STATIC_I18N_KEYS = [
   'Successfully deleted {{count}} API key(s)',
   'Enter API key for this channel',
 
+  // OpenCode API Key channel (constants-driven labels)
+  'OpenCode API Key',
+  'Batch Add',
+  'Enter OpenCode API key',
+
+  // Channel affinity key sources
+  'OpenCode identity (token_id fallback)',
+
   // Users
   'Root',
   'Deleted',

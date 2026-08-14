@@ -173,6 +173,30 @@ func TestOpenCodeGoChannelValidateIdentityProxyRejectsExplicitZeroMinutes(t *tes
 	require.ErrorContains(t, channel.ValidateSettings(), "identity_proxy_rotate_minutes")
 }
 
+func TestOpenCodeAPIKeyChannelValidatesOnlySharedProtocolSettings(t *testing.T) {
+	poolOnlyInvalid := &dto.OpenCodeGoConfig{
+		DefaultProtocol:            dto.OpenCodeGoProtocolResponses,
+		ModelProtocols:             map[string]string{"future-*": dto.OpenCodeGoProtocolMessages},
+		GenericFailoverThreshold:   1,
+		AffinityFallback:           "invalid-pool-value",
+		IdentityProxyEnabled:       true,
+		IdentityProxyCountry:       "invalid",
+		IdentityProxyRotateMinutes: -1,
+	}
+	channel := &Channel{Type: constant.ChannelTypeOpenCodeAPIKey}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{OpenCodeGo: poolOnlyInvalid})
+	require.NoError(t, channel.ValidateSettings())
+
+	poolOnlyInvalid.DefaultProtocol = "auto"
+	channel.SetOtherSettings(dto.ChannelOtherSettings{OpenCodeGo: poolOnlyInvalid})
+	require.ErrorContains(t, channel.ValidateSettings(), "default protocol")
+
+	poolOnlyInvalid.DefaultProtocol = dto.OpenCodeGoProtocolChat
+	poolOnlyInvalid.ModelProtocols = map[string]string{"future-[": dto.OpenCodeGoProtocolMessages}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{OpenCodeGo: poolOnlyInvalid})
+	require.ErrorContains(t, channel.ValidateSettings(), "model protocol pattern")
+}
+
 func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(t *testing.T) {
 	inferenceRoute := dto.AdvancedCustomRoute{
 		IncomingPath: "/v1/chat/completions",

@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -21,11 +22,12 @@ func PreValidateRelayRequest() gin.HandlerFunc {
 			return
 		}
 
-		_, err := helper.GetAndValidateRequest(c, format)
+		request, err := helper.GetAndValidateRequest(c, format)
 		if err != nil {
 			renderRelayRequestValidationError(c, format, err)
 			return
 		}
+		service.PrepareOpenCodeAffinityIdentity(c, request)
 		c.Next()
 	}
 }

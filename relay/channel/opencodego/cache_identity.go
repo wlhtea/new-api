@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -51,12 +52,15 @@ const (
 	AffinitySourcePromptCacheKey    = constant.OpenCodeGoAffinitySourcePromptCacheKey
 )
 
-// affinityIdentityForRequest resolves the workspace-affinity key and its source
-// for a request. Session markers keep priority; when none is present and the
-// channel opted into token fallback, the caller token identity is used so
-// stateless traffic (for example load tests) stays on a stable workspace
-// instead of round-robining and losing its cache on every request.
+// affinityIdentityForRequest resolves the account-affinity key and its source.
+// Type 63 defaults to token fallback for generic channel selection, while Type
+// 62 keeps its per-channel opt-in fallback for workspace selection.
 func affinityIdentityForRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (string, string) {
+	if info != nil && info.GetChannelType() == constant.ChannelTypeOpenCodeAPIKey {
+		identity := service.ResolveOpenCodeAffinityIdentityWithTokenID(c, request, true, info.TokenId)
+		return identity.Value, identity.Source
+	}
+
 	if c != nil && c.Request != nil {
 		if value := strings.TrimSpace(c.Request.Header.Get(claudeCodeSessionHeader)); value != "" {
 			return hashCacheIdentity("claude-code-session", value), AffinitySourceClaudeCodeSession

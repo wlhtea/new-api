@@ -133,6 +133,8 @@ func GetAdaptor(apiType int) channel.Adaptor {
 		return &newapi.Adaptor{}
 	case constant.APITypeOpenCodeGo:
 		return &opencodego.Adaptor{}
+	case constant.APITypeOpenCodeAPIKey:
+		return &opencodego.Adaptor{}
 	}
 	return nil
 }

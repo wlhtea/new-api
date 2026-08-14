@@ -16,7 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { CHANNEL_TYPES } from '../constants'
+import {
+  CHANNEL_TYPES,
+  CHANNEL_TYPE_OPENCODE_API_KEY,
+  CHANNEL_TYPE_OPENCODE_GO,
+} from '../constants'
 
 // ============================================================================
 // Channel Type Configuration
@@ -25,6 +29,7 @@ import { CHANNEL_TYPES } from '../constants'
 export const SEED_DANCE_DEFAULT_BASE_URL =
   'http://alb-o13xqj8f2cpjsa67ym.ap-northeast-1.alb.aliyuncsslbintl.com/v1/public_api/m-predict/polar4ai-i2v'
 export const OPENCODE_GO_BASE_URL = 'https://opencode.ai/zen/go/v1'
+export const OPENCODE_API_KEY_BASE_URL = OPENCODE_GO_BASE_URL
 
 export const OPENCODE_GO_MODELS = [
   'grok-4.5',
@@ -41,11 +46,14 @@ export const OPENCODE_GO_MODELS = [
   'minimax-m3',
   'minimax-m2.7',
   'minimax-m2.5',
+  'qwen3.8-max',
   'qwen3.7-max',
   'qwen3.7-plus',
   'qwen3.6-plus',
   'gpt-5.6-luna',
 ] as const
+
+export const OPENCODE_API_KEY_MODELS = [...OPENCODE_GO_MODELS] as const
 
 export interface ChannelTypeConfig {
   id: number
@@ -212,6 +220,15 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
     usesLegacyKey: false,
     supportedModels: [...OPENCODE_GO_MODELS],
   },
+  [CHANNEL_TYPE_OPENCODE_API_KEY]: {
+    id: CHANNEL_TYPE_OPENCODE_API_KEY,
+    name: CHANNEL_TYPES[CHANNEL_TYPE_OPENCODE_API_KEY],
+    icon: 'OpenCode',
+    defaultBaseUrl: OPENCODE_API_KEY_BASE_URL,
+    fixedBaseUrl: true,
+    usesLegacyKey: true,
+    supportedModels: [...OPENCODE_API_KEY_MODELS],
+  },
 }
 
 /**
@@ -272,6 +289,16 @@ export function shouldWarnAboutV1BaseUrl(
 
 export function usesLegacyChannelKey(type: number): boolean {
   return CHANNEL_TYPE_CONFIGS[type]?.usesLegacyKey !== false
+}
+
+export function isOpenCodeAPIKeyChannel(type: number): boolean {
+  return type === CHANNEL_TYPE_OPENCODE_API_KEY
+}
+
+export function usesOpenCodeProtocolSettings(type: number): boolean {
+  return (
+    type === CHANNEL_TYPE_OPENCODE_GO || type === CHANNEL_TYPE_OPENCODE_API_KEY
+  )
 }
 
 /**

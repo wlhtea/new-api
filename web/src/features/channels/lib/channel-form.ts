@@ -20,12 +20,13 @@ import { z } from 'zod'
 
 import {
   CHANNEL_TYPE_NEW_API,
+  CHANNEL_TYPE_OPENCODE_API_KEY,
   CHANNEL_TYPE_OPENCODE_GO,
   CHANNEL_STATUS,
   ERROR_MESSAGES,
   MODEL_FETCHABLE_TYPES,
 } from '../constants'
-import type { Channel } from '../types'
+import type { Channel, ChannelCreateMode } from '../types'
 import {
   CHANNEL_TYPE_ADVANCED_CUSTOM,
   advancedCustomConfigUsesRelativeUpstreamPath,
@@ -34,7 +35,14 @@ import {
   stringifyAdvancedCustomConfig,
   validateAdvancedCustomConfig,
 } from './advanced-custom'
-import { usesLegacyChannelKey } from './channel-type-config'
+import {
+  isOpenCodeAPIKeyChannel,
+  usesLegacyChannelKey,
+} from './channel-type-config'
+import {
+  isOpenCodeAPIKeyBatchForm,
+  resolveChannelCreateMode,
+} from './opencode-api-key'
 import {
   OPENCODE_GO_IDENTITY_PROXY_COUNTRY_ERROR,
   OPENCODE_GO_IDENTITY_PROXY_DEFAULT_COUNTRY,
@@ -437,6 +445,17 @@ export const channelFormSchema = z
         ctx,
         'key',
         'Vertex AI service account key must be valid JSON'
+      )
+    }
+
+    if (
+      data.type === CHANNEL_TYPE_OPENCODE_API_KEY &&
+      data.multi_key_mode === 'multi_to_single'
+    ) {
+      addRequiredIssue(
+        ctx,
+        'multi_key_mode',
+        'OpenCode API Key channels do not support multi-key mode'
       )
     }
 
@@ -857,11 +876,20 @@ export function transformChannelToFormDefaults(
  * Build the setting JSON string from form extra settings
  */
 export function buildSettingJSON(formData: ChannelFormValues): string {
+  const proxy = isOpenCodeAPIKeyBatchForm(
+    formData.type,
+    formData.multi_key_mode,
+    false
+  )
+    ? ''
+    : formData.proxy?.trim() || ''
   const settingObj: Record<string, unknown> = {
     force_format: formData.force_format || false,
     thinking_to_content: formData.thinking_to_content || false,
-    proxy: formData.proxy?.trim() || '',
-    pass_through_body_enabled: formData.pass_through_body_enabled || false,
+    proxy,
+    pass_through_body_enabled:
+      formData.type !== CHANNEL_TYPE_OPENCODE_API_KEY &&
+      (formData.pass_through_body_enabled || false),
     system_prompt: formData.system_prompt || '',
     system_prompt_override: formData.system_prompt_override || false,
   }
@@ -1053,6 +1081,13 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     openCodeGo.auto_cancel_subscription_renewal =
       formData.opencode_go_auto_cancel_subscription_renewal === true
     settingsObj.opencode_go = openCodeGo
+  } else if (isOpenCodeAPIKeyChannel(formData.type)) {
+    settingsObj.opencode_go = {
+      model_protocols: parseOpenCodeGoProtocolOverrides(
+        formData.opencode_go_model_protocols
+      ),
+      default_protocol: formData.opencode_go_default_protocol || '',
+    }
   } else if ('opencode_go' in settingsObj) {
     delete settingsObj.opencode_go
   }
@@ -1070,12 +1105,12 @@ function normalizeBaseUrl(value: string | undefined): string {
  * Transform form data to API payload for creating channel
  */
 export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
-  mode: 'single' | 'batch' | 'multi_to_single'
+  mode: ChannelCreateMode
   multi_key_mode?: 'random' | 'polling'
   batch_add_set_key_prefix_2_name?: boolean
   channel: Partial<Channel>
 } {
-  const mode = formData.multi_key_mode || 'single'
+  const mode = resolveChannelCreateMode(formData.type, formData.multi_key_mode)
 
   const channel: Partial<Channel> = {
     name: formData.name,

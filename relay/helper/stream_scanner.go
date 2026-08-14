@@ -256,7 +256,15 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 			ticker.Reset(streamingTimeout)
 			rawData := strings.TrimSpace(scanner.Text())
-			logger.LogDebug(c, "stream scanner data: %s", rawData)
+			if info != nil && constant.IsOpenCodeChannelType(info.GetChannelType()) {
+				// OpenCode response envelopes can contain upstream credentials,
+				// proxy URLs, session identifiers, or private endpoints. The
+				// protocol-specific handler classifies and sanitizes them later;
+				// never write the raw SSE line to DEBUG logs here.
+				logger.LogDebug(c, "stream scanner data omitted (bytes=%d)", len(rawData))
+			} else {
+				logger.LogDebug(c, "stream scanner data: %s", rawData)
+			}
 
 			var data string
 			switch {

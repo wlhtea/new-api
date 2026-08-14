@@ -84,6 +84,32 @@ func TestHandleNon2xxResponseMarksEveryUpstreamErrorBranch(t *testing.T) {
 	}
 }
 
+func TestHandleNon2xxResponseRetryPolicyDiffersByOpenCodeChannelType(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		channelType   int
+		wantSkipRetry bool
+	}{
+		{name: "account pool owns dedicated retry", channelType: constant.ChannelTypeOpenCodeGo, wantSkipRetry: true},
+		{name: "api key row uses generic retry", channelType: constant.ChannelTypeOpenCodeAPIKey, wantSkipRetry: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: test.channelType}}
+			resp := &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"upstream_error","message":"temporary"}}`)),
+			}
+
+			apiErr, _ := (&Adaptor{}).HandleNon2xxResponse(newAdaptorTestContext(), resp, info)
+
+			require.NotNil(t, apiErr)
+			assert.Equal(t, test.wantSkipRetry, types.IsSkipRetryError(apiErr))
+			assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+		})
+	}
+}
+
 func TestHandleNon2xxResponseLogsOnlyPrivacySafeRequestShape(t *testing.T) {
 	originalWriter := gin.DefaultErrorWriter
 	var output bytes.Buffer
@@ -258,7 +284,11 @@ func TestHandleNon2xxResponseCountsOnlyGenericFailoverStatuses(t *testing.T) {
 		selectedWorkspaceUID: "workspace-provider",
 		failoverAttempt:      &service.OpenCodeGoFailoverAttempt{},
 	}
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "kimi-k3"}}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType:       constant.ChannelTypeOpenCodeGo,
+		ChannelId:         42,
+		UpstreamModelName: "kimi-k3",
+	}}
 	for _, test := range []struct {
 		status int
 		body   string
@@ -309,7 +339,11 @@ func TestHandleNon2xxResponseReadFailureStillClassifiesKnownStatus(t *testing.T)
 		selectedWorkspaceUID: "workspace-provider",
 		failoverAttempt:      &service.OpenCodeGoFailoverAttempt{},
 	}
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 42, UpstreamModelName: "kimi-k3"}}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType:       constant.ChannelTypeOpenCodeGo,
+		ChannelId:         42,
+		UpstreamModelName: "kimi-k3",
+	}}
 	for index, test := range []struct {
 		status       int
 		wantFailover int

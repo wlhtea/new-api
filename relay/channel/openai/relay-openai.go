@@ -124,7 +124,27 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
 	var streamErr *types.NewAPIError
-	strictOpenCodeGo := info != nil && info.ChannelType == constant.ChannelTypeOpenCodeGo
+	strictOpenCodeGo := info != nil && constant.IsOpenCodeChannelType(info.ChannelType)
+	var deferredClaudeTerminalBatch []*dto.ClaudeResponse
+
+	handleStreamFormat := func(data string) error {
+		if !strictOpenCodeGo || info.RelayFormat != types.RelayFormatClaude {
+			return HandleStreamFormat(c, info, data, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
+		}
+
+		info.SendResponseCount++
+		claudeResponses, err := convertClaudeStreamResponses(c, data, info)
+		if err != nil {
+			return err
+		}
+		for _, response := range claudeResponses {
+			if response != nil && response.Type == "message_stop" {
+				deferredClaudeTerminalBatch = claudeResponses
+				return nil
+			}
+		}
+		return writeClaudeStreamResponses(c, claudeResponses)
+	}
 
 	// 检查是否为音频模型
 	isAudioModel := strings.Contains(strings.ToLower(model), "audio")
@@ -135,7 +155,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			return
 		}
 		if lastStreamData != "" {
-			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
+			if err := handleStreamFormat(lastStreamData); err != nil {
 				common.SysLog("error handling stream format: " + err.Error())
 				if strictOpenCodeGo {
 					streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
@@ -184,6 +204,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	if streamErr != nil {
 		return nil, streamErr
 	}
+	if !relaycommon.OpenCodeStreamReadyForFinalization(info) {
+		return usage, nil
+	}
 
 	// 对音频模型，从倒数第二个stream data中提取usage信息
 	if isAudioModel && secondLastStreamData != "" {
@@ -207,7 +230,11 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	shouldSendLastResp := true
 	if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
 		&containStreamUsage, info, &shouldSendLastResp); err != nil {
-		logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
+		if strictOpenCodeGo {
+			logger.LogError(c, fmt.Sprintf("error handling last response: %s, last stream bytes: %d", err.Error(), len(lastStreamData)))
+		} else {
+			logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
+		}
 		if strictOpenCodeGo {
 			return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 		}
@@ -236,6 +263,12 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	}
 
 	if err := HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage); err != nil {
+		if info.StreamStatus != nil {
+			info.StreamStatus.MarkLocalFailure()
+		}
+		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+	if err := writeClaudeStreamResponses(c, deferredClaudeTerminalBatch); err != nil {
 		if info.StreamStatus != nil {
 			info.StreamStatus.MarkLocalFailure()
 		}
@@ -278,7 +311,11 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
-	logger.LogDebug(c, "upstream response body: %s", responseBody)
+	if constant.IsOpenCodeChannelType(info.GetChannelType()) {
+		logger.LogDebug(c, "upstream response body omitted (bytes=%d)", len(responseBody))
+	} else {
+		logger.LogDebug(c, "upstream response body: %s", responseBody)
+	}
 	// Unmarshal to simpleResponse
 	if info.ChannelType == constant.ChannelTypeOpenRouter && info.ChannelOtherSettings.IsOpenRouterEnterprise() {
 		// 尝试解析为 openrouter enterprise

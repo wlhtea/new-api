@@ -263,6 +263,37 @@ func TestOaiResponsesHandlerKeepsPrivateWordsOutsideError(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "OpenCode workspace guide")
 }
 
+func TestOaiResponsesHandlerOpenCodeRetryPolicyDiffersByChannelType(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		channelType   int
+		wantSkipRetry bool
+	}{
+		{name: "account pool owns dedicated retry", channelType: constant.ChannelTypeOpenCodeGo, wantSkipRetry: true},
+		{name: "api key row uses generic retry", channelType: constant.ChannelTypeOpenCodeAPIKey, wantSkipRetry: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: test.channelType}}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"error":{"type":"upstream_error","code":"server_error","message":"temporary"}}`,
+				)),
+				Header: http.Header{"Content-Type": []string{"application/json"}},
+			}
+
+			_, apiErr := OaiResponsesHandler(c, info, resp)
+
+			require.NotNil(t, apiErr)
+			assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+			assert.Equal(t, test.wantSkipRetry, types.IsSkipRetryError(apiErr))
+		})
+	}
+}
+
 func runResponsesImageBillingStream(t *testing.T, events ...string) *relaycommon.RelayInfo {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -381,6 +412,50 @@ func TestOaiResponsesStreamHandlerClassifiesCodeOnlyErrors(t *testing.T) {
 			assert.Equal(t, types.ErrorCode(tt.code), apiErr.GetErrorCode())
 			require.NotNil(t, info.StreamStatus)
 			assert.Equal(t, tt.upstream, info.StreamStatus.UpstreamFailureObserved())
+		})
+	}
+}
+
+func TestOaiResponsesStreamHandlerMarksProviderTerminalErrorsWithUpstreamStatus(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	for _, eventType := range []string{"response.incomplete", "response.cancelled", "response.canceled"} {
+		t.Run(eventType, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			info := &relaycommon.RelayInfo{
+				DisablePing: true,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType:       constant.ChannelTypeOpenCodeAPIKey,
+					UpstreamModelName: "gpt-test",
+				},
+			}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`data: {"type":"` + eventType + `","response":{"status":"incomplete"}}` + "\n\n",
+				)),
+				Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+			}
+
+			_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+			require.NotNil(t, apiErr)
+			assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+			assert.False(t, types.IsSkipRetryError(apiErr))
+			upstreamStatus, ok := service.OpenCodeGoUpstreamRelayStatusCode(apiErr)
+			require.True(t, ok)
+			assert.Equal(t, http.StatusOK, upstreamStatus)
+			publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeAPIKey, apiErr)
+			assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+			assert.Equal(t, constant.OpenCodeGoPublicOverloadMessage, publicErr.Error())
 		})
 	}
 }
@@ -690,36 +765,43 @@ func TestOaiResponsesStreamHandlerDoesNotAppendPrivateOpenCodeGoErrorAfterDelta(
 	constant.StreamingTimeout = 30
 	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
 
-	body := strings.Join([]string{
-		`data: {"type":"response.output_text.delta","delta":"public text"}`,
-		`data: {"type":"response.failed","response":{"error":{"type":"upstream_error","code":"workspace_unavailable","message":"Error from provider (Console Go): Endpoint is unavailable.","metadata":{"workspace":"wrk_private"}}}}`,
-		"",
-	}, "\n\n")
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	c.Set(common.RequestIdKey, "responses-private-error-after-delta-test")
-	info := &relaycommon.RelayInfo{
-		DisablePing: true,
-		ChannelMeta: &relaycommon.ChannelMeta{
-			ChannelType:       constant.ChannelTypeOpenCodeGo,
-			UpstreamModelName: "gpt-test",
-		},
-	}
-	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(strings.NewReader(body)),
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-	}
+	for _, channelType := range []int{
+		constant.ChannelTypeOpenCodeGo,
+		constant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(constant.ChannelTypeNames[channelType], func(t *testing.T) {
+			body := strings.Join([]string{
+				`data: {"type":"response.output_text.delta","delta":"public text"}`,
+				`data: {"type":"response.failed","response":{"error":{"type":"upstream_error","code":"workspace_unavailable","message":"Error from provider (Console Go): Endpoint is unavailable.","metadata":{"workspace":"wrk_private"}}}}`,
+				"",
+			}, "\n\n")
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			c.Set(common.RequestIdKey, "responses-private-error-after-delta-test")
+			info := &relaycommon.RelayInfo{
+				DisablePing: true,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType:       channelType,
+					UpstreamModelName: "gpt-test",
+				},
+			}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			}
 
-	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+			_, apiErr := OaiResponsesStreamHandler(c, info, resp)
 
-	require.NotNil(t, apiErr)
-	assert.True(t, w.Flushed)
-	responseBody := strings.ToLower(w.Body.String())
-	assert.Contains(t, responseBody, "public text")
-	for _, marker := range []string{"opencode", "console go", "workspace", "wrk_", "endpoint is unavailable"} {
-		assert.NotContains(t, responseBody, marker)
+			require.NotNil(t, apiErr)
+			assert.True(t, w.Flushed)
+			responseBody := strings.ToLower(w.Body.String())
+			assert.Contains(t, responseBody, "public text")
+			for _, marker := range []string{"opencode", "console go", "workspace", "wrk_", "endpoint is unavailable"} {
+				assert.NotContains(t, responseBody, marker)
+			}
+		})
 	}
 }
 

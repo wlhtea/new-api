@@ -60,7 +60,8 @@ const (
 	ChannelTypeSub2API        = 60
 	ChannelTypeNewAPI         = 61
 	ChannelTypeOpenCodeGo     = 62
-	ChannelTypeDummy          = 63 // this one is only for count, do not add any channel after this
+	ChannelTypeOpenCodeAPIKey = 63
+	ChannelTypeDummy          = 64 // this one is only for count, do not add any channel after this
 
 )
 
@@ -128,6 +129,7 @@ var ChannelBaseURLs = []string{
 	"",                              //60
 	"",                              //61
 	"https://opencode.ai/zen/go/v1", //62
+	"https://opencode.ai/zen/go/v1", //63
 }
 
 var ChannelTypeNames = map[int]string{
@@ -190,6 +192,15 @@ var ChannelTypeNames = map[int]string{
 	ChannelTypeSeedDance:      "SeedDance",
 	ChannelTypeNewAPI:         "New API",
 	ChannelTypeOpenCodeGo:     "OpenCode Go",
+	ChannelTypeOpenCodeAPIKey: "OpenCode API Key",
+}
+
+func IsOpenCodeChannelType(channelType int) bool {
+	return channelType == ChannelTypeOpenCodeGo || channelType == ChannelTypeOpenCodeAPIKey
+}
+
+func IsOpenCodeGoPoolChannelType(channelType int) bool {
+	return channelType == ChannelTypeOpenCodeGo
 }
 
 func GetChannelTypeName(channelType int) string {

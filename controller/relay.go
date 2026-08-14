@@ -85,8 +85,16 @@ func renderRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websock
 	if newAPIError == nil {
 		return
 	}
-	logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+	logMessage := newAPIError.Error()
+	if c != nil && constant.IsOpenCodeChannelType(common.GetContextKeyInt(c, constant.ContextKeyChannelType)) {
+		logMessage = service.OpenCodeGoAdminErrorWithStatusCode(newAPIError)
+	}
+	logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(logMessage)))
 	if relayFormat != types.RelayFormatOpenAIRealtime && c.Writer.Written() {
+		// The status is already committed (usually 200 for an SSE stream), so the
+		// error cannot be rendered. Do not let the distributor treat this relay as
+		// a success solely from that committed status.
+		common.SetContextKey(c, constant.ContextKeyRelayFailed, true)
 		return
 	}
 	publicError := publicRelayError(c, newAPIError)
@@ -497,8 +505,20 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if openaiErr == nil {
 		return false
 	}
-	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeOpenCodeGo {
+	channelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
+	if channelType == constant.ChannelTypeOpenCodeGo {
 		return false
+	}
+	if channelType == constant.ChannelTypeOpenCodeAPIKey {
+		if c.Writer != nil && c.Writer.Written() {
+			return false
+		}
+		if c.Request != nil && c.Request.Context().Err() != nil {
+			return false
+		}
+		if service.ResponseBodyWriteError(c) != nil {
+			return false
+		}
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		return false
@@ -515,7 +535,7 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if _, ok := c.Get("specific_channel_id"); ok {
 		return false
 	}
-	code := openaiErr.StatusCode
+	code := service.OpenCodeGoRelayPolicyStatusCode(openaiErr)
 	if code >= 200 && code < 300 {
 		return false
 	}
@@ -529,12 +549,16 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
-	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
+	adminError := err.ErrorWithStatusCode()
+	if constant.IsOpenCodeChannelType(channelError.ChannelType) {
+		adminError = service.OpenCodeGoAdminErrorWithStatusCode(err)
+	}
+	logger.LogError(c, fmt.Sprintf("channel error (channel #%d): %s", channelError.ChannelId, common.LocalLogPreview(adminError)))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
 	if shouldDisableWholeChannel(channelError.ChannelType, err) && channelError.AutoBan {
 		gopool.Go(func() {
-			service.DisableChannel(channelError, err.ErrorWithStatusCode())
+			service.DisableChannel(channelError, adminError)
 		})
 	}
 
@@ -565,13 +589,20 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		}
 		service.AppendChannelAffinityAdminInfo(c, adminInfo)
 		service.AppendOpenCodeGoWorkspaceAdminInfo(c, adminInfo)
+		if upstreamStatusCode, ok := service.OpenCodeGoUpstreamRelayStatusCode(err); ok {
+			adminInfo["upstream_status_code"] = upstreamStatusCode
+		}
 		other["admin_info"] = adminInfo
 		startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
 		if startTime.IsZero() {
 			startTime = time.Now()
 		}
 		useTimeSeconds := int(time.Since(startTime).Seconds())
-		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+		logMessage := err.MaskSensitiveErrorWithStatusCode()
+		if constant.IsOpenCodeChannelType(channelError.ChannelType) {
+			logMessage = adminError
+		}
+		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, logMessage, tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
 	}
 
 }

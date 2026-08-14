@@ -35,9 +35,17 @@ func HandleStreamFormat(c *gin.Context, info *relaycommon.RelayInfo, data string
 }
 
 func handleClaudeFormat(c *gin.Context, data string, info *relaycommon.RelayInfo) error {
+	claudeResponses, err := convertClaudeStreamResponses(c, data, info)
+	if err != nil {
+		return err
+	}
+	return writeClaudeStreamResponses(c, claudeResponses)
+}
+
+func convertClaudeStreamResponses(c *gin.Context, data string, info *relaycommon.RelayInfo) ([]*dto.ClaudeResponse, error) {
 	var streamResponse dto.ChatCompletionsStreamResponse
 	if err := common.Unmarshal(common.StringToByteSlice(data), &streamResponse); err != nil {
-		return err
+		return nil, err
 	}
 
 	if streamResponse.Usage != nil {
@@ -45,12 +53,16 @@ func handleClaudeFormat(c *gin.Context, data string, info *relaycommon.RelayInfo
 	}
 	result, err := relayconvert.ConvertStreamResponse(c, info, types.RelayFormatClaude, &streamResponse)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	claudeResponses, ok := result.Value.([]*dto.ClaudeResponse)
 	if !ok {
-		return fmt.Errorf("expected Claude stream responses, got %T", result.Value)
+		return nil, fmt.Errorf("expected Claude stream responses, got %T", result.Value)
 	}
+	return claudeResponses, nil
+}
+
+func writeClaudeStreamResponses(c *gin.Context, claudeResponses []*dto.ClaudeResponse) error {
 	for _, resp := range claudeResponses {
 		if err := helper.ClaudeData(c, *resp); err != nil {
 			return err

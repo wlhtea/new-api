@@ -371,8 +371,14 @@ export interface ChannelFormData {
 // Add Channel Request (special structure)
 // ============================================================================
 
+export type ChannelCreateMode =
+  | 'single'
+  | 'batch'
+  | 'multi_to_single'
+  | 'opencode_api_key_batch'
+
 export interface AddChannelRequest {
-  mode: 'single' | 'batch' | 'multi_to_single'
+  mode: ChannelCreateMode
   multi_key_mode?: 'random' | 'polling'
   batch_add_set_key_prefix_2_name?: boolean
   channel: Partial<Channel>

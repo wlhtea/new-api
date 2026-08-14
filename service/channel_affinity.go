@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/cachex"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -123,7 +124,7 @@ func GetChannelAffinityCacheStats() ChannelAffinityCacheStats {
 	mainCap, _ := cache.Capacity()
 	mainAlgo, _ := cache.Algorithm()
 
-	rules := setting.Rules
+	rules := setting.EffectiveRules()
 	ruleByName := make(map[string]operation_setting.ChannelAffinityRule, len(rules))
 	for _, r := range rules {
 		name := strings.TrimSpace(r.Name)
@@ -222,8 +223,9 @@ func ClearChannelAffinityCacheByRuleName(ruleName string) (int, error) {
 	}
 
 	var matchedRule *operation_setting.ChannelAffinityRule
-	for i := range setting.Rules {
-		r := &setting.Rules[i]
+	effectiveRules := setting.EffectiveRules()
+	for i := range effectiveRules {
+		r := &effectiveRules[i]
 		if strings.TrimSpace(r.Name) != ruleName {
 			continue
 		}
@@ -288,6 +290,12 @@ func matchAnyIncludeFold(patterns []string, s string) bool {
 
 func extractChannelAffinityValue(c *gin.Context, src operation_setting.ChannelAffinityKeySource) string {
 	switch src.Type {
+	case "opencode_identity":
+		identity, ok := GetOpenCodeAffinityIdentity(c)
+		if !ok {
+			return ""
+		}
+		return identity.Value
 	case "context_int":
 		if src.Key == "" {
 			return ""
@@ -561,7 +569,7 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 		userAgent = c.Request.UserAgent()
 	}
 
-	for _, rule := range setting.Rules {
+	for _, rule := range setting.EffectiveRules() {
 		if !matchAnyRegexCached(rule.ModelRegex, modelName) {
 			continue
 		}
@@ -602,7 +610,7 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 			KeySourceType:  strings.TrimSpace(usedSource.Type),
 			KeySourceKey:   strings.TrimSpace(usedSource.Key),
 			KeySourcePath:  strings.TrimSpace(usedSource.Path),
-			KeyHint:        buildChannelAffinityKeyHint(affinityValue),
+			KeyHint:        affinityKeyHintForSource(usedSource, affinityValue),
 			KeyFingerprint: affinityFingerprint(affinityValue),
 			UsingGroup:     usingGroup,
 			ModelName:      modelName,
@@ -621,6 +629,13 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 		return 0, false
 	}
 	return 0, false
+}
+
+func affinityKeyHintForSource(source operation_setting.ChannelAffinityKeySource, value string) string {
+	if strings.EqualFold(strings.TrimSpace(source.Type), "opencode_identity") {
+		return ""
+	}
+	return buildChannelAffinityKeyHint(value)
 }
 
 func ShouldSkipRetryAfterChannelAffinityFailure(c *gin.Context) bool {
@@ -711,7 +726,7 @@ func AppendChannelAffinityAdminInfo(c *gin.Context, adminInfo map[string]interfa
 }
 
 func RecordChannelAffinity(c *gin.Context, channelID int) {
-	if channelID <= 0 {
+	if c == nil || channelID <= 0 || common.GetContextKeyBool(c, constant.ContextKeyRelayFailed) {
 		return
 	}
 	setting := operation_setting.GetChannelAffinitySetting()

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
@@ -190,6 +192,138 @@ func TestExtractChannelAffinityValue_RequestHeader(t *testing.T) {
 	require.Equal(t, "tenant-123", value)
 }
 
+func TestExtractChannelAffinityValue_OpenCodeIdentityHasNoRawHint(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Set(OpenCodeAffinityIdentityContextKey, "ocg_privacy-safe-value")
+	ctx.Set(OpenCodeAffinitySourceContextKey, "token")
+	source := operation_setting.ChannelAffinityKeySource{Type: "opencode_identity"}
+
+	require.Equal(t, "ocg_privacy-safe-value", extractChannelAffinityValue(ctx, source))
+	require.Empty(t, affinityKeyHintForSource(source, "ocg_privacy-safe-value"))
+	require.Equal(t, "abcd...wxyz", affinityKeyHintForSource(
+		operation_setting.ChannelAffinityKeySource{Type: "request_header"},
+		"abcdefghijklmnopwxyz",
+	))
+}
+
+func TestDefaultOpenCodeAPIKeyAffinityRuleUsesNormalizedIdentity(t *testing.T) {
+	setting := operation_setting.GetChannelAffinitySetting()
+	require.NotNil(t, setting)
+
+	var rule *operation_setting.ChannelAffinityRule
+	effectiveRules := setting.EffectiveRules()
+	for index := range effectiveRules {
+		if effectiveRules[index].Name == "opencode api key trace" {
+			rule = &effectiveRules[index]
+			break
+		}
+	}
+	require.NotNil(t, rule)
+	require.Equal(t, []operation_setting.ChannelAffinityKeySource{{Type: "opencode_identity"}}, rule.KeySources)
+	require.False(t, rule.SkipRetryOnFailure)
+	require.True(t, rule.IncludeUsingGroup)
+	require.True(t, rule.IncludeModelName)
+
+	for _, model := range []string{"glm-5.2", "qwen3.7-max", "gpt-5.6-luna"} {
+		for _, path := range []string{"/v1/chat/completions", "/v1/messages", "/v1/responses"} {
+			require.True(t, matchAnyRegexCached(rule.ModelRegex, model), "%s", model)
+			require.True(t, matchAnyRegexCached(rule.PathRegex, path), "%s", path)
+		}
+	}
+	require.False(t, matchAnyRegexCached(rule.PathRegex, "/v1/responses/compact"))
+	require.False(t, matchAnyRegexCached(rule.ModelRegex, "claude-3-7-sonnet"))
+}
+
+func TestGetPreferredChannelByAffinityOpenCodeIdentityDoesNotExposeHint(t *testing.T) {
+	setting := operation_setting.GetChannelAffinitySetting()
+	originalRules := setting.Rules
+	rule := operation_setting.ChannelAffinityRule{
+		Name:               "opencode-test",
+		ModelRegex:         []string{"^affinity-test-model$"},
+		PathRegex:          []string{"^/v1/chat/completions$"},
+		KeySources:         []operation_setting.ChannelAffinityKeySource{{Type: "opencode_identity"}},
+		IncludeUsingGroup:  true,
+		IncludeModelName:   true,
+		IncludeRuleName:    true,
+		SkipRetryOnFailure: false,
+	}
+	setting.Rules = []operation_setting.ChannelAffinityRule{rule}
+	t.Cleanup(func() { setting.Rules = originalRules })
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Set(OpenCodeAffinityIdentityContextKey, "ocg_normalized-private")
+	ctx.Set(OpenCodeAffinitySourceContextKey, "token")
+
+	_, found := GetPreferredChannelByAffinity(ctx, "affinity-test-model", "opencode-group")
+	require.False(t, found)
+	meta, ok := getChannelAffinityMeta(ctx)
+	require.True(t, ok)
+	require.Equal(t, "opencode_identity", meta.KeySourceType)
+	require.Empty(t, meta.KeyHint)
+	require.NotEmpty(t, meta.KeyFingerprint)
+	require.Contains(t, meta.CacheKey, "ocg_normalized-private")
+}
+
+func TestDefaultOpenCodeAffinityWinsOverCodexAndKeepsRawTokenOutOfCacheKey(t *testing.T) {
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "test-default-opencode-affinity-secret"
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	setting := operation_setting.GetChannelAffinitySetting()
+	var rule *operation_setting.ChannelAffinityRule
+	effectiveRules := setting.EffectiveRules()
+	for index := range effectiveRules {
+		if effectiveRules[index].Name == "opencode api key trace" {
+			rule = &effectiveRules[index]
+			break
+		}
+	}
+	require.NotNil(t, rule)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	common.SetContextKey(ctx, constant.ContextKeyTokenId, 991337)
+	identity := PrepareOpenCodeAffinityIdentity(ctx, nil)
+	require.Equal(t, constant.OpenCodeGoAffinitySourceToken, identity.Source)
+
+	cacheKeySuffix := buildChannelAffinityCacheKeySuffix(*rule, "gpt-5.6-luna", "opencode-group", identity.Value)
+	cache := getChannelAffinityCache()
+	require.NoError(t, cache.SetWithTTL(cacheKeySuffix, 9928, time.Minute))
+	t.Cleanup(func() {
+		_, _ = cache.DeleteMany([]string{cacheKeySuffix})
+	})
+
+	channelID, found := GetPreferredChannelByAffinity(ctx, "gpt-5.6-luna", "opencode-group")
+	require.True(t, found)
+	require.Equal(t, 9928, channelID)
+	meta, ok := getChannelAffinityMeta(ctx)
+	require.True(t, ok)
+	require.Equal(t, "opencode api key trace", meta.RuleName)
+	require.Equal(t, "opencode_identity", meta.KeySourceType)
+	require.Empty(t, meta.KeyHint)
+	require.NotContains(t, meta.CacheKey, "991337")
+}
+
+func TestOpenCodeBuiltInAffinityStillHonorsGlobalDisabledSetting(t *testing.T) {
+	setting := operation_setting.GetChannelAffinitySetting()
+	originalEnabled := setting.Enabled
+	setting.Enabled = false
+	t.Cleanup(func() { setting.Enabled = originalEnabled })
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set(OpenCodeAffinityIdentityContextKey, "ocg_disabled-control")
+	ctx.Set(OpenCodeAffinitySourceContextKey, "token")
+
+	channelID, found := GetPreferredChannelByAffinity(ctx, "gpt-5.6-luna", "opencode-group")
+	require.False(t, found)
+	require.Zero(t, channelID)
+	_, hasMeta := getChannelAffinityMeta(ctx)
+	require.False(t, hasMeta)
+}
+
 func TestGetPreferredChannelByAffinity_RequestHeaderKeySource(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -261,6 +395,45 @@ func TestClearCurrentChannelAffinityCache(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, found)
 	require.False(t, ShouldSkipRetryAfterChannelAffinityFailure(ctx))
+}
+
+func TestRecordChannelAffinitySkipsCommittedRelayFailure(t *testing.T) {
+	previousRedisEnabled := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previousRedisEnabled })
+
+	setting := operation_setting.GetChannelAffinitySetting()
+	previousSetting := *setting
+	*setting = operation_setting.ChannelAffinitySetting{
+		Enabled:           true,
+		SwitchOnSuccess:   true,
+		DefaultTTLSeconds: 60,
+	}
+	t.Cleanup(func() { *setting = previousSetting })
+
+	cacheKeySuffix := fmt.Sprintf("relay-failure-%d", time.Now().UnixNano())
+	cacheKeyFull := channelAffinityCacheNamespace + ":" + cacheKeySuffix
+	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+		CacheKey:   cacheKeyFull,
+		TTLSeconds: 60,
+	})
+	common.SetContextKey(ctx, constant.ContextKeyRelayFailed, true)
+
+	RecordChannelAffinity(ctx, 9731)
+	cache := getChannelAffinityCache()
+	_, found, err := cache.Get(cacheKeySuffix)
+	require.NoError(t, err)
+	require.False(t, found)
+
+	common.SetContextKey(ctx, constant.ContextKeyRelayFailed, false)
+	RecordChannelAffinity(ctx, 9731)
+	channelID, found, err := cache.Get(cacheKeySuffix)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, 9731, channelID)
+	t.Cleanup(func() {
+		_, _ = cache.DeleteMany([]string{cacheKeySuffix})
+	})
 }
 
 func TestChannelAffinityHitCodexTemplatePassHeadersEffective(t *testing.T) {

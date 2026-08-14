@@ -72,14 +72,15 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	}
 	if oaiError := responsesResponse.GetOpenAIError(); responsesErrorHasDetails(oaiError) {
 		responseErr := types.WithOpenAIError(*oaiError, resp.StatusCode)
-		if info.GetChannelType() == constant.ChannelTypeOpenCodeGo {
-			responseErr = service.MarkOpenCodeGoUpstreamRelayError(responseErr)
+		if constant.IsOpenCodeChannelType(info.GetChannelType()) {
+			responseErr = withOpenCodeResponsesRetryPolicy(c, info, responseErr)
+			responseErr = service.MarkOpenCodeGoUpstreamRelayErrorWithStatus(responseErr, resp.StatusCode)
 		}
 		return nil, responseErr
 	}
-	if info.GetChannelType() == constant.ChannelTypeOpenCodeGo {
+	if constant.IsOpenCodeChannelType(info.GetChannelType()) {
 		if rawError, present := rawResponsesError(responsesResponse.Error); present {
-			return nil, newRawOpenCodeGoResponsesError(rawError, resp.StatusCode)
+			return nil, newRawOpenCodeGoResponsesError(c, info, rawError, resp.StatusCode)
 		}
 	}
 
@@ -126,7 +127,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
 	var streamErr *types.NewAPIError
-	strictOpenCodeGo := info.GetChannelType() == constant.ChannelTypeOpenCodeGo
+	strictOpenCodeGo := constant.IsOpenCodeChannelType(info.GetChannelType())
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		if streamErr != nil {
@@ -203,10 +204,10 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 		case "response.incomplete", "response.cancelled", "response.canceled":
 			// `incomplete` commonly means a deterministic stop such as
-			// max_output_tokens/content_filter; `cancelled` can be client-driven.
-			// Surface both without rotating the workspace.
+			// max_output_tokens/content_filter; a provider-reported `cancelled`
+			// is not the same as this downstream request being cancelled.
 			if strictOpenCodeGo {
-				streamErr = types.NewOpenAIError(fmt.Errorf("responses stream ended with %s", streamResponse.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+				streamErr = newOpenCodeResponsesTerminalError(c, info, streamResponse.Type, resp.StatusCode)
 			}
 			if !imageCommitted {
 				imageCounter.Reset()
@@ -233,7 +234,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 		}
 		if strictOpenCodeGo && len(errorPayload) > 0 {
-			streamErr = newRawOpenCodeGoResponsesError(errorPayload, resp.StatusCode)
+			streamErr = newRawOpenCodeGoResponsesError(c, info, errorPayload, resp.StatusCode)
 			sr.Stop(streamErr)
 			return
 		}
@@ -245,13 +246,16 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					http.StatusInternalServerError,
 				)
 			}
-			streamErr = service.MarkOpenCodeGoUpstreamRelayError(streamErr)
+			streamErr = service.MarkOpenCodeGoUpstreamRelayErrorWithStatus(
+				withOpenCodeResponsesRetryPolicy(c, info, streamErr),
+				resp.StatusCode,
+			)
 			sr.Stop(streamErr)
 			return
 		}
 		if strictOpenCodeGo && len(privateTerminalPayload) > 0 &&
 			service.OpenCodeGoErrorHasPrivateDetail(string(privateTerminalPayload)) {
-			streamErr = newRawOpenCodeGoResponsesError(privateTerminalPayload, resp.StatusCode)
+			streamErr = newRawOpenCodeGoResponsesError(c, info, privateTerminalPayload, resp.StatusCode)
 			sr.Stop(streamErr)
 			return
 		}
@@ -287,7 +291,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	return usage, nil
 }
 
-func newRawOpenCodeGoResponsesError(payload []byte, statusCode int) *types.NewAPIError {
+func newRawOpenCodeGoResponsesError(c *gin.Context, info *relaycommon.RelayInfo, payload []byte, statusCode int) *types.NewAPIError {
 	if statusCode < 100 || statusCode > 599 {
 		statusCode = http.StatusInternalServerError
 	}
@@ -310,9 +314,33 @@ func newRawOpenCodeGoResponsesError(payload []byte, statusCode int) *types.NewAP
 			openAIError.Code = "upstream_error"
 		}
 	}
-	return service.MarkOpenCodeGoUpstreamRelayError(
-		types.WithOpenAIError(openAIError, statusCode, types.ErrOptionWithSkipRetry()),
+	return service.MarkOpenCodeGoUpstreamRelayErrorWithStatus(
+		withOpenCodeResponsesRetryPolicy(c, info, types.WithOpenAIError(openAIError, statusCode)),
+		statusCode,
 	)
+}
+
+func newOpenCodeResponsesTerminalError(c *gin.Context, info *relaycommon.RelayInfo, eventType string, upstreamStatusCode int) *types.NewAPIError {
+	relayErr := types.NewOpenAIError(
+		fmt.Errorf("responses stream ended with %s", eventType),
+		types.ErrorCodeBadResponse,
+		http.StatusBadGateway,
+	)
+	return service.MarkOpenCodeGoUpstreamRelayErrorWithStatus(
+		withOpenCodeResponsesRetryPolicy(c, info, relayErr),
+		upstreamStatusCode,
+	)
+}
+
+func withOpenCodeResponsesRetryPolicy(c *gin.Context, info *relaycommon.RelayInfo, relayErr *types.NewAPIError) *types.NewAPIError {
+	if relayErr == nil {
+		return relayErr
+	}
+	if info != nil && info.GetChannelType() != constant.ChannelTypeOpenCodeGo &&
+		(c == nil || c.Writer == nil || !c.Writer.Written()) {
+		return relayErr
+	}
+	return types.NewError(relayErr, relayErr.GetErrorCode(), types.ErrOptionWithSkipRetry())
 }
 
 func rawResponsesError(errorField any) (json.RawMessage, bool) {

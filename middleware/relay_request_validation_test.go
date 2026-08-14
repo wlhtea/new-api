@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -112,6 +113,39 @@ func TestPreValidateRelayRequestPassesOtherPathsAndCachesTargetModel(t *testing.
 			require.Equal(t, http.StatusNoContent, recorder.Code)
 		})
 	}
+}
+
+func TestPreValidateRelayRequestPreparesTokenAffinityBeforeDistribution(t *testing.T) {
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "test-pre-validation-affinity-secret"
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	const tokenID = 7001
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		common.SetContextKey(c, constant.ContextKeyTokenId, tokenID)
+		c.Next()
+	})
+	engine.Use(BodyStorageCleanup(), PreValidateRelayRequest())
+	engine.POST("/v1/responses", func(c *gin.Context) {
+		identity, ok := service.GetOpenCodeAffinityIdentity(c)
+		require.True(t, ok)
+		require.Equal(t, constant.OpenCodeGoAffinitySourceToken, identity.Source)
+		require.Equal(t, common.OpenCodeGoDiagnosticRef("token-fallback", "7001"), identity.Value)
+		require.NotContains(t, identity.Value, "7001")
+		c.Status(http.StatusNoContent)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/responses",
+		bytes.NewBufferString(`{"model":"gpt-5.6-luna","input":"hello"}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
 }
 
 func TestPreValidateRelayRequestAllowsMissingContentTypeButRejectsExplicitNonJSON(t *testing.T) {

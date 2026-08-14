@@ -262,10 +262,8 @@ func (c *OpenCodeGoConfig) Validate() error {
 			)
 		}
 	}
-	if c.DefaultProtocol != "" {
-		if err := validateOpenCodeGoProtocol(c.DefaultProtocol); err != nil {
-			return fmt.Errorf("invalid OpenCode Go default protocol: %w", err)
-		}
+	if err := c.validateDefaultProtocol(); err != nil {
+		return err
 	}
 	if c.AffinityFallback != "" && c.AffinityFallback != "none" && c.AffinityFallback != "token" {
 		return fmt.Errorf("OpenCode Go affinity_fallback must be \"none\" or \"token\"")
@@ -306,6 +304,33 @@ func (c *OpenCodeGoConfig) Validate() error {
 			OpenCodeGoGenericFailoverMaxLeaseSeconds,
 		)
 	}
+	return c.validateModelProtocols()
+}
+
+// ValidateProtocolRouting validates the OpenCode settings shared by the
+// account-pool and ordinary API-key channel types. Pool-only settings are
+// intentionally ignored by the API-key channel.
+func (c *OpenCodeGoConfig) ValidateProtocolRouting() error {
+	if c == nil {
+		return nil
+	}
+	if err := c.validateDefaultProtocol(); err != nil {
+		return err
+	}
+	return c.validateModelProtocols()
+}
+
+func (c *OpenCodeGoConfig) validateDefaultProtocol() error {
+	if c.DefaultProtocol == "" {
+		return nil
+	}
+	if err := validateOpenCodeGoProtocol(c.DefaultProtocol); err != nil {
+		return fmt.Errorf("invalid OpenCode Go default protocol: %w", err)
+	}
+	return nil
+}
+
+func (c *OpenCodeGoConfig) validateModelProtocols() error {
 	seenPatterns := make(map[string]struct{}, len(c.ModelProtocols))
 	for pattern, protocol := range c.ModelProtocols {
 		pattern = strings.TrimSpace(pattern)

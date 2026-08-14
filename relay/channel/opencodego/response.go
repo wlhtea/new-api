@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -339,16 +341,15 @@ func openCodeGoTopLevelErrorPayload(eventType string, fields ...json.RawMessage)
 
 func openCodeGoErrorEnvelope(upstreamError json.RawMessage, protocol Protocol, stream bool) []byte {
 	upstreamError = canonicalOpenCodeGoError(upstreamError)
-	internalError := map[string]any{
-		"message": string(upstreamError),
-		"type":    "upstream_error",
-		"code":    "upstream_error",
-	}
+	internalError := openCodeGoStructuredError(upstreamError)
 	var envelope any
 	switch protocol {
 	case ProtocolMessages:
-		delete(internalError, "code")
-		envelope = map[string]any{"type": "error", "error": internalError}
+		claudeError := types.ClaudeError{
+			Message: internalError.Message,
+			Type:    internalError.Type,
+		}
+		envelope = map[string]any{"type": "error", "error": claudeError}
 	case ProtocolResponses:
 		if stream {
 			envelope = map[string]any{
@@ -369,6 +370,40 @@ func openCodeGoErrorEnvelope(upstreamError json.RawMessage, protocol Protocol, s
 		return []byte(`{"error":{"message":"upstream error","type":"upstream_error","code":"upstream_error"}}`)
 	}
 	return encoded
+}
+
+func openCodeGoStructuredError(upstreamError json.RawMessage) types.OpenAIError {
+	fallback := types.OpenAIError{
+		Message: string(upstreamError),
+		Type:    "upstream_error",
+		Code:    "upstream_error",
+	}
+	var decoded types.OpenAIError
+	if common.Unmarshal(upstreamError, &decoded) != nil || !decoded.HasDetails() {
+		return fallback
+	}
+	code := ""
+	if decoded.Code != nil {
+		code = strings.TrimSpace(fmt.Sprint(decoded.Code))
+	}
+	errorType := strings.TrimSpace(decoded.Type)
+	if strings.TrimSpace(decoded.Message) == "" && strings.TrimSpace(decoded.Param) == "" && code == "" {
+		switch errorType {
+		case "error", "response.error", "response.failed":
+			return fallback
+		}
+	}
+	if errorType == "" {
+		if code != "" {
+			decoded.Type = code
+		} else {
+			decoded.Type = "upstream_error"
+		}
+	}
+	if code == "" {
+		decoded.Code = decoded.Type
+	}
+	return decoded
 }
 
 func canonicalOpenCodeGoError(upstreamError json.RawMessage) json.RawMessage {

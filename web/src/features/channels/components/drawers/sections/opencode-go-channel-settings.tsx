@@ -22,7 +22,6 @@ import {
   Network,
   ShieldAlert,
   ShieldCheck,
-  Waypoints,
 } from 'lucide-react'
 import { useRef } from 'react'
 import { useFormContext } from 'react-hook-form'
@@ -48,10 +47,10 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { Textarea } from '@/components/ui/textarea'
 
 import type { ChannelFormInput } from '../../../lib/channel-form'
 import { inferOpenCodeGoIdentityProxyPolicyOnEnable } from '../../../lib/opencode-go-identity-proxy'
+import { OpenCodeProtocolSettings } from './opencode-protocol-settings'
 
 type OpenCodeGoChannelSettingsProps = {
   disabled?: boolean
@@ -200,89 +199,18 @@ export function OpenCodeGoChannelSettings(
         </div>
       </div>
 
-      <div className='flex items-center gap-2'>
-        <Waypoints
-          className='text-muted-foreground h-3.5 w-3.5'
-          aria-hidden='true'
-        />
-        <h4 className='text-muted-foreground text-xs font-medium tracking-wide uppercase'>
-          {t('OpenCode Go protocol routing')}
-        </h4>
-      </div>
-
-      <Alert>
-        <AlertDescription>
-          {t(
-            'Account credentials are managed in the OpenCode Go account pool after this channel is created.'
-          )}
-        </AlertDescription>
-      </Alert>
-
-      <div className='grid gap-4 sm:grid-cols-[14rem_minmax(0,1fr)]'>
-        <FormField
-          control={form.control}
-          name='opencode_go_default_protocol'
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('Fallback protocol')}</FormLabel>
-              <Select
-                items={[
-                  { value: 'built-in', label: t('Built-in routing') },
-                  { value: 'chat', label: t('Chat Completions') },
-                  { value: 'messages', label: t('Claude Messages') },
-                  { value: 'responses', label: t('OpenAI Responses') },
-                ]}
-                value={field.value || 'built-in'}
-                onValueChange={(value) =>
-                  field.onChange(value === 'built-in' ? '' : value)
-                }
-              >
-                <FormControl>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                </FormControl>
-                <SelectContent alignItemWithTrigger={false}>
-                  <SelectGroup>
-                    <SelectItem value='built-in'>
-                      {t('Built-in routing')}
-                    </SelectItem>
-                    <SelectItem value='chat'>
-                      {t('Chat Completions')}
-                    </SelectItem>
-                    <SelectItem value='messages'>
-                      {t('Claude Messages')}
-                    </SelectItem>
-                    <SelectItem value='responses'>
-                      {t('OpenAI Responses')}
-                    </SelectItem>
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-
-        <FormField
-          control={form.control}
-          name='opencode_go_model_protocols'
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('Model protocol overrides')}</FormLabel>
-              <FormControl>
-                <Textarea
-                  className='min-h-24 resize-y font-mono text-xs'
-                  placeholder='{"model-*":"messages"}'
-                  spellCheck={false}
-                  {...field}
-                />
-              </FormControl>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-      </div>
+      <OpenCodeProtocolSettings
+        title='OpenCode Go protocol routing'
+        notice={
+          <Alert>
+            <AlertDescription>
+              {t(
+                'Account credentials are managed in the OpenCode Go account pool after this channel is created.'
+              )}
+            </AlertDescription>
+          </Alert>
+        }
+      />
 
       <div className='flex items-center gap-2'>
         <ShieldAlert

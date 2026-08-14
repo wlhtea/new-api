@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -9,8 +10,10 @@ import (
 	"sync/atomic"
 	"testing"
 
+	rootconstant "github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -143,10 +146,39 @@ func TestDoApiRequestWithClientLeaseReleasesAfterTransportFailure(t *testing.T) 
 	require.Equal(t, int32(1), released.Load())
 }
 
+func TestDoApiRequestRedactsOpenCodeTransportFailureBeforeServerLog(t *testing.T) {
+	previousWriter := gin.DefaultErrorWriter
+	var logBuffer bytes.Buffer
+	gin.DefaultErrorWriter = &logBuffer
+	t.Cleanup(func() { gin.DefaultErrorWriter = previousWriter })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	adaptor := &clientResolverTestAdaptor{requestURL: "http://upstream.invalid/v1/responses"}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType: rootconstant.ChannelTypeOpenCodeAPIKey,
+	}}
+	transport := &clientResolverTestTransport{err: errors.New(
+		"proxy Authorization: Bearer private-bearer via socks5://proxy-user:proxy-password@10.0.0.8:1080",
+	)}
+
+	response, err := DoApiRequestWithClientLease(adaptor, c, info, strings.NewReader("{}"), func() (*http.Client, func(), error) {
+		return &http.Client{Transport: transport}, nil, nil
+	})
+
+	require.Error(t, err)
+	require.Nil(t, response)
+	serverLog := logBuffer.String()
+	for _, secret := range []string{"private-bearer", "proxy-user", "proxy-password", "10.0.0.8"} {
+		require.NotContains(t, serverLog, secret)
+	}
+	require.Contains(t, serverLog, "[redacted]")
+}
+
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -169,7 +201,6 @@ func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 func TestProcessHeaderOverride_ChannelTestSkipsClientHeaderPlaceholder(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -193,7 +224,6 @@ func TestProcessHeaderOverride_ChannelTestSkipsClientHeaderPlaceholder(t *testin
 func TestProcessHeaderOverride_NonTestKeepsClientHeaderPlaceholder(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -213,10 +243,62 @@ func TestProcessHeaderOverride_NonTestKeepsClientHeaderPlaceholder(t *testing.T)
 	require.Equal(t, "trace-123", headers["x-upstream-trace"])
 }
 
+func TestProcessHeaderOverride_OpenCodeAPIKeyReservesAccountHeaders(t *testing.T) {
+	t.Parallel()
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	for _, test := range []struct {
+		name         string
+		channelType  int
+		wantReserved bool
+	}{
+		{
+			name:         "api key row reserves authentication and cache identity",
+			channelType:  rootconstant.ChannelTypeOpenCodeAPIKey,
+			wantReserved: false,
+		},
+		{
+			name:         "account pool keeps existing override behavior",
+			channelType:  rootconstant.ChannelTypeOpenCodeGo,
+			wantReserved: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			info := &relaycommon.RelayInfo{
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType: test.channelType,
+					HeadersOverride: map[string]any{
+						"Authorization":      "Bearer channel-override",
+						"X-Api-Key":          "channel-api-key-override",
+						"X-OpenCode-Session": "channel-session-override",
+						"Anthropic-Beta":     "tools-2024-04-04",
+						"X-Upstream-Feature": "allowed",
+					},
+				},
+			}
+
+			headers, err := processHeaderOverride(info, ctx)
+			require.NoError(t, err)
+			if test.wantReserved {
+				assert.Equal(t, "Bearer channel-override", headers["authorization"])
+				assert.Equal(t, "channel-api-key-override", headers["x-api-key"])
+				assert.Equal(t, "channel-session-override", headers["x-opencode-session"])
+			} else {
+				assert.NotContains(t, headers, "authorization")
+				assert.NotContains(t, headers, "x-api-key")
+				assert.NotContains(t, headers, "x-opencode-session")
+			}
+			assert.Equal(t, "tools-2024-04-04", headers["anthropic-beta"])
+			assert.Equal(t, "allowed", headers["x-upstream-feature"])
+		})
+	}
+}
+
 func TestProcessHeaderOverride_RuntimeOverrideIsFinalHeaderMap(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -247,7 +329,6 @@ func TestProcessHeaderOverride_RuntimeOverrideIsFinalHeaderMap(t *testing.T) {
 func TestProcessHeaderOverride_PassthroughSkipsAcceptEncoding(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -274,7 +355,6 @@ func TestProcessHeaderOverride_PassthroughSkipsAcceptEncoding(t *testing.T) {
 func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)

@@ -43,6 +43,7 @@ import { SettingsSection } from '../../components/settings-section'
 import { useUpdateOption } from '../../hooks/use-update-option'
 import { getCacheStats, clearAllCache, clearRuleCache } from './api'
 import { RULE_TEMPLATES, cloneTemplate, makeUniqueName } from './constants'
+import { formatKeySource } from './key-sources'
 import { RuleEditorDialog } from './rule-editor-dialog'
 import type { AffinityRule, CacheStats, ChannelAffinitySettings } from './types'
 
@@ -570,9 +571,8 @@ export function ChannelAffinitySection(props: Props) {
                 header: t('Key Sources'),
                 cell: (rule) => (
                   <RuleBadgeList
-                    items={(rule.key_sources || []).map(
-                      (src) =>
-                        `${src.type}:${src.type === 'gjson' ? src.path : src.key}`
+                    items={(rule.key_sources || []).map((source) =>
+                      t(formatKeySource(source))
                     )}
                   />
                 ),

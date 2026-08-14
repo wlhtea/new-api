@@ -7,8 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -141,4 +144,143 @@ func TestAffinityIdentityTokenFallbackIsOptInAndStable(t *testing.T) {
 	otherTokenIdentity, _ := affinityIdentityForRequest(newCacheIdentityContext(""), otherToken, request)
 	assert.Equal(t, tokenIdentity, sameTokenIdentity)
 	assert.NotEqual(t, tokenIdentity, otherTokenIdentity)
+}
+
+func TestAPIKeyChannelAffinityUsesSharedNormalizedIdentity(t *testing.T) {
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "test-api-key-channel-affinity-secret"
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	newInfo := func(tokenID int) *relaycommon.RelayInfo {
+		return &relaycommon.RelayInfo{
+			TokenId: tokenID,
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelType: constant.ChannelTypeOpenCodeAPIKey,
+			},
+		}
+	}
+
+	tests := []struct {
+		name         string
+		configure    func(*gin.Context)
+		request      any
+		tokenID      int
+		wantSource   string
+		wantDomain   string
+		privateValue string
+	}{
+		{
+			name: "claude code header wins",
+			configure: func(c *gin.Context) {
+				c.Request.Header.Set(claudeCodeSessionHeader, "claude-private")
+				c.Request.Header.Set(cacheIdentityHeader, "opencode-private")
+			},
+			request:      &dto.GeneralOpenAIRequest{PromptCacheKey: "prompt-private"},
+			tokenID:      1001,
+			wantSource:   AffinitySourceClaudeCodeSession,
+			wantDomain:   "claude-code-session",
+			privateValue: "claude-private",
+		},
+		{
+			name:      "claude metadata session is normalized",
+			configure: func(*gin.Context) {},
+			request: &dto.ClaudeRequest{Metadata: json.RawMessage(
+				`{"user_id":"{\"session_id\":\"metadata-private\"}"}`,
+			)},
+			tokenID:      1002,
+			wantSource:   AffinitySourceClaudeMetadata,
+			wantDomain:   "claude-metadata-session",
+			privateValue: "metadata-private",
+		},
+		{
+			name: "opencode session is normalized",
+			configure: func(c *gin.Context) {
+				c.Request.Header.Set(cacheIdentityHeader, "opencode-private")
+			},
+			request:      &dto.GeneralOpenAIRequest{PromptCacheKey: "prompt-private"},
+			tokenID:      1003,
+			wantSource:   AffinitySourceOpenCodeSession,
+			wantDomain:   "opencode-session",
+			privateValue: "opencode-private",
+		},
+		{
+			name:         "prompt cache key is normalized",
+			configure:    func(*gin.Context) {},
+			request:      &dto.GeneralOpenAIRequest{PromptCacheKey: "prompt-private"},
+			tokenID:      1004,
+			wantSource:   AffinitySourcePromptCacheKey,
+			wantDomain:   "prompt-cache-key",
+			privateValue: "prompt-private",
+		},
+		{
+			name:         "token fallback uses relay info",
+			configure:    func(*gin.Context) {},
+			tokenID:      1005,
+			wantSource:   AffinitySourceToken,
+			wantDomain:   "token-fallback",
+			privateValue: "1005",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := newCacheIdentityContext("")
+			test.configure(c)
+			identity, source := affinityIdentityForRequest(c, newInfo(test.tokenID), test.request)
+
+			require.Equal(t, test.wantSource, source)
+			require.Equal(t, common.OpenCodeGoDiagnosticRef(test.wantDomain, test.privateValue), identity)
+			require.NotContains(t, identity, test.privateValue)
+			require.Equal(t, identity, cacheIdentityForRequest(c, newInfo(test.tokenID), test.request))
+		})
+	}
+}
+
+func TestAPIKeyChannelAffinityReusesPreparedIdentity(t *testing.T) {
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "test-api-key-channel-prepared-affinity-secret"
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	c := newCacheIdentityContext("")
+	c.Request.Header.Set(cacheIdentityHeader, "prepared-private")
+	request := &dto.GeneralOpenAIRequest{PromptCacheKey: "ignored-private"}
+	prepared := service.PrepareOpenCodeAffinityIdentity(c, request)
+	info := &relaycommon.RelayInfo{
+		TokenId: 1006,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeOpenCodeAPIKey,
+		},
+	}
+
+	identity, source := affinityIdentityForRequest(c, info, request)
+	require.Equal(t, prepared.Value, identity)
+	require.Equal(t, prepared.Source, source)
+	require.Equal(t, identity, cacheIdentityForRequest(c, info, request))
+	require.NotContains(t, identity, "prepared-private")
+}
+
+func TestPoolChannelIgnoresPreparedTokenIdentityWithoutOptIn(t *testing.T) {
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "test-pool-channel-prepared-affinity-secret"
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	c := newCacheIdentityContext("")
+	common.SetContextKey(c, constant.ContextKeyTokenId, 1007)
+	prepared := service.PrepareOpenCodeAffinityIdentity(c, nil)
+	require.Equal(t, AffinitySourceToken, prepared.Source)
+
+	info := &relaycommon.RelayInfo{
+		TokenId: 1007,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeOpenCodeGo,
+		},
+	}
+	identity, source := affinityIdentityForRequest(c, info, nil)
+	require.Empty(t, identity)
+	require.Empty(t, source)
+
+	info.ChannelOtherSettings.OpenCodeGo = &dto.OpenCodeGoConfig{AffinityFallback: "token"}
+	identity, source = affinityIdentityForRequest(c, info, nil)
+	require.Equal(t, prepared.Value, identity)
+	require.Equal(t, AffinitySourceToken, source)
 }

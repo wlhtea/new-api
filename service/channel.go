@@ -80,10 +80,16 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	if types.IsChannelError(err) {
 		return true
 	}
+	statusCode := OpenCodeGoRelayPolicyStatusCode(err)
+	// skipRetry protects replay safety, but it must not discard authoritative
+	// upstream health evidence such as a rejected API key after bytes were sent.
+	if IsOpenCodeGoUpstreamRelayError(err) && operation_setting.ShouldDisableByStatusCode(statusCode) {
+		return true
+	}
 	if types.IsSkipRetryError(err) {
 		return false
 	}
-	if operation_setting.ShouldDisableByStatusCode(err.StatusCode) {
+	if operation_setting.ShouldDisableByStatusCode(statusCode) {
 		return true
 	}
 

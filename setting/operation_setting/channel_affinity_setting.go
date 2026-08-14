@@ -1,9 +1,15 @@
 package operation_setting
 
-import "github.com/QuantumNous/new-api/setting/config"
+import (
+	"strings"
+
+	"github.com/QuantumNous/new-api/setting/config"
+)
+
+const builtInOpenCodeAPIKeyAffinityRuleName = "opencode api key trace"
 
 type ChannelAffinityKeySource struct {
-	Type string `json:"type"` // context_int, context_string, request_header, gjson
+	Type string `json:"type"` // context_int, context_string, request_header, gjson, opencode_identity
 	Key  string `json:"key,omitempty"`
 	Path string `json:"path,omitempty"`
 }
@@ -34,6 +40,41 @@ type ChannelAffinitySetting struct {
 	MaxEntries            int                   `json:"max_entries"`
 	DefaultTTLSeconds     int                   `json:"default_ttl_seconds"`
 	Rules                 []ChannelAffinityRule `json:"rules"`
+}
+
+func builtInOpenCodeAPIKeyAffinityRule() ChannelAffinityRule {
+	return ChannelAffinityRule{
+		Name:       builtInOpenCodeAPIKeyAffinityRuleName,
+		ModelRegex: []string{"^(grok|glm|kimi|deepseek|mimo|hy3|minimax|qwen|gpt-5\\.6-luna).*"},
+		PathRegex:  []string{"^/v1/(chat/completions|messages|responses)$"},
+		KeySources: []ChannelAffinityKeySource{
+			{Type: "opencode_identity"},
+		},
+		TTLSeconds:         0,
+		SkipRetryOnFailure: false,
+		IncludeUsingGroup:  true,
+		IncludeModelName:   true,
+		IncludeRuleName:    true,
+	}
+}
+
+// EffectiveRules returns the mandatory OpenCode API-key rule followed by the
+// persisted operator rules. Older databases may already contain a copy of the
+// built-in rule, so its reserved name is filtered to keep the runtime rule set
+// authoritative and duplicate-free.
+func (setting *ChannelAffinitySetting) EffectiveRules() []ChannelAffinityRule {
+	if setting == nil {
+		return nil
+	}
+	rules := make([]ChannelAffinityRule, 0, len(setting.Rules)+1)
+	rules = append(rules, builtInOpenCodeAPIKeyAffinityRule())
+	for _, rule := range setting.Rules {
+		if strings.EqualFold(strings.TrimSpace(rule.Name), builtInOpenCodeAPIKeyAffinityRuleName) {
+			continue
+		}
+		rules = append(rules, rule)
+	}
+	return rules
 }
 
 // Keep Codex CLI passthrough aligned with upstream. Codex uses lower-case

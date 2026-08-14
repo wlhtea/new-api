@@ -146,7 +146,11 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	baseURL := strings.TrimRight(constant.ChannelBaseURLs[constant.ChannelTypeOpenCodeGo], "/")
+	channelType := constant.ChannelTypeOpenCodeGo
+	if info != nil && constant.IsOpenCodeChannelType(info.ChannelType) {
+		channelType = info.ChannelType
+	}
+	baseURL := strings.TrimRight(constant.ChannelBaseURLs[channelType], "/")
 	switch protocol {
 	case ProtocolChat:
 		return baseURL + "/chat/completions", nil
@@ -163,6 +167,25 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 	protocol, err := a.resolveProtocol(info)
 	if err != nil {
 		return err
+	}
+	if !constant.IsOpenCodeGoPoolChannelType(info.GetChannelType()) {
+		if strings.TrimSpace(info.ApiKey) == "" {
+			return errors.New("OpenCode API key channel has no API key")
+		}
+		if a.cacheIdentity == "" {
+			a.cacheIdentity = cacheIdentityForRequest(c, info, nil)
+		}
+		channel.SetupApiRequestHeader(info, c, header)
+		header.Del("Authorization")
+		header.Del("x-api-key")
+		header.Set(cacheIdentityHeader, a.cacheIdentity)
+		header.Set("x-opencode-client", "new-api")
+		if protocol == ProtocolMessages {
+			setupOpenCodeMessagesRequestHeader(c, header, info.ApiKey)
+			return nil
+		}
+		header.Set("Authorization", "Bearer "+info.ApiKey)
+		return nil
 	}
 	if !a.workspaceSelected {
 		// convertRequest normally resolves the affinity identity before this
@@ -230,19 +253,28 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 	header.Set("x-opencode-client", "new-api")
 
 	if protocol == ProtocolMessages {
-		header.Set("x-api-key", info.ApiKey)
-		version := ""
-		if c != nil && c.Request != nil {
-			version = c.Request.Header.Get("anthropic-version")
-		}
-		if version == "" {
-			version = "2023-06-01"
-		}
-		header.Set("anthropic-version", version)
+		setupOpenCodeMessagesRequestHeader(c, header, info.ApiKey)
 		return nil
 	}
 	header.Set("Authorization", "Bearer "+info.ApiKey)
 	return nil
+}
+
+func setupOpenCodeMessagesRequestHeader(c *gin.Context, header *http.Header, apiKey string) {
+	header.Set("x-api-key", apiKey)
+	version := ""
+	beta := ""
+	if c != nil && c.Request != nil {
+		version = c.Request.Header.Get("anthropic-version")
+		beta = c.Request.Header.Get("anthropic-beta")
+	}
+	if version == "" {
+		version = "2023-06-01"
+	}
+	header.Set("anthropic-version", version)
+	if beta != "" {
+		header.Set("anthropic-beta", beta)
+	}
 }
 
 func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
@@ -397,10 +429,18 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 	if !a.converted {
 		return nil, errors.New("OpenCode Go does not allow pass-through request bodies")
 	}
-	response, err := doOpenCodeGoAPIRequest(a, c, info, requestBody)
+	var (
+		response *http.Response
+		err      error
+	)
+	if constant.IsOpenCodeGoPoolChannelType(info.GetChannelType()) {
+		response, err = doOpenCodeGoAPIRequest(a, c, info, requestBody)
+	} else {
+		response, err = channel.DoApiRequest(a, c, info, requestBody)
+	}
 	if err != nil {
 		a.releaseInFlight()
-		if a.workspaceSelected && !openCodeGoCallerCancelled(c, err) && info != nil {
+		if constant.IsOpenCodeGoPoolChannelType(info.GetChannelType()) && a.workspaceSelected && !openCodeGoCallerCancelled(c, err) && info != nil {
 			reason := sanitizeErrorMessage(err.Error())
 			if _, observeErr := observeOpenCodeGoTransportFailure(
 				info.ChannelId,
@@ -417,6 +457,14 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 				))
 			}
 		}
+	}
+	if err != nil && constant.IsOpenCodeChannelType(info.GetChannelType()) && !openCodeGoCallerCancelled(c, err) {
+		return response, service.MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
+			err,
+			types.ErrorCodeDoRequestFailed,
+			http.StatusBadGateway,
+			openCodeUpstreamErrorOptions(c, info)...,
+		))
 	}
 	return response, err
 }
@@ -436,7 +484,13 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	if info == nil {
 		return nil, types.NewOpenAIError(errors.New("OpenCode Go relay info is nil"), types.ErrorCodeBadResponse, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
 	}
-	defer a.releaseInFlight()
+	upstreamStatusCode := http.StatusBadGateway
+	if resp != nil {
+		upstreamStatusCode = resp.StatusCode
+	}
+	if constant.IsOpenCodeGoPoolChannelType(info.GetChannelType()) {
+		defer a.releaseInFlight()
+	}
 	// Responses and Messages have explicit protocol terminal events. Preserve
 	// that requirement through the stream helper so an early EOF cannot be
 	// recorded as a successful request. Chat uses the SSE [DONE] sentinel.
@@ -459,7 +513,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 			err,
 			types.ErrorCodeReadResponseBodyFailed,
 			http.StatusBadGateway,
-			types.ErrOptionWithSkipRetry(),
+			openCodeUpstreamErrorOptions(c, info)...,
 		))
 	}
 
@@ -515,12 +569,30 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 			fmt.Errorf("unsupported OpenCode Go protocol %q", protocol),
 			types.ErrorCodeBadResponse,
 			http.StatusBadGateway,
-			types.ErrOptionWithSkipRetry(),
+			openCodeUpstreamErrorOptions(c, info)...,
 		))
 	}
-	streamFailureReason := a.openCodeGoStreamFailureReason(c, info, responseErr)
-	if streamFailureReason != "" {
-		a.recordFailoverFailure(c, info, streamFailureReason)
+	if state.sawUpstreamError {
+		statusCode := http.StatusBadGateway
+		if responseErr != nil {
+			statusCode = responseErr.StatusCode
+		}
+		responseErr = types.WithOpenAIError(
+			openCodeGoStructuredError(state.upstreamErrorPayload),
+			statusCode,
+			openCodeUpstreamErrorOptions(c, info)...,
+		)
+		// Keep the complete canonical payload as the internal cause while the
+		// structured relay error supplies trusted type/code policy fields.
+		responseErr.SetMessage(string(state.upstreamErrorPayload))
+		responseErr = service.MarkOpenCodeGoUpstreamRelayErrorWithStatus(responseErr, upstreamStatusCode)
+	}
+	streamFailureReason := ""
+	if constant.IsOpenCodeGoPoolChannelType(info.GetChannelType()) {
+		streamFailureReason = a.openCodeGoStreamFailureReason(c, info, responseErr)
+		if streamFailureReason != "" {
+			a.recordFailoverFailure(c, info, streamFailureReason)
+		}
 	}
 	if responseErr != nil {
 		if !openCodeGoCallerCancelled(c, responseErr) &&
@@ -539,18 +611,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 				}
 			}
 		}
-		if state.sawUpstreamError {
-			responseErr = service.MarkOpenCodeGoUpstreamRelayError(responseErr)
-		}
 		return nil, responseErr
-	}
-	if state.sawUpstreamError {
-		responseErr = types.WithOpenAIError(types.OpenAIError{
-			Message: string(state.upstreamErrorPayload),
-			Type:    "upstream_error",
-			Code:    "upstream_error",
-		}, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
-		return nil, service.MarkOpenCodeGoUpstreamRelayError(responseErr)
 	}
 	if writeErr := service.ResponseBodyWriteError(c); writeErr != nil {
 		return nil, types.NewOpenAIError(
@@ -560,10 +621,10 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
-	if settlementErr := a.openCodeGoStreamSettlementError(c, info); settlementErr != nil {
+	if settlementErr := a.openCodeGoStreamSettlementError(c, info, upstreamStatusCode); settlementErr != nil {
 		return nil, settlementErr
 	}
-	if streamFailureReason == "" && !a.openCodeGoStreamHasLocalErrors(info) {
+	if constant.IsOpenCodeGoPoolChannelType(info.GetChannelType()) && streamFailureReason == "" && !a.openCodeGoStreamHasLocalErrors(info) {
 		a.recordFailoverSuccess(c, info)
 	}
 	return finalizeResponseUsage(usage, state), nil
@@ -591,7 +652,7 @@ func rawJSONFieldPresent(raw []byte) bool {
 	return value != "" && value != "null"
 }
 
-func (a *Adaptor) openCodeGoStreamSettlementError(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+func (a *Adaptor) openCodeGoStreamSettlementError(c *gin.Context, info *relaycommon.RelayInfo, upstreamStatusCode int) *types.NewAPIError {
 	if a == nil || !a.requestUpstreamStream || info == nil {
 		return nil
 	}
@@ -613,12 +674,15 @@ func (a *Adaptor) openCodeGoStreamSettlementError(c *gin.Context, info *relaycom
 		)
 	}
 	if a.openCodeGoStreamIncomplete(c, info) {
-		return service.MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
-			errors.New("OpenCode Go upstream stream ended before completion"),
-			types.ErrorCodeBadResponseBody,
-			http.StatusBadGateway,
-			types.ErrOptionWithSkipRetry(),
-		))
+		return service.MarkOpenCodeGoUpstreamRelayErrorWithStatus(
+			types.NewOpenAIError(
+				errors.New("OpenCode Go upstream stream ended before completion"),
+				types.ErrorCodeBadResponseBody,
+				http.StatusBadGateway,
+				openCodeUpstreamErrorOptions(c, info)...,
+			),
+			upstreamStatusCode,
+		)
 	}
 	return nil
 }

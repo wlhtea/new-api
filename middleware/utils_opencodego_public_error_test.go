@@ -16,24 +16,26 @@ import (
 )
 
 func TestAbortWithOpenAiMessageHidesOpenCodeGoInternalDetails(t *testing.T) {
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenCodeGo)
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		common.SetContextKey(c, constant.ContextKeyChannelType, channelType)
 
-	abortWithOpenAiMessage(
-		c,
-		http.StatusServiceUnavailable,
-		"OpenCode Go channel workspace is unavailable",
-		types.ErrorCodeGetChannelFailed,
-	)
+		abortWithOpenAiMessage(
+			c,
+			http.StatusServiceUnavailable,
+			"OpenCode Go channel workspace is unavailable",
+			types.ErrorCodeGetChannelFailed,
+		)
 
-	require.Equal(t, http.StatusTooManyRequests, recorder.Code)
-	body := strings.ToLower(recorder.Body.String())
-	assert.Contains(t, body, service.OpenCodeGoPublicOverloadMessage)
-	assert.Contains(t, body, service.OpenCodeGoPublicRateLimitErrorCode)
-	for _, marker := range []string{"opencode", "channel", "workspace", "wrk_"} {
-		assert.NotContains(t, body, marker)
+		require.Equal(t, http.StatusTooManyRequests, recorder.Code)
+		body := strings.ToLower(recorder.Body.String())
+		assert.Contains(t, body, service.OpenCodeGoPublicOverloadMessage)
+		assert.Contains(t, body, service.OpenCodeGoPublicRateLimitErrorCode)
+		for _, marker := range []string{"opencode", "channel", "workspace", "wrk_"} {
+			assert.NotContains(t, body, marker)
+		}
 	}
 }
 

@@ -35,6 +35,8 @@ var (
 	openCodeGoIdentityUIDPattern     = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b`)
 	openCodeGoProxyUserinfoPattern   = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^/@\s]+@[^/\s]+`)
 	openCodeGoAuthorizationPattern   = regexp.MustCompile(`(?i)(\b(?:proxy-)?authorization\s*[:=]\s*)[^\r\n]+`)
+	openCodeGoHeaderSecretPattern    = regexp.MustCompile(`(?i)(\b(?:x-(?:api|goog)-key|api[_ -]?key|(?:set-)?cookie)\s*[:=]\s*)[^\r\n]+`)
+	openCodeGoCredentialFieldPattern = regexp.MustCompile(`(?i)(\b(?:access[_ -]?token|refresh[_ -]?token|id[_ -]?token|session(?:[_ -]?id)?|token[_ -]?id|x[_ -]?opencode[_ -]?session|password|credential|secret)\s*[:=]\s*)[^\s,;\]}]+`)
 )
 
 type openCodeGoConsoleReader interface {
@@ -1159,6 +1161,7 @@ func sanitizeOpenCodeGoError(err error, secrets ...string) string {
 			message = strings.ReplaceAll(message, secret, "[redacted]")
 		}
 	}
+	message = common.RedactOpenCodeGoPrivateErrorJSONFields(message)
 	message = openCodeGoSecretPattern.ReplaceAllString(message, "[redacted-key]")
 	message = openCodeGoCookiePattern.ReplaceAllString(message, "auth=[redacted]")
 	message = openCodeGoUpstreamIDPattern.ReplaceAllString(message, "[workspace]")
@@ -1168,6 +1171,9 @@ func sanitizeOpenCodeGoError(err error, secrets ...string) string {
 	message = openCodeGoIdentityUIDPattern.ReplaceAllString(message, "[identity]")
 	message = openCodeGoProxyUserinfoPattern.ReplaceAllString(message, "[redacted-proxy]")
 	message = openCodeGoAuthorizationPattern.ReplaceAllString(message, "$1[redacted]")
+	message = openCodeGoHeaderSecretPattern.ReplaceAllString(message, "$1[redacted]")
+	message = openCodeGoCredentialFieldPattern.ReplaceAllString(message, "$1[redacted]")
+	message = common.MaskSensitiveInfo(message)
 	message = strings.ToValidUTF8(message, "\uFFFD")
 	message = strings.Join(strings.Fields(message), " ")
 	if len(message) > 512 {

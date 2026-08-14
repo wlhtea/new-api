@@ -382,6 +382,15 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
 
 	var url string
 	switch channel.Type {
+	case constant.ChannelTypeOpenCodeAPIKey:
+		// The fixed OpenCode Go root already ends in /v1. Keep support for
+		// test/custom roots without a version path while avoiding /v1/v1/models.
+		trimmedBaseURL := strings.TrimRight(baseURL, "/")
+		if strings.HasSuffix(trimmedBaseURL, "/v1") {
+			url = trimmedBaseURL + "/models"
+		} else {
+			url = trimmedBaseURL + "/v1/models"
+		}
 	case constant.ChannelTypeAli:
 		url = fmt.Sprintf("%s/compatible-mode/v1/models", baseURL)
 	case constant.ChannelTypeZhipu_v4:

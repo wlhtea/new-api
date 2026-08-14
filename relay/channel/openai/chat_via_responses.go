@@ -326,7 +326,7 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 	accumulator := relayconvert.NewResponsesBufferedAccumulator()
 	var finalResponse *dto.OpenAIResponsesResponse
 	var streamErr *types.NewAPIError
-	strictOpenCodeGo := info != nil && info.ChannelType == constant.ChannelTypeOpenCodeGo
+	strictOpenCodeGo := info != nil && constant.IsOpenCodeChannelType(info.ChannelType)
 	ensureBufferedStreamStatus(info)
 	if strictOpenCodeGo && info.StreamStatus != nil {
 		info.StreamStatus.RequireProtocolTerminal()
@@ -471,7 +471,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 	streamErr := (*types.NewAPIError)(nil)
-	strictOpenCodeGo := info != nil && info.ChannelType == constant.ChannelTypeOpenCodeGo
+	strictOpenCodeGo := info != nil && constant.IsOpenCodeChannelType(info.ChannelType)
 
 	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo == nil {
 		info.ClaudeConvertInfo = &relaycommon.ClaudeConvertInfo{LastMessagesType: relaycommon.LastMessageTypeNone}
@@ -605,6 +605,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 	if streamErr != nil {
 		return nil, streamErr
+	}
+	if !relaycommon.OpenCodeStreamReadyForFinalization(info) {
+		return state.Usage(), nil
 	}
 
 	usage := state.Usage()

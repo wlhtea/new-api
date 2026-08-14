@@ -602,6 +602,14 @@ func (channel *Channel) Update() error {
 	if err != nil {
 		return err
 	}
+	// API-key OpenCode rows are always ordinary single-key channels. GORM's
+	// struct Updates skips zero-value JSON fields, so explicitly persist the
+	// cleared ChannelInfo when normalizing a legacy row.
+	if channel.Type == constant.ChannelTypeOpenCodeAPIKey {
+		if err := DB.Model(&Channel{}).Where("id = ?", channel.Id).Update("channel_info", channel.ChannelInfo).Error; err != nil {
+			return err
+		}
+	}
 	DB.Model(channel).First(channel, "id = ?", channel.Id)
 	err = channel.UpdateAbilities(nil)
 	return err
@@ -1059,6 +1067,10 @@ func (channel *Channel) ValidateSettings() error {
 			channel.SetOtherSettings(*channelOtherSettings)
 		}
 		if err := channelOtherSettings.OpenCodeGo.Validate(); err != nil {
+			return err
+		}
+	} else if channel.Type == constant.ChannelTypeOpenCodeAPIKey {
+		if err := channelOtherSettings.OpenCodeGo.ValidateProtocolRouting(); err != nil {
 			return err
 		}
 	}

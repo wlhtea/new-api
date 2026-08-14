@@ -83,6 +83,8 @@ func ChannelType2APIType(channelType int) (int, bool) {
 		apiType = constant.APITypeNewAPI
 	case constant.ChannelTypeOpenCodeGo:
 		apiType = constant.APITypeOpenCodeGo
+	case constant.ChannelTypeOpenCodeAPIKey:
+		apiType = constant.APITypeOpenCodeAPIKey
 	}
 	if apiType == -1 {
 		return constant.APITypeOpenAI, false

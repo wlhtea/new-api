@@ -62,11 +62,18 @@ func GetAllEnableAbilities() []Ability {
 func getEnabledAbilityQuery(group string, model string, requestPath string) *gorm.DB {
 	query := DB.Model(&Ability{}).
 		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
+	unsupportedOpenCodeTypes := make([]int, 0, 2)
 	if !IsOpenCodeGoSupportedRequestPath(requestPath) {
-		openCodeGoChannelIDs := DB.Model(&Channel{}).
+		unsupportedOpenCodeTypes = append(unsupportedOpenCodeTypes, constant.ChannelTypeOpenCodeGo)
+	}
+	if !IsOpenCodeSupportedRequestPath(requestPath) {
+		unsupportedOpenCodeTypes = append(unsupportedOpenCodeTypes, constant.ChannelTypeOpenCodeAPIKey)
+	}
+	if len(unsupportedOpenCodeTypes) > 0 {
+		unsupportedChannelIDs := DB.Model(&Channel{}).
 			Select("id").
-			Where("type = ?", constant.ChannelTypeOpenCodeGo)
-		query = query.Where("channel_id NOT IN (?)", openCodeGoChannelIDs)
+			Where("type IN ?", unsupportedOpenCodeTypes)
+		query = query.Where("channel_id NOT IN (?)", unsupportedChannelIDs)
 	}
 	return query
 }

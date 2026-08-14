@@ -127,7 +127,7 @@ func formatUserLogs(logs []*Log, startIdx int) {
 		if !hasChannelType {
 			channelType, hasChannelType = resolvedChannelTypes[logs[i].ChannelId]
 		}
-		if hasChannelType && channelType == constant.ChannelTypeOpenCodeGo {
+		if hasChannelType && constant.IsOpenCodeChannelType(channelType) {
 			logs[i].UpstreamRequestId = ""
 		} else if !hasChannelType {
 			// Historical rows may predate persisted channel attribution, and the
@@ -169,17 +169,55 @@ func classifyUserLogOpenCodeGoError(log *Log, other map[string]interface{}) cons
 		return constant.ClassifyOpenCodeGoPublicError(http.StatusBadGateway, "", "", "")
 	}
 	statusCode := userLogStatusCode(other, log.Content)
+	if upstreamStatusCode, hasUpstreamStatus := userLogUpstreamStatusCode(other); hasUpstreamStatus {
+		// A marked relay error persists its raw upstream status in admin_info.
+		// Use it rather than a post-mapping public status when deciding whether
+		// a historical upstream error can remain a user-facing 400.
+		statusCode = upstreamStatusCode
+	}
 	errorType := userLogStringValue(other, "error_type")
 	errorCode := userLogStringValue(other, "error_code")
+	if constant.IsOpenCodeGoSafeUpstreamClientRequestError(statusCode, errorType, errorCode, log.Content) {
+		projection := constant.ClassifyOpenCodeGoPublicError(
+			http.StatusBadRequest,
+			constant.OpenCodeGoPublicInvalidRequestCode,
+			constant.OpenCodeGoPublicInvalidRequestCode,
+			log.Content,
+		)
+		projection.Message = common.OpenCodeGoPublicClientRequestMessage(log.Content)
+		return projection
+	}
 	projection := constant.ClassifyOpenCodeGoPublicError(statusCode, errorType, errorCode, log.Content)
-	// Historical records without a structured status were previously all
-	// exposed as overloads. Keep those records private, but preserve the
-	// request/upstream distinction whenever a status was persisted.
-	if statusCode == http.StatusInternalServerError &&
-		projection.StatusCode == http.StatusInternalServerError {
-		projection = constant.ClassifyOpenCodeGoPublicError(http.StatusBadGateway, errorType, errorCode, log.Content)
+	if projection.StatusCode != 499 {
+		// A raw upstream 400 is not sufficient evidence of a user mistake. Only
+		// the explicit allowlist above may keep client-error semantics.
+		return constant.ClassifyOpenCodeGoPublicError(
+			http.StatusTooManyRequests,
+			constant.OpenCodeGoPublicRateLimitErrorCode,
+			constant.OpenCodeGoPublicRateLimitErrorCode,
+			log.Content,
+		)
 	}
 	return projection
+}
+
+func userLogUpstreamStatusCode(other map[string]interface{}) (int, bool) {
+	if other == nil {
+		return 0, false
+	}
+	adminInfo, ok := other["admin_info"].(map[string]interface{})
+	if !ok {
+		return 0, false
+	}
+	rawStatus, exists := adminInfo["upstream_status_code"]
+	if !exists {
+		return 0, false
+	}
+	statusCode, ok := parseUserLogInt(rawStatus)
+	if !ok || statusCode < 100 || statusCode > 599 {
+		return 0, true
+	}
+	return statusCode, true
 }
 
 func userLogStatusCode(other map[string]interface{}, content string) int {
@@ -287,7 +325,7 @@ func userLogNeedsOpenCodeGoErrorProjection(log *Log, other map[string]interface{
 		return false
 	}
 	if hasChannelType {
-		return channelType == constant.ChannelTypeOpenCodeGo
+		return constant.IsOpenCodeChannelType(channelType)
 	}
 	return userLogHasOpenCodeGoPrivateMarker(log.Content, log.ChannelName, log.UpstreamRequestId, log.Other)
 }

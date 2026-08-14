@@ -143,6 +143,9 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	if streamErr != nil {
 		return nil, streamErr
 	}
+	if !relaycommon.OpenCodeStreamReadyForFinalization(info) {
+		return state.Usage(), nil
+	}
 
 	usage := state.Usage()
 	if usage == nil || usage.TotalTokens == 0 {

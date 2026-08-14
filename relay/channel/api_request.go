@@ -12,6 +12,7 @@ import (
 	"time"
 
 	common2 "github.com/QuantumNous/new-api/common"
+	rootconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
@@ -296,6 +297,15 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 		}
 
 		headerOverride[key] = value
+	}
+	if info.GetChannelType() == rootconstant.ChannelTypeOpenCodeAPIKey {
+		// The adaptor owns account credentials and the normalized OpenCode cache
+		// identity for a one-key row. Header overrides are applied after adaptor
+		// setup on HTTP, form, and WebSocket paths, so these must be removed from
+		// the final override map rather than from an individual caller.
+		delete(headerOverride, "authorization")
+		delete(headerOverride, "x-api-key")
+		delete(headerOverride, "x-opencode-session")
 	}
 	return headerOverride, nil
 }
@@ -623,7 +633,11 @@ func doRequestWithClient(c *gin.Context, req *http.Request, info *common.RelayIn
 
 	resp, err := relayClient.Do(req)
 	if err != nil {
-		logger.LogError(c, "do request failed: "+err.Error())
+		logMessage := err.Error()
+		if info != nil && rootconstant.IsOpenCodeChannelType(info.GetChannelType()) {
+			logMessage = service.SanitizeOpenCodeGoAdminError(err)
+		}
+		logger.LogError(c, "do request failed: "+common2.LocalLogPreview(logMessage))
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {

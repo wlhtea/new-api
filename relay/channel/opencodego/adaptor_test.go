@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,10 +23,84 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBuiltInAffinityRuleCoversEveryOpenCodeModel(t *testing.T) {
+	setting := operation_setting.GetChannelAffinitySetting()
+	require.NotNil(t, setting)
+	assert.Contains(t, ModelList, "qwen3.8-max")
+
+	var builtInRule *operation_setting.ChannelAffinityRule
+	for _, rule := range setting.EffectiveRules() {
+		if rule.Name == "opencode api key trace" {
+			ruleCopy := rule
+			builtInRule = &ruleCopy
+			break
+		}
+	}
+	require.NotNil(t, builtInRule)
+
+	for _, model := range ModelList {
+		covered := false
+		for _, pattern := range builtInRule.ModelRegex {
+			matched, err := regexp.MatchString(pattern, model)
+			require.NoError(t, err)
+			if matched {
+				covered = true
+				break
+			}
+		}
+		assert.Truef(t, covered, "built-in affinity rule does not cover model %q", model)
+	}
+}
+
+func TestAdaptorForwardsAnthropicHeadersForMessages(t *testing.T) {
+	originalSelector := selectOpenCodeGoWorkspace
+	selectOpenCodeGoWorkspace = func(_ int, _ string, _ service.OpenCodeGoPoolSelectOptions) (*service.OpenCodeGoPoolSelection, error) {
+		return &service.OpenCodeGoPoolSelection{
+			WorkspaceID:  1,
+			WorkspaceUID: "workspace-test",
+			APIKey:       "pool-api-key",
+		}, nil
+	}
+	t.Cleanup(func() { selectOpenCodeGoWorkspace = originalSelector })
+
+	for _, test := range []struct {
+		name string
+		info *relaycommon.RelayInfo
+		key  string
+	}{
+		{name: "account pool", info: newAdaptorTestInfo("minimax-m3", false), key: "pool-api-key"},
+		{name: "api key row", info: newAPIKeyAdaptorTestInfo("minimax-m3", false), key: "row-api-key"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			test.info.ApiKey = test.key
+			c := newAdaptorTestContext()
+			c.Request.Header.Set("anthropic-version", "2023-10-01")
+			c.Request.Header.Set("anthropic-beta", "tools-2024-04-04")
+			adaptor := &Adaptor{}
+			adaptor.Init(test.info)
+
+			_, err := adaptor.ConvertOpenAIRequest(
+				c,
+				test.info,
+				requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest),
+			)
+			require.NoError(t, err)
+			header := http.Header{}
+			require.NoError(t, adaptor.SetupRequestHeader(c, &header, test.info))
+
+			assert.Equal(t, test.key, header.Get("x-api-key"))
+			assert.Equal(t, "2023-10-01", header.Get("anthropic-version"))
+			assert.Equal(t, "tools-2024-04-04", header.Get("anthropic-beta"))
+			assert.Empty(t, header.Get("Authorization"))
+		})
+	}
+}
 
 type openCodeGoTestRoundTripFunc func(*http.Request) (*http.Response, error)
 
@@ -52,6 +127,13 @@ func newAdaptorTestInfo(model string, stream bool) *relaycommon.RelayInfo {
 		},
 	}
 	setAdaptorTestClientFormat(info, types.RelayFormatOpenAI)
+	return info
+}
+
+func newAPIKeyAdaptorTestInfo(model string, stream bool) *relaycommon.RelayInfo {
+	info := newAdaptorTestInfo(model, stream)
+	info.ChannelType = constant.ChannelTypeOpenCodeAPIKey
+	info.ApiType = constant.APITypeOpenCodeAPIKey
 	return info
 }
 

@@ -11,12 +11,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var openCodeGoSupportedSelectionPaths = []string{
+var openCodeSharedSupportedSelectionPaths = []string{
 	"/v1/chat/completions",
-	"/pg/chat/completions",
 	"/v1/messages",
 	"/v1/responses",
 }
+
+const openCodeGoPoolOnlySelectionPath = "/pg/chat/completions"
 
 var openCodeGoUnsupportedSelectionPaths = []string{
 	"",
@@ -43,16 +44,24 @@ var openCodeGoUnsupportedSelectionPaths = []string{
 }
 
 func TestOpenCodeGoSupportedRequestPathIsExact(t *testing.T) {
-	for _, path := range openCodeGoSupportedSelectionPaths {
+	for _, path := range openCodeSharedSupportedSelectionPaths {
 		t.Run("supported_"+path, func(t *testing.T) {
+			assert.True(t, IsOpenCodeSupportedRequestPath(path))
 			assert.True(t, IsOpenCodeGoSupportedRequestPath(path))
 			assert.True(t, ChannelTypeSupportsRequestPath(constant.ChannelTypeOpenCodeGo, path))
+			assert.True(t, ChannelTypeSupportsRequestPath(constant.ChannelTypeOpenCodeAPIKey, path))
 		})
 	}
+	assert.False(t, IsOpenCodeSupportedRequestPath(openCodeGoPoolOnlySelectionPath))
+	assert.True(t, IsOpenCodeGoSupportedRequestPath(openCodeGoPoolOnlySelectionPath))
+	assert.True(t, ChannelTypeSupportsRequestPath(constant.ChannelTypeOpenCodeGo, openCodeGoPoolOnlySelectionPath))
+	assert.False(t, ChannelTypeSupportsRequestPath(constant.ChannelTypeOpenCodeAPIKey, openCodeGoPoolOnlySelectionPath))
 	for _, path := range openCodeGoUnsupportedSelectionPaths {
 		t.Run("unsupported_"+path, func(t *testing.T) {
+			assert.False(t, IsOpenCodeSupportedRequestPath(path))
 			assert.False(t, IsOpenCodeGoSupportedRequestPath(path))
 			assert.False(t, ChannelTypeSupportsRequestPath(constant.ChannelTypeOpenCodeGo, path))
+			assert.False(t, ChannelTypeSupportsRequestPath(constant.ChannelTypeOpenCodeAPIKey, path))
 			assert.True(t, ChannelTypeSupportsRequestPath(constant.ChannelTypeOpenAI, path))
 		})
 	}
@@ -130,7 +139,7 @@ func TestGetRandomSatisfiedChannelFiltersOpenCodeGoBeforePrioritySelection(t *te
 				assert.Equal(t, fallbackID, channel.Id, path)
 			}
 
-			for _, path := range openCodeGoSupportedSelectionPaths {
+			for _, path := range append(openCodeSharedSupportedSelectionPaths, openCodeGoPoolOnlySelectionPath) {
 				channel, err := GetRandomSatisfiedChannel(group, modelName, 0, path)
 				require.NoError(t, err, path)
 				require.NotNil(t, channel, path)

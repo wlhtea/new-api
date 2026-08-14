@@ -467,6 +467,55 @@ func TestResponseTransformStateFailsClosedForExplicitEmptyErrorEvent(t *testing.
 	}
 }
 
+func TestAdaptorHTTP200CodeOnlyResponsesErrorPreservesPolicyClassification(t *testing.T) {
+	tests := []struct {
+		code             string
+		wantPolicyStatus int
+		wantPublicStatus int
+	}{
+		{code: "server_error", wantPolicyStatus: http.StatusInternalServerError, wantPublicStatus: http.StatusTooManyRequests},
+		{code: "rate_limit_exceeded", wantPolicyStatus: http.StatusTooManyRequests, wantPublicStatus: http.StatusTooManyRequests},
+		{code: "invalid_api_key", wantPolicyStatus: http.StatusUnauthorized, wantPublicStatus: http.StatusTooManyRequests},
+		{code: "invalid_prompt", wantPolicyStatus: http.StatusBadRequest, wantPublicStatus: http.StatusTooManyRequests},
+		{code: "shard_failure", wantPolicyStatus: http.StatusBadGateway, wantPublicStatus: http.StatusTooManyRequests},
+	}
+
+	for _, test := range tests {
+		t.Run(test.code, func(t *testing.T) {
+			info := responseTestInfo(ProtocolResponses, types.RelayFormatOpenAIResponses, false)
+			info.ChannelType = constant.ChannelTypeOpenCodeAPIKey
+			info.ApiType = constant.APITypeOpenCodeAPIKey
+			c, recorder := responseTestContext(types.RelayFormatOpenAIResponses)
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"` + test.code + `"}}`)),
+			}
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+
+			usage, apiErr := adaptor.DoResponse(c, resp, info)
+
+			require.Nil(t, usage)
+			require.NotNil(t, apiErr)
+			assert.Empty(t, recorder.Body.String())
+			assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+			assert.Equal(t, test.wantPolicyStatus, service.OpenCodeGoRelayPolicyStatusCode(apiErr))
+			assert.Equal(t, test.code, fmt.Sprint(apiErr.ToOpenAIError().Code))
+			assert.Contains(t, apiErr.Error(), test.code)
+
+			publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeAPIKey, apiErr)
+			require.NotSame(t, apiErr, publicErr)
+			assert.Equal(t, test.wantPublicStatus, publicErr.StatusCode)
+			if test.wantPublicStatus == http.StatusBadRequest {
+				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestMessage, publicErr.Error())
+			} else {
+				assert.Equal(t, service.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+			}
+		})
+	}
+}
+
 func TestAdaptorDoesNotExposeTopLevelPrivateErrorsAcrossProtocolMatrix(t *testing.T) {
 	oldMode := gin.Mode()
 	gin.SetMode(gin.TestMode)
@@ -781,6 +830,195 @@ func TestAdaptorRejectsIncompleteUpstreamStreamWithoutFailoverAttempt(t *testing
 	}
 }
 
+func TestOpenCodeIncompleteStreamsDoNotSynthesizeSuccessTerminals(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	tests := []struct {
+		name               string
+		protocol           Protocol
+		client             types.RelayFormat
+		upstreamTerminal   string
+		downstreamTerminal string
+	}{
+		{
+			name:               "chat to chat",
+			protocol:           ProtocolChat,
+			client:             types.RelayFormatOpenAI,
+			upstreamTerminal:   "data: [DONE]",
+			downstreamTerminal: "data: [DONE]",
+		},
+		{
+			name:               "chat to messages",
+			protocol:           ProtocolChat,
+			client:             types.RelayFormatClaude,
+			upstreamTerminal:   "data: [DONE]",
+			downstreamTerminal: "event: message_stop",
+		},
+		{
+			name:               "chat to responses",
+			protocol:           ProtocolChat,
+			client:             types.RelayFormatOpenAIResponses,
+			upstreamTerminal:   "data: [DONE]",
+			downstreamTerminal: "event: response.completed",
+		},
+		{
+			name:               "messages to chat",
+			protocol:           ProtocolMessages,
+			client:             types.RelayFormatOpenAI,
+			upstreamTerminal:   `"type":"message_stop"`,
+			downstreamTerminal: "data: [DONE]",
+		},
+		{
+			name:               "messages to responses",
+			protocol:           ProtocolMessages,
+			client:             types.RelayFormatOpenAIResponses,
+			upstreamTerminal:   `"type":"message_stop"`,
+			downstreamTerminal: "event: response.completed",
+		},
+		{
+			name:               "responses to chat",
+			protocol:           ProtocolResponses,
+			client:             types.RelayFormatOpenAI,
+			upstreamTerminal:   `"type":"response.completed"`,
+			downstreamTerminal: "data: [DONE]",
+		},
+		{
+			name:               "responses to messages",
+			protocol:           ProtocolResponses,
+			client:             types.RelayFormatClaude,
+			upstreamTerminal:   `"type":"response.completed"`,
+			downstreamTerminal: "event: message_stop",
+		},
+	}
+
+	channelTypes := []struct {
+		name        string
+		channelType int
+		apiType     int
+	}{
+		{name: "account pool", channelType: constant.ChannelTypeOpenCodeGo, apiType: constant.APITypeOpenCodeGo},
+		{name: "api key", channelType: constant.ChannelTypeOpenCodeAPIKey, apiType: constant.APITypeOpenCodeAPIKey},
+	}
+
+	for _, channel := range channelTypes {
+		for _, test := range tests {
+			t.Run(channel.name+"/"+test.name, func(t *testing.T) {
+				lines := strings.Split(responseFixture(test.protocol, true), "\n")
+				filtered := lines[:0]
+				for _, line := range lines {
+					if !strings.Contains(line, test.upstreamTerminal) {
+						filtered = append(filtered, line)
+					}
+				}
+
+				info := responseTestInfo(test.protocol, test.client, true)
+				info.ChannelType = channel.channelType
+				info.ApiType = channel.apiType
+				c, recorder := responseTestContext(test.client)
+				adaptor := &Adaptor{}
+				adaptor.Init(info)
+				adaptor.requestUpstreamStream = true
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader(strings.Join(filtered, "\n"))),
+				}
+
+				usage, apiErr := adaptor.DoResponse(c, resp, info)
+
+				require.Nil(t, usage)
+				require.NotNil(t, apiErr)
+				assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+				if channel.channelType == constant.ChannelTypeOpenCodeAPIKey {
+					assert.True(t, types.IsSkipRetryError(apiErr), "written output must prevent a generic channel retry")
+				}
+				output := recorder.Body.String()
+				assert.Contains(t, output, "OK")
+				assert.NotContains(t, output, test.downstreamTerminal)
+				require.NotNil(t, info.StreamStatus)
+				if test.protocol == ProtocolChat {
+					assert.False(t, info.StreamStatus.DoneSentinelObserved())
+				} else {
+					assert.False(t, info.StreamStatus.ProtocolTerminalObserved())
+				}
+			})
+		}
+	}
+}
+
+func TestOpenCodeChatToClaudeDefersTerminalBatchUntilDone(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	channelTypes := []struct {
+		name        string
+		channelType int
+		apiType     int
+	}{
+		{name: "account pool", channelType: constant.ChannelTypeOpenCodeGo, apiType: constant.APITypeOpenCodeGo},
+		{name: "api key", channelType: constant.ChannelTypeOpenCodeAPIKey, apiType: constant.APITypeOpenCodeAPIKey},
+	}
+	streamLines := []string{
+		`data: {"id":"chat_1","object":"chat.completion.chunk","created":1710000000,"model":"vendor/chat-alias","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},"finish_reason":null}]}`,
+		`data: {"id":"chat_1","object":"chat.completion.chunk","created":1710000000,"model":"vendor/chat-alias","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`data: {"id":"chat_1","object":"chat.completion.chunk","created":1710000000,"model":"vendor/chat-alias","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`,
+		`data: {"type":"ping"}`,
+	}
+
+	for _, channel := range channelTypes {
+		for _, complete := range []bool{false, true} {
+			name := "incomplete"
+			if complete {
+				name = "complete"
+			}
+			t.Run(channel.name+"/"+name, func(t *testing.T) {
+				lines := append([]string(nil), streamLines...)
+				if complete {
+					lines = append(lines, "data: [DONE]")
+				}
+
+				info := responseTestInfo(ProtocolChat, types.RelayFormatClaude, true)
+				info.ChannelType = channel.channelType
+				info.ApiType = channel.apiType
+				c, recorder := responseTestContext(types.RelayFormatClaude)
+				adaptor := &Adaptor{}
+				adaptor.Init(info)
+				adaptor.requestUpstreamStream = true
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader(strings.Join(lines, "\n"))),
+				}
+
+				usage, apiErr := adaptor.DoResponse(c, resp, info)
+
+				output := recorder.Body.String()
+				assert.Contains(t, output, "OK")
+				require.NotNil(t, info.StreamStatus)
+				assert.Equal(t, complete, info.StreamStatus.DoneSentinelObserved())
+				if !complete {
+					require.Nil(t, usage)
+					require.NotNil(t, apiErr)
+					assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+					assert.Zero(t, strings.Count(output, "event: content_block_stop\n"))
+					assert.Zero(t, strings.Count(output, "event: message_delta\n"))
+					assert.Zero(t, strings.Count(output, "event: message_stop\n"))
+					return
+				}
+
+				require.Nil(t, apiErr)
+				require.NotNil(t, usage)
+				assert.Equal(t, 1, strings.Count(output, "event: content_block_stop\n"))
+				assert.Equal(t, 1, strings.Count(output, "event: message_delta\n"))
+				assert.Equal(t, 1, strings.Count(output, "event: message_stop\n"))
+			})
+		}
+	}
+}
+
 func TestAdaptorBufferedNonstreamUpstreamIsNotRejectedAsIncomplete(t *testing.T) {
 	info := responseTestInfo(ProtocolChat, types.RelayFormatClaude, true)
 	c, _ := responseTestContext(types.RelayFormatClaude)
@@ -872,7 +1110,7 @@ func TestAdaptorLocalStreamFailureAfterTerminalReturnsSettlementError(t *testing
 	adaptor := &Adaptor{protocol: ProtocolResponses, requestUpstreamStream: true}
 	c, _ := responseTestContext(types.RelayFormatOpenAIResponses)
 
-	apiErr := adaptor.openCodeGoStreamSettlementError(c, info)
+	apiErr := adaptor.openCodeGoStreamSettlementError(c, info, http.StatusOK)
 
 	require.NotNil(t, apiErr)
 	assert.True(t, types.IsSkipRetryError(apiErr))

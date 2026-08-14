@@ -139,6 +139,7 @@ import {
 import {
   ADD_MODE_OPTIONS,
   CHANNEL_STATUS_LABELS,
+  CHANNEL_TYPE_OPENCODE_API_KEY,
   CHANNEL_TYPE_OPENCODE_GO,
   CHANNEL_TYPE_OPTIONS,
   CHANNEL_TYPE_WARNINGS,
@@ -146,6 +147,8 @@ import {
   FIELD_DESCRIPTIONS,
   FIELD_PLACEHOLDERS,
   MODEL_FETCHABLE_TYPES,
+  OPENCODE_API_KEY_ADD_MODE_OPTIONS,
+  OPENCODE_API_KEY_BATCH_FORMAT,
 } from '../../constants'
 import { useChannelMutateForm } from '../../hooks/use-channel-mutate-form'
 import {
@@ -154,6 +157,7 @@ import {
   channelFormSchema,
   channelsQueryKeys,
   getAdvancedCustomStats,
+  deduplicateOpenCodeAPIKeyBatchEntries,
   transformChannelToFormDefaults,
   type ChannelFormInput,
   type ChannelFormValues,
@@ -171,7 +175,10 @@ import {
   shouldWarnAboutV1BaseUrl,
   validateModelMappingJson,
   hasAdvancedSettingsErrors,
+  isOpenCodeAPIKeyBatchForm,
+  shouldShowSharedChannelProxy,
   usesLegacyChannelKey,
+  usesOpenCodeProtocolSettings,
 } from '../../lib'
 import {
   collectInvalidStatusCodeEntries,
@@ -195,6 +202,7 @@ import {
   ChannelBasicSection,
   ChannelEditorLoadingState,
   ChannelModelsSection,
+  OpenCodeAPIKeyChannelSettings,
   OpenCodeGoChannelSettings,
 } from './sections'
 
@@ -780,7 +788,8 @@ export function ChannelMutateDrawer({
   const shouldPreviewUnsavedModels =
     !isEditing ||
     ((currentType === CHANNEL_TYPE_ADVANCED_CUSTOM ||
-      currentType === CHANNEL_TYPE_OPENCODE_GO) &&
+      currentType === CHANNEL_TYPE_OPENCODE_GO ||
+      currentType === CHANNEL_TYPE_OPENCODE_API_KEY) &&
       canEditSensitive)
   const {
     unlocked: doubaoApiEditUnlocked,
@@ -876,13 +885,23 @@ export function ChannelMutateDrawer({
     currentTypeUsesLegacyKey &&
     currentType !== 57 &&
     !(currentType === 41 && vertexKeyType === 'api_key')
-  const addModeOptions = useMemo(
-    () =>
-      supportsMultiKeyAddMode
-        ? ADD_MODE_OPTIONS
-        : ADD_MODE_OPTIONS.filter((option) => option.value === 'single'),
-    [supportsMultiKeyAddMode]
+  const isOpenCodeAPIKeyType = currentType === CHANNEL_TYPE_OPENCODE_API_KEY
+  const isOpenCodeAPIKeyBatch = isOpenCodeAPIKeyBatchForm(
+    currentType,
+    multiKeyMode,
+    isEditing
   )
+  const showSharedProxy = shouldShowSharedChannelProxy(
+    currentType,
+    multiKeyMode,
+    isEditing
+  )
+  const addModeOptions = useMemo(() => {
+    if (isOpenCodeAPIKeyType) return OPENCODE_API_KEY_ADD_MODE_OPTIONS
+    return supportsMultiKeyAddMode
+      ? ADD_MODE_OPTIONS
+      : ADD_MODE_OPTIONS.filter((option) => option.value === 'single')
+  }, [isOpenCodeAPIKeyType, supportsMultiKeyAddMode])
 
   const advancedCustomStats = useMemo(
     () => getAdvancedCustomStats(currentAdvancedCustom),
@@ -1041,9 +1060,10 @@ export function ChannelMutateDrawer({
   const extraSettingsConfigured = Boolean(
     currentForceFormat ||
     currentThinkingToContent ||
-    currentPassThroughBodyEnabled ||
+    (currentType !== CHANNEL_TYPE_OPENCODE_API_KEY &&
+      currentPassThroughBodyEnabled) ||
     currentDisableTaskPollingSleep ||
-    currentProxy?.trim() ||
+    (showSharedProxy && currentProxy?.trim()) ||
     currentSystemPrompt?.trim() ||
     currentSystemPromptOverride ||
     (currentHttpProtocol && currentHttpProtocol !== 'auto') ||
@@ -1292,20 +1312,27 @@ export function ChannelMutateDrawer({
 
   // Handle type change - set default values for specific types
   useEffect(() => {
-    if (currentType === CHANNEL_TYPE_OPENCODE_GO) {
-      const defaults = getChannelTypeCreateDefaults(CHANNEL_TYPE_OPENCODE_GO)
+    if (usesOpenCodeProtocolSettings(currentType)) {
+      const defaults = getChannelTypeCreateDefaults(currentType)
       form.setValue('base_url', defaults.baseUrl, {
         shouldDirty: !isEditing,
         shouldValidate: true,
       })
-      form.setValue('key', '', {
-        shouldDirty: false,
-        shouldValidate: true,
-      })
-      form.setValue('multi_key_mode', 'single', {
-        shouldDirty: false,
-        shouldValidate: true,
-      })
+      if (currentType === CHANNEL_TYPE_OPENCODE_GO) {
+        form.setValue('key', '', {
+          shouldDirty: false,
+          shouldValidate: true,
+        })
+        form.setValue('multi_key_mode', 'single', {
+          shouldDirty: false,
+          shouldValidate: true,
+        })
+      } else if (form.getValues('multi_key_mode') === 'multi_to_single') {
+        form.setValue('multi_key_mode', 'single', {
+          shouldDirty: false,
+          shouldValidate: true,
+        })
+      }
       if (!isEditing) {
         form.setValue('models', defaults.models, {
           shouldDirty: true,
@@ -1365,6 +1392,14 @@ export function ChannelMutateDrawer({
     }
   }, [form, isEditing, multiKeyMode, supportsMultiKeyAddMode])
 
+  useEffect(() => {
+    if (!isOpenCodeAPIKeyBatch || !form.getValues('proxy')) return
+    form.setValue('proxy', '', {
+      shouldDirty: true,
+      shouldValidate: true,
+    })
+  }, [form, isOpenCodeAPIKeyBatch])
+
   // Validate base_url - warn if it ends with /v1
   useEffect(() => {
     if (!open || !shouldWarnAboutV1BaseUrl(currentType, currentBaseUrl)) return
@@ -1390,7 +1425,9 @@ export function ChannelMutateDrawer({
       return
     }
 
-    const result = deduplicateKeys(currentKey)
+    const result = isOpenCodeAPIKeyBatch
+      ? deduplicateOpenCodeAPIKeyBatchEntries(currentKey)
+      : deduplicateKeys(currentKey)
 
     if (result.removedCount === 0) {
       toast.info(t('No duplicate keys found'))
@@ -1522,7 +1559,8 @@ export function ChannelMutateDrawer({
     const editingFormPreview =
       isEditing &&
       (type === CHANNEL_TYPE_ADVANCED_CUSTOM ||
-        type === CHANNEL_TYPE_OPENCODE_GO)
+        type === CHANNEL_TYPE_OPENCODE_GO ||
+        type === CHANNEL_TYPE_OPENCODE_API_KEY)
     if (editingFormPreview && channelId === null) {
       throw new Error(t('No channel selected'))
     }
@@ -2875,6 +2913,12 @@ export function ChannelMutateDrawer({
                               />
                             )}
 
+                            {currentType === CHANNEL_TYPE_OPENCODE_API_KEY && (
+                              <OpenCodeAPIKeyChannelSettings
+                                disabled={sensitiveLocked}
+                              />
+                            )}
+
                             {currentType === CHANNEL_TYPE_ADVANCED_CUSTOM && (
                               <FormField
                                 control={form.control}
@@ -3034,6 +3078,9 @@ export function ChannelMutateDrawer({
                                       keyPlaceholder = t(
                                         'Enter key, format: AccessKey|SecretAccessKey|Region'
                                       )
+                                    } else if (isOpenCodeAPIKeyBatch) {
+                                      keyPlaceholder =
+                                        OPENCODE_API_KEY_BATCH_FORMAT
                                     } else if (isBatchMode) {
                                       keyPlaceholder = t(
                                         'Enter one key per line for batch creation'
@@ -3063,6 +3110,10 @@ export function ChannelMutateDrawer({
                                             </span>
                                           )}
                                         </>
+                                      )
+                                    } else if (isOpenCodeAPIKeyBatch) {
+                                      keyDescription = t(
+                                        'Enter one account per line. Proxy URL is optional.'
                                       )
                                     } else if (isBatchMode) {
                                       keyDescription = t(
@@ -3478,32 +3529,33 @@ export function ChannelMutateDrawer({
                                     />
                                     {t('Fill All Models')}
                                   </Button>
-                                  {MODEL_FETCHABLE_TYPES.has(currentType) && (
-                                    <>
-                                      <Button
-                                        type='button'
-                                        variant='outline'
-                                        size='sm'
-                                        onClick={handleFetchModels}
-                                        disabled={
-                                          !isEditing && !canEditSensitive
-                                        }
-                                      >
-                                        <Sparkles
-                                          className='mr-2 h-4 w-4'
-                                          aria-hidden='true'
-                                        />
-                                        {t('Fetch from Upstream')}
-                                      </Button>
-                                      {!isEditing && !canEditSensitive && (
-                                        <span className='text-muted-foreground basis-full text-xs'>
-                                          {t(
-                                            'No permission to perform this action'
-                                          )}
-                                        </span>
-                                      )}
-                                    </>
-                                  )}
+                                  {MODEL_FETCHABLE_TYPES.has(currentType) &&
+                                    !isOpenCodeAPIKeyBatch && (
+                                      <>
+                                        <Button
+                                          type='button'
+                                          variant='outline'
+                                          size='sm'
+                                          onClick={handleFetchModels}
+                                          disabled={
+                                            !isEditing && !canEditSensitive
+                                          }
+                                        >
+                                          <Sparkles
+                                            className='mr-2 h-4 w-4'
+                                            aria-hidden='true'
+                                          />
+                                          {t('Fetch from Upstream')}
+                                        </Button>
+                                        {!isEditing && !canEditSensitive && (
+                                          <span className='text-muted-foreground basis-full text-xs'>
+                                            {t(
+                                              'No permission to perform this action'
+                                            )}
+                                          </span>
+                                        )}
+                                      </>
+                                    )}
                                   <Button
                                     type='button'
                                     variant='outline'
@@ -3703,7 +3755,12 @@ export function ChannelMutateDrawer({
                                   <div className='space-y-1'>
                                     <FormLabel>{t('Groups *')}</FormLabel>
                                     <FormDescription>
-                                      {t(FIELD_DESCRIPTIONS.GROUP)}
+                                      {currentType ===
+                                      CHANNEL_TYPE_OPENCODE_API_KEY
+                                        ? t(
+                                            'Use a dedicated group for this API key pool so it does not mix with other providers.'
+                                          )
+                                        : t(FIELD_DESCRIPTIONS.GROUP)}
                                     </FormDescription>
                                   </div>
                                   <FormControl>
@@ -4238,30 +4295,33 @@ export function ChannelMutateDrawer({
                                 )}
                               />
 
-                              <FormField
-                                control={form.control}
-                                name='pass_through_body_enabled'
-                                render={({ field }) => (
-                                  <FormItem className='flex items-center justify-between px-4 py-3'>
-                                    <div className='space-y-0.5'>
-                                      <FormLabel>
-                                        {t('Pass Through Body')}
-                                      </FormLabel>
-                                      <FormDescription>
-                                        {t(
-                                          'Pass request body directly to upstream'
-                                        )}
-                                      </FormDescription>
-                                    </div>
-                                    <FormControl>
-                                      <Switch
-                                        checked={field.value}
-                                        onCheckedChange={field.onChange}
-                                      />
-                                    </FormControl>
-                                  </FormItem>
-                                )}
-                              />
+                              {currentType !==
+                                CHANNEL_TYPE_OPENCODE_API_KEY && (
+                                <FormField
+                                  control={form.control}
+                                  name='pass_through_body_enabled'
+                                  render={({ field }) => (
+                                    <FormItem className='flex items-center justify-between px-4 py-3'>
+                                      <div className='space-y-0.5'>
+                                        <FormLabel>
+                                          {t('Pass Through Body')}
+                                        </FormLabel>
+                                        <FormDescription>
+                                          {t(
+                                            'Pass request body directly to upstream'
+                                          )}
+                                        </FormDescription>
+                                      </div>
+                                      <FormControl>
+                                        <Switch
+                                          checked={field.value}
+                                          onCheckedChange={field.onChange}
+                                        />
+                                      </FormControl>
+                                    </FormItem>
+                                  )}
+                                />
+                              )}
 
                               <FormField
                                 control={form.control}
@@ -4289,29 +4349,31 @@ export function ChannelMutateDrawer({
                               />
                             </div>
 
-                            <FormField
-                              control={form.control}
-                              name='proxy'
-                              render={({ field }) => (
-                                <FormItem>
-                                  <FormLabel>{t('Proxy Address')}</FormLabel>
-                                  <FormControl>
-                                    <Input
-                                      placeholder={t(
-                                        'socks5://user:pass@host:port'
+                            {showSharedProxy && (
+                              <FormField
+                                control={form.control}
+                                name='proxy'
+                                render={({ field }) => (
+                                  <FormItem>
+                                    <FormLabel>{t('Proxy Address')}</FormLabel>
+                                    <FormControl>
+                                      <Input
+                                        placeholder={t(
+                                          'socks5://user:pass@host:port'
+                                        )}
+                                        {...field}
+                                      />
+                                    </FormControl>
+                                    <FormDescription>
+                                      {t(
+                                        'Network proxy for this channel (supports HTTP, HTTPS, SOCKS5, and SOCKS5H)'
                                       )}
-                                      {...field}
-                                    />
-                                  </FormControl>
-                                  <FormDescription>
-                                    {t(
-                                      'Network proxy for this channel (supports HTTP, HTTPS, SOCKS5, and SOCKS5H)'
-                                    )}
-                                  </FormDescription>
-                                  <FormMessage />
-                                </FormItem>
-                              )}
-                            />
+                                    </FormDescription>
+                                    <FormMessage />
+                                  </FormItem>
+                                )}
+                              />
+                            )}
 
                             <FormField
                               control={form.control}

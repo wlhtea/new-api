@@ -633,11 +633,54 @@ func TestOpenCodeGoChannelTypeCannotBeChangedAfterCreation(t *testing.T) {
 
 	UpdateChannel(ctx)
 
-	assert.Contains(t, recorder.Body.String(), "OpenCode Go channel type cannot be changed")
+	assert.Contains(t, recorder.Body.String(), "OpenCode channel type cannot be changed")
 	reloaded, err := model.GetChannelById(channel.Id, true)
 	require.NoError(t, err)
 	assert.Equal(t, constant.ChannelTypeOpenCodeGo, reloaded.Type)
 	assert.Empty(t, reloaded.Key)
+}
+
+func TestGenericMultiKeyChannelCannotBeChangedToOpenCodeAPIKey(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	channel := &model.Channel{
+		Type:   constant.ChannelTypeOpenAI,
+		Name:   "generic multi-key",
+		Key:    "key-one\nkey-two",
+		Status: common.ChannelStatusEnabled,
+		Models: "model-a",
+		Group:  "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+		},
+	}
+	require.NoError(t, db.Create(channel).Error)
+
+	body := []byte(fmt.Sprintf(`{
+		"id":%d,
+		"type":63,
+		"name":"invalid conversion",
+		"key":"",
+		"models":"model-b",
+		"group":"vip"
+	}`, channel.Id))
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/channel", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	UpdateChannel(ctx)
+
+	assert.Contains(t, recorder.Body.String(), "OpenCode channel type cannot be changed")
+	reloaded, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	assert.Equal(t, constant.ChannelTypeOpenAI, reloaded.Type)
+	assert.Equal(t, "generic multi-key", reloaded.Name)
+	assert.Equal(t, "key-one\nkey-two", reloaded.Key)
+	assert.Equal(t, "model-a", reloaded.Models)
+	assert.Equal(t, "default", reloaded.Group)
+	assert.True(t, reloaded.ChannelInfo.IsMultiKey)
+	assert.Equal(t, 2, reloaded.ChannelInfo.MultiKeySize)
 }
 
 func TestEnablingEmptyOpenCodeGoChannelImmediatelyRestoresPoolDisablement(t *testing.T) {

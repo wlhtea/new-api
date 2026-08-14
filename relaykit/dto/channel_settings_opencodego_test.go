@@ -56,6 +56,29 @@ func TestOpenCodeGoConfigValidate(t *testing.T) {
 	}
 }
 
+func TestOpenCodeGoConfigValidateProtocolRoutingIgnoresPoolOnlySettings(t *testing.T) {
+	config := OpenCodeGoConfig{
+		DefaultProtocol:              OpenCodeGoProtocolResponses,
+		ModelProtocols:               map[string]string{"future-*": OpenCodeGoProtocolMessages},
+		GenericFailoverThreshold:     1,
+		AffinityFallback:             "invalid-pool-value",
+		IdentityProxyEnabled:         true,
+		IdentityProxyCountry:         "invalid",
+		IdentityProxyRotateMinutes:   -1,
+		ReferralRewardsMaxPerRun:     func() *int { value := 21; return &value }(),
+		GenericFailoverWindowSeconds: OpenCodeGoGenericFailoverMaxWindowSeconds + 1,
+	}
+
+	require.NoError(t, config.ValidateProtocolRouting())
+	require.Error(t, config.Validate())
+
+	config.DefaultProtocol = "auto"
+	require.ErrorContains(t, config.ValidateProtocolRouting(), "default protocol")
+	config.DefaultProtocol = OpenCodeGoProtocolChat
+	config.ModelProtocols = map[string]string{"future-[": OpenCodeGoProtocolMessages}
+	require.ErrorContains(t, config.ValidateProtocolRouting(), "model protocol pattern")
+}
+
 func TestOpenCodeGoConfigRejectsExplicitZeroRotateMinutes(t *testing.T) {
 	var config OpenCodeGoConfig
 	require.NoError(t, json.Unmarshal([]byte(`{

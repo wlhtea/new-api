@@ -41,14 +41,21 @@ func (e *openCodeGoUpstreamOriginError) Is(target error) bool {
 	return target == errOpenCodeGoUpstreamOrigin
 }
 
-// MarkOpenCodeGoUpstreamRelayError records that a relay error came from the
-// type-62 upstream. The wrapper is not serialized and preserves Error() so
-// internal logs keep the original diagnostics.
+// MarkOpenCodeGoUpstreamRelayError records that a relay error came from an
+// OpenCode upstream boundary. The wrapper is not serialized and preserves
+// Error() so internal logs keep the original diagnostics.
 func MarkOpenCodeGoUpstreamRelayError(relayErr *types.NewAPIError) *types.NewAPIError {
 	if relayErr == nil || errors.Is(relayErr, errOpenCodeGoUpstreamOrigin) {
 		return relayErr
 	}
 	return markOpenCodeGoUpstreamRelayErrorWithStatus(relayErr, relayErr.StatusCode)
+}
+
+// MarkOpenCodeGoUpstreamRelayErrorWithStatus records the HTTP status observed
+// at the upstream boundary. This is needed for HTTP-200 error envelopes whose
+// protocol handler may otherwise synthesize a different relay status.
+func MarkOpenCodeGoUpstreamRelayErrorWithStatus(relayErr *types.NewAPIError, upstreamStatusCode int) *types.NewAPIError {
+	return markOpenCodeGoUpstreamRelayErrorWithStatus(relayErr, upstreamStatusCode)
 }
 
 func markOpenCodeGoUpstreamRelayErrorWithStatus(relayErr *types.NewAPIError, upstreamStatusCode int) *types.NewAPIError {
@@ -67,7 +74,7 @@ func markOpenCodeGoUpstreamRelayErrorWithStatus(relayErr *types.NewAPIError, ups
 }
 
 // IsOpenCodeGoUpstreamRelayError reports whether the error was explicitly
-// marked at a type-62 upstream boundary.
+// marked at an OpenCode upstream boundary.
 func IsOpenCodeGoUpstreamRelayError(err error) bool {
 	return errors.Is(err, errOpenCodeGoUpstreamOrigin)
 }
@@ -80,20 +87,107 @@ func openCodeGoUpstreamRelayStatusCode(err error) (int, bool) {
 	return originErr.upstreamStatusCode, true
 }
 
-// PublicOpenCodeGoRelayError replaces type-62 errors that name internal
-// infrastructure with a provider-neutral error. It returns a fresh error so
-// private relay metadata and the original unwrap chain cannot be serialized.
+// OpenCodeGoUpstreamRelayStatusCode returns the status observed at the
+// upstream boundary before channel status mapping or public projection.
+func OpenCodeGoUpstreamRelayStatusCode(relayErr *types.NewAPIError) (int, bool) {
+	return openCodeGoUpstreamRelayStatusCode(relayErr)
+}
+
+// OpenCodeGoRelayPolicyStatusCode returns the status used for internal retry
+// and channel-disable decisions. A real non-200 upstream status wins over
+// channel status mapping. HTTP-200 error envelopes instead use their trusted
+// structured type/code so they cannot be mistaken for successful responses.
+// The relay error itself is intentionally left unchanged for admin diagnostics
+// and the later public projection.
+func OpenCodeGoRelayPolicyStatusCode(relayErr *types.NewAPIError) int {
+	if relayErr == nil {
+		return 0
+	}
+	upstreamStatusCode, marked := openCodeGoUpstreamRelayStatusCode(relayErr)
+	if !marked {
+		return relayErr.StatusCode
+	}
+	if upstreamStatusCode != http.StatusOK {
+		return upstreamStatusCode
+	}
+
+	errorType, errorCode := openCodeGoRelayErrorClassification(relayErr)
+	classification := strings.ToLower(strings.Join([]string{errorType, errorCode}, " "))
+	switch {
+	case openCodeGoPolicyClassificationContains(classification,
+		"authentication_error", "authenticationerror", "auth_error", "autherror",
+		"invalid_api_key", "invalid api key", "unauthorized", "invalid_token"):
+		return http.StatusUnauthorized
+	case constant.IsOpenCodeGoClientRequestError(errorType, errorCode, ""):
+		return http.StatusBadRequest
+	case openCodeGoPolicyClassificationContains(classification,
+		"rate_limit", "rate-limit", "ratelimit", "too_many_requests",
+		"overload", "usage_limit", "usagelimit", "quota", "credits"):
+		return http.StatusTooManyRequests
+	case openCodeGoPolicyClassificationContains(classification,
+		"server_error", "servererror", "internal_error", "internalerror",
+		"service_unavailable", "serviceunavailable", "api_error", "apierror",
+		"gateway_error", "gatewayerror", "timeout"):
+		return http.StatusInternalServerError
+	default:
+		// A recognized error envelope is never a successful response. Unknown
+		// upstream classifications fail closed as a retryable bad gateway.
+		return http.StatusBadGateway
+	}
+}
+
+// SanitizeOpenCodeGoAdminError keeps useful upstream diagnostics while
+// removing credentials, internal addresses, and raw account/session values.
+func SanitizeOpenCodeGoAdminError(err error) string {
+	return sanitizeOpenCodeGoError(err)
+}
+
+// OpenCodeGoAdminErrorWithStatusCode keeps useful upstream diagnostics for
+// administrators while removing credentials and raw account/session values.
+func OpenCodeGoAdminErrorWithStatusCode(relayErr *types.NewAPIError) string {
+	if relayErr == nil {
+		return ""
+	}
+	message := SanitizeOpenCodeGoAdminError(relayErr)
+	if relayErr.StatusCode == 0 {
+		return message
+	}
+	if message == "" {
+		return fmt.Sprintf("status_code=%d", relayErr.StatusCode)
+	}
+	return fmt.Sprintf("status_code=%d, %s", relayErr.StatusCode, message)
+}
+
+func openCodeGoPolicyClassificationContains(classification string, markers ...string) bool {
+	for _, marker := range markers {
+		if strings.Contains(classification, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// PublicOpenCodeGoRelayError replaces OpenCode-channel errors that name
+// internal infrastructure with a provider-neutral error. It returns a fresh
+// error so private relay metadata and the original unwrap chain cannot be
+// serialized. Type-62 workspace sentinels remain scoped to the account pool.
 func PublicOpenCodeGoRelayError(channelType int, relayErr *types.NewAPIError) *types.NewAPIError {
 	if relayErr == nil {
 		return nil
 	}
-	poolExhausted := errors.Is(relayErr, ErrOpenCodeGoNoEligibleWorkspace)
-	selectionStale := channelType == constant.ChannelTypeOpenCodeGo &&
+	isOpenCodeChannel := constant.IsOpenCodeChannelType(channelType)
+	// Pool exhaustion can be raised before relay metadata has recorded the
+	// selected channel type. Preserve the existing unknown-context projection,
+	// but never apply this Type-62 sentinel rule to the API-key channel.
+	isOpenCodeGoPool := channelType == constant.ChannelTypeUnknown ||
+		constant.IsOpenCodeGoPoolChannelType(channelType)
+	poolExhausted := isOpenCodeGoPool && errors.Is(relayErr, ErrOpenCodeGoNoEligibleWorkspace)
+	selectionStale := isOpenCodeGoPool &&
 		(errors.Is(relayErr, ErrOpenCodeGoIdentityProxySelectionStale) ||
 			errors.Is(relayErr, ErrOpenCodeGoSelectedCredentialUnavailable))
-	upstreamOrigin := channelType == constant.ChannelTypeOpenCodeGo && IsOpenCodeGoUpstreamRelayError(relayErr)
-	privateDetail := channelType == constant.ChannelTypeOpenCodeGo && openCodeGoRelayErrorContainsPrivateDetail(relayErr)
-	projectionCandidate := channelType == constant.ChannelTypeOpenCodeGo && openCodeGoRelayErrorProjectionCandidate(relayErr)
+	upstreamOrigin := isOpenCodeChannel && IsOpenCodeGoUpstreamRelayError(relayErr)
+	privateDetail := isOpenCodeChannel && openCodeGoRelayErrorContainsPrivateDetail(relayErr)
+	projectionCandidate := isOpenCodeChannel && openCodeGoRelayErrorProjectionCandidate(relayErr)
 	if !poolExhausted && !selectionStale && !upstreamOrigin && !privateDetail && !projectionCandidate {
 		return relayErr
 	}
@@ -114,8 +208,8 @@ func PublicOpenCodeGoRelayError(channelType int, relayErr *types.NewAPIError) *t
 		))
 	}
 	projection := openCodeGoPublicErrorProjection(relayErr)
-	explicitClientRequest := upstreamOrigin && openCodeGoRelayErrorIsExplicitClientRequest(relayErr)
-	if explicitClientRequest {
+	safeUpstreamClientRequest := upstreamOrigin && openCodeGoRelayErrorIsSafeUpstreamClientRequest(relayErr)
+	if safeUpstreamClientRequest {
 		projection = constant.ClassifyOpenCodeGoPublicError(
 			http.StatusBadRequest,
 			constant.OpenCodeGoPublicInvalidRequestCode,
@@ -124,65 +218,64 @@ func PublicOpenCodeGoRelayError(channelType int, relayErr *types.NewAPIError) *t
 		)
 		projection.Message = openCodeGoPublicClientRequestMessage(relayErr)
 	}
-	// Explicit client request classifications remain 400 even when they were
-	// reported by the upstream. Every other marked upstream error is collapsed
-	// to the generic 429 without changing its raw status used by retry/health.
-	if upstreamOrigin && !explicitClientRequest && projection.StatusCode != 499 {
-		projection = constant.ClassifyOpenCodeGoPublicError(
-			http.StatusTooManyRequests,
-			OpenCodeGoPublicRateLimitErrorCode,
-			OpenCodeGoPublicRateLimitErrorCode,
-			relayErr.Error(),
-		)
+	// A marked upstream error may keep 400 only when its unmodified upstream
+	// status was 400/422 and its classification passed the non-operator client
+	// allowlist. HTTP-200 error envelopes and all other upstream statuses fail
+	// closed to 429 without changing the raw status used by retry/health.
+	// Cancellation is a 499 only when it originated from the downstream
+	// request. An upstream 499 or HTTP-200 error envelope that happens to say
+	// "context canceled" is still an upstream failure and must not bypass the
+	// provider-neutral overload projection.
+	if upstreamOrigin && !safeUpstreamClientRequest {
+		projection = constant.OpenCodeGoPublicError{
+			StatusCode: http.StatusTooManyRequests,
+			Message:    OpenCodeGoPublicOverloadMessage,
+			Type:       OpenCodeGoPublicRateLimitErrorCode,
+			Code:       OpenCodeGoPublicRateLimitErrorCode,
+		}
 	}
 	return newOpenCodeGoPublicRelayError(projection)
 }
 
-func openCodeGoRelayErrorIsExplicitClientRequest(relayErr *types.NewAPIError) bool {
+func openCodeGoRelayErrorIsSafeUpstreamClientRequest(relayErr *types.NewAPIError) bool {
 	if relayErr == nil {
 		return false
 	}
-	switch relayErr.GetErrorCode() {
-	case types.ErrorCodeInvalidRequest,
-		types.ErrorCodeBadRequestBody,
-		types.ErrorCodeConvertRequestFailed,
-		types.ErrorCodeChannelParamOverrideInvalid,
-		types.ErrorCodeChannelHeaderOverrideInvalid:
-		return true
+	upstreamStatusCode, marked := openCodeGoUpstreamRelayStatusCode(relayErr)
+	if !marked {
+		return false
 	}
 	errorType, errorCode := openCodeGoRelayErrorClassification(relayErr)
-	return constant.IsOpenCodeGoClientRequestError(errorType, errorCode, relayErr.Error())
+	return constant.IsOpenCodeGoSafeUpstreamClientRequestError(
+		upstreamStatusCode,
+		errorType,
+		errorCode,
+		relayErr.Error(),
+	)
 }
 
 func openCodeGoPublicClientRequestMessage(relayErr *types.NewAPIError) string {
 	if relayErr == nil {
 		return constant.OpenCodeGoPublicInvalidRequestMessage
 	}
-	message := strings.TrimSpace(relayErr.ToOpenAIError().Message)
-	for _, prefix := range []string{
-		"Error from provider (Console Go):",
-		"Error from provider (OpenCode Go):",
-		"Upstream request failed:",
-		"[invalid_request_error]",
-		"[invalid_request]",
-		"[validation_error]",
-		"[bad_request]",
-		"[bad_request_body]",
-	} {
-		message = trimOpenCodeGoPublicPrefix(message, prefix)
+	message := ""
+	switch typed := relayErr.RelayError.(type) {
+	case types.OpenAIError:
+		message = typed.Message
+	case *types.OpenAIError:
+		if typed != nil {
+			message = typed.Message
+		}
+	case types.ClaudeError:
+		message = typed.Message
+	case *types.ClaudeError:
+		if typed != nil {
+			message = typed.Message
+		}
+	default:
+		message = relayErr.ToOpenAIError().Message
 	}
-	if message == "" || OpenCodeGoErrorHasPrivateDetail(message) {
-		return constant.OpenCodeGoPublicInvalidRequestMessage
-	}
-	return message
-}
-
-func trimOpenCodeGoPublicPrefix(value, prefix string) string {
-	value = strings.TrimSpace(value)
-	if len(value) >= len(prefix) && strings.EqualFold(value[:len(prefix)], prefix) {
-		return strings.TrimSpace(value[len(prefix):])
-	}
-	return value
+	return common.OpenCodeGoPublicClientRequestMessage(message)
 }
 
 func openCodeGoRelayErrorClassification(relayErr *types.NewAPIError) (string, string) {
@@ -281,38 +374,5 @@ func openCodeGoRelayErrorContainsPrivateDetail(relayErr *types.NewAPIError) bool
 // OpenCodeGoErrorHasPrivateDetail reports whether an error representation
 // contains provider, channel, or workspace details that must stay internal.
 func OpenCodeGoErrorHasPrivateDetail(values ...string) bool {
-	for _, value := range values {
-		if openCodeGoStringHasPrivateErrorMarker(value) {
-			return true
-		}
-		var decoded any
-		if common.UnmarshalJsonStr(value, &decoded) == nil && openCodeGoJSONHasPrivateErrorMarker(decoded) {
-			return true
-		}
-	}
-	return false
-}
-
-func openCodeGoJSONHasPrivateErrorMarker(value any) bool {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, child := range typed {
-			if openCodeGoStringHasPrivateErrorMarker(key) || openCodeGoJSONHasPrivateErrorMarker(child) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range typed {
-			if openCodeGoJSONHasPrivateErrorMarker(child) {
-				return true
-			}
-		}
-	case string:
-		return openCodeGoStringHasPrivateErrorMarker(typed)
-	}
-	return false
-}
-
-func openCodeGoStringHasPrivateErrorMarker(value string) bool {
-	return constant.OpenCodeGoStringHasPrivateErrorMarker(value)
+	return common.OpenCodeGoErrorHasPrivateDetail(values...)
 }

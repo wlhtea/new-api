@@ -370,6 +370,7 @@ var streamSupportedChannels = map[int]bool{
 	constant.ChannelTypeSub2API:        true,
 	constant.ChannelTypeNewAPI:         true,
 	constant.ChannelTypeOpenCodeGo:     true,
+	constant.ChannelTypeOpenCodeAPIKey: true,
 	constant.ChannelTypeTencent:        true,
 }
 
@@ -785,6 +786,23 @@ func (info *RelayInfo) GetChannelType() int {
 		return 0
 	}
 	return info.ChannelType
+}
+
+// OpenCodeStreamReadyForFinalization reports whether a stream handler may
+// synthesize its downstream terminal event. OpenCode Chat streams require the
+// upstream [DONE] sentinel, while Messages and Responses require their
+// protocol terminal event. Other channel types keep their existing behavior.
+func OpenCodeStreamReadyForFinalization(info *RelayInfo) bool {
+	if info == nil || !constant.IsOpenCodeChannelType(info.GetChannelType()) {
+		return true
+	}
+	if info.StreamStatus == nil {
+		return false
+	}
+	if info.StreamProtocolTerminalRequired || info.StreamStatus.ProtocolTerminalRequired() {
+		return info.StreamStatus.ProtocolTerminalObserved()
+	}
+	return info.StreamStatus.DoneSentinelObserved()
 }
 
 func (info *RelayInfo) GetIsStream() bool {

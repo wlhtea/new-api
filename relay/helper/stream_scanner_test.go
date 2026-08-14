@@ -2,6 +2,7 @@ package helper
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -674,4 +675,49 @@ func TestStreamScannerHandlerOpenCodeGoUsesOnlyLocalSSEHeaders(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStreamScannerHandlerOmitsOpenCodeSSEDataFromDebugLog(t *testing.T) {
+	previousDebug := common.DebugEnabled
+	previousWriter := gin.DefaultErrorWriter
+	var logs bytes.Buffer
+	common.DebugEnabled = true
+	common.LogWriterMu.Lock()
+	gin.DefaultErrorWriter = &logs
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.DebugEnabled = previousDebug
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = previousWriter
+		common.LogWriterMu.Unlock()
+	})
+
+	const payload = `{"type":"error","error":{"message":"Console Go Authorization: Bearer stream-private-key; Cookie: session=private-session; x-opencode-session=private-session; proxy=socks5://proxy-user:proxy-pass@proxy.internal:1080; endpoint=http://internal-control.local/private"}}`
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		t.Run(constant.GetChannelTypeName(channelType), func(t *testing.T) {
+			logs.Reset()
+			c, resp, info := setupStreamTest(t, strings.NewReader("data: "+payload+"\n"))
+			info.ChannelMeta.ChannelType = channelType
+			var received string
+			StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+				received = data
+			})
+
+			assert.Contains(t, received, "stream-private-key")
+			assert.Contains(t, received, "private-session")
+			assert.Contains(t, logs.String(), "stream scanner data omitted")
+			assert.NotContains(t, logs.String(), "Console Go")
+			assert.NotContains(t, logs.String(), "stream-private-key")
+			assert.NotContains(t, logs.String(), "private-session")
+			assert.NotContains(t, logs.String(), "proxy-user")
+			assert.NotContains(t, logs.String(), "proxy.internal")
+			assert.NotContains(t, logs.String(), "internal-control.local")
+		})
+	}
+
+	logs.Reset()
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: "+payload+"\n"))
+	info.ChannelMeta.ChannelType = constant.ChannelTypeOpenAI
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+	assert.Contains(t, logs.String(), payload, "non-OpenCode debug logging must remain unchanged")
 }

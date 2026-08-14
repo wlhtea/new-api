@@ -45,18 +45,17 @@ import { Textarea } from '@/components/ui/textarea'
 
 import { SettingsSwitchField } from '../../components/settings-form-layout'
 import { RULE_TEMPLATES } from './constants'
+import {
+  formatKeySource,
+  KEY_SOURCE_TYPES,
+  normalizeKeySource,
+  normalizeValidKeySources,
+} from './key-sources'
 import type { AffinityRule, KeySource } from './types'
 
 type KeySourceRow = KeySource & {
   rowId: string
 }
-
-const KEY_SOURCE_TYPES = [
-  'context_int',
-  'context_string',
-  'request_header',
-  'gjson',
-] as const
 
 const CONTEXT_KEY_PRESETS = [
   'id',
@@ -91,12 +90,6 @@ function normalizeStringList(text: string): string[] {
     .split('\n')
     .map((s) => s.trim())
     .filter((s) => s.length > 0)
-}
-
-function normalizeKeySource(src: Partial<KeySource>): KeySource {
-  const type = (src?.type || 'gjson') as KeySource['type']
-  if (type === 'gjson') return { type, key: '', path: src?.path || '' }
-  return { type, key: src?.key || '', path: '' }
 }
 
 interface Props {
@@ -197,9 +190,7 @@ export function RuleEditorDialog(props: Props) {
       return
     }
 
-    const validKeySources = keySources
-      .map(normalizeKeySource)
-      .filter((s) => s.type && (s.type === 'gjson' ? s.path : s.key))
+    const validKeySources = normalizeValidKeySources(keySources)
     if (validKeySources.length === 0) {
       toast.error(t('At least one valid key source is required'))
       return
@@ -333,7 +324,10 @@ export function RuleEditorDialog(props: Props) {
                 className='flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center'
               >
                 <Select
-                  items={KEY_SOURCE_TYPES.map((t) => ({ value: t, label: t }))}
+                  items={KEY_SOURCE_TYPES.map((type) => ({
+                    value: type,
+                    label: t(formatKeySource({ type })),
+                  }))}
                   value={src.type}
                   onValueChange={(v) => {
                     if (v === null) return
@@ -348,37 +342,46 @@ export function RuleEditorDialog(props: Props) {
                     setKeySources(next)
                   }}
                 >
-                  <SelectTrigger className='w-full sm:w-[160px]'>
+                  <SelectTrigger className='w-full sm:w-[190px]'>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent alignItemWithTrigger={false}>
                     <SelectGroup>
-                      {KEY_SOURCE_TYPES.map((t) => (
-                        <SelectItem key={t} value={t}>
-                          {t}
+                      {KEY_SOURCE_TYPES.map((type) => (
+                        <SelectItem key={type} value={type}>
+                          {t(formatKeySource({ type }))}
                         </SelectItem>
                       ))}
                     </SelectGroup>
                   </SelectContent>
                 </Select>
-                <Input
-                  className='min-w-0 flex-1'
-                  placeholder={
-                    src.type === 'gjson'
-                      ? 'metadata.conversation_id'
-                      : 'user_id'
-                  }
-                  value={src.type === 'gjson' ? src.path || '' : src.key || ''}
-                  onChange={(e) => {
-                    const next = [...keySources]
-                    if (src.type === 'gjson') {
-                      next[idx] = { ...src, path: e.target.value }
-                    } else {
-                      next[idx] = { ...src, key: e.target.value }
+                {src.type === 'opencode_identity' ? (
+                  <div
+                    className='hidden min-w-0 flex-1 sm:block'
+                    aria-hidden='true'
+                  />
+                ) : (
+                  <Input
+                    className='min-w-0 flex-1'
+                    placeholder={
+                      src.type === 'gjson'
+                        ? 'metadata.conversation_id'
+                        : 'user_id'
                     }
-                    setKeySources(next)
-                  }}
-                />
+                    value={
+                      src.type === 'gjson' ? src.path || '' : src.key || ''
+                    }
+                    onChange={(e) => {
+                      const next = [...keySources]
+                      if (src.type === 'gjson') {
+                        next[idx] = { ...src, path: e.target.value }
+                      } else {
+                        next[idx] = { ...src, key: e.target.value }
+                      }
+                      setKeySources(next)
+                    }}
+                  />
+                )}
                 <Button
                   type='button'
                   variant='ghost'

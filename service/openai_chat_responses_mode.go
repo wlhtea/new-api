@@ -39,7 +39,7 @@ func matchAnyModelPattern(patterns []string, model string) bool {
 }
 
 func ShouldChatCompletionsUseResponsesPolicy(policy model_setting.ChatCompletionsToResponsesPolicy, channelID int, channelType int, model string) bool {
-	if channelType == constant.ChannelTypeOpenCodeGo {
+	if constant.IsOpenCodeChannelType(channelType) {
 		return false
 	}
 	if !policy.IsChannelEnabled(channelID, channelType) {

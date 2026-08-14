@@ -71,7 +71,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	adaptor.Init(info)
 
 	passThroughGlobal := model_setting.GetGlobalSettings().PassThroughRequestEnabled
-	if info.ChannelType == constant.ChannelTypeOpenCodeGo &&
+	if constant.IsOpenCodeChannelType(info.ChannelType) &&
 		(passThroughGlobal || info.ChannelSetting.PassThroughBodyEnabled) {
 		return types.NewErrorWithStatusCode(
 			fmt.Errorf("OpenCode Go does not allow pass-through request bodies"),
@@ -180,7 +180,11 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 			}
 		}
 
-		logger.LogDebug(c, "text request body: %s", jsonData)
+		if constant.IsOpenCodeChannelType(info.GetChannelType()) {
+			logger.LogDebug(c, "upstream request body omitted (bytes=%d)", len(jsonData))
+		} else {
+			logger.LogDebug(c, "text request body: %s", jsonData)
+		}
 
 		body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 		if err != nil {

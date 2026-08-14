@@ -321,6 +321,110 @@ func TestFetchModelsOpenCodeGoSavedAndUnsavedUseAccountPoolRules(t *testing.T) {
 	}
 }
 
+func TestFetchModelsOpenCodeAPIKeySavedChannelUsesPersistedCredentials(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	received := make(chan struct {
+		path          string
+		authorization string
+	}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- struct {
+			path          string
+			authorization string
+		}{path: r.URL.Path, authorization: r.Header.Get("Authorization")}
+		_, _ = w.Write([]byte(`{"data":[{"id":"saved-opencode-model"}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	savedChannel := &model.Channel{
+		Type:    constant.ChannelTypeOpenCodeAPIKey,
+		Name:    "saved OpenCode API key",
+		Key:     "persisted-opencode-key",
+		Status:  common.ChannelStatusEnabled,
+		Group:   "default",
+		BaseURL: common.GetPointer(server.URL),
+	}
+	require.NoError(t, db.Create(savedChannel).Error)
+
+	requestBody, err := common.Marshal(fetchModelsRequest{
+		ChannelID: savedChannel.Id,
+		Type:      constant.ChannelTypeOpenCodeAPIKey,
+		Key:       "request-key-must-be-ignored",
+		BaseURL:   common.GetPointer("https://request.example.invalid/v1"),
+	})
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/fetch_models", bytes.NewReader(requestBody))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	FetchModels(ctx)
+
+	var response struct {
+		Success bool     `json:"success"`
+		Message string   `json:"message"`
+		Data    []string `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.True(t, response.Success, response.Message)
+	require.Equal(t, []string{"saved-opencode-model"}, response.Data)
+	require.NotContains(t, recorder.Body.String(), "persisted-opencode-key")
+	require.NotContains(t, recorder.Body.String(), "request-key-must-be-ignored")
+
+	upstreamRequest := <-received
+	require.Equal(t, "/v1/models", upstreamRequest.path)
+	require.Equal(t, "Bearer persisted-opencode-key", upstreamRequest.authorization)
+}
+
+func TestFetchOpenCodeAPIKeyModelsDoesNotDuplicateVersionPath(t *testing.T) {
+	receivedPath := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath <- r.URL.Path
+		_, _ = w.Write([]byte(`{"data":[{"id":"opencode-model"}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	baseURL := server.URL + "/v1"
+	channel := &model.Channel{
+		Type:    constant.ChannelTypeOpenCodeAPIKey,
+		Key:     "opencode-key",
+		BaseURL: &baseURL,
+	}
+
+	models, err := fetchChannelUpstreamModelIDs(channel)
+	require.NoError(t, err)
+	require.Equal(t, []string{"opencode-model"}, models)
+	require.Equal(t, "/v1/models", <-receivedPath)
+}
+
+func TestFetchOpenCodeAPIKeyModelsProtectsAuthenticationHeadersFromOverrides(t *testing.T) {
+	received := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Clone()
+		_, _ = w.Write([]byte(`{"data":[{"id":"opencode-model"}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	baseURL := server.URL
+	headerOverride := `{"Authorization":"Bearer override-key","X-Api-Key":"override-api-key","X-OpenCode-Session":"override-session","X-Feature":"enabled"}`
+	channel := &model.Channel{
+		Type:           constant.ChannelTypeOpenCodeAPIKey,
+		Key:            "opencode-key",
+		BaseURL:        &baseURL,
+		HeaderOverride: &headerOverride,
+	}
+
+	models, err := fetchChannelUpstreamModelIDs(channel)
+	require.NoError(t, err)
+	require.Equal(t, []string{"opencode-model"}, models)
+
+	headers := <-received
+	require.Equal(t, "Bearer opencode-key", headers.Get("Authorization"))
+	require.Empty(t, headers.Get("X-Api-Key"))
+	require.Empty(t, headers.Get("X-OpenCode-Session"))
+	require.Equal(t, "enabled", headers.Get("X-Feature"))
+}
+
 func TestFetchModelsAdvancedCustomCreatePreview(t *testing.T) {
 	receivedAuthorization := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

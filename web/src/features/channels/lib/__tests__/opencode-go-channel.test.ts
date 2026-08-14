@@ -64,8 +64,9 @@ describe('OpenCode Go channel configuration', () => {
     assert.equal(usesLegacyChannelKey(CHANNEL_TYPE_OPENCODE_GO), false)
     assert.equal(
       getChannelTypeConfig(CHANNEL_TYPE_OPENCODE_GO).supportedModels?.length,
-      18
+      OPENCODE_GO_MODELS.length
     )
+    assert.equal(OPENCODE_GO_MODELS.includes('qwen3.8-max'), true)
     assert.equal(getChannelTypeIcon(CHANNEL_TYPE_OPENCODE_GO), 'OpenCode')
     assert.equal(
       shouldWarnAboutV1BaseUrl(CHANNEL_TYPE_OPENCODE_GO, OPENCODE_GO_BASE_URL),
