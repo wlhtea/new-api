@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 type openCodeGoRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -262,6 +263,31 @@ func TestAcquireOpenCodeGoRelayHTTPClientAcceptsCurrentDirectSelection(t *testin
 	require.NotNil(t, release)
 	release()
 	release()
+}
+
+func TestAcquireOpenCodeGoRelayHTTPClientRejectsStaleGenerationBeforeQueries(t *testing.T) {
+	channel, _, identity, workspace, apiKey, generation := createOpenCodeGoRelayFenceFixture(t)
+	openCodeGoIdentityProxyClients.advanceSelectionGeneration(channel.Id)
+
+	var queryCount atomic.Int32
+	const callbackName = "test:opencode-go-stale-generation-query-count"
+	require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callbackName, func(*gorm.DB) {
+		queryCount.Add(1)
+	}))
+	t.Cleanup(func() { _ = model.DB.Callback().Query().Remove(callbackName) })
+
+	client, release, err := AcquireOpenCodeGoRelayHTTPClient(
+		channel.Id,
+		identity.UID,
+		workspace.UID,
+		apiKey,
+		"model-a",
+		generation,
+	)
+	require.ErrorIs(t, err, ErrOpenCodeGoIdentityProxySelectionStale)
+	assert.Nil(t, client)
+	assert.Nil(t, release)
+	assert.Zero(t, queryCount.Load())
 }
 
 func TestAcquireOpenCodeGoRelayHTTPClientRejectsDeletedOrDisabledOwnership(t *testing.T) {

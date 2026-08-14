@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/glebarez/sqlite"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -555,6 +556,7 @@ func TestOpenCodeGoAuthenticationFailureKeepsRelayBlockedUntilRebuildCompletes(t
 	refreshResult := make(chan error, 1)
 	go func() {
 		refreshResult <- poolService.markIdentityRefreshFailure(
+			context.Background(),
 			channel.Id,
 			identity,
 			model.OpenCodeGoIdentityStatusAuthError,
@@ -1031,6 +1033,7 @@ func TestOpenCodeGoOlderRefreshFailureCannotInvalidateNewerSnapshot(t *testing.T
 	poolService.now = func() time.Time { return newer.Add(-time.Second) }
 	poolService.rebuild = nil
 	require.NoError(t, poolService.markIdentityRefreshFailure(
+		context.Background(),
 		channel.Id,
 		staleIdentity,
 		model.OpenCodeGoIdentityStatusAuthError,
@@ -1071,6 +1074,7 @@ func TestOpenCodeGoTransientRefreshFailurePreservesCompleteSnapshotEligibility(t
 	poolService.now = func() time.Time { return time.Unix(1_900_000_060, 0) }
 	poolService.rebuild = nil
 	require.NoError(t, poolService.markIdentityRefreshFailure(
+		context.Background(),
 		channel.Id,
 		&identity,
 		model.OpenCodeGoIdentityStatusStale,
@@ -1256,6 +1260,231 @@ func TestOpenCodeGoQuotaReplacementRollsBackAtomically(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, before.Workspaces[0].QuotaFetchedAt, after.Workspaces[0].QuotaFetchedAt)
 	require.Equal(t, beforeWindows, after.Workspaces[0].QuotaWindows)
+}
+
+func TestOpenCodeGoRefreshRetryUsesFreshPreparedState(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	previousDatabaseType := common.MainDatabaseType()
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() { common.SetMainDatabaseType(previousDatabaseType) })
+	busyErr := captureOpenCodeGoSQLiteBusyError(t)
+
+	const authCookie = "synthetic-refresh-retry-cookie"
+	identityUID := "identity-refresh-retry"
+	ciphertext, err := codec.Encrypt(
+		OpenCodeGoCredentialAuthCookie,
+		channel.Id,
+		identityUID,
+		authCookie,
+	)
+	require.NoError(t, err)
+	fingerprint, err := codec.Fingerprint(OpenCodeGoCredentialAuthCookie, authCookie)
+	require.NoError(t, err)
+	identity := model.OpenCodeGoIdentity{
+		UID:                   identityUID,
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  ciphertext,
+		AuthCookieFingerprint: fingerprint,
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, db.Create(&identity).Error)
+
+	fetchedAt := int64(1_900_000_000)
+	fake := &fakeOpenCodeGoConsole{
+		discovered: []OpenCodeGoWorkspacePageResult{{
+			Workspace: OpenCodeGoDiscoveredWorkspace{ID: "wrk_RETRY"},
+			Page:      completeOpenCodeGoConsolePage("wrk_RETRY", 25, fetchedAt),
+		}},
+		keys:        map[string]string{"wrk_RETRY": "api-key-synthetic-retry"},
+		keyErrors:   map[string]error{},
+		models:      map[string][]string{"api-key-synthetic-retry": {"model-a"}},
+		modelErrors: map[string]error{},
+	}
+	poolService := newOpenCodeGoAccountPoolService(fake, codec)
+	poolService.now = func() time.Time { return time.Unix(fetchedAt, 0) }
+	poolService.rebuild = nil
+
+	var workspaceCreates atomic.Int32
+	const callbackName = "test:opencode-go-refresh-retry-workspace-create"
+	require.NoError(t, db.Callback().Create().After("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "open_code_go_workspaces" {
+			return
+		}
+		if workspaceCreates.Add(1) == 1 {
+			tx.AddError(busyErr)
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Create().Remove(callbackName) })
+
+	refreshed, err := poolService.RefreshIdentity(context.Background(), channel.Id, identity.UID)
+	require.NoError(t, err)
+	require.NotNil(t, refreshed)
+	require.Len(t, refreshed.Workspaces, 1)
+	assert.Equal(t, int32(2), workspaceCreates.Load())
+
+	var workspaceCount int64
+	var windowCount int64
+	var modelCount int64
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspace{}).
+		Where("identity_id = ?", identity.ID).
+		Count(&workspaceCount).Error)
+	require.NoError(t, db.Model(&model.OpenCodeGoQuotaWindow{}).Count(&windowCount).Error)
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspaceModel{}).Count(&modelCount).Error)
+	assert.Equal(t, int64(1), workspaceCount)
+	assert.Equal(t, int64(len(model.OpenCodeGoQuotaKinds)), windowCount)
+	assert.Equal(t, int64(1), modelCount)
+}
+
+func TestOpenCodeGoRefreshFailureRetriesContention(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	previousDatabaseType := common.MainDatabaseType()
+	common.SetMainDatabaseType(common.DatabaseTypeMySQL)
+	t.Cleanup(func() { common.SetMainDatabaseType(previousDatabaseType) })
+
+	createEligibleOpenCodeGoWorkspace(
+		t,
+		db,
+		codec,
+		channel.Id,
+		"failure-retry",
+		"workspace-failure-retry",
+		"upstream-failure-retry",
+		[]string{"model-a"},
+	)
+	identity, err := model.GetOpenCodeGoIdentityPool(channel.Id, "identity-failure-retry")
+	require.NoError(t, err)
+	require.NotNil(t, identity)
+
+	var identityUpdates atomic.Int32
+	const callbackName = "test:opencode-go-refresh-failure-retry"
+	require.NoError(t, db.Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "open_code_go_identities" {
+			return
+		}
+		if identityUpdates.Add(1) == 1 {
+			tx.AddError(&mysqldriver.MySQLError{
+				Number:  openCodeGoMySQLDeadlockErrno,
+				Message: "synthetic refresh failure deadlock",
+			})
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Update().Remove(callbackName) })
+
+	poolService := &OpenCodeGoAccountPoolService{
+		now:     func() time.Time { return time.Unix(1_900_000_100, 0) },
+		rebuild: nil,
+	}
+	err = poolService.markIdentityRefreshFailure(
+		context.Background(),
+		channel.Id,
+		identity,
+		model.OpenCodeGoIdentityStatusAuthError,
+		errors.New("authentication rejected"),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), identityUpdates.Load())
+
+	after, err := model.GetOpenCodeGoIdentityPool(channel.Id, identity.UID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, model.OpenCodeGoIdentityStatusAuthError, after.Status)
+	require.Len(t, after.Workspaces, 1)
+	assert.Equal(t, model.OpenCodeGoStateAuthError, after.Workspaces[0].EffectiveState)
+}
+
+func TestOpenCodeGoRefreshTargetsPersistsConcurrentSQLiteBatch(t *testing.T) {
+	db, channel, codec := setupOpenCodeGoPoolTestDB(t)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(8)
+	previousDatabaseType := common.MainDatabaseType()
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() { common.SetMainDatabaseType(previousDatabaseType) })
+
+	const identityCount = 12
+	fetchedAt := int64(1_900_000_000)
+	fake := &fakeOpenCodeGoConsole{
+		discoveredByCookie:     make(map[string][]OpenCodeGoWorkspacePageResult, identityCount),
+		discoverErrorsByCookie: map[string]error{},
+		discoverDelay:          10 * time.Millisecond,
+		keys:                   make(map[string]string, identityCount),
+		keyErrors:              map[string]error{},
+		models:                 make(map[string][]string, identityCount),
+		modelErrors:            map[string]error{},
+	}
+	targets := make([]model.OpenCodeGoRefreshTarget, 0, identityCount)
+	for index := 0; index < identityCount; index++ {
+		identityUID := fmt.Sprintf("identity-concurrent-%02d", index)
+		authCookie := fmt.Sprintf("cookie-concurrent-%02d", index)
+		workspaceID := fmt.Sprintf("wrk_CONCURRENT_%02d", index)
+		apiKey := fmt.Sprintf("api-key-concurrent-%02d", index)
+		ciphertext, encryptErr := codec.Encrypt(
+			OpenCodeGoCredentialAuthCookie,
+			channel.Id,
+			identityUID,
+			authCookie,
+		)
+		require.NoError(t, encryptErr)
+		fingerprint, fingerprintErr := codec.Fingerprint(OpenCodeGoCredentialAuthCookie, authCookie)
+		require.NoError(t, fingerprintErr)
+		require.NoError(t, db.Create(&model.OpenCodeGoIdentity{
+			UID:                   identityUID,
+			ChannelID:             channel.Id,
+			AuthCookieCiphertext:  ciphertext,
+			AuthCookieFingerprint: fingerprint,
+			Status:                model.OpenCodeGoIdentityStatusActive,
+		}).Error)
+		fake.discoveredByCookie[authCookie] = []OpenCodeGoWorkspacePageResult{{
+			Workspace: OpenCodeGoDiscoveredWorkspace{ID: workspaceID},
+			Page:      completeOpenCodeGoConsolePage(workspaceID, float64(index), fetchedAt),
+		}}
+		fake.keys[workspaceID] = apiKey
+		fake.models[apiKey] = []string{"model-a"}
+		targets = append(targets, model.OpenCodeGoRefreshTarget{
+			ChannelID:   channel.Id,
+			IdentityUID: identityUID,
+		})
+	}
+
+	poolService := newOpenCodeGoAccountPoolService(fake, codec)
+	poolService.now = func() time.Time { return time.Unix(fetchedAt, 0) }
+	poolService.rebuild = nil
+	summary, err := poolService.RefreshIdentityTargets(
+		context.Background(),
+		targets,
+		identityCount,
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, identityCount, summary.Total)
+	assert.Equal(t, identityCount, summary.Succeeded)
+	assert.Zero(t, summary.Failed)
+	assert.Greater(t, fake.maxActiveDiscoveries.Load(), int32(1))
+
+	var workspaceCount int64
+	var windowCount int64
+	var modelCount int64
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspace{}).Count(&workspaceCount).Error)
+	require.NoError(t, db.Model(&model.OpenCodeGoQuotaWindow{}).Count(&windowCount).Error)
+	require.NoError(t, db.Model(&model.OpenCodeGoWorkspaceModel{}).Count(&modelCount).Error)
+	assert.Equal(t, int64(identityCount), workspaceCount)
+	assert.Equal(t, int64(identityCount*len(model.OpenCodeGoQuotaKinds)), windowCount)
+	assert.Equal(t, int64(identityCount), modelCount)
+	var identities []model.OpenCodeGoIdentity
+	var workspaces []model.OpenCodeGoWorkspace
+	require.NoError(t, db.Order("id asc").Find(&identities).Error)
+	require.NoError(t, db.Order("id asc").Find(&workspaces).Error)
+	require.Len(t, identities, identityCount)
+	require.Len(t, workspaces, identityCount)
+	for index := range identities {
+		assert.Equal(t, model.OpenCodeGoIdentityStatusActive, identities[index].Status)
+	}
+	for index := range workspaces {
+		assert.True(t, workspaces[index].ManualEnabled)
+		assert.Equal(t, model.OpenCodeGoCredentialValid, workspaces[index].CredentialStatus)
+		assert.Equal(t, model.OpenCodeGoStateEligible, workspaces[index].EffectiveState)
+		assert.Zero(t, workspaces[index].CooldownUntil)
+	}
 }
 
 func createEligibleOpenCodeGoWorkspace(

@@ -154,6 +154,9 @@ func AcquireOpenCodeGoRelayHTTPClient(
 			lease()
 		}
 	}()
+	if !openCodeGoIdentityProxyClients.generationMatches(channelID, &generation) {
+		return nil, nil, ErrOpenCodeGoIdentityProxySelectionStale
+	}
 
 	settings, otherSettings, err := validateOpenCodeGoRelaySelection(
 		channelID,

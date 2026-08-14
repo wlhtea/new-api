@@ -200,6 +200,15 @@ func (cache *openCodeGoIdentityProxyClientCache) generationMatchesLocked(
 			generation.channel == cache.channelGeneration[channelID])
 }
 
+func (cache *openCodeGoIdentityProxyClientCache) generationMatches(
+	channelID int,
+	generation *OpenCodeGoIdentityProxyGeneration,
+) bool {
+	cache.generationMutex.Lock()
+	defer cache.generationMutex.Unlock()
+	return cache.generationMatchesLocked(channelID, generation)
+}
+
 func openCodeGoIdentityProxyHMAC(secret string, domain string, fields ...string) []byte {
 	digest := hmac.New(sha256.New, []byte(secret))
 	_, _ = digest.Write([]byte(domain))

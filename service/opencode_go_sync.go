@@ -79,6 +79,29 @@ type openCodeGoPreparedWorkspace struct {
 	healthObservation OpenCodeGoHealthObservation
 }
 
+// GORM mutates generated IDs even when the surrounding transaction rolls back.
+func cloneOpenCodeGoPreparedWorkspaces(source []openCodeGoPreparedWorkspace) []openCodeGoPreparedWorkspace {
+	cloned := make([]openCodeGoPreparedWorkspace, len(source))
+	for index := range source {
+		cloned[index] = source[index]
+		cloned[index].windows = append([]model.OpenCodeGoQuotaWindow(nil), source[index].windows...)
+		cloned[index].models = append([]string(nil), source[index].models...)
+		cloned[index].record.QuotaWindows = append(
+			[]model.OpenCodeGoQuotaWindow(nil),
+			source[index].record.QuotaWindows...,
+		)
+		cloned[index].record.Models = append(
+			[]model.OpenCodeGoWorkspaceModel(nil),
+			source[index].record.Models...,
+		)
+		if source[index].record.ChinaModelsEnabled != nil {
+			enabled := *source[index].record.ChinaModelsEnabled
+			cloned[index].record.ChinaModelsEnabled = &enabled
+		}
+	}
+	return cloned
+}
+
 type openCodeGoIdentityCredentialUpdate struct {
 	ciphertext  string
 	fingerprint string
@@ -400,7 +423,15 @@ func (service *OpenCodeGoAccountPoolService) RefreshIdentity(
 		identity.AuthCookieCiphertext,
 	)
 	if err != nil {
-		_ = service.markIdentityRefreshFailure(channelID, identity, model.OpenCodeGoIdentityStatusAuthError, err)
+		if persistErr := service.markIdentityRefreshFailure(
+			ctx,
+			channelID,
+			identity,
+			model.OpenCodeGoIdentityStatusAuthError,
+			err,
+		); persistErr != nil {
+			return nil, fmt.Errorf("OpenCode Go refresh failure persistence failed: %w", persistErr)
+		}
 		return nil, err
 	}
 	return service.refreshIdentityWithCookie(ctx, channelID, identity, authCookie, nil, true)
@@ -479,8 +510,17 @@ func (service *OpenCodeGoAccountPoolService) refreshIdentityWithCookie(
 		if errors.Is(err, ErrOpenCodeGoAuthenticationInvalid) {
 			status = model.OpenCodeGoIdentityStatusAuthError
 		}
-		if markFailure {
-			_ = service.markIdentityRefreshFailure(channelID, identity, status, err, authCookie)
+		if markFailure && ctx.Err() == nil {
+			if persistErr := service.markIdentityRefreshFailure(
+				ctx,
+				channelID,
+				identity,
+				status,
+				err,
+				authCookie,
+			); persistErr != nil {
+				return nil, fmt.Errorf("OpenCode Go refresh failure persistence failed: %w", persistErr)
+			}
 		}
 		return nil, err
 	}
@@ -518,7 +558,8 @@ func (service *OpenCodeGoAccountPoolService) refreshIdentityWithCookie(
 	releaseMutation := BeginOpenCodeGoPoolMutation(channelID)
 	defer releaseMutation()
 	now := service.now().Unix()
-	err = model.DB.Transaction(func(tx *gorm.DB) error {
+	err = runOpenCodeGoContentionTransaction(ctx, "identity_refresh", func(tx *gorm.DB) error {
+		attemptPrepared := cloneOpenCodeGoPreparedWorkspaces(prepared)
 		if err := validateOpenCodeGoPoolChannelTx(tx, channelID); err != nil {
 			return err
 		}
@@ -549,15 +590,15 @@ func (service *OpenCodeGoAccountPoolService) refreshIdentityWithCookie(
 				return err
 			}
 		}
-		for index := range prepared {
-			prepared[index].record.IdentityID = currentIdentity.ID
-			if prepared[index].record.ID == 0 {
-				if err := createOpenCodeGoPreparedWorkspaceTx(tx, &prepared[index]); err != nil {
+		for index := range attemptPrepared {
+			attemptPrepared[index].record.IdentityID = currentIdentity.ID
+			if attemptPrepared[index].record.ID == 0 {
+				if err := createOpenCodeGoPreparedWorkspaceTx(tx, &attemptPrepared[index]); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := updateOpenCodeGoPreparedWorkspaceTx(tx, &prepared[index], now); err != nil {
+			if err := updateOpenCodeGoPreparedWorkspaceTx(tx, &attemptPrepared[index], now); err != nil {
 				return err
 			}
 		}
@@ -967,6 +1008,7 @@ func prepareMissingOpenCodeGoWorkspace(existing model.OpenCodeGoWorkspace, now i
 }
 
 func (service *OpenCodeGoAccountPoolService) markIdentityRefreshFailure(
+	ctx context.Context,
 	channelID int,
 	identity *model.OpenCodeGoIdentity,
 	status string,
@@ -988,7 +1030,7 @@ func (service *OpenCodeGoAccountPoolService) markIdentityRefreshFailure(
 		releaseMutation = BeginOpenCodeGoPoolMutation(channelID)
 	}
 	defer releaseMutation()
-	dbErr := model.DB.Transaction(func(tx *gorm.DB) error {
+	dbErr := runOpenCodeGoContentionTransaction(ctx, "refresh_failure", func(tx *gorm.DB) error {
 		var currentIdentity model.OpenCodeGoIdentity
 		if err := model.LockForUpdate(tx).
 			Where("channel_id = ? AND id = ?", channelID, identity.ID).

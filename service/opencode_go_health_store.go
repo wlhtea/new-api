@@ -1,21 +1,15 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"time"
 
-	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
-	gosqlite "github.com/glebarez/go-sqlite"
 	"gorm.io/gorm"
 )
-
-var openCodeGoHealthTransactionRetryDelays = [...]time.Duration{
-	10 * time.Millisecond,
-	25 * time.Millisecond,
-}
 
 func ObserveOpenCodeGoProviderFailure(
 	channelID int,
@@ -92,8 +86,14 @@ func applyOpenCodeGoClassifiedFailureWithMutation(
 	if classified.Observation.Kind == "" {
 		return false, nil
 	}
-	if classified.Scope == OpenCodeGoHealthScopeModel && (upstreamModel == "" || len(upstreamModel) > 191) {
-		return false, errors.New("OpenCode Go model health observation target is invalid")
+	switch classified.Scope {
+	case OpenCodeGoHealthScopeWorkspace:
+	case OpenCodeGoHealthScopeModel:
+		if upstreamModel == "" || len(upstreamModel) > 191 {
+			return false, errors.New("OpenCode Go model health observation target is invalid")
+		}
+	default:
+		return false, errors.New("unsupported OpenCode Go health observation scope")
 	}
 	restrictive := isRestrictiveOpenCodeGoHealthObservation(classified.Observation.Kind)
 	releaseMutation := func() {}
@@ -129,9 +129,12 @@ func persistOpenCodeGoHealthWithRetry(
 	upstreamModel string,
 	classified OpenCodeGoClassifiedFailure,
 ) (bool, error) {
-	for attempt := 0; ; attempt++ {
-		applied := false
-		err := model.DB.Transaction(func(tx *gorm.DB) error {
+	applied := false
+	err := runOpenCodeGoContentionTransaction(
+		context.Background(),
+		"health_persistence",
+		func(tx *gorm.DB) error {
+			applied = false
 			return applyOpenCodeGoHealthTransaction(
 				tx,
 				channelID,
@@ -140,15 +143,12 @@ func persistOpenCodeGoHealthWithRetry(
 				classified,
 				&applied,
 			)
-		})
-		if err == nil {
-			return applied, nil
-		}
-		if !isRetryableOpenCodeGoHealthLockError(err) || attempt == len(openCodeGoHealthTransactionRetryDelays) {
-			return false, err
-		}
-		time.Sleep(openCodeGoHealthTransactionRetryDelays[attempt])
+		},
+	)
+	if err != nil {
+		return false, err
 	}
+	return applied, nil
 }
 
 func applyOpenCodeGoHealthTransaction(
@@ -164,8 +164,12 @@ func applyOpenCodeGoHealthTransaction(
 		Where("channel_id = ? AND uid = ?", channelID, workspaceUID).
 		Preload("QuotaWindows").
 		Preload("Models")
-	if err := query.First(&workspace).Error; err != nil {
-		return err
+	workspaceResult := query.Limit(1).Find(&workspace)
+	if workspaceResult.Error != nil {
+		return workspaceResult.Error
+	}
+	if workspaceResult.RowsAffected == 0 {
+		return nil
 	}
 
 	switch classified.Scope {
@@ -198,10 +202,15 @@ func applyOpenCodeGoHealthTransaction(
 		return nil
 	case OpenCodeGoHealthScopeModel:
 		var entry model.OpenCodeGoWorkspaceModel
-		if err := model.LockForUpdate(tx).
+		modelResult := model.LockForUpdate(tx).
 			Where("workspace_id = ? AND model = ?", workspace.ID, upstreamModel).
-			First(&entry).Error; err != nil {
-			return err
+			Limit(1).
+			Find(&entry)
+		if modelResult.Error != nil {
+			return modelResult.Error
+		}
+		if modelResult.RowsAffected == 0 {
+			return nil
 		}
 		next, changed, err := ReduceOpenCodeGoModelHealth(entry, classified.Observation)
 		if err != nil || !changed {
@@ -225,40 +234,6 @@ func applyOpenCodeGoHealthTransaction(
 		return nil
 	default:
 		return errors.New("unsupported OpenCode Go health observation scope")
-	}
-}
-
-// MySQL lock-wait and deadlock errnos that are safe to retry. InnoDB surfaces
-// the same row contention as the SQLite busy/locked codes handled below.
-const (
-	openCodeGoMySQLLockWaitTimeoutErrno = 1205 // ER_LOCK_WAIT_TIMEOUT
-	openCodeGoMySQLDeadlockErrno        = 1213 // ER_LOCK_DEADLOCK
-)
-
-// isRetryableOpenCodeGoHealthLockError reports whether a health-persistence
-// transaction failure is transient row contention that is safe to retry within
-// the bounded retry window. SQLite reports busy/locked as error codes 5 and 6;
-// MySQL InnoDB reports the same contention as lock-wait timeout (1205) or
-// deadlock (1213). Every other error is terminal so the observation is not
-// silently dropped after pointless retries.
-func isRetryableOpenCodeGoHealthLockError(err error) bool {
-	switch common.MainDatabaseType() {
-	case common.DatabaseTypeSQLite:
-		var sqliteErr *gosqlite.Error
-		if !errors.As(err, &sqliteErr) {
-			return false
-		}
-		baseCode := sqliteErr.Code() & 0xff
-		return baseCode == 5 || baseCode == 6
-	case common.DatabaseTypeMySQL:
-		var mysqlErr *mysqldriver.MySQLError
-		if !errors.As(err, &mysqlErr) {
-			return false
-		}
-		return mysqlErr.Number == openCodeGoMySQLLockWaitTimeoutErrno ||
-			mysqlErr.Number == openCodeGoMySQLDeadlockErrno
-	default:
-		return false
 	}
 }
 

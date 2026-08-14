@@ -194,6 +194,16 @@ func (openCodeGoRefreshHandler) Run(ctx context.Context, task *model.SystemTask,
 			return
 		}
 	}
+	if summary.Failed > 0 {
+		finishSystemTaskHandler(
+			task,
+			runnerID,
+			model.SystemTaskStatusFailed,
+			summary,
+			fmt.Errorf("OpenCode Go refresh completed with %d failed item(s)", summary.Failed),
+		)
+		return
+	}
 	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
 }
 

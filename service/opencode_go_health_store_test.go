@@ -4,18 +4,20 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/glebarez/sqlite"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -634,7 +636,71 @@ func TestRestorativeOpenCodeGoHealthWriteDoesNotAcquireRestrictiveMutationBarrie
 	}
 }
 
-func TestIsRetryableOpenCodeGoHealthLockError(t *testing.T) {
+func TestApplyOpenCodeGoClassifiedFailureTreatsDeletedTargetsAsStaleNoOps(t *testing.T) {
+	_, channel, _ := setupOpenCodeGoPoolTestDB(t)
+	observedAt := time.Unix(1_900_000_100, 0)
+	rebuilds := 0
+
+	workspaceFailure := OpenCodeGoClassifiedFailure{
+		Scope: OpenCodeGoHealthScopeWorkspace,
+		Observation: OpenCodeGoHealthObservation{
+			Kind:       OpenCodeGoObservationCredentialFailure,
+			ObservedAt: observedAt,
+			Reason:     "credential rejected",
+		},
+	}
+	applied, err := applyOpenCodeGoClassifiedFailure(
+		channel.Id,
+		"deleted-workspace",
+		"model-a",
+		workspaceFailure,
+		func(int) error {
+			rebuilds++
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.Zero(t, rebuilds)
+
+	identity := model.OpenCodeGoIdentity{
+		UID:                   "identity-deleted-model",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "encrypted-cookie",
+		AuthCookieFingerprint: "deleted-model-fingerprint",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}
+	require.NoError(t, model.DB.Create(&identity).Error)
+	workspace := seedOpenCodeGoHealthWorkspace(
+		t,
+		channel.Id,
+		identity.ID,
+		"workspace-deleted-model",
+	)
+	modelFailure := OpenCodeGoClassifiedFailure{
+		Scope: OpenCodeGoHealthScopeModel,
+		Observation: OpenCodeGoHealthObservation{
+			Kind:       OpenCodeGoObservationModelBlocked,
+			ObservedAt: observedAt,
+			Reason:     "model unavailable",
+		},
+	}
+	applied, err = applyOpenCodeGoClassifiedFailure(
+		channel.Id,
+		workspace.UID,
+		"deleted-model",
+		modelFailure,
+		func(int) error {
+			rebuilds++
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.Zero(t, rebuilds)
+}
+
+func TestIsRetryableOpenCodeGoContentionError(t *testing.T) {
 	previousType := common.MainDatabaseType()
 	t.Cleanup(func() { common.SetMainDatabaseType(previousType) })
 
@@ -642,17 +708,17 @@ func TestIsRetryableOpenCodeGoHealthLockError(t *testing.T) {
 	t.Run("mysql deadlock and lock wait timeout are retryable", func(t *testing.T) {
 		for _, number := range []uint16{1205, 1213} {
 			err := &mysqldriver.MySQLError{Number: number, Message: "lock contention"}
-			assert.True(t, isRetryableOpenCodeGoHealthLockError(err), "errno %d should be retryable", number)
+			assert.True(t, isRetryableOpenCodeGoContentionError(err), "errno %d should be retryable", number)
 			wrapped := fmt.Errorf("persist health: %w", err)
-			assert.True(t, isRetryableOpenCodeGoHealthLockError(wrapped), "wrapped errno %d should be retryable", number)
+			assert.True(t, isRetryableOpenCodeGoContentionError(wrapped), "wrapped errno %d should be retryable", number)
 		}
 	})
 	t.Run("mysql other errors are terminal", func(t *testing.T) {
 		for _, number := range []uint16{1045, 1062, 1452, 2002} {
 			err := &mysqldriver.MySQLError{Number: number, Message: "other failure"}
-			assert.False(t, isRetryableOpenCodeGoHealthLockError(err), "errno %d should not be retryable", number)
+			assert.False(t, isRetryableOpenCodeGoContentionError(err), "errno %d should not be retryable", number)
 		}
-		assert.False(t, isRetryableOpenCodeGoHealthLockError(errors.New("generic error")))
+		assert.False(t, isRetryableOpenCodeGoContentionError(errors.New("generic error")))
 	})
 
 	t.Run("sqlite remains sqlite-only and other types are not misclassified", func(t *testing.T) {
@@ -660,12 +726,128 @@ func TestIsRetryableOpenCodeGoHealthLockError(t *testing.T) {
 		// gosqlite errors carry their code in unexported fields, so the SQLite
 		// busy/locked path is exercised by the contention integration test
 		// instead; here we only verify cross-driver isolation.
-		assert.False(t, isRetryableOpenCodeGoHealthLockError(&mysqldriver.MySQLError{Number: 1213}))
-		assert.False(t, isRetryableOpenCodeGoHealthLockError(errors.New("generic error")))
+		assert.False(t, isRetryableOpenCodeGoContentionError(&mysqldriver.MySQLError{Number: 1213}))
+		assert.False(t, isRetryableOpenCodeGoContentionError(errors.New("generic error")))
 	})
 
 	t.Run("other database types never retry", func(t *testing.T) {
 		common.SetMainDatabaseType(common.DatabaseTypePostgreSQL)
-		assert.False(t, isRetryableOpenCodeGoHealthLockError(&mysqldriver.MySQLError{Number: 1213}))
+		assert.False(t, isRetryableOpenCodeGoContentionError(&mysqldriver.MySQLError{Number: 1213}))
 	})
+}
+
+func TestApplyOpenCodeGoClassifiedFailureRetriesMySQLLockWait(t *testing.T) {
+	dsn := os.Getenv("TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("TEST_MYSQL_DSN is not configured")
+	}
+	db, err := gorm.Open(gormmysql.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+
+	for _, target := range []any{
+		&model.OpenCodeGoWorkspace{},
+		&model.OpenCodeGoQuotaWindow{},
+		&model.OpenCodeGoWorkspaceModel{},
+	} {
+		if db.Migrator().HasTable(target) {
+			t.Fatal("TEST_MYSQL_DSN must point to a fresh isolated database")
+		}
+	}
+	require.NoError(t, db.AutoMigrate(
+		&model.OpenCodeGoWorkspace{},
+		&model.OpenCodeGoQuotaWindow{},
+		&model.OpenCodeGoWorkspaceModel{},
+	))
+	t.Cleanup(func() {
+		require.NoError(t, db.Migrator().DropTable(
+			&model.OpenCodeGoWorkspaceModel{},
+			&model.OpenCodeGoQuotaWindow{},
+			&model.OpenCodeGoWorkspace{},
+		))
+	})
+
+	previousDB := model.DB
+	previousDatabaseType := common.MainDatabaseType()
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseTypeMySQL)
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.SetMainDatabaseType(previousDatabaseType)
+	})
+
+	workspace := model.OpenCodeGoWorkspace{
+		UID:                 "workspace-mysql-lock-wait",
+		ChannelID:           881,
+		IdentityID:          1,
+		UpstreamWorkspaceID: "synthetic-mysql-lock-wait",
+		APIKeyCiphertext:    "encrypted-fixture",
+		CredentialStatus:    model.OpenCodeGoCredentialValid,
+		MembershipStatus:    model.OpenCodeGoMembershipActive,
+		ManualEnabled:       true,
+		EffectiveState:      model.OpenCodeGoStateEligible,
+		QuotaSnapshotStatus: model.OpenCodeGoQuotaSnapshotComplete,
+		QuotaFetchedAt:      time.Unix(1_900_000_000, 0).Unix(),
+	}
+	require.NoError(t, db.Create(&workspace).Error)
+
+	blocker := db.Begin()
+	require.NoError(t, blocker.Error)
+	var heldID int64
+	require.NoError(t, blocker.Raw(
+		"SELECT id FROM open_code_go_workspaces WHERE id = ? FOR UPDATE",
+		workspace.ID,
+	).Scan(&heldID).Error)
+	require.Equal(t, workspace.ID, heldID)
+	var blockerReleased atomic.Bool
+	releaseBlocker := func() {
+		if blockerReleased.CompareAndSwap(false, true) {
+			require.NoError(t, blocker.Rollback().Error)
+		}
+	}
+	t.Cleanup(releaseBlocker)
+
+	var workspaceReads atomic.Int32
+	var sawLockWait atomic.Bool
+	const callbackName = "test:opencode-go-mysql-lock-wait"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table != "open_code_go_workspaces" {
+			return
+		}
+		workspaceReads.Add(1)
+		var mysqlErr *mysqldriver.MySQLError
+		if errors.As(tx.Error, &mysqlErr) && mysqlErr.Number == openCodeGoMySQLLockWaitTimeoutErrno {
+			sawLockWait.Store(true)
+			releaseBlocker()
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+	observedAt := time.Unix(1_900_000_100, 0)
+	applied, err := applyOpenCodeGoClassifiedFailure(
+		workspace.ChannelID,
+		workspace.UID,
+		"model-a",
+		OpenCodeGoClassifiedFailure{
+			Scope: OpenCodeGoHealthScopeWorkspace,
+			Observation: OpenCodeGoHealthObservation{
+				Kind:       OpenCodeGoObservationCredentialFailure,
+				ObservedAt: observedAt,
+				Reason:     "credential rejected",
+			},
+		},
+		nil,
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+	assert.True(t, sawLockWait.Load())
+	assert.Equal(t, int32(2), workspaceReads.Load())
+
+	var after model.OpenCodeGoWorkspace
+	require.NoError(t, db.First(&after, workspace.ID).Error)
+	assert.Equal(t, model.OpenCodeGoStateKeyError, after.EffectiveState)
+	assert.Equal(t, observedAt.UnixNano(), after.HealthObservedAt)
 }

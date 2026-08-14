@@ -102,6 +102,75 @@ func TestOpenCodeGoRefreshHandlerPersistsZeroTargetProgressAndResult(t *testing.
 	assert.Zero(t, summary.Failed)
 }
 
+func TestOpenCodeGoRefreshHandlerMarksPartialBatchFailed(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.SystemTask{},
+		&model.SystemTaskLock{},
+		&model.OpenCodeGoIdentity{},
+		&model.OpenCodeGoWorkspace{},
+		&model.OpenCodeGoQuotaWindow{},
+		&model.OpenCodeGoWorkspaceModel{},
+		&model.OpenCodeGoOperation{},
+	))
+	previousSecret := common.CryptoSecret
+	previousConfigured := common.CryptoSecretExplicitlyConfigured
+	common.CryptoSecret = "controller-opencode-go-partial-task-secret"
+	common.CryptoSecretExplicitlyConfigured = true
+	t.Cleanup(func() {
+		common.CryptoSecret = previousSecret
+		common.CryptoSecretExplicitlyConfigured = previousConfigured
+	})
+
+	channel := &model.Channel{
+		Type:   constant.ChannelTypeOpenCodeGo,
+		Name:   "OpenCode Go partial refresh pool",
+		Group:  "default",
+		Status: common.ChannelStatusEnabled,
+	}
+	require.NoError(t, db.Create(channel).Error)
+	require.NoError(t, db.Create(&model.OpenCodeGoIdentity{
+		UID:                   "identity-partial-refresh",
+		ChannelID:             channel.Id,
+		AuthCookieCiphertext:  "invalid-encrypted-cookie",
+		AuthCookieFingerprint: "partial-refresh-fingerprint",
+		Status:                model.OpenCodeGoIdentityStatusActive,
+	}).Error)
+
+	task, err := model.CreateSystemTaskWithActiveKey(
+		model.SystemTaskTypeOpenCodeGoRefresh,
+		"opencode_go_refresh:test-partial",
+		openCodeGoRefreshTaskPayload{ChannelID: channel.Id, Concurrency: 1},
+		nil,
+	)
+	require.NoError(t, err)
+	const runnerID = "opencode-go-partial-test-runner"
+	claimed, acquired, err := model.ClaimSystemTask(
+		task.ID,
+		task.Type,
+		runnerID,
+		common.GetTimestamp()+60,
+	)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	openCodeGoRefreshHandler{}.Run(context.Background(), claimed, runnerID)
+
+	finished, err := model.GetSystemTaskByTaskID(task.TaskID)
+	require.NoError(t, err)
+	require.NotNil(t, finished)
+	assert.Equal(t, model.SystemTaskStatusFailed, finished.Status)
+	assert.Equal(t, "OpenCode Go refresh completed with 1 failed item(s)", finished.Error)
+	var summary service.OpenCodeGoRefreshSummary
+	require.NoError(t, common.UnmarshalJsonStr(finished.Result, &summary))
+	assert.Equal(t, 1, summary.Total)
+	assert.Equal(t, 1, summary.Processed)
+	assert.Zero(t, summary.Succeeded)
+	assert.Equal(t, 1, summary.Failed)
+	require.Len(t, summary.Results, 1)
+	assert.Equal(t, "error", summary.Results[0].Status)
+}
+
 func TestOpenCodeGoRiskRecheckHandlerPersistsZeroTargetProgressAndResult(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(
