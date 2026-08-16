@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -440,8 +441,8 @@ func ResolveHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 
 // PreflightOpenCodeRequestTransport validates request metadata that is not part
 // of the JSON body. It is side-effect free and must run before billing or
-// workspace acquisition. OpenCode currently has no declared query/trailer
-// forwarding contract for the three inference endpoints.
+// workspace acquisition. OpenCode accepts only the Claude Code beta marker on
+// the Messages client endpoint; no client query is forwarded upstream.
 func PreflightOpenCodeRequestTransport(info *common.RelayInfo, c *gin.Context) *types.NewAPIError {
 	preflightInfo, isOpenCode := openCodePreflightRelayInfo(info, c)
 	if !isOpenCode {
@@ -459,11 +460,11 @@ func PreflightOpenCodeRequestTransport(info *common.RelayInfo, c *gin.Context) *
 			}),
 		)
 	}
-	if c.Request.URL.RawQuery != "" {
+	if err := validateOpenCodeRequestQuery(preflightInfo, c.Request.URL); err != nil {
 		return newOpenCodeClientTransportError(
 			http.StatusBadRequest,
 			"query_parameters",
-			"query parameters are not supported for this OpenCode relay endpoint",
+			err.Error(),
 		)
 	}
 	if len(c.Request.Trailer) != 0 || strings.TrimSpace(c.Request.Header.Get("Trailer")) != "" {
@@ -487,6 +488,36 @@ func PreflightOpenCodeRequestTransport(info *common.RelayInfo, c *gin.Context) *
 			return apiErr
 		}
 		return newOpenCodeHeaderOverrideError(err)
+	}
+	return nil
+}
+
+const openCodeClaudeMessagesPath = "/v1/messages"
+
+// validateOpenCodeRequestQuery is intentionally narrower than the Type-14
+// outbound beta setting. Claude Code sends beta=true as a client-compatibility
+// marker; OpenCode's fixed upstream endpoints do not need that marker in their
+// URL. Require the observed raw spelling as well as the structured shape so
+// trailing separators, encoded aliases, and duplicate values do not get
+// silently normalized into an accepted request.
+func validateOpenCodeRequestQuery(info *common.RelayInfo, requestURL *url.URL) error {
+	if requestURL == nil || requestURL.RawQuery == "" {
+		return nil
+	}
+
+	values, err := url.ParseQuery(requestURL.RawQuery)
+	if err != nil {
+		return errors.New("OpenCode query parameters are invalid")
+	}
+	if requestURL.Path != openCodeClaudeMessagesPath || info == nil || info.RelayFormat != types.RelayFormatClaude {
+		return errors.New("OpenCode query parameters are not supported for this relay endpoint")
+	}
+	if requestURL.RawQuery != "beta=true" {
+		return errors.New("OpenCode query parameters are invalid")
+	}
+	betaValues, ok := values["beta"]
+	if !ok || len(values) != 1 || len(betaValues) != 1 || betaValues[0] != "true" {
+		return errors.New("OpenCode query parameters are invalid")
 	}
 	return nil
 }

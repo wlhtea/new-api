@@ -311,6 +311,27 @@ func TestAdaptorUsesFixedURLsAndProtocolAuthentication(t *testing.T) {
 	}
 }
 
+func TestAdaptorDoesNotForwardClaudeBetaQueryToOpenCode(t *testing.T) {
+	for _, channelType := range []int{
+		constant.ChannelTypeOpenCodeGo,
+		constant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(constant.GetChannelTypeName(channelType), func(t *testing.T) {
+			info := newAdaptorTestInfo("minimax-m3", false)
+			info.ChannelType = channelType
+			info.IsClaudeBetaQuery = true
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+
+			requestURL, err := adaptor.GetRequestURL(info)
+			require.NoError(t, err)
+			assert.Equal(t, constant.ChannelBaseURLs[channelType]+"/messages", requestURL)
+			assert.NotContains(t, requestURL, "?", "OpenCode must not receive client query metadata")
+			assert.NotContains(t, requestURL, "beta")
+		})
+	}
+}
+
 func TestAdaptorResolvesRequestClientAfterIdentitySelection(t *testing.T) {
 	originalSelector := selectOpenCodeGoWorkspace
 	originalResolver := acquireOpenCodeGoRelayHTTPClient

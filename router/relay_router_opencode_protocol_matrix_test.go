@@ -35,9 +35,10 @@ func (capture *relayRouterProtocolCapture) RoundTrip(request *http.Request) (*ht
 	}
 	capture.mutex.Lock()
 	capture.requests = append(capture.requests, relayRouterCapturedRequest{
-		path:   request.URL.Path,
-		header: request.Header.Clone(),
-		body:   append([]byte(nil), body...),
+		path:     request.URL.Path,
+		rawQuery: request.URL.RawQuery,
+		header:   request.Header.Clone(),
+		body:     append([]byte(nil), body...),
 	})
 	capture.mutex.Unlock()
 
