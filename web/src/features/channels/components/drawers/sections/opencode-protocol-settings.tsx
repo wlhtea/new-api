@@ -26,6 +26,7 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormDescription,
   FormMessage,
 } from '@/components/ui/form'
 import {
@@ -36,6 +37,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 
 import type { ChannelFormInput } from '../../../lib/channel-form'
@@ -128,6 +130,33 @@ export function OpenCodeProtocolSettings(props: OpenCodeProtocolSettingsProps) {
           )}
         />
       </div>
+
+      <FormField
+        control={form.control}
+        name='opencode_go_billing_usage_conversion_enabled'
+        render={({ field }) => (
+          <FormItem className='border-border/60 flex min-h-16 items-center justify-between gap-4 border-y py-3'>
+            <div className='min-w-0'>
+              <FormLabel>
+                {t('Enable OpenAI-compatible Usage conversion')}
+              </FormLabel>
+              <FormDescription>
+                {t(
+                  'Controls public Usage projection only; it does not change model pricing or internal settlement.'
+                )}
+              </FormDescription>
+            </div>
+            <FormControl>
+              <Switch
+                checked={field.value !== false}
+                onCheckedChange={field.onChange}
+                aria-label={t('Enable OpenAI-compatible Usage conversion')}
+              />
+            </FormControl>
+            <FormMessage />
+          </FormItem>
+        )}
+      />
     </>
   )
 }

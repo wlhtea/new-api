@@ -220,6 +220,55 @@ func TestRelayInfoGetFinalRequestRelayFormatNilReceiver(t *testing.T) {
 	require.Equal(t, types.RelayFormat(""), info.GetFinalRequestRelayFormat())
 }
 
+func TestRelayInfoConvOptionsSnapshotsOpenCodeUsageConversionPolicy(t *testing.T) {
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		t.Run(constant.ChannelTypeNames[channelType], func(t *testing.T) {
+			for _, test := range []struct {
+				name    string
+				present bool
+				value   bool
+				want    bool
+			}{
+				{name: "absent defaults enabled", want: true},
+				{name: "explicit enabled", present: true, value: true, want: true},
+				{name: "explicit disabled", present: true, value: false, want: false},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					configured := test.value
+					var configuredPointer *bool
+					if test.present {
+						configuredPointer = &configured
+					}
+					info := &RelayInfo{ChannelMeta: &ChannelMeta{
+						ChannelType: channelType,
+						ChannelOtherSettings: dto.ChannelOtherSettings{
+							OpenCodeGo: &dto.OpenCodeGoConfig{BillingUsageConversionEnabled: configuredPointer},
+						},
+					}}
+					options := info.ConvOptions()
+					require.NotNil(t, options.UsageConversionEnabled)
+					require.Equal(t, test.want, options.IsUsageConversionEnabled())
+
+					// The request-scoped snapshot must not follow a later mutation of
+					// the channel settings object.
+					configured = !configured
+					require.Equal(t, test.want, options.IsUsageConversionEnabled())
+				})
+			}
+		})
+	}
+
+	disabled := false
+	other := &RelayInfo{ChannelMeta: &ChannelMeta{
+		ChannelType: constant.ChannelTypeOpenAI,
+		ChannelOtherSettings: dto.ChannelOtherSettings{
+			OpenCodeGo: &dto.OpenCodeGoConfig{BillingUsageConversionEnabled: &disabled},
+		},
+	}}
+	require.Nil(t, other.ConvOptions().UsageConversionEnabled)
+	require.True(t, other.ConvOptions().IsUsageConversionEnabled())
+}
+
 func TestRelayInfoMetaTypedNilReceiver(t *testing.T) {
 	var info *RelayInfo
 	var meta convmeta.Meta = info

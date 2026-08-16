@@ -1666,6 +1666,8 @@
     "Enable {{parameter}}": "Включить {{parameter}}",
     "Enable 2FA": "Включить 2FA",
     "Enable All": "Включить все",
+    "Enable OpenAI-compatible Usage conversion": "Включить преобразование Usage, совместимое с OpenAI",
+    "Controls public Usage projection only; it does not change model pricing or internal settlement.": "Управляет только публичным представлением Usage; не изменяет цены моделей или внутренние расчёты.",
     "Enable automatic renewal cancellation": "Включить автоматическую отмену продления",
     "Enable check-in feature": "Включить функцию прибытия",
     "Enable China models (all)": "Включить модели Китая (все)",

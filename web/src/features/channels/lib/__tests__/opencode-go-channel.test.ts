@@ -142,6 +142,7 @@ describe('OpenCode Go channel configuration', () => {
     const settings = JSON.parse(String(result.channel.settings))
 
     assert.deepEqual(settings.opencode_go, {
+      billing_usage_conversion_enabled: true,
       identity_proxy_enabled: false,
       identity_proxy_country: 'US',
       identity_proxy_rotate_minutes: 10,
@@ -211,6 +212,7 @@ describe('OpenCode Go channel configuration', () => {
     assert.equal(defaults.key, '')
     assert.equal(defaults.models, 'glm-5.2')
     assert.equal(defaults.opencode_go_default_protocol, 'messages')
+    assert.equal(defaults.opencode_go_billing_usage_conversion_enabled, true)
     assert.equal(defaults.opencode_go_generic_failover_enabled, true)
     assert.equal(defaults.opencode_go_generic_failover_threshold, 3)
     assert.equal(defaults.opencode_go_generic_failover_window_seconds, 45)
@@ -231,6 +233,7 @@ describe('OpenCode Go channel configuration', () => {
     assert.equal('key' in update, false)
     assert.equal(update.models, 'glm-5.2')
     assert.equal(settings.retained_setting, 'keep-me')
+    assert.equal(settings.opencode_go.billing_usage_conversion_enabled, true)
     assert.equal(settings.opencode_go.referral_rewards_max_per_run, 0)
     assert.equal(settings.opencode_go.generic_failover_enabled, true)
     assert.equal(settings.opencode_go.generic_failover_threshold, 3)
@@ -260,6 +263,7 @@ describe('OpenCode Go channel configuration', () => {
         retained_setting: 'keep-me',
         opencode_go: {
           retained_nested_setting: 'keep-me-too',
+          billing_usage_conversion_enabled: false,
           identity_proxy_enabled: true,
           identity_proxy_country: 'gb',
           identity_proxy_rotate_minutes: 20,
@@ -271,6 +275,7 @@ describe('OpenCode Go channel configuration', () => {
     assert.equal(defaults.opencode_go_identity_proxy_enabled, true)
     assert.equal(defaults.opencode_go_identity_proxy_country, 'GB')
     assert.equal(defaults.opencode_go_identity_proxy_rotate_minutes, 20)
+    assert.equal(defaults.opencode_go_billing_usage_conversion_enabled, false)
     assert.equal(channelFormSchema.safeParse(defaults).success, true)
 
     defaults.opencode_go_identity_proxy_country = ' ca '
@@ -283,6 +288,7 @@ describe('OpenCode Go channel configuration', () => {
     )
     assert.equal(settings.retained_setting, 'keep-me')
     assert.equal(settings.opencode_go.retained_nested_setting, 'keep-me-too')
+    assert.equal(settings.opencode_go.billing_usage_conversion_enabled, false)
     assert.equal(settings.opencode_go.identity_proxy_enabled, true)
     assert.equal(settings.opencode_go.identity_proxy_country, 'CA')
     assert.equal(settings.opencode_go.identity_proxy_rotate_minutes, 20)

@@ -1666,6 +1666,8 @@
     "Enable {{parameter}}": "Bật {{parameter}}",
     "Enable 2FA": "Bật 2FA",
     "Enable All": "Bật tất cả",
+    "Enable OpenAI-compatible Usage conversion": "Bật chuyển đổi Usage tương thích OpenAI",
+    "Controls public Usage projection only; it does not change model pricing or internal settlement.": "Chỉ kiểm soát phép chiếu Usage công khai; không thay đổi giá mô hình hoặc quyết toán nội bộ.",
     "Enable automatic renewal cancellation": "Bật tự động hủy gia hạn",
     "Enable check-in feature": "Bật tính năng điểm danh",
     "Enable China models (all)": "Bật mô hình Trung Quốc (tất cả)",

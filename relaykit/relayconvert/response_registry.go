@@ -320,6 +320,7 @@ func ConvertStreamResponseChunk(c context.Context, info convmeta.Meta, state *Re
 		return nil, err
 	}
 	state.rememberUsage(usage)
+	values = projectNativeUsageValuesForTarget(info, state.To, values, usage)
 	return responseStreamResults(state, values, usage), nil
 }
 
@@ -362,6 +363,7 @@ func FinalizeStreamResponse(c context.Context, info convmeta.Meta, state *Respon
 		}
 		values = append(values, current...)
 	}
+	values = projectNativeUsageValuesForTarget(info, state.To, values, usage)
 	return responseStreamResults(state, values, usage), nil
 }
 
@@ -438,6 +440,7 @@ func executeResponseSteps(c context.Context, info convmeta.Meta, from types.Rela
 		}
 		steps = append(steps, step)
 	}
+	current = projectNativeUsageForTarget(info, target, current, usage)
 
 	converters := make([]string, 0, len(steps))
 	for _, step := range steps {
@@ -497,6 +500,7 @@ func executeStatelessStreamResponseSpec(c context.Context, info convmeta.Meta, f
 			To:        step.To,
 		})
 	}
+	current = projectNativeUsageForTarget(info, target, current, usage)
 	return &ResponseResult{
 		Value:     current,
 		Usage:     usage,

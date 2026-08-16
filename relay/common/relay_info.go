@@ -927,6 +927,13 @@ func (info *RelayInfo) ConvOptions() *convmeta.Options {
 		PreserveThinkingSuffix: model_setting.ShouldPreserveThinkingSuffix,
 	}
 	if info != nil {
+		// OpenCode usage conversion is a channel-scoped opt-out. Copy the
+		// pointer value into a request snapshot so retries cannot observe a
+		// later settings mutation, while nil preserves the historical default.
+		if constant.IsOpenCodeChannelType(info.GetChannelType()) && info.ChannelOtherSettings.OpenCodeGo != nil {
+			enabled := info.ChannelOtherSettings.OpenCodeGo.IsBillingUsageConversionEnabled()
+			options.UsageConversionEnabled = &enabled
+		}
 		info.convOptions = options
 	}
 	return options

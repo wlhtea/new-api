@@ -129,3 +129,33 @@ func TestOpenCodeGoConfigNormalizeIdentityProxy(t *testing.T) {
 	require.Equal(t, OpenCodeGoIdentityProxyDefaultRotateMinutes, config.IdentityProxyRotateMinutes)
 	require.NoError(t, config.Validate())
 }
+
+func TestOpenCodeGoBillingUsageConversionPresenceAndDefault(t *testing.T) {
+	var absent OpenCodeGoConfig
+	require.NoError(t, json.Unmarshal([]byte(`{"default_protocol":"chat"}`), &absent))
+	require.Nil(t, absent.BillingUsageConversionEnabled)
+	require.True(t, absent.IsBillingUsageConversionEnabled())
+
+	var disabled OpenCodeGoConfig
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"billing_usage_conversion_enabled": false,
+		"future_nested": {"preserve": true}
+	}`), &disabled))
+	require.NotNil(t, disabled.BillingUsageConversionEnabled)
+	require.False(t, *disabled.BillingUsageConversionEnabled)
+	require.False(t, disabled.IsBillingUsageConversionEnabled())
+
+	encoded, err := json.Marshal(disabled)
+	require.NoError(t, err)
+	var roundTrip map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &roundTrip))
+	require.Equal(t, false, roundTrip["billing_usage_conversion_enabled"])
+	require.Equal(t, map[string]any{"preserve": true}, roundTrip["future_nested"])
+
+	enabled := true
+	config := OpenCodeGoConfig{BillingUsageConversionEnabled: &enabled}
+	require.True(t, config.IsBillingUsageConversionEnabled())
+	encoded, err = json.Marshal(config)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"billing_usage_conversion_enabled":true}`, string(encoded))
+}

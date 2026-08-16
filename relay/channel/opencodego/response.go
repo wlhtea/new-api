@@ -89,8 +89,11 @@ type normalizedCostUsage struct {
 }
 
 type responseTransformState struct {
-	model                     string
-	protocol                  Protocol
+	model    string
+	protocol Protocol
+	// usageConversionDisabled gates only synthetic public usage frames. Native
+	// fallback capture and final settlement reconciliation remain active.
+	usageConversionDisabled   bool
 	namespaceTools            map[string]openCodeGoNamespaceTool
 	sawUpstreamError          bool
 	upstreamErrorPayload      json.RawMessage
@@ -328,7 +331,7 @@ func (s *responseTransformState) transformJSON(data []byte, stream bool) []byte 
 	}
 	if isCostExtension(data) {
 		capturedFallback := s.captureFallbackUsage(data)
-		if stream && s.protocol == ProtocolChat && !s.sawStandardUsage && !s.emittedSyntheticChatUsage &&
+		if stream && s.protocol == ProtocolChat && !s.usageConversionDisabled && !s.sawStandardUsage && !s.emittedSyntheticChatUsage &&
 			capturedFallback && s.sawFallbackInputField {
 			s.emittedSyntheticChatUsage = true
 			return s.standardChatUsageFrame()

@@ -1666,6 +1666,8 @@
     "Enable {{parameter}}": "启用 {{parameter}}",
     "Enable 2FA": "启用 2FA",
     "Enable All": "启用全部",
+    "Enable OpenAI-compatible Usage conversion": "启用 OpenAI 兼容 Usage 转换",
+    "Controls public Usage projection only; it does not change model pricing or internal settlement.": "仅控制公开 Usage 投影，不会改变模型价格或内部结算。",
     "Enable automatic renewal cancellation": "启用自动取消续费",
     "Enable check-in feature": "启用签到功能",
     "Enable China models (all)": "开启全部中国模型",

@@ -558,10 +558,11 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		clientModel = info.UpstreamModelName
 	}
 	state := &responseTransformState{
-		model:                clientModel,
-		protocol:             protocol,
-		namespaceTools:       a.namespaceTools,
-		estimatedInputTokens: info.GetEstimatePromptTokens(),
+		model:                   clientModel,
+		protocol:                protocol,
+		usageConversionDisabled: !info.ConvOptions().IsUsageConversionEnabled(),
+		namespaceTools:          a.namespaceTools,
+		estimatedInputTokens:    info.GetEstimatePromptTokens(),
 	}
 	responseContext := context.Background()
 	if c != nil && c.Request != nil {

@@ -345,6 +345,329 @@ func TestConvertResponseProviderToOAIChatUsage(t *testing.T) {
 	assert.Equal(t, 17, toChat.Usage.BillingUsage.GeminiUsageMetadata.TotalTokenCount)
 }
 
+func TestConvertResponseDisabledUsageConversionPreservesClaudeCategories(t *testing.T) {
+	disabled := false
+	info := &convmeta.Values{Options: &convmeta.Options{UsageConversionEnabled: &disabled}}
+	claude := &dto.ClaudeResponse{
+		Id:   "msg_native",
+		Type: "message",
+		Usage: &dto.ClaudeUsage{
+			InputTokens:              10,
+			CacheReadInputTokens:     3,
+			CacheCreationInputTokens: 4,
+			OutputTokens:             5,
+		},
+	}
+	expectedCanonical := UsageFromClaudeAPIUsage(claude.Usage)
+
+	result, err := ConvertResponse(nil, info, types.RelayFormatOpenAI, claude)
+	require.NoError(t, err)
+	chat, ok := result.Value.(*dto.OpenAITextResponse)
+	require.True(t, ok)
+	// Disabled mode keeps Claude's uncached input as the public scalar instead
+	// of folding cache read/write categories into prompt_tokens.
+	assert.Equal(t, 10, chat.Usage.PromptTokens)
+	assert.Equal(t, 5, chat.Usage.CompletionTokens)
+	assert.Equal(t, 15, chat.Usage.TotalTokens)
+	assert.Equal(t, 3, chat.Usage.PromptTokensDetails.CachedTokens)
+	assert.Equal(t, 4, chat.Usage.PromptTokensDetails.CacheWriteTokens)
+	assert.Equal(t, 22, result.Usage.TotalTokens)
+	require.NotNil(t, result.Usage.BillingUsage)
+	require.NotNil(t, result.Usage.BillingUsage.ClaudeUsage)
+	assert.Equal(t, 10, result.Usage.BillingUsage.ClaudeUsage.InputTokens)
+	assert.Equal(t, expectedCanonical, result.Usage)
+}
+
+func TestConvertResponseDisabledUsageConversionProjectsClaudeToResponses(t *testing.T) {
+	disabled := false
+	info := &convmeta.Values{Options: &convmeta.Options{UsageConversionEnabled: &disabled}}
+	claude := &dto.ClaudeResponse{
+		Id:   "msg_native",
+		Type: "message",
+		Usage: &dto.ClaudeUsage{
+			InputTokens:              10,
+			CacheReadInputTokens:     3,
+			CacheCreationInputTokens: 4,
+			OutputTokens:             5,
+		},
+	}
+
+	result, err := ConvertResponse(nil, info, types.RelayFormatOpenAIResponses, claude)
+	require.NoError(t, err)
+	response, ok := result.Value.(*dto.OpenAIResponsesResponse)
+	require.True(t, ok)
+	require.NotNil(t, response.Usage)
+	assert.Equal(t, 10, response.Usage.InputTokens)
+	assert.Equal(t, 5, response.Usage.OutputTokens)
+	assert.Equal(t, 15, response.Usage.TotalTokens)
+	require.NotNil(t, response.Usage.InputTokensDetails)
+	assert.Equal(t, 3, response.Usage.InputTokensDetails.CachedTokens)
+	assert.Equal(t, 4, response.Usage.InputTokensDetails.CacheWriteTokens)
+	require.NotNil(t, result.Usage.BillingUsage)
+	require.NotNil(t, result.Usage.BillingUsage.ClaudeUsage)
+	assert.Equal(t, 10, result.Usage.BillingUsage.ClaudeUsage.InputTokens)
+	assert.Equal(t, 3, result.Usage.BillingUsage.ClaudeUsage.CacheReadInputTokens)
+	assert.Equal(t, 4, result.Usage.BillingUsage.ClaudeUsage.CacheCreationInputTokens)
+	assert.Equal(t, 5, result.Usage.BillingUsage.ClaudeUsage.OutputTokens)
+}
+
+func TestConvertResponseDisabledUsageConversionMapsOpenAIToClaudeWithoutAggregation(t *testing.T) {
+	disabled := false
+	info := &convmeta.Values{Options: &convmeta.Options{UsageConversionEnabled: &disabled}}
+	chat := textRegistryChatResponse()
+	chat.Usage = dto.Usage{
+		PromptTokens:     20,
+		CompletionTokens: 4,
+		TotalTokens:      24,
+		PromptTokensDetails: dto.InputTokenDetails{
+			CachedTokens:     5,
+			CacheWriteTokens: 2,
+		},
+	}
+	chat.Usage.BillingUsage = dto.NewOpenAIChatBillingUsage(&chat.Usage)
+
+	result, err := ConvertResponse(nil, info, types.RelayFormatClaude, chat)
+	require.NoError(t, err)
+	claude, ok := result.Value.(*dto.ClaudeResponse)
+	require.True(t, ok)
+	require.NotNil(t, claude.Usage)
+	assert.Equal(t, 13, claude.Usage.InputTokens)
+	assert.Equal(t, 5, claude.Usage.CacheReadInputTokens)
+	assert.Equal(t, 2, claude.Usage.CacheCreationInputTokens)
+	assert.Equal(t, 4, claude.Usage.OutputTokens)
+	assert.Equal(t, 20, result.Usage.PromptTokens)
+}
+
+func TestConvertResponseDisabledUsageConversionMapsChatAndResponsesFields(t *testing.T) {
+	disabled := false
+	info := &convmeta.Values{Options: &convmeta.Options{UsageConversionEnabled: &disabled}}
+
+	t.Run("chat to responses", func(t *testing.T) {
+		chat := textRegistryChatResponse()
+		chat.Usage = dto.Usage{
+			PromptTokens:     20,
+			CompletionTokens: 4,
+			TotalTokens:      24,
+			PromptTokensDetails: dto.InputTokenDetails{
+				CachedTokens: 5,
+			},
+		}
+		chat.Usage.BillingUsage = dto.NewOpenAIChatBillingUsage(&chat.Usage)
+
+		result, err := ConvertResponse(nil, info, types.RelayFormatOpenAIResponses, chat)
+		require.NoError(t, err)
+		response := result.Value.(*dto.OpenAIResponsesResponse)
+		require.NotNil(t, response.Usage)
+		assert.Equal(t, 20, response.Usage.InputTokens)
+		assert.Equal(t, 4, response.Usage.OutputTokens)
+		assert.Equal(t, 24, response.Usage.TotalTokens)
+		require.NotNil(t, response.Usage.InputTokensDetails)
+		assert.Equal(t, 5, response.Usage.InputTokensDetails.CachedTokens)
+		assert.Equal(t, 20, result.Usage.PromptTokens)
+	})
+
+	t.Run("responses to chat", func(t *testing.T) {
+		response := &dto.OpenAIResponsesResponse{
+			ID:     "resp_native",
+			Object: "response",
+			Usage: &dto.Usage{
+				InputTokens:  20,
+				OutputTokens: 4,
+				TotalTokens:  24,
+				InputTokensDetails: &dto.InputTokenDetails{
+					CachedTokens: 5,
+				},
+			},
+		}
+		response.Usage.BillingUsage = dto.NewOpenAIResponsesBillingUsage(response.Usage)
+
+		result, err := ConvertResponse(nil, info, types.RelayFormatOpenAI, response)
+		require.NoError(t, err)
+		chat := result.Value.(*dto.OpenAITextResponse)
+		assert.Equal(t, 20, chat.Usage.PromptTokens)
+		assert.Equal(t, 4, chat.Usage.CompletionTokens)
+		assert.Equal(t, 24, chat.Usage.TotalTokens)
+		assert.Equal(t, 5, chat.Usage.PromptTokensDetails.CachedTokens)
+		assert.Equal(t, 20, result.Usage.PromptTokens)
+	})
+}
+
+func TestConvertStreamResponseDisabledUsageConversionProjectsSliceValues(t *testing.T) {
+	disabled := false
+	info := &convmeta.Values{Options: &convmeta.Options{UsageConversionEnabled: &disabled}}
+	chat := &dto.ChatCompletionsStreamResponse{
+		Usage: &dto.Usage{
+			PromptTokens:     12,
+			CompletionTokens: 3,
+			TotalTokens:      15,
+			PromptTokensDetails: dto.InputTokenDetails{
+				CachedTokens:     2,
+				CacheWriteTokens: 1,
+			},
+		},
+	}
+	chat.Usage.BillingUsage = dto.NewOpenAIChatBillingUsage(chat.Usage)
+
+	result, err := ConvertStreamResponse(nil, info, types.RelayFormatClaude, chat)
+	require.NoError(t, err)
+	values, ok := result.Value.([]*dto.ClaudeResponse)
+	require.True(t, ok)
+	require.Len(t, values, 2)
+	assert.Equal(t, "message_delta", values[0].Type)
+	require.NotNil(t, values[0].Usage)
+	assert.Equal(t, 9, values[0].Usage.InputTokens)
+	assert.Equal(t, 2, values[0].Usage.CacheReadInputTokens)
+	assert.Equal(t, 1, values[0].Usage.CacheCreationInputTokens)
+	assert.Equal(t, 3, values[0].Usage.OutputTokens)
+	assert.Equal(t, "message_stop", values[1].Type)
+	assert.Nil(t, values[1].Usage)
+	assert.Equal(t, 12, result.Usage.PromptTokens)
+	require.NotNil(t, result.Usage.BillingUsage)
+	require.NotNil(t, result.Usage.BillingUsage.OpenAIUsage)
+	assert.Equal(t, 12, result.Usage.BillingUsage.OpenAIUsage.PromptTokens)
+}
+
+func TestConvertStreamResponseDisabledUsageProjectionDoesNotMutateResponsesState(t *testing.T) {
+	disabled := false
+	info := &convmeta.Values{Options: &convmeta.Options{UsageConversionEnabled: &disabled}}
+	state, err := NewResponseStreamState(types.RelayFormatOpenAIResponses, types.RelayFormatOpenAI, ResponseStreamOptions{
+		ID:           "chatcmpl_native",
+		Model:        "native-model",
+		IncludeUsage: true,
+	})
+	require.NoError(t, err)
+
+	nativeClaudeUsage := &dto.ClaudeUsage{
+		InputTokens:              10,
+		CacheReadInputTokens:     3,
+		CacheCreationInputTokens: 4,
+		OutputTokens:             5,
+	}
+	upstreamUsage := &dto.Usage{
+		InputTokens:  17,
+		OutputTokens: 5,
+		TotalTokens:  22,
+		BillingUsage: dto.NewClaudeMessagesBillingUsage(nativeClaudeUsage),
+	}
+	results, err := ConvertStreamResponseChunk(nil, info, state, &dto.ResponsesStreamResponse{
+		Type: "response.completed",
+		Response: &dto.OpenAIResponsesResponse{
+			ID:     "resp_native",
+			Object: "response",
+			Model:  "native-model",
+			Status: []byte(`"completed"`),
+			Usage:  upstreamUsage,
+		},
+	})
+	require.NoError(t, err)
+
+	var publicUsage *dto.Usage
+	for _, result := range results {
+		chunk, ok := result.Value.(dto.ChatCompletionsStreamResponse)
+		if ok && chunk.Usage != nil {
+			publicUsage = chunk.Usage
+		}
+	}
+	require.NotNil(t, publicUsage)
+	assert.Equal(t, 10, publicUsage.PromptTokens)
+	assert.Equal(t, 5, publicUsage.CompletionTokens)
+	assert.Equal(t, 15, publicUsage.TotalTokens)
+
+	canonical := state.Usage()
+	require.NotNil(t, canonical)
+	assert.NotSame(t, canonical, publicUsage)
+	assert.Equal(t, 17, canonical.PromptTokens)
+	assert.Equal(t, 22, canonical.TotalTokens)
+	require.NotNil(t, canonical.BillingUsage)
+	require.NotNil(t, canonical.BillingUsage.ClaudeUsage)
+	assert.Equal(t, 10, canonical.BillingUsage.ClaudeUsage.InputTokens)
+	for _, result := range results {
+		if result.Usage != nil {
+			assert.Equal(t, 22, result.Usage.TotalTokens)
+		}
+	}
+}
+
+func TestFinalizeStreamResponseDisabledUsageProjectionHandlesResponsesEventWrapper(t *testing.T) {
+	disabled := false
+	info := &convmeta.Values{Options: &convmeta.Options{UsageConversionEnabled: &disabled}}
+	state, err := NewResponseStreamState(types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, ResponseStreamOptions{
+		ID:    "resp_native",
+		Model: "native-model",
+	})
+	require.NoError(t, err)
+
+	nativeClaudeUsage := &dto.ClaudeUsage{
+		InputTokens:              10,
+		CacheReadInputTokens:     3,
+		CacheCreationInputTokens: 4,
+		OutputTokens:             5,
+	}
+	chatUsage := &dto.Usage{
+		PromptTokens:     17,
+		CompletionTokens: 5,
+		TotalTokens:      22,
+		BillingUsage:     dto.NewClaudeMessagesBillingUsage(nativeClaudeUsage),
+	}
+	_, err = ConvertStreamResponseChunk(nil, info, state, &dto.ChatCompletionsStreamResponse{
+		Id:      "chatcmpl_native",
+		Model:   "native-model",
+		Choices: make([]dto.ChatCompletionsStreamResponseChoice, 0),
+		Usage:   chatUsage,
+	})
+	require.NoError(t, err)
+
+	results, err := FinalizeStreamResponse(nil, info, state)
+	require.NoError(t, err)
+	require.NotEmpty(t, results)
+	completed, ok := results[len(results)-1].Value.(ChatToResponsesStreamEvent)
+	require.True(t, ok)
+	assert.Equal(t, "response.completed", completed.Type)
+	require.NotNil(t, completed.Payload.Response)
+	require.NotNil(t, completed.Payload.Response.Usage)
+	publicUsage := completed.Payload.Response.Usage
+	assert.Equal(t, 10, publicUsage.InputTokens)
+	assert.Equal(t, 5, publicUsage.OutputTokens)
+	assert.Equal(t, 15, publicUsage.TotalTokens)
+	require.NotNil(t, publicUsage.InputTokensDetails)
+	assert.Equal(t, 3, publicUsage.InputTokensDetails.CachedTokens)
+	assert.Equal(t, 4, publicUsage.InputTokensDetails.CacheWriteTokens)
+
+	canonical := state.Usage()
+	require.NotNil(t, canonical)
+	assert.NotSame(t, canonical, publicUsage)
+	assert.Equal(t, 17, canonical.InputTokens)
+	assert.Equal(t, 22, canonical.TotalTokens)
+	require.NotNil(t, canonical.BillingUsage)
+	require.NotNil(t, canonical.BillingUsage.ClaudeUsage)
+	assert.Equal(t, 10, canonical.BillingUsage.ClaudeUsage.InputTokens)
+	assert.Equal(t, 22, results[len(results)-1].Usage.TotalTokens)
+}
+
+func TestDisabledUsageProjectionLeavesSameProtocolAndMissingSnapshotUntouched(t *testing.T) {
+	disabled := false
+	info := &convmeta.Values{Options: &convmeta.Options{UsageConversionEnabled: &disabled}}
+	chat := textRegistryChatResponse()
+
+	sameProtocol, err := ConvertResponse(nil, info, types.RelayFormatOpenAI, chat)
+	require.NoError(t, err)
+	assert.Same(t, chat, sameProtocol.Value)
+
+	withoutBilling := &dto.ChatCompletionsStreamResponse{
+		Usage: &dto.Usage{PromptTokens: 7, CompletionTokens: 2, TotalTokens: 9},
+	}
+	projected := projectNativeUsageForTarget(info, types.RelayFormatOpenAI, withoutBilling, nil)
+	assert.Same(t, withoutBilling, projected)
+
+	canonical := &dto.Usage{PromptTokens: 7, CompletionTokens: 2, TotalTokens: 9}
+	canonical.BillingUsage = dto.NewOpenAIChatBillingUsage(canonical)
+	var nilResponses []*dto.ClaudeResponse
+	projectedNil := projectNativeUsageForTarget(info, types.RelayFormatClaude, nilResponses, canonical)
+	typedNil, ok := projectedNil.([]*dto.ClaudeResponse)
+	require.True(t, ok)
+	assert.Nil(t, typedNil)
+}
+
 func TestConvertResponsePreservesBillingUsageAcrossChatResponsesBridge(t *testing.T) {
 	chat := textRegistryChatResponse()
 	chat.Usage.BillingUsage = dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{

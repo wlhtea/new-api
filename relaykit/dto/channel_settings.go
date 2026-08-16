@@ -111,24 +111,35 @@ const (
 )
 
 type OpenCodeGoConfig struct {
-	ModelProtocols                map[string]string `json:"model_protocols,omitempty"`
-	DefaultProtocol               string            `json:"default_protocol,omitempty"`
-	GenericFailoverEnabled        bool              `json:"generic_failover_enabled,omitempty"`
-	GenericFailoverThreshold      int               `json:"generic_failover_threshold,omitempty"`
-	GenericFailoverWindowSeconds  int               `json:"generic_failover_window_seconds,omitempty"`
-	GenericFailoverMaxBackups     int               `json:"generic_failover_max_backups,omitempty"`
-	GenericFailoverLeaseSeconds   int               `json:"generic_failover_lease_seconds,omitempty"`
-	AffinityFallback              string            `json:"affinity_fallback,omitempty"`
-	LoadAwareEnabled              bool              `json:"load_aware_enabled,omitempty"`
-	AutoEnableChinaModels         *bool             `json:"auto_enable_china_models,omitempty"`
-	AutoApplyReferralRewards      *bool             `json:"auto_apply_referral_rewards,omitempty"`
-	ReferralRewardsMaxPerRun      *int              `json:"referral_rewards_max_per_run,omitempty"`
-	AutoCancelSubscriptionRenewal bool              `json:"auto_cancel_subscription_renewal,omitempty"`
-	IdentityProxyEnabled          bool              `json:"identity_proxy_enabled,omitempty"`
-	IdentityProxyCountry          string            `json:"identity_proxy_country,omitempty"`
-	IdentityProxyRotateMinutes    int               `json:"identity_proxy_rotate_minutes,omitempty"`
+	ModelProtocols  map[string]string `json:"model_protocols,omitempty"`
+	DefaultProtocol string            `json:"default_protocol,omitempty"`
+	// BillingUsageConversionEnabled controls only the public usage projection
+	// for OpenCode responses. A nil value preserves the historical default of
+	// enabled while allowing an explicit false to survive JSON round trips.
+	BillingUsageConversionEnabled *bool  `json:"billing_usage_conversion_enabled,omitempty"`
+	GenericFailoverEnabled        bool   `json:"generic_failover_enabled,omitempty"`
+	GenericFailoverThreshold      int    `json:"generic_failover_threshold,omitempty"`
+	GenericFailoverWindowSeconds  int    `json:"generic_failover_window_seconds,omitempty"`
+	GenericFailoverMaxBackups     int    `json:"generic_failover_max_backups,omitempty"`
+	GenericFailoverLeaseSeconds   int    `json:"generic_failover_lease_seconds,omitempty"`
+	AffinityFallback              string `json:"affinity_fallback,omitempty"`
+	LoadAwareEnabled              bool   `json:"load_aware_enabled,omitempty"`
+	AutoEnableChinaModels         *bool  `json:"auto_enable_china_models,omitempty"`
+	AutoApplyReferralRewards      *bool  `json:"auto_apply_referral_rewards,omitempty"`
+	ReferralRewardsMaxPerRun      *int   `json:"referral_rewards_max_per_run,omitempty"`
+	AutoCancelSubscriptionRenewal bool   `json:"auto_cancel_subscription_renewal,omitempty"`
+	IdentityProxyEnabled          bool   `json:"identity_proxy_enabled,omitempty"`
+	IdentityProxyCountry          string `json:"identity_proxy_country,omitempty"`
+	IdentityProxyRotateMinutes    int    `json:"identity_proxy_rotate_minutes,omitempty"`
 	unknownFields                 map[string]json.RawMessage
 	identityProxyRotateMinutesSet bool
+}
+
+// IsBillingUsageConversionEnabled reports the effective OpenCode usage
+// projection policy. Existing channel rows do not contain this field, so an
+// absent value intentionally keeps the current enabled behavior.
+func (c *OpenCodeGoConfig) IsBillingUsageConversionEnabled() bool {
+	return c == nil || c.BillingUsageConversionEnabled == nil || *c.BillingUsageConversionEnabled
 }
 
 func (settings *ChannelOtherSettings) UnmarshalJSON(data []byte) error {

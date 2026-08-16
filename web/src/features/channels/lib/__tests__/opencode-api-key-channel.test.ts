@@ -93,6 +93,7 @@ describe('OpenCode API Key channel', () => {
       usesOpenCodeProtocolSettings(CHANNEL_TYPE_OPENCODE_API_KEY),
       true
     )
+    assert.equal(usesOpenCodeProtocolSettings(1), false)
     assert.equal(MODEL_FETCHABLE_TYPES.has(CHANNEL_TYPE_OPENCODE_API_KEY), true)
     assert.equal(getChannelTypeIcon(CHANNEL_TYPE_OPENCODE_API_KEY), 'OpenCode')
     assert.equal(
@@ -194,6 +195,7 @@ describe('OpenCode API Key channel', () => {
       weight: 10,
       proxy: 'socks5h://proxy.invalid:1080',
       opencode_go_default_protocol: 'responses',
+      opencode_go_billing_usage_conversion_enabled: false,
       opencode_go_model_protocols: '{"GLM-*":"messages"}',
       opencode_go_identity_proxy_enabled: true,
       opencode_go_generic_failover_enabled: true,
@@ -203,7 +205,8 @@ describe('OpenCode API Key channel', () => {
       settings: JSON.stringify({
         retained_setting: 'keep-me',
         opencode_go: {
-          retained_pool_setting: 'remove-me',
+          future_protocol_setting: 'keep-me-too',
+          generic_failover_enabled: true,
         },
       }),
     })
@@ -221,6 +224,8 @@ describe('OpenCode API Key channel', () => {
     assert.equal(setting.pass_through_body_enabled, false)
     assert.equal(settings.retained_setting, 'keep-me')
     assert.deepEqual(settings.opencode_go, {
+      future_protocol_setting: 'keep-me-too',
+      billing_usage_conversion_enabled: false,
       model_protocols: { 'glm-*': 'messages' },
       default_protocol: 'responses',
     })
@@ -248,12 +253,13 @@ describe('OpenCode API Key channel', () => {
     assert.equal(setting.proxy, '')
     assert.equal(result.batch_add_set_key_prefix_2_name, undefined)
     assert.deepEqual(settings.opencode_go, {
+      billing_usage_conversion_enabled: true,
       model_protocols: { 'qwen*': 'messages' },
       default_protocol: 'messages',
     })
   })
 
-  test('edits an imported row as one ordinary key and removes pool-only settings', () => {
+  test('round-trips disabled conversion while removing pool-only settings', () => {
     const channel = channelSchema.parse({
       id: 6301,
       type: CHANNEL_TYPE_OPENCODE_API_KEY,
@@ -275,6 +281,8 @@ describe('OpenCode API Key channel', () => {
         opencode_go: {
           default_protocol: 'chat',
           model_protocols: { 'glm-*': 'messages' },
+          billing_usage_conversion_enabled: false,
+          future_protocol_setting: 'keep-me-too',
           generic_failover_enabled: true,
           identity_proxy_enabled: true,
           load_aware_enabled: true,
@@ -286,6 +294,7 @@ describe('OpenCode API Key channel', () => {
     assert.equal(defaults.key, '')
     assert.equal(defaults.proxy, 'https://proxy.invalid:8443')
     assert.equal(defaults.opencode_go_default_protocol, 'chat')
+    assert.equal(defaults.opencode_go_billing_usage_conversion_enabled, false)
 
     defaults.key = 'replacement-key'
     const update = transformFormDataToUpdatePayload(defaults, channel.id)
@@ -298,6 +307,8 @@ describe('OpenCode API Key channel', () => {
     )
     assert.equal(settings.retained_setting, 'keep-me')
     assert.deepEqual(settings.opencode_go, {
+      billing_usage_conversion_enabled: false,
+      future_protocol_setting: 'keep-me-too',
       model_protocols: { 'glm-*': 'messages' },
       default_protocol: 'chat',
     })

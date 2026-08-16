@@ -8,6 +8,12 @@ type Options struct {
 	Claude ClaudeOptions
 	Gemini GeminiOptions
 
+	// UsageConversionEnabled controls the public usage projection performed by
+	// response converters. Nil means enabled for backwards compatibility. The
+	// host populates this only for OpenCode channel types 62 and 63; standalone
+	// relaykit callers may set it explicitly for deterministic tests.
+	UsageConversionEnabled *bool
+
 	// OpenRouterDialect marks the upstream as OpenRouter's OpenAI-compatible
 	// surface, which accepts extra fields (reasoning config, cache_control on
 	// system parts) that converters emit only for that dialect. The host sets
@@ -18,6 +24,13 @@ type Options struct {
 	// suffix must be kept on the outgoing model name (host blacklist lookup).
 	// Nil means "never preserve".
 	PreserveThinkingSuffix func(modelName string) bool
+}
+
+// IsUsageConversionEnabled returns the effective public usage projection
+// policy. An absent option is deliberately equivalent to true so existing
+// callers and historical channel settings retain their behavior.
+func (o *Options) IsUsageConversionEnabled() bool {
+	return o == nil || o.UsageConversionEnabled == nil || *o.UsageConversionEnabled
 }
 
 type ClaudeOptions struct {

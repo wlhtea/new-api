@@ -397,6 +397,33 @@ func TestTransformChatCostTrailerDoesNotRepeatSyntheticUsage(t *testing.T) {
 	}
 }
 
+func TestTransformChatCostEventDisabledKeepsBillingFallbackWithoutPublicUsage(t *testing.T) {
+	payload := []byte(`{"choices":[],"x-opencode-type":"inference-cost","cost":"private","normalizedUsage":{"inputTokens":100,"outputTokens":40,"reasoningTokens":15,"cacheReadTokens":80,"cacheWrite5mTokens":20,"cacheWrite1hTokens":10}}`)
+	state := &responseTransformState{
+		protocol:                ProtocolChat,
+		usageConversionDisabled: true,
+	}
+
+	transformed := state.transformJSON(payload, true)
+
+	assert.Nil(t, transformed)
+	require.NotNil(t, state.fallbackUsage)
+	assert.True(t, state.sawFallbackInputField)
+	assert.False(t, state.emittedSyntheticChatUsage)
+	usage := finalizeResponseUsage(nil, state).(*dto.Usage)
+	assertFinalResponseUsage(t, ProtocolChat, usage, responseUsageVector{
+		input:        100,
+		openAIInput:  210,
+		cacheRead:    80,
+		cacheWrite5m: 20,
+		cacheWrite1h: 10,
+		output:       40,
+		reasoning:    15,
+	})
+	require.NotNil(t, usage.BillingUsage)
+	assert.False(t, usage.BillingUsage.Estimated)
+}
+
 func TestFinalizeResponseUsageKeepsExplicitZeroStandardInputOverLocalEstimate(t *testing.T) {
 	standards := map[Protocol][]byte{
 		ProtocolChat:      []byte(`{"usage":{"prompt_tokens":0,"completion_tokens":40}}`),

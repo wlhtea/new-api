@@ -62,6 +62,8 @@ const { useForm } = await import('react-hook-form')
 const { Form } = await import('@/components/ui/form')
 const { CHANNEL_FORM_DEFAULT_VALUES } =
   await import('../../../lib/channel-form')
+const { OpenCodeAPIKeyChannelSettings } =
+  await import('../../drawers/sections/opencode-api-key-channel-settings')
 const { OpenCodeGoChannelSettings } =
   await import('../../drawers/sections/opencode-go-channel-settings')
 
@@ -168,6 +170,11 @@ describe('OpenCode Go channel settings', () => {
         control.getAttribute('aria-label') ===
         'Use identity-scoped proxy sessions'
     )
+    const usageConversionSwitch = switches.find(
+      (control) =>
+        control.getAttribute('aria-label') ===
+        'Enable OpenAI-compatible Usage conversion'
+    )
     const lifecycleSwitches = [
       'Enable China-deployed models',
       'Apply referral rewards',
@@ -191,6 +198,9 @@ describe('OpenCode Go channel settings', () => {
     assert.equal(identityProxySwitch.hasAttribute('disabled'), false)
     assert.notEqual(identityProxySwitch.getAttribute('aria-disabled'), 'true')
     assert.equal(identityProxySwitch.hasAttribute('data-disabled'), false)
+    assert.ok(usageConversionSwitch)
+    assert.equal(usageConversionSwitch.getAttribute('aria-checked'), 'true')
+    assert.equal(usageConversionSwitch.hasAttribute('disabled'), false)
     assert.equal(lifecycleSwitches.length, 3)
     assert.equal(
       lifecycleSwitches.every(
@@ -211,6 +221,41 @@ describe('OpenCode Go channel settings', () => {
     assert.ok(openPoolButton)
     await act(async () => openPoolButton.click())
     assert.equal(openPolicyCount, 1)
+  })
+
+  test('renders the shared Usage conversion switch for API Key channels', async () => {
+    function Harness() {
+      const form = useForm({
+        defaultValues: {
+          ...CHANNEL_FORM_DEFAULT_VALUES,
+          opencode_go_billing_usage_conversion_enabled: false,
+        },
+      })
+      return (
+        <Form {...form}>
+          <OpenCodeAPIKeyChannelSettings />
+        </Form>
+      )
+    }
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const root = createRoot(host)
+    renderedSettings = { host, root }
+    await act(async () => root.render(<Harness />))
+
+    const usageConversionSwitch = host.querySelector<HTMLButtonElement>(
+      '[role="switch"][aria-label="Enable OpenAI-compatible Usage conversion"]'
+    )
+    assert.ok(usageConversionSwitch)
+    assert.equal(usageConversionSwitch.getAttribute('aria-checked'), 'false')
+    assert.match(
+      host.textContent || '',
+      /Controls public Usage projection only; it does not change model pricing or internal settlement\./
+    )
+
+    await act(async () => usageConversionSwitch.click())
+    assert.equal(usageConversionSwitch.getAttribute('aria-checked'), 'true')
   })
 
   test('infers the initial policy when identity proxy routing is enabled', async () => {

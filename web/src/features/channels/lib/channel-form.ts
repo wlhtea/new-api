@@ -70,6 +70,23 @@ const SUPPORTED_PROXY_PROTOCOLS = new Set([
   'socks5h:',
 ])
 
+const OPENCODE_GO_POOL_ONLY_SETTING_KEYS = [
+  'identity_proxy_enabled',
+  'identity_proxy_country',
+  'identity_proxy_rotate_minutes',
+  'generic_failover_enabled',
+  'generic_failover_threshold',
+  'generic_failover_window_seconds',
+  'generic_failover_max_backups',
+  'generic_failover_lease_seconds',
+  'affinity_fallback',
+  'load_aware_enabled',
+  'auto_enable_china_models',
+  'auto_apply_referral_rewards',
+  'referral_rewards_max_per_run',
+  'auto_cancel_subscription_renewal',
+] as const
+
 function isOptionalProxyURL(value: string | undefined): boolean {
   const trimmedValue = value?.trim() || ''
   if (!trimmedValue) return true
@@ -315,6 +332,7 @@ export const channelFormSchema = z
     opencode_go_default_protocol: z
       .enum(['', 'chat', 'messages', 'responses'])
       .optional(),
+    opencode_go_billing_usage_conversion_enabled: z.boolean().default(true),
     opencode_go_model_protocols: z
       .string()
       .optional()
@@ -591,6 +609,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   opencode_go_identity_proxy_rotate_minutes:
     OPENCODE_GO_IDENTITY_PROXY_DEFAULT_ROTATE_MINUTES,
   opencode_go_default_protocol: '',
+  opencode_go_billing_usage_conversion_enabled: true,
   opencode_go_model_protocols: '',
   opencode_go_generic_failover_enabled: false,
   opencode_go_generic_failover_threshold: 2,
@@ -673,6 +692,7 @@ export function transformChannelToFormDefaults(
   let openCodeGoIdentityProxyRotateMinutes =
     OPENCODE_GO_IDENTITY_PROXY_DEFAULT_ROTATE_MINUTES
   let openCodeGoDefaultProtocol: '' | 'chat' | 'messages' | 'responses' = ''
+  let openCodeGoBillingUsageConversionEnabled = true
   let openCodeGoModelProtocols = ''
   let openCodeGoGenericFailoverEnabled = false
   let openCodeGoGenericFailoverThreshold = 2
@@ -734,6 +754,10 @@ export function transformChannelToFormDefaults(
           openCodeGo.default_protocol === 'responses'
         ) {
           openCodeGoDefaultProtocol = openCodeGo.default_protocol
+        }
+        if (typeof openCodeGo.billing_usage_conversion_enabled === 'boolean') {
+          openCodeGoBillingUsageConversionEnabled =
+            openCodeGo.billing_usage_conversion_enabled
         }
         openCodeGoModelProtocols = stringifyOpenCodeGoProtocolOverrides(
           openCodeGo.model_protocols
@@ -851,6 +875,8 @@ export function transformChannelToFormDefaults(
     opencode_go_identity_proxy_rotate_minutes:
       openCodeGoIdentityProxyRotateMinutes,
     opencode_go_default_protocol: openCodeGoDefaultProtocol,
+    opencode_go_billing_usage_conversion_enabled:
+      openCodeGoBillingUsageConversionEnabled,
     opencode_go_model_protocols: openCodeGoModelProtocols,
     opencode_go_generic_failover_enabled: openCodeGoGenericFailoverEnabled,
     opencode_go_generic_failover_threshold: openCodeGoGenericFailoverThreshold,
@@ -1039,54 +1065,65 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     delete settingsObj.advanced_custom
   }
 
-  if (formData.type === CHANNEL_TYPE_OPENCODE_GO) {
+  if (
+    formData.type === CHANNEL_TYPE_OPENCODE_GO ||
+    isOpenCodeAPIKeyChannel(formData.type)
+  ) {
     const existing = settingsObj.opencode_go
     const openCodeGo: Record<string, unknown> =
       existing && typeof existing === 'object' && !Array.isArray(existing)
         ? { ...existing }
         : {}
-    openCodeGo.identity_proxy_enabled =
-      formData.opencode_go_identity_proxy_enabled === true
-    openCodeGo.identity_proxy_country = String(
-      formData.opencode_go_identity_proxy_country ||
-        OPENCODE_GO_IDENTITY_PROXY_DEFAULT_COUNTRY
-    )
-      .trim()
-      .toUpperCase()
-    openCodeGo.identity_proxy_rotate_minutes =
-      formData.opencode_go_identity_proxy_rotate_minutes
-    openCodeGo.model_protocols = parseOpenCodeGoProtocolOverrides(
-      formData.opencode_go_model_protocols
-    )
-    openCodeGo.default_protocol = formData.opencode_go_default_protocol || ''
-    openCodeGo.generic_failover_enabled =
-      formData.opencode_go_generic_failover_enabled === true
-    openCodeGo.generic_failover_threshold =
-      formData.opencode_go_generic_failover_threshold
-    openCodeGo.generic_failover_window_seconds =
-      formData.opencode_go_generic_failover_window_seconds
-    openCodeGo.generic_failover_max_backups =
-      formData.opencode_go_generic_failover_max_backups
-    openCodeGo.generic_failover_lease_seconds =
-      formData.opencode_go_generic_failover_lease_seconds
-    openCodeGo.affinity_fallback = formData.opencode_go_affinity_fallback || ''
-    openCodeGo.load_aware_enabled =
-      formData.opencode_go_load_aware_enabled === true
-    openCodeGo.auto_enable_china_models =
-      formData.opencode_go_auto_enable_china_models !== false
-    openCodeGo.auto_apply_referral_rewards =
-      formData.opencode_go_auto_apply_referral_rewards !== false
-    openCodeGo.referral_rewards_max_per_run =
-      formData.opencode_go_referral_rewards_max_per_run
-    openCodeGo.auto_cancel_subscription_renewal =
-      formData.opencode_go_auto_cancel_subscription_renewal === true
-    settingsObj.opencode_go = openCodeGo
-  } else if (isOpenCodeAPIKeyChannel(formData.type)) {
-    settingsObj.opencode_go = {
-      model_protocols: parseOpenCodeGoProtocolOverrides(
+    openCodeGo.billing_usage_conversion_enabled =
+      formData.opencode_go_billing_usage_conversion_enabled !== false
+
+    if (isOpenCodeAPIKeyChannel(formData.type)) {
+      for (const key of OPENCODE_GO_POOL_ONLY_SETTING_KEYS) {
+        delete openCodeGo[key]
+      }
+      openCodeGo.model_protocols = parseOpenCodeGoProtocolOverrides(
         formData.opencode_go_model_protocols
-      ),
-      default_protocol: formData.opencode_go_default_protocol || '',
+      )
+      openCodeGo.default_protocol = formData.opencode_go_default_protocol || ''
+      settingsObj.opencode_go = openCodeGo
+    } else {
+      openCodeGo.identity_proxy_enabled =
+        formData.opencode_go_identity_proxy_enabled === true
+      openCodeGo.identity_proxy_country = String(
+        formData.opencode_go_identity_proxy_country ||
+          OPENCODE_GO_IDENTITY_PROXY_DEFAULT_COUNTRY
+      )
+        .trim()
+        .toUpperCase()
+      openCodeGo.identity_proxy_rotate_minutes =
+        formData.opencode_go_identity_proxy_rotate_minutes
+      openCodeGo.model_protocols = parseOpenCodeGoProtocolOverrides(
+        formData.opencode_go_model_protocols
+      )
+      openCodeGo.default_protocol = formData.opencode_go_default_protocol || ''
+      openCodeGo.generic_failover_enabled =
+        formData.opencode_go_generic_failover_enabled === true
+      openCodeGo.generic_failover_threshold =
+        formData.opencode_go_generic_failover_threshold
+      openCodeGo.generic_failover_window_seconds =
+        formData.opencode_go_generic_failover_window_seconds
+      openCodeGo.generic_failover_max_backups =
+        formData.opencode_go_generic_failover_max_backups
+      openCodeGo.generic_failover_lease_seconds =
+        formData.opencode_go_generic_failover_lease_seconds
+      openCodeGo.affinity_fallback =
+        formData.opencode_go_affinity_fallback || ''
+      openCodeGo.load_aware_enabled =
+        formData.opencode_go_load_aware_enabled === true
+      openCodeGo.auto_enable_china_models =
+        formData.opencode_go_auto_enable_china_models !== false
+      openCodeGo.auto_apply_referral_rewards =
+        formData.opencode_go_auto_apply_referral_rewards !== false
+      openCodeGo.referral_rewards_max_per_run =
+        formData.opencode_go_referral_rewards_max_per_run
+      openCodeGo.auto_cancel_subscription_renewal =
+        formData.opencode_go_auto_cancel_subscription_renewal === true
+      settingsObj.opencode_go = openCodeGo
     }
   } else if ('opencode_go' in settingsObj) {
     delete settingsObj.opencode_go

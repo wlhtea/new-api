@@ -1666,6 +1666,8 @@
     "Enable {{parameter}}": "Activer {{parameter}}",
     "Enable 2FA": "Activer 2FA",
     "Enable All": "Tout activer",
+    "Enable OpenAI-compatible Usage conversion": "Activer la conversion Usage compatible OpenAI",
+    "Controls public Usage projection only; it does not change model pricing or internal settlement.": "Contrôle uniquement la projection publique de l'Usage ; ne modifie pas la tarification des modèles ni le règlement interne.",
     "Enable automatic renewal cancellation": "Activer l'annulation automatique du renouvellement",
     "Enable check-in feature": "Activer la fonction de connexion",
     "Enable China models (all)": "Activer les modèles Chine (tous)",

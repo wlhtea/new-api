@@ -1666,6 +1666,8 @@
     "Enable {{parameter}}": "{{parameter}}を有効化",
     "Enable 2FA": "2FA を有効にする",
     "Enable All": "すべて有効にする",
+    "Enable OpenAI-compatible Usage conversion": "OpenAI 互換の Usage 変換を有効にする",
+    "Controls public Usage projection only; it does not change model pricing or internal settlement.": "公開 Usage の投影のみを制御し、モデル料金や内部精算は変更しません。",
     "Enable automatic renewal cancellation": "更新の自動キャンセルを有効化",
     "Enable check-in feature": "チェックイン機能を有効にする",
     "Enable China models (all)": "中国モデルをすべて有効化",
