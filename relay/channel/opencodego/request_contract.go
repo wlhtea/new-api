@@ -125,22 +125,35 @@ var typedRequestTopLevelFields = map[types.RelayFormat][]string{
 	},
 }
 
+// These OpenCode selector aliases are intentionally outside the public DTOs.
+// Explicit contract rows keep them from falling through as opaque extensions.
+var effortAliasTopLevelFields = map[types.RelayFormat][]string{
+	types.RelayFormatClaude:          {"effort", "outputConfig"},
+	types.RelayFormatOpenAI:          {"reasoningEffort"},
+	types.RelayFormatOpenAIResponses: {"reasoningEffort", "reasoning_effort"},
+}
+
 // Cross-protocol rows exist only when the current converter/finalizer performs
 // the stated action. Every other typed cross-protocol field receives an
 // explicit reject row instead of relying on DTO loss.
 var crossProtocolRequestWireActions = map[requestPathProtocolKey]map[string]RequestPathWireAction{
 	{clientFormat: types.RelayFormatClaude, finalProtocol: ProtocolChat}: {
-		"model":          RequestPathWireTranslate,
-		"system":         RequestPathWireTranslate,
-		"messages":       RequestPathWireTranslate,
-		"max_tokens":     RequestPathWireTranslate,
-		"stop_sequences": RequestPathWireTranslate,
-		"temperature":    RequestPathWireTranslate,
-		"top_p":          RequestPathWireTranslate,
-		"top_k":          RequestPathWireTranslate,
-		"stream":         RequestPathWireTranslate,
-		"tools":          RequestPathWireTranslate,
-		"thinking":       RequestPathWireForwardRaw,
+		"effort":             RequestPathWireTranslate,
+		"outputConfig":       RequestPathWireTranslate,
+		"model":              RequestPathWireTranslate,
+		"system":             RequestPathWireTranslate,
+		"messages":           RequestPathWireTranslate,
+		"max_tokens":         RequestPathWireTranslate,
+		"stop_sequences":     RequestPathWireTranslate,
+		"temperature":        RequestPathWireTranslate,
+		"top_p":              RequestPathWireTranslate,
+		"top_k":              RequestPathWireTranslate,
+		"stream":             RequestPathWireTranslate,
+		"tools":              RequestPathWireTranslate,
+		"thinking":           RequestPathWireForwardRaw,
+		"metadata":           RequestPathWireTranslate,
+		"output_config":      RequestPathWireTranslate,
+		"context_management": RequestPathWireConsumeLocal,
 	},
 	{clientFormat: types.RelayFormatClaude, finalProtocol: ProtocolResponses}: {
 		"model":       RequestPathWireTranslate,
@@ -159,6 +172,7 @@ var crossProtocolRequestWireActions = map[requestPathProtocolKey]map[string]Requ
 		"max_tokens":            RequestPathWireTranslate,
 		"max_completion_tokens": RequestPathWireTranslate,
 		"reasoning_effort":      RequestPathWireTranslate,
+		"reasoningEffort":       RequestPathWireTranslate,
 		"temperature":           RequestPathWireTranslate,
 		"top_p":                 RequestPathWireTranslate,
 		"top_k":                 RequestPathWireTranslate,
@@ -177,6 +191,8 @@ var crossProtocolRequestWireActions = map[requestPathProtocolKey]map[string]Requ
 		"max_tokens":            RequestPathWireTranslate,
 		"max_completion_tokens": RequestPathWireTranslate,
 		"reasoning_effort":      RequestPathWireTranslate,
+		"reasoningEffort":       RequestPathWireTranslate,
+		"reasoning":             RequestPathWireTranslate,
 		"temperature":           RequestPathWireTranslate,
 		"top_p":                 RequestPathWireTranslate,
 		"n":                     RequestPathWireConsumeLocal,
@@ -204,6 +220,8 @@ var crossProtocolRequestWireActions = map[requestPathProtocolKey]map[string]Requ
 		"frequency_penalty":      RequestPathWireTranslate,
 		"presence_penalty":       RequestPathWireTranslate,
 		"reasoning":              RequestPathWireTranslate,
+		"reasoningEffort":        RequestPathWireTranslate,
+		"reasoning_effort":       RequestPathWireTranslate,
 		"service_tier":           RequestPathWireTranslate,
 		"store":                  RequestPathWireTranslate,
 		"prompt_cache_key":       RequestPathWireTranslate,
@@ -227,6 +245,8 @@ var crossProtocolRequestWireActions = map[requestPathProtocolKey]map[string]Requ
 		"max_output_tokens":   RequestPathWireTranslate,
 		"parallel_tool_calls": RequestPathWireTranslate,
 		"reasoning":           RequestPathWireTranslate,
+		"reasoningEffort":     RequestPathWireTranslate,
+		"reasoning_effort":    RequestPathWireTranslate,
 		"stream":              RequestPathWireTranslate,
 		"temperature":         RequestPathWireTranslate,
 		"tool_choice":         RequestPathWireTranslate,
@@ -245,6 +265,7 @@ var responseObligationFields = map[string]struct{}{
 	"logprobs": {}, "top_logprobs": {}, "modalities": {}, "audio": {}, "output_config": {},
 	"output_format": {}, "enable_thinking": {}, "thinking_budget": {}, "return_images": {},
 	"return_related_questions": {}, "text": {}, "include": {}, "max_tool_calls": {},
+	"context_management": {},
 }
 
 var affinityObligationFields = map[string]struct{}{
@@ -287,6 +308,14 @@ func ValidateRequestPathContracts(
 		!validRequestContractProtocol(finalProtocol) {
 		return errors.New("validated request contract routing input is invalid")
 	}
+	if clientFormat == types.RelayFormatClaude && finalProtocol == ProtocolChat {
+		if _, err := ParseClaudeChatProjection(envelope); err != nil {
+			return err
+		}
+	}
+	if _, err := validateEnvelopeEffortSelection(envelope, clientFormat, finalProtocol); err != nil {
+		return err
+	}
 	for _, field := range envelope.TopLevelFieldNames() {
 		contract, found := LookupRequestPathContract(clientFormat, finalProtocol, field)
 		if !found {
@@ -312,6 +341,9 @@ func ValidateRequestPathContracts(
 			continue
 		}
 		if contract.WireAction != RequestPathWireTranslate {
+			continue
+		}
+		if isEffortSelectorAliasTopLevelField(clientFormat, field) {
 			continue
 		}
 		raw, present, err := envelope.RawTopLevelField(field)
@@ -457,7 +489,7 @@ var (
 	chatToolFunctionKeys   = requestContractKeySet("description", "name", "parameters")
 	chatToolChoiceKeys     = requestContractKeySet("type", "name", "function")
 	chatFunctionNameKeys   = requestContractKeySet("name")
-	chatReasoningKeys      = requestContractKeySet("max_tokens")
+	chatReasoningKeys      = requestContractKeySet("max_tokens", "effort")
 	chatLocationKeys       = requestContractKeySet("approximate")
 	chatApproximateKeys    = requestContractKeySet("timezone", "country", "region", "city")
 
@@ -1376,6 +1408,30 @@ func buildRequestPathContracts() (map[requestPathContractKey]RequestPathContract
 					ruleID = RequestContractUnmappedPathRule
 				} else if action == RequestPathWireConsumeLocal {
 					ruleID = RequestContractLocalPathRule
+				}
+				if err := addRequestPathContract(contracts, RequestPathContract{
+					RuleID:           ruleID,
+					ClientFormat:     clientFormat,
+					FinalProtocol:    finalProtocol,
+					SourcePath:       []string{field},
+					LocalObligations: requestPathLocalObligations(field),
+					WireAction:       action,
+				}); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	for clientFormat, fields := range effortAliasTopLevelFields {
+		for _, field := range fields {
+			if field == "" {
+				return nil, errors.New("request contract contains an empty effort alias")
+			}
+			for _, finalProtocol := range requestContractProtocols {
+				action := typedRequestWireAction(clientFormat, finalProtocol, field)
+				ruleID := RequestContractTypedPathRule
+				if action == RequestPathWireReject {
+					ruleID = RequestContractUnmappedPathRule
 				}
 				if err := addRequestPathContract(contracts, RequestPathContract{
 					RuleID:           ruleID,

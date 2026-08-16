@@ -238,7 +238,7 @@ func TestFinalizeSameProtocolPreservesRawPresenceAndNestedExtensions(t *testing.
 				"messages":[{"role":"user","content":"hello","provider_extension":{"big":9007199254740993}}],
 				"temperature":null,
 				"modalities":[],
-				"metadata":{"scale":1e+09}
+				"metadata":{"scale":"1e+09"}
 			}`,
 			presenceField:     "temperature",
 			emptyField:        "modalities",
@@ -300,6 +300,46 @@ func TestFinalizeSameProtocolPreservesRawPresenceAndNestedExtensions(t *testing.
 			assert.Contains(t, string(object["metadata"]), "1e+09")
 		})
 	}
+}
+
+func TestFinalizeChatMetadataAttributesClientAndOperatorFailures(t *testing.T) {
+	t.Run("client metadata is a fixed client validation error", func(t *testing.T) {
+		body := []byte(`{
+			"model":"glm-5.2",
+			"messages":[{"role":"user","content":"hello"}],
+			"metadata":{"scale":1e+09}
+		}`)
+		c, info, request := newSameProtocolFinalizerFixture(
+			t, types.RelayFormatOpenAI, "/v1/chat/completions", body,
+		)
+
+		_, err := finalizeOutboundRequest(c, info, request)
+		require.Error(t, err)
+		validationErr, ok := helper.AsClientRequestValidationError(err)
+		require.True(t, ok)
+		assert.Equal(t, http.StatusBadRequest, validationErr.StatusCode)
+		assert.Equal(t, RequestContractPublicMessage, validationErr.Message)
+		assert.Equal(t, ChatMetadataShapeRule, validationErr.RuleID)
+		assert.Equal(t, ChatMetadataFinalizationStage, validationErr.StageID)
+	})
+
+	t.Run("operator metadata remains a configuration failure", func(t *testing.T) {
+		body := []byte(`{
+			"model":"glm-5.2",
+			"messages":[{"role":"user","content":"hello"}]
+		}`)
+		c, info, request := newSameProtocolFinalizerFixture(
+			t, types.RelayFormatOpenAI, "/v1/chat/completions", body,
+		)
+		info.ParamOverride = map[string]interface{}{
+			"metadata": map[string]interface{}{"scale": 1e9},
+		}
+
+		_, err := finalizeOutboundRequest(c, info, request)
+		require.EqualError(t, err, "finalized Chat metadata is invalid")
+		_, isClientError := helper.AsClientRequestValidationError(err)
+		assert.False(t, isClientError)
+	})
 }
 
 func TestFinalizePreservesClientTopLevelExtensionsAcrossProtocolMatrix(t *testing.T) {

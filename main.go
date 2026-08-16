@@ -100,6 +100,9 @@ func main() {
 
 		go model.SyncChannelCache(common.SyncFrequency)
 	}
+	// Capability state is loaded synchronously before relay traffic can use it;
+	// subsequent metadata-first polling converges updates from another node.
+	service.StartOpenCodeGoCapabilityAuthority(common.SyncFrequency)
 	service.InitOpenCodeGoPools()
 
 	// Warm pricing after channel cache initialization so Advanced Custom

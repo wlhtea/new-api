@@ -31,6 +31,12 @@ type outboundGatewayFields struct {
 	streamPresent bool
 }
 
+type protectedOutboundField struct {
+	path    []string
+	raw     json.RawMessage
+	present bool
+}
+
 // ValidateMessagesStopSourceCollision rejects two source fields that both map
 // to Chat's `stop`. Presence, including an explicit null, is what conflicts.
 func ValidateMessagesStopSourceCollision(
@@ -148,6 +154,25 @@ func finalizeOutboundRequest(
 	if err != nil {
 		return nil, err
 	}
+	jsonData, projection, err := applyClaudeChatProjection(envelope, info.RelayFormat, finalProtocol, jsonData)
+	if err != nil {
+		return nil, err
+	}
+	jsonData, wireEffort, err := applyEffortProjection(envelope, info.RelayFormat, finalProtocol, jsonData)
+	if err != nil {
+		return nil, err
+	}
+	if metadata := gjson.GetBytes(jsonData, "metadata"); metadata.Exists() && finalProtocol == ProtocolChat {
+		if err := validateClientChatMetadata(json.RawMessage(metadata.Raw)); err != nil {
+			return nil, err
+		}
+	}
+	protectedFields, err := captureProtectedOutboundFields(
+		envelope, info.RelayFormat, finalProtocol, projection, wireEffort, jsonData,
+	)
+	if err != nil {
+		return nil, err
+	}
 	if len(info.ParamOverride) > 0 {
 		jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
 		if err != nil {
@@ -162,16 +187,122 @@ func finalizeOutboundRequest(
 	if err != nil {
 		return nil, err
 	}
-	if err := validateFinalOutboundRequest(
+	if err := assertProtectedOutboundFields(jsonData, protectedFields); err != nil {
+		return nil, err
+	}
+	finalEffort, err := validateFinalOutboundRequest(
 		jsonData,
 		info,
 		gatewayFields,
 		finalProtocol,
 		clientExtensions,
-	); err != nil {
+		wireEffort,
+	)
+	if err != nil {
+		return nil, err
+	}
+	info.SetReasoningEffort("")
+	if finalEffort.Present && !finalEffort.Null {
+		info.SetReasoningEffort(finalEffort.Value)
+	}
+	if err := StoreFinalEffortSelection(c, finalEffort); err != nil {
 		return nil, err
 	}
 	return jsonData, nil
+}
+
+func applyClaudeChatProjection(
+	envelope *helper.ValidatedRequestEnvelope,
+	clientFormat types.RelayFormat,
+	finalProtocol Protocol,
+	jsonData []byte,
+) ([]byte, ClaudeChatProjection, error) {
+	projection := ClaudeChatProjection{}
+	if clientFormat != types.RelayFormatClaude || finalProtocol != ProtocolChat {
+		return jsonData, projection, nil
+	}
+	var err error
+	projection, err = ParseClaudeChatProjection(envelope)
+	if err != nil {
+		return nil, projection, err
+	}
+	result := jsonData
+	if projection.MetadataPresent {
+		result, err = sjson.SetRawBytes(result, "metadata", projection.MetadataRaw)
+		if err != nil {
+			return nil, projection, errors.New("translate Claude metadata to Chat")
+		}
+	}
+	for _, sourceField := range []string{"output_config", "context_management"} {
+		result, err = sjson.DeleteBytes(result, sourceField)
+		if err != nil {
+			return nil, projection, errors.New("remove translated Claude field from Chat")
+		}
+	}
+	return result, projection, nil
+}
+
+func captureProtectedOutboundFields(
+	envelope *helper.ValidatedRequestEnvelope,
+	clientFormat types.RelayFormat,
+	finalProtocol Protocol,
+	projection ClaudeChatProjection,
+	wireEffort EffortSelection,
+	jsonData []byte,
+) ([]protectedOutboundField, error) {
+	paths := make([][]string, 0, 4)
+	if clientFormat == types.RelayFormatClaude && finalProtocol == ProtocolChat {
+		if projection.MetadataPresent {
+			paths = append(paths, []string{"metadata"})
+		}
+	}
+	if wireEffort.Present {
+		paths = append(paths, append([]string(nil), wireEffort.Path...))
+	}
+	if clientFormat == types.RelayFormatClaude && finalProtocol == ProtocolMessages {
+		for _, path := range []string{"metadata", "output_config", "context_management"} {
+			if _, present := envelope.TopLevelKind(path); present {
+				paths = append(paths, []string{path})
+			}
+		}
+	}
+	protected := make([]protectedOutboundField, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		key := strings.Join(path, "\x00")
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		value, present, err := rawJSONPath(jsonData, path)
+		if err != nil {
+			return nil, err
+		}
+		if !present {
+			return nil, errors.New("protected client field is absent before overrides")
+		}
+		protected = append(protected, protectedOutboundField{
+			path: append([]string(nil), path...), raw: value, present: true,
+		})
+	}
+	return protected, nil
+}
+
+func assertProtectedOutboundFields(jsonData []byte, protected []protectedOutboundField) error {
+	for _, field := range protected {
+		actual, present, err := rawJSONPath(jsonData, field.path)
+		if err != nil {
+			return err
+		}
+		equal, err := semanticJSONPresenceEqual(field.raw, field.present, actual, present)
+		if err != nil {
+			return err
+		}
+		if !equal {
+			return errors.New("operator override changed a protected client field")
+		}
+	}
+	return nil
 }
 
 func mergeCrossProtocolSameWireFields(
@@ -1206,24 +1337,37 @@ func validateFinalOutboundRequest(
 	fields outboundGatewayFields,
 	finalProtocol Protocol,
 	clientExtensions map[string]json.RawMessage,
-) error {
+	wireEffort EffortSelection,
+) (EffortSelection, error) {
 	if !isJSONObject(jsonData) {
-		return errors.New("finalized OpenCode request is not a JSON object")
+		return EffortSelection{}, errors.New("finalized OpenCode request is not a JSON object")
 	}
 	model := gjson.GetBytes(jsonData, "model")
 	if !model.Exists() || model.Type != gjson.String || model.String() != fields.model {
-		return errors.New("finalized OpenCode model invariant failed")
+		return EffortSelection{}, errors.New("finalized OpenCode model invariant failed")
 	}
 	stream := gjson.GetBytes(jsonData, "stream")
 	streamPresent := stream.Exists()
 	if streamPresent != fields.streamPresent ||
 		(streamPresent && (stream.Type != gjson.True && stream.Type != gjson.False || stream.Bool() != fields.stream)) {
-		return errors.New("finalized OpenCode stream invariant failed")
+		return EffortSelection{}, errors.New("finalized OpenCode stream invariant failed")
 	}
 	if info.RelayFormat == types.RelayFormatClaude && info.GetFinalRequestRelayFormat() == types.RelayFormatOpenAI {
 		if gjson.GetBytes(jsonData, "stop_sequences").Exists() {
-			return errors.New("finalized Chat request contains Messages stop_sequences")
+			return EffortSelection{}, errors.New("finalized Chat request contains Messages stop_sequences")
 		}
+		if gjson.GetBytes(jsonData, "output_config").Exists() || gjson.GetBytes(jsonData, "context_management").Exists() {
+			return EffortSelection{}, errors.New("finalized Chat request contains a Claude-only field")
+		}
+	}
+	if metadata := gjson.GetBytes(jsonData, "metadata"); metadata.Exists() && finalProtocol == ProtocolChat {
+		if err := validateChatMetadata(json.RawMessage(metadata.Raw)); err != nil {
+			return EffortSelection{}, err
+		}
+	}
+	finalEffort, err := classifyFinalEffortSelection(jsonData, finalProtocol, wireEffort)
+	if err != nil {
+		return EffortSelection{}, err
 	}
 
 	settings := info.ChannelOtherSettings
@@ -1236,24 +1380,24 @@ func validateFinalOutboundRequest(
 	}
 	for field, mustBeAbsent := range protected {
 		if mustBeAbsent && gjson.GetBytes(jsonData, field).Exists() {
-			return fmt.Errorf("finalized OpenCode protected field %s is present", field)
+			return EffortSelection{}, fmt.Errorf("finalized OpenCode protected field %s is present", field)
 		}
 	}
 	if !settings.AllowIncludeObfuscation {
 		streamOptions := gjson.GetBytes(jsonData, "stream_options")
 		if streamOptions.Exists() {
 			if streamOptions.Type != gjson.JSON || !isJSONObject([]byte(streamOptions.Raw)) {
-				return errors.New("finalized OpenCode stream_options is invalid")
+				return EffortSelection{}, errors.New("finalized OpenCode stream_options is invalid")
 			}
 			if gjson.Get(streamOptions.Raw, "include_obfuscation").Exists() {
-				return errors.New("finalized OpenCode include_obfuscation is present")
+				return EffortSelection{}, errors.New("finalized OpenCode include_obfuscation is present")
 			}
 		}
 	}
 	if err := validateFinalizedRequestPathContracts(jsonData, finalProtocol, clientExtensions); err != nil {
-		return err
+		return EffortSelection{}, err
 	}
-	return nil
+	return finalEffort, nil
 }
 
 func isJSONObject(data []byte) bool {

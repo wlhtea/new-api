@@ -34,6 +34,8 @@ const (
 type openCodeFinalizedCandidatePlan struct {
 	key                       opencodego.RequestPreflightPlanKey
 	body                      []byte
+	effort                    opencodego.EffortSelection
+	capabilityRevision        string
 	estimatedPromptTokens     int
 	estimatedCompletionTokens int
 }
@@ -47,115 +49,7 @@ func prepareOpenCodeFinalizedCandidatePlans(
 	c *gin.Context,
 	info *relaycommon.RelayInfo,
 ) (*openCodeFinalizedCandidatePlans, *types.NewAPIError) {
-	if c == nil || info == nil || !constant.IsOpenCodeChannelType(common.GetContextKeyInt(c, constant.ContextKeyChannelType)) {
-		return nil, nil
-	}
-
-	type candidate struct {
-		key       opencodego.RequestPreflightPlanKey
-		selection *frozenOpenCodeAPIKeySelection
-	}
-	candidates := make([]candidate, 0, 1)
-	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeOpenCodeAPIKey {
-		snapshot, found, err := getOpenCodeAPIKeyRetrySnapshot(c)
-		if err != nil || !found || snapshot == nil {
-			if err == nil {
-				err = errors.New("OpenCode API-key retry snapshot is unavailable")
-			}
-			return nil, newOpenCodeRetrySnapshotAPIError(c, err)
-		}
-		if len(snapshot.topology) > maxOpenCodeFinalizedCandidateCount {
-			return nil, newOpenCodeRetrySnapshotAPIError(c, errors.New("OpenCode candidate count exceeds planning limit"))
-		}
-		for index := range snapshot.topology {
-			selection := &snapshot.topology[index]
-			candidates = append(candidates, candidate{
-				key: opencodego.RequestPreflightPlanKey{
-					SelectionGroup: selection.selectionGroup,
-					ChannelID:      selection.channelID,
-				},
-				selection: selection,
-			})
-		}
-	} else {
-		candidates = append(candidates, candidate{key: opencodego.RequestPreflightPlanKey{
-			SelectionGroup: relaycommon.ResolveSelectionGroup(c, info),
-			ChannelID:      common.GetContextKeyInt(c, constant.ContextKeyChannelId),
-		}})
-	}
-
-	result := &openCodeFinalizedCandidatePlans{plans: make([]openCodeFinalizedCandidatePlan, 0, len(candidates))}
-	aggregateBytes := 0
-	for _, candidate := range candidates {
-		candidateContext := c.Copy()
-		if candidate.selection != nil {
-			if err := candidate.selection.apply(candidateContext); err != nil {
-				return nil, newOpenCodeRetrySnapshotAPIError(c, err)
-			}
-		}
-		if err := relaycommon.ValidateParamOverrideRequestStable(
-			common.GetContextKeyStringMap(candidateContext, constant.ContextKeyChannelParamOverride),
-		); err != nil {
-			return nil, newOpenCodeRequestPreflightAPIError(
-				c,
-				opencodego.NewRequestPreflightCandidateConfigError(err),
-			)
-		}
-		preflightPlan, found, planLookupErr := opencodego.GetRequestPreflightPlanForSelection(
-			candidateContext,
-			candidate.key.SelectionGroup,
-			candidate.key.ChannelID,
-		)
-		if planLookupErr != nil || !found {
-			if planLookupErr == nil {
-				planLookupErr = errors.New("OpenCode candidate has no request preflight plan")
-			}
-			return nil, newOpenCodeRetrySnapshotAPIError(c, planLookupErr)
-		}
-		body, planErr := relay.PlanOpenCodeOutboundRequest(candidateContext, info)
-		if planErr != nil {
-			return nil, newOpenCodeRequestPreflightAPIError(
-				c,
-				opencodego.NewRequestPreflightFinalizationError(planErr),
-			)
-		}
-		if len(body) == 0 || aggregateBytes > maxOpenCodeFinalizedCandidateBytes-len(body) {
-			return nil, newOpenCodeRetrySnapshotAPIError(c, errors.New("OpenCode finalized candidate bodies exceed planning limit"))
-		}
-		aggregateBytes += len(body)
-		estimatedPromptTokens, promptEstimateErr := finalizedCandidatePromptReservation(
-			candidateContext.Request.Context(),
-			body,
-			preflightPlan.FinalModel,
-		)
-		if promptEstimateErr != nil {
-			return nil, newOpenCodeRequestPreflightAPIError(
-				c,
-				opencodego.NewRequestPreflightCandidateConfigError(promptEstimateErr),
-			)
-		}
-		estimatedCompletionTokens, estimateErr := finalizedCandidateCompletionReservation(body)
-		if estimateErr != nil {
-			return nil, newOpenCodeRequestPreflightAPIError(
-				c,
-				opencodego.NewRequestPreflightCandidateConfigError(estimateErr),
-			)
-		}
-		result.plans = append(result.plans, openCodeFinalizedCandidatePlan{
-			key:                       candidate.key,
-			body:                      append([]byte(nil), body...),
-			estimatedPromptTokens:     estimatedPromptTokens,
-			estimatedCompletionTokens: estimatedCompletionTokens,
-		})
-	}
-	if len(result.plans) == 0 {
-		return nil, newOpenCodeRetrySnapshotAPIError(c, errors.New("OpenCode finalized candidate set is empty"))
-	}
-	c.Set(openCodeFinalizedCandidatePlansContextKey, result)
-	if err := relay.RequireOpenCodeOutboundPlanBinding(c); err != nil {
-		return nil, newOpenCodeRetrySnapshotAPIError(c, err)
-	}
-	return result, nil
+	return prepareAndFreezeOpenCodeCandidatePlans(c, info)
 }
 
 func (plans *openCodeFinalizedCandidatePlans) billingViews(basePromptTokens int) []helper.BillingCandidateView {
@@ -279,6 +173,7 @@ func (plans *openCodeFinalizedCandidatePlans) find(c *gin.Context, info *relayco
 		if plan.key == key {
 			clone := plan
 			clone.body = append([]byte(nil), plan.body...)
+			clone.effort.Path = append([]string(nil), plan.effort.Path...)
 			return clone, true
 		}
 	}
@@ -298,7 +193,11 @@ func bindOpenCodeFinalizedCandidateBilling(c *gin.Context, info *relaycommon.Rel
 	if !found {
 		return newOpenCodeRetrySnapshotAPIError(c, errors.New("selected OpenCode candidate has no finalized billing view"))
 	}
-	if err := relay.BindOpenCodeOutboundPlan(c, info, plan.body); err != nil {
+	finalReasoningEffort := ""
+	if plan.effort.Present && !plan.effort.Null {
+		finalReasoningEffort = plan.effort.Value
+	}
+	if err := relay.BindOpenCodeOutboundPlanWithEffort(c, info, plan.body, finalReasoningEffort); err != nil {
 		return newOpenCodeRetrySnapshotAPIError(c, err)
 	}
 	estimatedPromptTokens := max(plans.basePromptTokens, plan.estimatedPromptTokens)

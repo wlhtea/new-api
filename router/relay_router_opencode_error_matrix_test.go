@@ -150,6 +150,7 @@ func TestRelayRouterOpenCodeRawClientErrorMatrix(t *testing.T) {
 							recorder := serveRelayRouterRequest(engine, endpoint.path, body)
 
 							require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+							assert.Equal(t, "application/json; charset=utf-8", recorder.Header().Get("Content-Type"))
 							assert.Equal(t, callsBefore+1, transport.callCount())
 							assert.Equal(t, channelType, observation.channelType)
 							assert.Equal(t, channel.Id, observation.channelID)
@@ -269,16 +270,11 @@ func assertFixedRelayRouterInvalidRequest(t *testing.T, path string, body []byte
 		}, payload)
 		return
 	}
-	if errorPayload, ok := payload["error"].(map[string]any); ok {
-		if param, present := errorPayload["param"]; present {
-			assert.Equal(t, "", param, "the public validation envelope may include only an empty param")
-			delete(errorPayload, "param")
-		}
-	}
 	assert.Equal(t, map[string]any{
 		"error": map[string]any{
 			"message": constant.OpenCodeGoPublicInvalidRequestMessage,
 			"type":    constant.OpenCodeGoPublicInvalidRequestCode,
+			"param":   "",
 			"code":    constant.OpenCodeGoPublicInvalidRequestCode,
 		},
 	}, payload)

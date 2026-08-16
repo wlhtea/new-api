@@ -27,10 +27,11 @@ type openCodeOutboundPlanCapture struct {
 }
 
 type openCodeBoundOutboundPlan struct {
-	selectionGroup string
-	channelID      int
-	body           []byte
-	verified       bool
+	selectionGroup  string
+	channelID       int
+	body            []byte
+	reasoningEffort string
+	verified        bool
 }
 
 func finalizeConvertedRequest(
@@ -90,6 +91,22 @@ func finalizeConvertedRequest(
 // to initialize protocol-specific adaptor state, then must reproduce this body
 // exactly before any upstream I/O.
 func BindOpenCodeOutboundPlan(c *gin.Context, info *relaycommon.RelayInfo, body []byte) error {
+	reasoningEffort := ""
+	if info != nil {
+		reasoningEffort = info.GetReasoningEffort()
+	}
+	return BindOpenCodeOutboundPlanWithEffort(c, info, body, reasoningEffort)
+}
+
+// BindOpenCodeOutboundPlanWithEffort binds both immutable bytes and the
+// validated selector value. InitChannelMeta resets effort from the source DTO,
+// so every physical attempt must reproduce the finalized value before I/O.
+func BindOpenCodeOutboundPlanWithEffort(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	body []byte,
+	reasoningEffort string,
+) error {
 	if c == nil || info == nil || len(body) == 0 ||
 		!constant.IsOpenCodeChannelType(common.GetContextKeyInt(c, constant.ContextKeyChannelType)) {
 		return errors.New("OpenCode outbound candidate binding is invalid")
@@ -100,10 +117,12 @@ func BindOpenCodeOutboundPlan(c *gin.Context, info *relaycommon.RelayInfo, body 
 		return errors.New("OpenCode outbound candidate selection is invalid")
 	}
 	c.Set(openCodeBoundOutboundPlanContextKey, &openCodeBoundOutboundPlan{
-		selectionGroup: selectionGroup,
-		channelID:      channelID,
-		body:           append([]byte(nil), body...),
+		selectionGroup:  selectionGroup,
+		channelID:       channelID,
+		body:            append([]byte(nil), body...),
+		reasoningEffort: reasoningEffort,
 	})
+	info.SetReasoningEffort(reasoningEffort)
 	c.Set(openCodeOutboundPlanRequiredContextKey, true)
 	return nil
 }
@@ -150,6 +169,7 @@ func PrepareOpenCodeGoOutboundPlanReplay(c *gin.Context, info *relaycommon.Relay
 		bound.channelID != info.ChannelId {
 		return errors.New("OpenCode Go outbound replay selection changed")
 	}
+	info.SetReasoningEffort(bound.reasoningEffort)
 	bound.verified = false
 	return nil
 }
@@ -179,6 +199,9 @@ func verifyBoundOpenCodeOutboundPlan(c *gin.Context, info *relaycommon.RelayInfo
 		bound.channelID != common.GetContextKeyInt(c, constant.ContextKeyChannelId) ||
 		bound.channelID != info.ChannelId {
 		return errors.New("OpenCode outbound candidate selection changed before materialization")
+	}
+	if info.GetReasoningEffort() != bound.reasoningEffort {
+		return errors.New("OpenCode finalized effort differs from the pre-billing candidate")
 	}
 	if !bytes.Equal(bound.body, body) {
 		return errors.New("OpenCode finalized body differs from the pre-billing candidate")

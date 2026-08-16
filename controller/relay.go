@@ -146,6 +146,7 @@ func renderOpenCodeFixedInvalidRequest(c *gin.Context, relayFormat types.RelayFo
 		"error": gin.H{
 			"message": constant.OpenCodeGoPublicInvalidRequestMessage,
 			"type":    constant.OpenCodeGoPublicInvalidRequestCode,
+			"param":   "",
 			"code":    constant.OpenCodeGoPublicInvalidRequestCode,
 		},
 	})
@@ -267,7 +268,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if common.IsRequestBodyTooLargeError(err) || errors.Is(err, common.ErrRequestBodyTooLarge) {
 			newAPIError = types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
 		} else {
-			newAPIError = types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			newAPIError = newRelayInvalidRequestError(err)
 		}
 		return
 	}
@@ -282,15 +283,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 	if preflightErr := relaychannel.PreflightOpenCodeRequestTransport(relayInfo, c); preflightErr != nil {
-		newAPIError = preflightErr
-		return
-	}
-	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeOpenCodeAPIKey {
-		if snapshotErr := freezeOpenCodeAPIKeyRetrySnapshot(c, relayInfo); snapshotErr != nil {
-			newAPIError = snapshotErr
-			return
-		}
-	} else if preflightErr := preflightOpenCodeRequest(c, relayInfo); preflightErr != nil {
 		newAPIError = preflightErr
 		return
 	}
@@ -482,6 +474,26 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if newAPIError != nil {
 		perfmetrics.ScheduleRelaySample(relayInfo, false, 0)
 	}
+}
+
+func newRelayInvalidRequestError(err error) *types.NewAPIError {
+	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
+	if validationErr, ok := helper.AsClientRequestValidationError(err); ok {
+		subtype := strings.TrimSpace(validationErr.RuleID)
+		if subtype == "" {
+			subtype = "request.body.invalid"
+		}
+		options = append(options, types.ErrOptionWithProvenance(types.ErrorProvenance{
+			Origin:  types.ErrorOriginLocalValidation,
+			Subtype: subtype,
+		}))
+	}
+	return types.NewErrorWithStatusCode(
+		err,
+		types.ErrorCodeInvalidRequest,
+		http.StatusBadRequest,
+		options...,
+	)
 }
 
 type relayAttemptContextSnapshot struct {

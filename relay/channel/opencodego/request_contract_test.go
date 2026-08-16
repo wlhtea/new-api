@@ -36,6 +36,7 @@ func TestRequestPathContractRegistryClassifiesEveryDTOField(t *testing.T) {
 		sort.Strings(listedFields)
 		assert.Equal(t, dtoFields, listedFields, "typed field list drifted for %s", clientFormat)
 		expectedRows += len(dtoFields) * len(requestContractProtocols)
+		expectedRows += len(effortAliasTopLevelFields[clientFormat]) * len(requestContractProtocols)
 
 		for _, field := range dtoFields {
 			for _, finalProtocol := range requestContractProtocols {
@@ -45,6 +46,15 @@ func TestRequestPathContractRegistryClassifiesEveryDTOField(t *testing.T) {
 				assert.NotEmpty(t, contract.RuleID)
 				assert.True(t, validRequestPathWireAction(contract.WireAction))
 				assert.Zero(t, contract.LocalObligations&^requestPathObligationAll)
+			}
+		}
+	}
+	for clientFormat, fields := range effortAliasTopLevelFields {
+		for _, field := range fields {
+			for _, finalProtocol := range requestContractProtocols {
+				contract, found := LookupRequestPathContract(clientFormat, finalProtocol, field)
+				require.Truef(t, found, "missing effort alias row for %s -> %s field %q", clientFormat, finalProtocol, field)
+				assert.Equal(t, []string{field}, contract.SourcePath)
 			}
 		}
 	}
@@ -79,10 +89,22 @@ func TestRequestPathContractRegistryMatchesImplementedCrossProtocolActions(t *te
 			wantObligation: RequestPathObligationBilling | RequestPathObligationResponse,
 		},
 		{
-			name:         "Messages metadata cannot disappear in Chat conversion",
+			name:         "Messages metadata translates to Chat metadata",
 			clientFormat: types.RelayFormatClaude, finalProtocol: ProtocolChat,
-			field: "metadata", wantAction: RequestPathWireReject,
+			field: "metadata", wantAction: RequestPathWireTranslate,
 			wantObligation: RequestPathObligationAffinity,
+		},
+		{
+			name:         "Messages output config is strictly translated to Chat",
+			clientFormat: types.RelayFormatClaude, finalProtocol: ProtocolChat,
+			field: "output_config", wantAction: RequestPathWireTranslate,
+			wantObligation: RequestPathObligationBilling | RequestPathObligationResponse,
+		},
+		{
+			name:         "Messages no-op context is consumed locally for Chat",
+			clientFormat: types.RelayFormatClaude, finalProtocol: ProtocolChat,
+			field: "context_management", wantAction: RequestPathWireConsumeLocal,
+			wantObligation: RequestPathObligationResponse,
 		},
 		{
 			name:         "Chat thinking has no Responses mapping",

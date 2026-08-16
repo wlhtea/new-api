@@ -33,19 +33,20 @@ const (
 )
 
 type RequestPreflightPlan struct {
-	Version           string
-	ChannelType       int
-	ChannelID         int
-	SelectionGroup    string
-	ClientFormat      types.RelayFormat
-	OriginModel       string
-	FinalModel        string
-	ModelMapped       bool
-	BaseProtocol      Protocol
-	FinalProtocol     Protocol
-	ProtocolSource    ProtocolResolutionSource
-	DynamicReason     string
-	ConfigFingerprint string
+	Version            string
+	ChannelType        int
+	ChannelID          int
+	SelectionGroup     string
+	ClientFormat       types.RelayFormat
+	OriginModel        string
+	FinalModel         string
+	ModelMapped        bool
+	BaseProtocol       Protocol
+	FinalProtocol      Protocol
+	ProtocolSource     ProtocolResolutionSource
+	DynamicReason      string
+	ConfigFingerprint  string
+	CapabilityRevision string
 }
 
 // RequestPreflightPlanKey identifies one frozen routing candidate. Channel IDs

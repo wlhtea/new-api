@@ -757,6 +757,67 @@ func (info *RelayInfo) GetFinalRequestRelayFormat() types.RelayFormat {
 	return info.RelayFormat
 }
 
+// CloneForOpenCodePlanning returns an isolated view for evaluating one
+// OpenCode candidate. Candidate conversion and parameter overrides are allowed
+// to mutate this clone, but must not affect the root request or another
+// candidate.
+//
+// Runtime handles that OpenCode planning never calls are intentionally shared:
+// websocket connections, the billing session, the last error's immutable error
+// graph, and TaskRelayInfo.LockedChannel. Function callbacks in converter and
+// billing snapshots are also shared as immutable code values. Every mutable
+// request, header, channel/settings, conversion, audit, and usage value that
+// planning can reach is copied below.
+func (info *RelayInfo) CloneForOpenCodePlanning() (*RelayInfo, error) {
+	if info == nil {
+		return nil, errors.New("cannot clone nil RelayInfo for OpenCode planning")
+	}
+
+	clone := *info
+	var err error
+
+	clone.Request, err = cloneOpenCodePlanningRequest(info.Request)
+	if err != nil {
+		return nil, fmt.Errorf("clone OpenCode planning request: %w", err)
+	}
+	clone.RequestHeaders = cloneStringMap(info.RequestHeaders)
+	clone.RequestConversionChain = cloneSlice(info.RequestConversionChain)
+	clone.RuntimeHeadersOverride, err = cloneOpenCodePlanningMap(info.RuntimeHeadersOverride)
+	if err != nil {
+		return nil, fmt.Errorf("clone OpenCode planning runtime header overrides: %w", err)
+	}
+	clone.ParamOverrideAudit = cloneSlice(info.ParamOverrideAudit)
+
+	clone.ChannelMeta, err = cloneChannelMetaForOpenCodePlanning(info.ChannelMeta)
+	if err != nil {
+		return nil, fmt.Errorf("clone OpenCode planning channel metadata: %w", err)
+	}
+	clone.ClaudeConvertInfo, err = cloneClaudeConvertInfoForOpenCodePlanning(info.ClaudeConvertInfo)
+	if err != nil {
+		return nil, fmt.Errorf("clone OpenCode planning Claude conversion state: %w", err)
+	}
+	clone.ResponsesUsageInfo = cloneResponsesUsageInfo(info.ResponsesUsageInfo)
+	clone.StreamStatus = cloneStreamStatus(info.StreamStatus)
+	clone.convOptions = cloneConvOptions(info.convOptions)
+
+	realtimeTools, err := cloneOpenCodePlanningValue(info.RealtimeTools)
+	if err != nil {
+		return nil, fmt.Errorf("clone OpenCode planning realtime tools: %w", err)
+	}
+	clone.RealtimeTools = *realtimeTools
+	clone.RerankerInfo, err = cloneRerankerInfoForOpenCodePlanning(info.RerankerInfo)
+	if err != nil {
+		return nil, fmt.Errorf("clone OpenCode planning reranker state: %w", err)
+	}
+	clone.TaskRelayInfo = cloneTaskRelayInfoForOpenCodePlanning(info.TaskRelayInfo)
+	clone.QuotaClamp = cloneQuotaClamp(info.QuotaClamp)
+	clone.TieredBillingSnapshot = cloneTieredBillingSnapshot(info.TieredBillingSnapshot)
+	clone.BillingRequestInput = cloneBillingRequestInput(info.BillingRequestInput)
+	clone.PriceData = clonePriceData(info.PriceData)
+
+	return &clone, nil
+}
+
 func GenRelayInfoResponsesCompaction(c *gin.Context, request *dto.OpenAIResponsesCompactionRequest) *RelayInfo {
 	info := genBaseRelayInfo(c, request)
 	if info.RelayMode == relayconstant.RelayModeUnknown {
@@ -1043,6 +1104,203 @@ func cloneChannelMeta(source *ChannelMeta) *ChannelMeta {
 	return &clone
 }
 
+func cloneOpenCodePlanningRequest(source dto.Request) (dto.Request, error) {
+	switch request := source.(type) {
+	case nil:
+		return nil, errors.New("request is nil")
+	case *dto.GeneralOpenAIRequest:
+		if request == nil {
+			return nil, errors.New("OpenAI Chat request is nil")
+		}
+		return cloneOpenCodePlanningValue(*request)
+	case *dto.OpenAIResponsesRequest:
+		if request == nil {
+			return nil, errors.New("OpenAI Responses request is nil")
+		}
+		return cloneOpenCodePlanningValue(*request)
+	case *dto.ClaudeRequest:
+		if request == nil {
+			return nil, errors.New("Claude Messages request is nil")
+		}
+		return cloneOpenCodePlanningValue(*request)
+	default:
+		return nil, fmt.Errorf("unsupported request type %T", source)
+	}
+}
+
+func cloneOpenCodePlanningValue[T any](source T) (*T, error) {
+	clone, err := common.DeepCopy(&source)
+	if err != nil {
+		return nil, err
+	}
+	return clone, nil
+}
+
+func cloneChannelMetaForOpenCodePlanning(source *ChannelMeta) (*ChannelMeta, error) {
+	if source == nil {
+		return nil, nil
+	}
+	clone := *source
+	var err error
+	clone.ParamOverride, err = cloneOpenCodePlanningMap(source.ParamOverride)
+	if err != nil {
+		return nil, fmt.Errorf("clone parameter overrides: %w", err)
+	}
+	clone.HeadersOverride, err = cloneOpenCodePlanningMap(source.HeadersOverride)
+	if err != nil {
+		return nil, fmt.Errorf("clone header overrides: %w", err)
+	}
+	channelSettings, err := cloneOpenCodePlanningValue(source.ChannelSetting)
+	if err != nil {
+		return nil, fmt.Errorf("clone channel settings: %w", err)
+	}
+	clone.ChannelSetting = *channelSettings
+	clone.ChannelOtherSettings, err = cloneChannelOtherSettingsForOpenCodePlanning(source.ChannelOtherSettings)
+	if err != nil {
+		return nil, fmt.Errorf("clone other settings: %w", err)
+	}
+	return &clone, nil
+}
+
+func cloneChannelOtherSettingsForOpenCodePlanning(source dto.ChannelOtherSettings) (dto.ChannelOtherSettings, error) {
+	data, err := common.Marshal(source)
+	if err != nil {
+		return dto.ChannelOtherSettings{}, err
+	}
+	var clone dto.ChannelOtherSettings
+	if err := common.Unmarshal(data, &clone); err != nil {
+		return dto.ChannelOtherSettings{}, err
+	}
+	return clone, nil
+}
+
+func cloneOpenCodePlanningMap(source map[string]interface{}) (map[string]interface{}, error) {
+	if source == nil {
+		return nil, nil
+	}
+	clone, err := cloneOpenCodePlanningValue(source)
+	if err != nil {
+		return nil, err
+	}
+	return *clone, nil
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
+func cloneSlice[T any](source []T) []T {
+	if source == nil {
+		return nil
+	}
+	clone := make([]T, len(source))
+	copy(clone, source)
+	return clone
+}
+
+func cloneConvOptions(source *convmeta.Options) *convmeta.Options {
+	if source == nil {
+		return nil
+	}
+	clone := *source
+	if source.UsageConversionEnabled != nil {
+		enabled := *source.UsageConversionEnabled
+		clone.UsageConversionEnabled = &enabled
+	}
+	return &clone
+}
+
+func cloneClaudeConvertInfoForOpenCodePlanning(source *ClaudeConvertInfo) (*ClaudeConvertInfo, error) {
+	if source == nil {
+		return nil, nil
+	}
+	return cloneOpenCodePlanningValue(*source)
+}
+
+func cloneStreamStatus(source *StreamStatus) *StreamStatus {
+	if source == nil {
+		return nil
+	}
+
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	clone := &StreamStatus{
+		EndReason:        source.EndReason,
+		EndError:         source.EndError,
+		Errors:           cloneSlice(source.Errors),
+		ErrorCount:       source.ErrorCount,
+		terminal:         source.terminal,
+		terminalRequired: source.terminalRequired,
+		done:             source.done,
+		upstream:         source.upstream,
+		localFailure:     source.localFailure,
+	}
+	if source.EndReason != StreamEndReasonNone || source.EndError != nil {
+		clone.endOnce.Do(func() {})
+	}
+	return clone
+}
+
+func cloneRerankerInfoForOpenCodePlanning(source *RerankerInfo) (*RerankerInfo, error) {
+	if source == nil {
+		return nil, nil
+	}
+	clone := *source
+	documents, err := cloneOpenCodePlanningValue(source.Documents)
+	if err != nil {
+		return nil, err
+	}
+	clone.Documents = *documents
+	return &clone, nil
+}
+
+func cloneTaskRelayInfoForOpenCodePlanning(source *TaskRelayInfo) *TaskRelayInfo {
+	if source == nil {
+		return nil
+	}
+	clone := *source
+	return &clone
+}
+
+func cloneQuotaClamp(source *common.QuotaClamp) *common.QuotaClamp {
+	if source == nil {
+		return nil
+	}
+	clone := *source
+	return &clone
+}
+
+func cloneTieredBillingSnapshot(source *billingexpr.BillingSnapshot) *billingexpr.BillingSnapshot {
+	if source == nil {
+		return nil
+	}
+	clone := *source
+	return &clone
+}
+
+func cloneBillingRequestInput(source *billingexpr.RequestInput) *billingexpr.RequestInput {
+	if source == nil {
+		return nil
+	}
+	clone := *source
+	clone.Headers = cloneStringMap(source.Headers)
+	clone.Body = cloneSlice(source.Body)
+	return &clone
+}
+
+func clonePriceData(source hosttypes.PriceData) hosttypes.PriceData {
+	clone := source
+	clone.ReplaceOtherRatios(source.OtherRatios())
+	return clone
+}
+
 func cloneRelayAttemptMap(source map[string]interface{}) map[string]interface{} {
 	if source == nil {
 		return nil
@@ -1087,7 +1345,11 @@ func cloneResponsesUsageInfo(source *ResponsesUsageInfo) *ResponsesUsageInfo {
 	if source == nil {
 		return nil
 	}
-	clone := &ResponsesUsageInfo{BuiltInTools: make(map[string]*BuildInToolInfo, len(source.BuiltInTools))}
+	clone := &ResponsesUsageInfo{}
+	if source.BuiltInTools == nil {
+		return clone
+	}
+	clone.BuiltInTools = make(map[string]*BuildInToolInfo, len(source.BuiltInTools))
 	for name, tool := range source.BuiltInTools {
 		if tool == nil {
 			clone.BuiltInTools[name] = nil

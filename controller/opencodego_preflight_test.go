@@ -74,7 +74,8 @@ func TestPreflightOpenCodeRequestRejectsGLM53WithStableRuleAndEndpointEnvelope(t
 					renderRelayError(c, endpoint.format, nil, relayErr, "local-request-id")
 					assert.Equal(t, http.StatusBadRequest, recorder.Code)
 					assert.Equal(t, "local-request-id", recorder.Header().Get(common.RequestIdKey))
-					assert.Contains(t, recorder.Body.String(), helper.OpenCodeGLM53ThinkingDisabledPublicMessage)
+					assert.Contains(t, recorder.Body.String(), constant.OpenCodeGoPublicInvalidRequestMessage)
+					assert.NotContains(t, recorder.Body.String(), helper.OpenCodeGLM53ThinkingDisabledPublicMessage)
 					assert.NotContains(t, recorder.Body.String(), "local-request-id")
 					assert.Contains(t, recorder.Body.String(), `"type":"invalid_request_error"`)
 					if endpoint.format == types.RelayFormatClaude {

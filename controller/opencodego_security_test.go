@@ -221,7 +221,8 @@ func TestRelayScansRawOpenCodeStringsBeforeRetrySnapshot(t *testing.T) {
 	Relay(c, types.RelayFormatOpenAI)
 
 	assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-	assert.Contains(t, recorder.Body.String(), "request contains sensitive content")
+	assert.Contains(t, recorder.Body.String(), constant.OpenCodeGoPublicInvalidRequestMessage)
+	assert.NotContains(t, recorder.Body.String(), "request contains sensitive content")
 	assert.NotContains(t, recorder.Body.String(), "controller-raw-secret")
 	assert.NotContains(t, recorder.Body.String(), "provider_extension")
 	_, snapshotFound, snapshotErr := getOpenCodeAPIKeyRetrySnapshot(c)

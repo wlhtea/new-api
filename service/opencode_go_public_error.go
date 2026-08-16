@@ -17,7 +17,8 @@ const (
 	openCodeGoPublicCancelMessage      = constant.OpenCodeGoPublicRequestCanceledMessage
 	openCodeGoPublicDeadlineMessage    = "请求处理超时"
 	openCodeGoPublicWriterMessage      = "响应写入失败"
-	openCodeGoPublicConfigMessage      = "请求路由配置无效"
+	openCodeGoPublicConfigMessage      = constant.OpenCodeGoPublicGatewayConfigMessage
+	openCodeGoPublicCapabilityMessage  = constant.OpenCodeGoPublicCapabilityMessage
 	openCodeGoPublicInvariantMessage   = "请求处理失败"
 )
 
@@ -292,7 +293,7 @@ func PublicOpenCodeGoRelayError(channelType int, relayErr *types.NewAPIError) *t
 	upstreamOrigin := isOpenCodeChannel && (provenance.IsUpstream() ||
 		(provenance.IsZero() && errors.Is(relayErr, errOpenCodeGoUpstreamOrigin)))
 	if isOpenCodeChannel && relayErr.Provenance().IsLocal() {
-		return newOpenCodeGoLocalPublicError(relayErr, relayErr.Provenance())
+		return newOpenCodeGoLocalPublicError(relayErr.Provenance())
 	}
 	if isOpenCodeChannel && relayErr.Provenance().IsGateway() {
 		return newOpenCodeGoGatewayPublicError(relayErr.Provenance())
@@ -329,18 +330,13 @@ func newOpenCodeGoOverloadError() *types.NewAPIError {
 	})
 }
 
-func newOpenCodeGoLocalPublicError(relayErr *types.NewAPIError, provenance types.ErrorProvenance) *types.NewAPIError {
+func newOpenCodeGoLocalPublicError(provenance types.ErrorProvenance) *types.NewAPIError {
 	statusCode := http.StatusInternalServerError
 	message := openCodeGoPublicWriterMessage
 	errorType := "internal_server_error"
 	switch provenance.Origin {
 	case types.ErrorOriginLocalValidation:
-		statusCode = http.StatusBadRequest
-		if relayErr != nil && relayErr.StatusCode >= 400 && relayErr.StatusCode < 500 {
-			statusCode = relayErr.StatusCode
-		}
-		message = openCodeGoSafeLocalValidationMessage(relayErr)
-		errorType = constant.OpenCodeGoPublicInvalidRequestCode
+		return newOpenCodeGoFixedInvalidRequestErrorWithProvenance(provenance)
 	case types.ErrorOriginLocalCancel:
 		statusCode = 499
 		message = openCodeGoPublicCancelMessage
@@ -359,18 +355,6 @@ func newOpenCodeGoLocalPublicError(relayErr *types.NewAPIError, provenance types
 	return publicErr
 }
 
-func openCodeGoSafeLocalValidationMessage(relayErr *types.NewAPIError) string {
-	if relayErr == nil {
-		return constant.OpenCodeGoPublicInvalidRequestMessage
-	}
-	message := common.OpenCodeGoPublicClientRequestMessage(relayErr.Error())
-	if strings.TrimSpace(message) == "" || strings.Contains(message, "***") ||
-		common.MaskSensitiveInfo(message) != message {
-		return constant.OpenCodeGoPublicInvalidRequestMessage
-	}
-	return message
-}
-
 func newOpenCodeGoGatewayPublicError(provenance types.ErrorProvenance) *types.NewAPIError {
 	statusCode := http.StatusInternalServerError
 	message := openCodeGoPublicInvariantMessage
@@ -378,7 +362,11 @@ func newOpenCodeGoGatewayPublicError(provenance types.ErrorProvenance) *types.Ne
 	if provenance.Origin == types.ErrorOriginGatewayConfig {
 		statusCode = http.StatusServiceUnavailable
 		message = openCodeGoPublicConfigMessage
-		errorType = "service_unavailable"
+		errorType = constant.OpenCodeGoPublicServiceUnavailableCode
+	} else if provenance.Origin == types.ErrorOriginGatewayDependency {
+		statusCode = http.StatusServiceUnavailable
+		message = openCodeGoPublicCapabilityMessage
+		errorType = constant.OpenCodeGoPublicServiceUnavailableCode
 	}
 	publicErr := types.WithOpenAIError(types.OpenAIError{
 		Message: message,
@@ -417,16 +405,20 @@ func IsOpenCodeGoFixedInvalidRequestProjection(relayErr *types.NewAPIError) bool
 }
 
 func newOpenCodeGoFixedInvalidRequestError(rawStatus int) *types.NewAPIError {
+	return newOpenCodeGoFixedInvalidRequestErrorWithProvenance(types.ErrorProvenance{
+		Origin:        types.ErrorOriginUpstreamHTTP,
+		Subtype:       "fixed_invalid_request",
+		RawStatusCode: rawStatus,
+	})
+}
+
+func newOpenCodeGoFixedInvalidRequestErrorWithProvenance(provenance types.ErrorProvenance) *types.NewAPIError {
 	publicErr := types.WithOpenAIError(types.OpenAIError{
 		Message: constant.OpenCodeGoPublicInvalidRequestMessage,
 		Type:    constant.OpenCodeGoPublicInvalidRequestCode,
 		Code:    constant.OpenCodeGoPublicInvalidRequestCode,
 	}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
-	publicErr.SetProvenance(types.ErrorProvenance{
-		Origin:        types.ErrorOriginUpstreamHTTP,
-		Subtype:       "fixed_invalid_request",
-		RawStatusCode: rawStatus,
-	})
+	publicErr.SetProvenance(provenance)
 	return publicErr
 }
 

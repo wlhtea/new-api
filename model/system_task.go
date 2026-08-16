@@ -25,6 +25,7 @@ const (
 	SystemTaskTypeSeedDanceSubmitReconciliation = "seedance_submit_reconciliation"
 	SystemTaskTypeOpenCodeGoRefresh             = "opencode_go_refresh"
 	SystemTaskTypeOpenCodeGoRiskRecheck         = "opencode_go_risk_recheck"
+	SystemTaskTypeOpenCodeGoCapabilityRefresh   = "opencode_go_model_capability_refresh"
 )
 
 var ErrSystemTaskLockLost = errors.New("system task lock lost")

@@ -133,21 +133,18 @@ func TestPublicOpenCodeGoRelayErrorProjectsTypedLocalTermination(t *testing.T) {
 	}
 }
 
-func TestPublicOpenCodeGoRelayErrorPreservesControlledLocalValidation(t *testing.T) {
+func TestPublicOpenCodeGoRelayErrorFixesEveryLocalValidationMessage(t *testing.T) {
 	tests := []struct {
-		name        string
-		message     string
-		wantMessage string
+		name    string
+		message string
 	}{
 		{
-			name:        "fixed message survives masker",
-			message:     "The selected model does not support disabling reasoning",
-			wantMessage: "The selected model does not support disabling reasoning",
+			name:    "controlled message is not exposed",
+			message: "The selected model does not support disabling reasoning",
 		},
 		{
-			name:        "domain-like parameter path falls back to fixed message",
-			message:     "thinking.type=disabled is not supported for the selected model",
-			wantMessage: constant.OpenCodeGoPublicInvalidRequestMessage,
+			name:    "parameter path is not exposed",
+			message: "thinking.type=disabled is not supported for the selected model",
 		},
 	}
 	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
@@ -167,10 +164,12 @@ func TestPublicOpenCodeGoRelayErrorPreservesControlledLocalValidation(t *testing
 
 				require.NotSame(t, internal, publicErr)
 				assert.Equal(t, http.StatusBadRequest, publicErr.StatusCode)
-				assert.Equal(t, test.wantMessage, publicErr.ToOpenAIError().Message)
+				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestMessage, publicErr.ToOpenAIError().Message)
 				assert.NotContains(t, publicErr.ToOpenAIError().Message, "***")
 				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestCode, publicErr.ToOpenAIError().Type)
 				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestCode, publicErr.ToOpenAIError().Code)
+				assert.Empty(t, publicErr.ToOpenAIError().Param)
+				assert.True(t, types.IsSkipRetryError(publicErr))
 				assert.Equal(t, internal.Provenance(), publicErr.Provenance())
 				assert.Equal(t, test.message, internal.Error())
 			})
@@ -265,8 +264,15 @@ func TestPublicOpenCodeGoRelayErrorProjectsGatewayErrorsWithoutInternalCause(t *
 			name:       "config",
 			origin:     types.ErrorOriginGatewayConfig,
 			wantStatus: http.StatusServiceUnavailable,
-			wantType:   "service_unavailable",
+			wantType:   constant.OpenCodeGoPublicServiceUnavailableCode,
 			wantText:   openCodeGoPublicConfigMessage,
+		},
+		{
+			name:       "dependency",
+			origin:     types.ErrorOriginGatewayDependency,
+			wantStatus: http.StatusServiceUnavailable,
+			wantType:   constant.OpenCodeGoPublicServiceUnavailableCode,
+			wantText:   openCodeGoPublicCapabilityMessage,
 		},
 		{
 			name:       "invariant",
@@ -291,6 +297,8 @@ func TestPublicOpenCodeGoRelayErrorProjectsGatewayErrorsWithoutInternalCause(t *
 			assert.Equal(t, test.wantText, publicErr.ToOpenAIError().Message)
 			assert.Equal(t, test.wantType, publicErr.ToOpenAIError().Type)
 			assert.Equal(t, test.wantType, publicErr.ToOpenAIError().Code)
+			assert.Empty(t, publicErr.ToOpenAIError().Param)
+			assert.True(t, types.IsSkipRetryError(publicErr))
 			assert.NotContains(t, publicErr.Error(), "workspace")
 			assert.Contains(t, internal.Error(), "workspace")
 		})

@@ -10,6 +10,9 @@ const (
 	OpenCodeGoPublicRateLimitErrorCode     = "rate_limit_error"
 	OpenCodeGoPublicInvalidRequestMessage  = "请求体或参数无效，请检查请求内容"
 	OpenCodeGoPublicInvalidRequestCode     = "invalid_request_error"
+	OpenCodeGoPublicGatewayConfigMessage   = "请求路由配置无效"
+	OpenCodeGoPublicCapabilityMessage      = "服务暂时不可用，请稍后再试"
+	OpenCodeGoPublicServiceUnavailableCode = "service_unavailable"
 	OpenCodeGoPublicRequestCanceledMessage = "请求已取消"
 	OpenCodeGoPublicRequestCanceledCode    = "request_canceled"
 

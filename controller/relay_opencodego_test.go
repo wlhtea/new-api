@@ -112,6 +112,7 @@ func TestRenderRelayErrorUsesFixedRawUpstream400ContractForBothOpenCodeTypes(t *
 								"error": map[string]any{
 									"message": constant.OpenCodeGoPublicInvalidRequestMessage,
 									"type":    constant.OpenCodeGoPublicInvalidRequestCode,
+									"param":   "",
 									"code":    constant.OpenCodeGoPublicInvalidRequestCode,
 								},
 							}, actual)

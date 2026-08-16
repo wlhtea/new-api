@@ -13,6 +13,7 @@ const (
 	ErrorOriginLocalWriter        ErrorOrigin = "local.writer"
 	ErrorOriginLocalPanic         ErrorOrigin = "local.panic"
 	ErrorOriginGatewayConfig      ErrorOrigin = "gateway.config"
+	ErrorOriginGatewayDependency  ErrorOrigin = "gateway.dependency"
 	ErrorOriginGatewayInvariant   ErrorOrigin = "gateway.invariant"
 	ErrorOriginUpstreamTransport  ErrorOrigin = "upstream.transport"
 	ErrorOriginUpstreamHTTP       ErrorOrigin = "upstream.http"
@@ -61,7 +62,9 @@ func (p ErrorProvenance) IsLocal() bool {
 }
 
 func (p ErrorProvenance) IsGateway() bool {
-	return p.Origin == ErrorOriginGatewayConfig || p.Origin == ErrorOriginGatewayInvariant
+	return p.Origin == ErrorOriginGatewayConfig ||
+		p.Origin == ErrorOriginGatewayDependency ||
+		p.Origin == ErrorOriginGatewayInvariant
 }
 
 // Provenance returns a copy so callers cannot mutate the error's policy

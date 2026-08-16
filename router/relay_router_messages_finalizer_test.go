@@ -102,7 +102,9 @@ func TestRelayRouterOpenCodeMessagesStopCollisionHasZeroSideEffects(t *testing.T
 			recorder := serveRelayRouterRequest(engine, "/v1/messages", body)
 
 			require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-			assert.Contains(t, recorder.Body.String(), "Messages stop_sequences and stop cannot both be provided")
+			assert.Equal(t, "application/json; charset=utf-8", recorder.Header().Get("Content-Type"))
+			assert.NotContains(t, recorder.Body.String(), "Messages stop_sequences and stop cannot both be provided")
+			assertFixedRelayRouterInvalidRequest(t, "/v1/messages", recorder.Body.Bytes())
 			require.True(t, observation.rejected)
 			assert.Equal(t, opencodego.MessagesStopSourceCollisionRule, observation.rejection.RuleID)
 			assert.Equal(t, opencodego.RequestContractPreflightStage, observation.rejection.StageID)
@@ -142,7 +144,9 @@ func TestRelayRouterOpenCodeFinalizedSystemPromptSensitiveValueHasZeroCalls(t *t
 			recorder := serveRelayRouterRequest(engine, "/v1/messages", body)
 
 			require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-			assert.Contains(t, recorder.Body.String(), "request contains sensitive content")
+			assert.Equal(t, "application/json; charset=utf-8", recorder.Header().Get("Content-Type"))
+			assert.NotContains(t, recorder.Body.String(), "request contains sensitive content")
+			assertFixedRelayRouterInvalidRequest(t, "/v1/messages", recorder.Body.Bytes())
 			assert.NotContains(t, recorder.Body.String(), "finalized-system-secret")
 			assert.Empty(t, capture.snapshot())
 			if channelType == constant.ChannelTypeOpenCodeGo {

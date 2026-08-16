@@ -496,8 +496,9 @@ func TestRelayRouterOpenCodeCapabilityPreflightHasMatchedCaptureAndZeroRejectSid
 							recorder := serveRelayRouterRequest(engine, endpoint.path, rejectedBody)
 
 							require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-							assert.Contains(t, recorder.Body.String(), helper.OpenCodeGLM53ThinkingDisabledPublicMessage)
-							assert.NotContains(t, recorder.Body.String(), constant.OpenCodeGoPublicInvalidRequestMessage)
+							assert.Equal(t, "application/json; charset=utf-8", recorder.Header().Get("Content-Type"))
+							assert.NotContains(t, recorder.Body.String(), helper.OpenCodeGLM53ThinkingDisabledPublicMessage)
+							assertFixedRelayRouterInvalidRequest(t, endpoint.path, recorder.Body.Bytes())
 							assert.Equal(t, channelType, observation.channelType)
 							assert.Equal(t, channel.Id, observation.channelID)
 							require.True(t, observation.rejected)

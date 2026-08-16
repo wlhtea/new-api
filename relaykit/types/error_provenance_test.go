@@ -64,3 +64,16 @@ func TestErrorProvenanceLocalAndUpstreamAxesAreDisjoint(t *testing.T) {
 	assert.True(t, provenance.IsUpstream())
 	assert.False(t, provenance.IsLocal())
 }
+
+func TestErrorProvenanceGatewayOrigins(t *testing.T) {
+	for _, origin := range []ErrorOrigin{
+		ErrorOriginGatewayConfig,
+		ErrorOriginGatewayDependency,
+		ErrorOriginGatewayInvariant,
+	} {
+		provenance := ErrorProvenance{Origin: origin}
+		assert.True(t, provenance.IsGateway(), origin)
+		assert.False(t, provenance.IsLocal(), origin)
+		assert.False(t, provenance.IsUpstream(), origin)
+	}
+}

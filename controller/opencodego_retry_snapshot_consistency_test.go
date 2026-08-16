@@ -98,7 +98,7 @@ func newOpenCodeAPIKeySnapshotTestFixtureWithExtra(
 	return c, info
 }
 
-func TestFreezeOpenCodeAPIKeyRetrySnapshotSkipsIncompatibleInitialCandidate(t *testing.T) {
+func TestPrepareOpenCodeCandidatePlansSkipsIncompatibleInitialCandidate(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	const modelName = "retry-snapshot-compatible-fallback-model"
 
@@ -124,8 +124,11 @@ func TestFreezeOpenCodeAPIKeyRetrySnapshotSkipsIncompatibleInitialCandidate(t *t
 		`,"thinking":{"type":"enabled"}`,
 	)
 
-	relayErr := freezeOpenCodeAPIKeyRetrySnapshot(c, info)
+	plans, relayErr := prepareAndFreezeOpenCodeCandidatePlans(c, info)
 	require.Nil(t, relayErr)
+	require.NotNil(t, plans)
+	require.Len(t, plans.plans, 1)
+	assert.Equal(t, compatible.Id, plans.plans[0].key.ChannelID)
 	assert.Equal(t, compatible.Id, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
 
 	_, incompatibleFound, err := opencodego.GetRequestPreflightPlanForSelection(c, "default", incompatible.Id)
@@ -144,7 +147,7 @@ func TestFreezeOpenCodeAPIKeyRetrySnapshotSkipsIncompatibleInitialCandidate(t *t
 	assert.Equal(t, compatible.Id, snapshot.selections[0].channelID)
 }
 
-func TestFreezeOpenCodeAPIKeyRetrySnapshotRejectsStaleInitialSelection(t *testing.T) {
+func TestPrepareOpenCodeCandidatePlansRejectsStaleInitialSelection(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	const modelName = "retry-snapshot-stale-initial-model"
 
@@ -154,8 +157,9 @@ func TestFreezeOpenCodeAPIKeyRetrySnapshotRejectsStaleInitialSelection(t *testin
 	stale.Id = available.Id + 1000
 
 	c, info := newOpenCodeAPIKeySnapshotTestFixture(t, &stale, modelName)
-	relayErr := freezeOpenCodeAPIKeyRetrySnapshot(c, info)
+	plans, relayErr := prepareAndFreezeOpenCodeCandidatePlans(c, info)
 	require.NotNil(t, relayErr)
+	assert.Nil(t, plans)
 	assert.Equal(t, types.ErrorOriginGatewayInvariant, relayErr.Provenance().Origin)
 	assert.Equal(t, opencodego.PreflightPlanMismatchRule, relayErr.Provenance().Subtype)
 	_, found, snapshotErr := getOpenCodeAPIKeyRetrySnapshot(c)
@@ -163,7 +167,7 @@ func TestFreezeOpenCodeAPIKeyRetrySnapshotRejectsStaleInitialSelection(t *testin
 	assert.False(t, found)
 }
 
-func TestFreezeOpenCodeAPIKeyRetrySnapshotReplacesStaleInitialConfigFromDatabase(t *testing.T) {
+func TestPrepareOpenCodeCandidatePlansReplacesStaleInitialConfigFromDatabase(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	const modelName = "retry-snapshot-refresh-initial-model"
 
@@ -182,7 +186,11 @@ func TestFreezeOpenCodeAPIKeyRetrySnapshotReplacesStaleInitialConfigFromDatabase
 	}})
 
 	c, info := newOpenCodeAPIKeySnapshotTestFixture(t, &stale, modelName)
-	require.Nil(t, freezeOpenCodeAPIKeyRetrySnapshot(c, info))
+	plans, relayErr := prepareAndFreezeOpenCodeCandidatePlans(c, info)
+	require.Nil(t, relayErr)
+	require.NotNil(t, plans)
+	require.Len(t, plans.plans, 1)
+	assert.Equal(t, persisted.Id, plans.plans[0].key.ChannelID)
 	assert.Equal(t, "snapshot-database-key", common.GetContextKeyString(c, constant.ContextKeyChannelKey))
 	assert.Equal(t, "database", common.GetContextKeyStringMap(c, constant.ContextKeyChannelHeaderOverride)["X-Snapshot-Config"])
 
@@ -199,7 +207,7 @@ func TestFreezeOpenCodeAPIKeyRetrySnapshotReplacesStaleInitialConfigFromDatabase
 	assert.Equal(t, "database", snapshot.topology[0].headerOverride["X-Snapshot-Config"])
 }
 
-func TestFreezeOpenCodeAPIKeyRetrySnapshotRejectsInvalidCandidateConfig(t *testing.T) {
+func TestPrepareOpenCodeCandidatePlansFiltersInvalidCandidateConfig(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	const modelName = "retry-snapshot-invalid-candidate-model"
 
@@ -211,11 +219,25 @@ func TestFreezeOpenCodeAPIKeyRetrySnapshotRejectsInvalidCandidateConfig(t *testi
 	persistOpenCodeAPIKeySnapshotTestChannel(t, db, &invalid)
 
 	c, info := newOpenCodeAPIKeySnapshotTestFixture(t, &initial, modelName)
-	relayErr := freezeOpenCodeAPIKeyRetrySnapshot(c, info)
-	require.NotNil(t, relayErr)
-	assert.Equal(t, types.ErrorOriginGatewayConfig, relayErr.Provenance().Origin)
-	assert.Equal(t, opencodego.PreflightCandidateConfigInvalidRule, relayErr.Provenance().Subtype)
-	_, found, snapshotErr := getOpenCodeAPIKeyRetrySnapshot(c)
+	plans, relayErr := prepareAndFreezeOpenCodeCandidatePlans(c, info)
+	require.Nil(t, relayErr)
+	require.NotNil(t, plans)
+	require.Len(t, plans.plans, 1)
+	assert.Equal(t, initial.Id, plans.plans[0].key.ChannelID)
+
+	_, invalidFound, err := opencodego.GetRequestPreflightPlanForSelection(c, "default", invalid.Id)
+	require.NoError(t, err)
+	assert.False(t, invalidFound)
+	_, initialFound, err := opencodego.GetRequestPreflightPlanForSelection(c, "default", initial.Id)
+	require.NoError(t, err)
+	assert.True(t, initialFound)
+
+	snapshot, found, snapshotErr := getOpenCodeAPIKeyRetrySnapshot(c)
 	require.NoError(t, snapshotErr)
-	assert.False(t, found)
+	require.True(t, found)
+	require.Len(t, snapshot.topology, 1)
+	assert.Equal(t, initial.Id, snapshot.topology[0].channelID)
+	for _, selection := range snapshot.selections {
+		assert.Equal(t, initial.Id, selection.channelID)
+	}
 }
