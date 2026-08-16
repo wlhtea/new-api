@@ -448,6 +448,14 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
+	// Optional channel fields must not survive a generic cross-channel retry.
+	// Every selected row starts from explicit zero values before its settings
+	// are installed below.
+	for _, key := range []string{"api_version", "region", "plugin", "bot_id"} {
+		c.Set(key, nil)
+	}
+	common.SetContextKey(c, constant.ContextKeyChannelOrganization, "")
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, 0)
 	common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
 	common.SetContextKey(c, constant.ContextKeyChannelName, channel.Name)
 	common.SetContextKey(c, constant.ContextKeyChannelType, channel.Type)

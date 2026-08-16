@@ -9,9 +9,14 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	rootcommon "github.com/QuantumNous/new-api/common"
 	rootconstant "github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,14 +24,22 @@ import (
 
 type clientResolverTestAdaptor struct {
 	Adaptor
-	requestURL  string
-	headerSetup atomic.Bool
+	requestURL      string
+	headerSetup     atomic.Bool
+	headerSetupCall atomic.Int32
+	setupHeader     func(*http.Header)
 }
 
 type clientResolverTestTransport struct {
 	calls    atomic.Int32
 	response *http.Response
 	err      error
+}
+
+type roundTripTestFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripTestFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
 }
 
 func (transport *clientResolverTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -43,10 +56,14 @@ func (adaptor *clientResolverTestAdaptor) GetRequestURL(*relaycommon.RelayInfo) 
 
 func (adaptor *clientResolverTestAdaptor) SetupRequestHeader(
 	_ *gin.Context,
-	_ *http.Header,
+	header *http.Header,
 	_ *relaycommon.RelayInfo,
 ) error {
 	adaptor.headerSetup.Store(true)
+	adaptor.headerSetupCall.Add(1)
+	if adaptor.setupHeader != nil {
+		adaptor.setupHeader(header)
+	}
 	return nil
 }
 
@@ -243,57 +260,576 @@ func TestProcessHeaderOverride_NonTestKeepsClientHeaderPlaceholder(t *testing.T)
 	require.Equal(t, "trace-123", headers["x-upstream-trace"])
 }
 
-func TestProcessHeaderOverride_OpenCodeAPIKeyReservesAccountHeaders(t *testing.T) {
+func TestProcessHeaderOverride_OpenCodeRejectsGatewayOwnedOperatorHeaders(t *testing.T) {
 	t.Parallel()
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 
-	for _, test := range []struct {
-		name         string
-		channelType  int
-		wantReserved bool
-	}{
-		{
-			name:         "api key row reserves authentication and cache identity",
-			channelType:  rootconstant.ChannelTypeOpenCodeAPIKey,
-			wantReserved: false,
-		},
-		{
-			name:         "account pool keeps existing override behavior",
-			channelType:  rootconstant.ChannelTypeOpenCodeGo,
-			wantReserved: true,
-		},
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			info := &relaycommon.RelayInfo{
-				ChannelMeta: &relaycommon.ChannelMeta{
-					ChannelType: test.channelType,
+		for _, headerName := range []string{"Authorization", "X-Api-Key", "X-OpenCode-Session"} {
+			name := rootconstant.GetChannelTypeName(channelType) + "/" + headerName
+			t.Run(name, func(t *testing.T) {
+				info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType: channelType,
 					HeadersOverride: map[string]any{
-						"Authorization":      "Bearer channel-override",
-						"X-Api-Key":          "channel-api-key-override",
-						"X-OpenCode-Session": "channel-session-override",
-						"Anthropic-Beta":     "tools-2024-04-04",
-						"X-Upstream-Feature": "allowed",
+						headerName: "operator-must-not-own-this-value",
 					},
+				}}
+
+				headers, err := processHeaderOverride(info, ctx)
+				require.Nil(t, headers)
+				var apiErr *types.NewAPIError
+				require.ErrorAs(t, err, &apiErr)
+				assert.Equal(t, types.ErrorOriginGatewayConfig, apiErr.Provenance().Origin)
+				assert.Equal(t, "header_override", apiErr.Provenance().Subtype)
+				assert.True(t, types.IsSkipRetryError(apiErr))
+			})
+		}
+	}
+}
+
+func TestProcessHeaderOverride_OpenCodeForwardsOnlyDeclaredClientSemanticHeaders(t *testing.T) {
+	t.Parallel()
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ctx.Request.Header.Set("Anthropic-Beta", "tools-2024-04-04")
+	ctx.Request.Header.Set("Anthropic-Version", "2023-06-01")
+	ctx.Request.Header.Set("Authorization", "Bearer client-secret")
+	ctx.Request.Header.Set("Accept-Encoding", "gzip")
+	ctx.Request.Header.Set("X-Unknown-Client", "must-not-cross")
+	ctx.Request.Header.Set("Connection", "X-Custom")
+	ctx.Request.Header.Set("X-Custom", "client-nominated-value")
+
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(rootconstant.GetChannelTypeName(channelType), func(t *testing.T) {
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelType: channelType,
+				HeadersOverride: map[string]any{
+					"*":                  "",
+					"X-Custom":           "operator-owned-value",
+					"X-Upstream-Feature": "enabled",
 				},
-			}
+			}}
 
 			headers, err := processHeaderOverride(info, ctx)
 			require.NoError(t, err)
-			if test.wantReserved {
-				assert.Equal(t, "Bearer channel-override", headers["authorization"])
-				assert.Equal(t, "channel-api-key-override", headers["x-api-key"])
-				assert.Equal(t, "channel-session-override", headers["x-opencode-session"])
-			} else {
-				assert.NotContains(t, headers, "authorization")
-				assert.NotContains(t, headers, "x-api-key")
-				assert.NotContains(t, headers, "x-opencode-session")
-			}
 			assert.Equal(t, "tools-2024-04-04", headers["anthropic-beta"])
-			assert.Equal(t, "allowed", headers["x-upstream-feature"])
+			assert.Equal(t, "2023-06-01", headers["anthropic-version"])
+			assert.Equal(t, "operator-owned-value", headers["x-custom"])
+			assert.Equal(t, "enabled", headers["x-upstream-feature"])
+			assert.NotContains(t, headers, "authorization")
+			assert.NotContains(t, headers, "accept-encoding")
+			assert.NotContains(t, headers, "x-unknown-client")
 		})
 	}
+}
+
+func TestDoApiRequest_OpenCodeRejectsHeaderConfigBeforeSetupOrIO(t *testing.T) {
+	t.Parallel()
+
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(rootconstant.GetChannelTypeName(channelType), func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			adaptor := &clientResolverTestAdaptor{requestURL: "http://upstream.invalid/v1/messages"}
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelType: channelType,
+				HeadersOverride: map[string]any{
+					"Authorization": "Bearer operator-value",
+				},
+			}}
+			transport := &clientResolverTestTransport{response: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       http.NoBody,
+			}}
+			var resolverCalls atomic.Int32
+
+			response, err := DoApiRequestWithClientLease(
+				adaptor,
+				ctx,
+				info,
+				strings.NewReader("{}"),
+				func() (*http.Client, func(), error) {
+					resolverCalls.Add(1)
+					return &http.Client{Transport: transport}, nil, nil
+				},
+			)
+
+			require.Nil(t, response)
+			var apiErr *types.NewAPIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, types.ErrorOriginGatewayConfig, apiErr.Provenance().Origin)
+			assert.True(t, types.IsSkipRetryError(apiErr))
+			assert.Zero(t, adaptor.headerSetupCall.Load())
+			assert.Zero(t, resolverCalls.Load())
+			assert.Zero(t, transport.calls.Load())
+		})
+	}
+}
+
+func TestDoApiRequest_OpenCodeFinalWireHeadersKeepGatewayOwnership(t *testing.T) {
+	t.Parallel()
+
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(rootconstant.GetChannelTypeName(channelType), func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			ctx.Request.Header.Set("Anthropic-Beta", "tools-2024-04-04")
+			ctx.Request.Header.Set("Anthropic-Version", "2023-06-01")
+			ctx.Request.Header.Set("X-Unknown-Client", "must-not-cross")
+
+			adaptor := &clientResolverTestAdaptor{
+				requestURL: "http://upstream.invalid/v1/messages",
+				setupHeader: func(header *http.Header) {
+					header.Set("Authorization", "Bearer gateway-owned")
+					header.Set("X-OpenCode-Session", "gateway-session")
+					header.Set("Content-Type", "application/json")
+					header.Set("Accept", "application/json")
+				},
+			}
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelType: channelType,
+				HeadersOverride: map[string]any{
+					"*":                  "",
+					"X-Upstream-Feature": "enabled",
+				},
+			}}
+			transport := &clientResolverTestTransport{response: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       http.NoBody,
+			}}
+
+			response, err := DoApiRequestWithClientLease(
+				adaptor,
+				ctx,
+				info,
+				strings.NewReader("{}"),
+				func() (*http.Client, func(), error) {
+					return &http.Client{Transport: transport}, nil, nil
+				},
+			)
+
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			require.NotNil(t, response.Request)
+			assert.Equal(t, "Bearer gateway-owned", response.Request.Header.Get("Authorization"))
+			assert.Equal(t, "gateway-session", response.Request.Header.Get("X-OpenCode-Session"))
+			assert.Equal(t, "application/json", response.Request.Header.Get("Content-Type"))
+			assert.Equal(t, "application/json", response.Request.Header.Get("Accept"))
+			assert.Equal(t, "tools-2024-04-04", response.Request.Header.Get("Anthropic-Beta"))
+			assert.Equal(t, "2023-06-01", response.Request.Header.Get("Anthropic-Version"))
+			assert.Equal(t, "enabled", response.Request.Header.Get("X-Upstream-Feature"))
+			assert.Empty(t, response.Request.Header.Get("X-Unknown-Client"))
+			assert.Equal(t, int32(1), transport.calls.Load())
+		})
+	}
+}
+
+func TestDoRequestWithClient_OpenCodeDelayedInvalidRequestDoesNotCommitSSE(t *testing.T) {
+	type requestResult struct {
+		response *http.Response
+		err      error
+	}
+	setting := operation_setting.GetGeneralSetting()
+	oldPingEnabled := setting.PingIntervalEnabled
+	oldPingSeconds := setting.PingIntervalSeconds
+	setting.PingIntervalEnabled = true
+	setting.PingIntervalSeconds = 1
+	t.Cleanup(func() {
+		setting.PingIntervalEnabled = oldPingEnabled
+		setting.PingIntervalSeconds = oldPingSeconds
+	})
+
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
+	} {
+		for _, statusCode := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
+			name := rootconstant.GetChannelTypeName(channelType) + "/" + http.StatusText(statusCode)
+			t.Run(name, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+				upstreamRequest, requestErr := http.NewRequestWithContext(
+					ctx.Request.Context(),
+					http.MethodPost,
+					"http://upstream.invalid/v1/messages",
+					strings.NewReader("{}"),
+				)
+				require.NoError(t, requestErr)
+
+				roundTripStarted := make(chan struct{})
+				releaseStatus := make(chan struct{})
+				client := &http.Client{Transport: roundTripTestFunc(func(request *http.Request) (*http.Response, error) {
+					close(roundTripStarted)
+					<-releaseStatus
+					return &http.Response{
+						StatusCode: statusCode,
+						Header:     make(http.Header),
+						Body:       http.NoBody,
+						Request:    request,
+					}, nil
+				})}
+				info := &relaycommon.RelayInfo{
+					IsStream: true,
+					ChannelMeta: &relaycommon.ChannelMeta{
+						ChannelType: channelType,
+					},
+				}
+				result := make(chan requestResult, 1)
+				go func() {
+					response, err := doRequestWithClient(ctx, upstreamRequest, info, client)
+					result <- requestResult{response: response, err: err}
+				}()
+
+				select {
+				case <-roundTripStarted:
+				case <-time.After(time.Second):
+					close(releaseStatus)
+					t.Fatal("timed out waiting for the upstream round trip")
+				}
+				// Hold the response past the configured ping interval. Before the
+				// OpenCode guard, the pre-status pinger committed an SSE response here.
+				time.Sleep(1100 * time.Millisecond)
+
+				assert.False(t, ctx.Writer.Written(), "the delayed upstream status must own the downstream status")
+				assert.False(t, recorder.Flushed)
+				assert.Empty(t, recorder.Body.String())
+				assert.Empty(t, recorder.Header().Get("Content-Type"), "SSE headers must be deferred until upstream status classification")
+
+				close(releaseStatus)
+				var outcome requestResult
+				select {
+				case outcome = <-result:
+				case <-time.After(time.Second):
+					t.Fatal("timed out waiting for the classified upstream response")
+				}
+				require.NoError(t, outcome.err)
+				require.NotNil(t, outcome.response)
+				t.Cleanup(func() { _ = outcome.response.Body.Close() })
+				assert.Equal(t, statusCode, outcome.response.StatusCode)
+				assert.False(t, ctx.Writer.Written())
+				assert.False(t, recorder.Flushed)
+				assert.Empty(t, recorder.Body.String())
+				assert.Empty(t, recorder.Header().Get("Content-Type"))
+			})
+		}
+	}
+}
+
+func TestDoOpenCodeRequestWithResponseHeaderTimeoutCancelsBlockedRoundTrip(t *testing.T) {
+	request, err := http.NewRequest(http.MethodPost, "http://upstream.invalid/v1/messages", strings.NewReader("{}"))
+	require.NoError(t, err)
+	client := &http.Client{Transport: roundTripTestFunc(func(request *http.Request) (*http.Response, error) {
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})}
+
+	startedAt := time.Now()
+	response, err := doOpenCodeRequestWithResponseHeaderTimeout(client, request, 20*time.Millisecond)
+
+	require.Nil(t, response)
+	require.ErrorIs(t, err, errOpenCodeResponseHeaderTimeout)
+	assert.Less(t, time.Since(startedAt), time.Second)
+}
+
+func TestDoOpenCodeRequestHeaderTimerStopsUntilResponseBodyCloses(t *testing.T) {
+	request, err := http.NewRequest(http.MethodPost, "http://upstream.invalid/v1/messages", strings.NewReader("{}"))
+	require.NoError(t, err)
+	client := &http.Client{Transport: roundTripTestFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+			Request:    request,
+		}, nil
+	})}
+
+	response, err := doOpenCodeRequestWithResponseHeaderTimeout(client, request, 20*time.Millisecond)
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	responseContext := response.Request.Context()
+	time.Sleep(40 * time.Millisecond)
+	assert.NoError(t, responseContext.Err(), "header timer must not become a full-stream timeout")
+	require.NoError(t, response.Body.Close())
+	select {
+	case <-responseContext.Done():
+	case <-time.After(time.Second):
+		t.Fatal("response body close did not release the request context")
+	}
+}
+
+func TestDoRequestWithClientOpenCodeDoesNotInheritWholeResponseClientTimeout(t *testing.T) {
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(rootconstant.GetChannelTypeName(channelType), func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			upstreamRequest, err := http.NewRequestWithContext(
+				ctx.Request.Context(),
+				http.MethodPost,
+				"http://upstream.invalid/v1/messages",
+				strings.NewReader("{}"),
+			)
+			require.NoError(t, err)
+
+			client := &http.Client{
+				Timeout: 10 * time.Millisecond,
+				Transport: roundTripTestFunc(func(request *http.Request) (*http.Response, error) {
+					select {
+					case <-time.After(30 * time.Millisecond):
+						return &http.Response{
+							StatusCode: http.StatusOK,
+							Header:     make(http.Header),
+							Body:       http.NoBody,
+							Request:    request,
+						}, nil
+					case <-request.Context().Done():
+						return nil, request.Context().Err()
+					}
+				}),
+			}
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType}}
+
+			response, err := doRequestWithClient(ctx, upstreamRequest, info, client)
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			require.NoError(t, response.Body.Close())
+		})
+	}
+}
+
+func TestDoRequestWithClientClassifiesOpenCodeHeaderTimeout(t *testing.T) {
+	oldDisableEnabled := rootcommon.AutomaticDisableChannelEnabled
+	oldDisableRanges := append([]operation_setting.StatusCodeRange(nil), operation_setting.AutomaticDisableStatusCodeRanges...)
+	rootcommon.AutomaticDisableChannelEnabled = true
+	operation_setting.AutomaticDisableStatusCodeRanges = []operation_setting.StatusCodeRange{{
+		Start: http.StatusGatewayTimeout,
+		End:   http.StatusGatewayTimeout,
+	}}
+	t.Cleanup(func() {
+		rootcommon.AutomaticDisableChannelEnabled = oldDisableEnabled
+		operation_setting.AutomaticDisableStatusCodeRanges = oldDisableRanges
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	upstreamRequest, err := http.NewRequestWithContext(
+		ctx.Request.Context(),
+		http.MethodPost,
+		"http://upstream.invalid/v1/messages",
+		strings.NewReader("{}"),
+	)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType: rootconstant.ChannelTypeOpenCodeAPIKey,
+	}}
+	client := &http.Client{Transport: roundTripTestFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errOpenCodeResponseHeaderTimeout
+	})}
+
+	response, err := doRequestWithClient(ctx, upstreamRequest, info, client)
+	require.Nil(t, response)
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, types.ErrorOriginLocalDeadline, apiErr.Provenance().Origin)
+	assert.Equal(t, "response_header_timeout", apiErr.Provenance().Subtype)
+	assert.Zero(t, apiErr.Provenance().RawStatusCode)
+	assert.True(t, types.IsSkipRetryError(apiErr))
+	assert.False(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+	_, hasRawStatus := service.OpenCodeGoUpstreamRelayStatusCode(apiErr)
+	assert.False(t, hasRawStatus)
+	assert.False(t, service.ShouldRetryOpenCodeGoRelayError(rootconstant.ChannelTypeOpenCodeGo, apiErr))
+	assert.False(t, service.ShouldDisableChannel(apiErr))
+}
+
+func TestPreflightOpenCodeRequestTransportRejectsUnclassifiedMetadata(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		mutate     func(*http.Request)
+		wantStatus int
+		wantRule   string
+	}{
+		{
+			name: "query",
+			mutate: func(request *http.Request) {
+				request.URL.RawQuery = "unknown=value&unknown=second"
+			},
+			wantStatus: http.StatusBadRequest,
+			wantRule:   "query_parameters",
+		},
+		{
+			name: "declared trailer",
+			mutate: func(request *http.Request) {
+				request.Header.Set("Trailer", "X-Late-Metadata")
+			},
+			wantStatus: http.StatusBadRequest,
+			wantRule:   "request_trailers",
+		},
+		{
+			name: "populated trailer",
+			mutate: func(request *http.Request) {
+				request.Trailer = http.Header{"X-Late-Metadata": []string{"value"}}
+			},
+			wantStatus: http.StatusBadRequest,
+			wantRule:   "request_trailers",
+		},
+		{
+			name: "undecoded encoding",
+			mutate: func(request *http.Request) {
+				request.Header.Set("Content-Encoding", "GZIP")
+			},
+			wantStatus: http.StatusUnsupportedMediaType,
+			wantRule:   "content_encoding",
+		},
+	}
+
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
+	} {
+		for _, test := range tests {
+			t.Run(rootconstant.GetChannelTypeName(channelType)+"/"+test.name, func(t *testing.T) {
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("{}"))
+				test.mutate(ctx.Request)
+				info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType}}
+
+				apiErr := PreflightOpenCodeRequestTransport(info, ctx)
+				require.NotNil(t, apiErr)
+				assert.Equal(t, test.wantStatus, apiErr.StatusCode)
+				assert.Equal(t, types.ErrorOriginLocalValidation, apiErr.Provenance().Origin)
+				assert.Equal(t, test.wantRule, apiErr.Provenance().Subtype)
+				assert.True(t, types.IsSkipRetryError(apiErr))
+			})
+		}
+	}
+}
+
+func TestPreflightOpenCodeRequestTransportHasReachableValidControl(t *testing.T) {
+	t.Parallel()
+
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(rootconstant.GetChannelTypeName(channelType), func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+			ctx.Request.Header.Set("Content-Encoding", "identity")
+			ctx.Request.Header.Set("Anthropic-Version", "2023-06-01")
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelType: channelType,
+				HeadersOverride: map[string]any{
+					"*":                  "",
+					"X-Upstream-Feature": "enabled",
+				},
+			}}
+
+			assert.Nil(t, PreflightOpenCodeRequestTransport(info, ctx))
+		})
+	}
+}
+
+func TestPreflightOpenCodeRequestTransportKeepsConfigAndClientOriginsDistinct(t *testing.T) {
+	t.Parallel()
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType: rootconstant.ChannelTypeOpenCodeAPIKey,
+		HeadersOverride: map[string]any{
+			"Authorization": "Bearer operator-value",
+		},
+	}}
+
+	apiErr := PreflightOpenCodeRequestTransport(info, ctx)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, types.ErrorOriginGatewayConfig, apiErr.Provenance().Origin)
+	assert.Equal(t, "header_override", apiErr.Provenance().Subtype)
+	assert.True(t, types.IsSkipRetryError(apiErr))
+}
+
+func TestPreflightOpenCodeRequestTransportDoesNotChangeOtherChannels(t *testing.T) {
+	t.Parallel()
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions?provider=value", strings.NewReader("{}"))
+	ctx.Request.Header.Set("Content-Encoding", "custom")
+	ctx.Request.Trailer = http.Header{"X-Late": []string{"value"}}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: rootconstant.ChannelTypeOpenAI}}
+
+	assert.Nil(t, PreflightOpenCodeRequestTransport(info, ctx))
+}
+
+func TestPreflightOpenCodeRequestTransportUsesSelectedChannelContextBeforeRelayInit(t *testing.T) {
+	t.Parallel()
+
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(rootconstant.GetChannelTypeName(channelType), func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(
+				http.MethodPost,
+				"/v1/chat/completions?unclassified=value",
+				strings.NewReader("{}"),
+			)
+			rootcommon.SetContextKey(ctx, rootconstant.ContextKeyChannelType, channelType)
+			rootcommon.SetContextKey(ctx, rootconstant.ContextKeyChannelHeaderOverride, map[string]any{
+				"Authorization": "Bearer operator-value",
+			})
+
+			// This is the production pre-billing shape: the distributor context is
+			// populated, while attempt-local ChannelMeta is still nil.
+			info := &relaycommon.RelayInfo{}
+			apiErr := PreflightOpenCodeRequestTransport(info, ctx)
+			require.NotNil(t, apiErr)
+			assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+			assert.Equal(t, types.ErrorOriginLocalValidation, apiErr.Provenance().Origin)
+			assert.Equal(t, "query_parameters", apiErr.Provenance().Subtype)
+			assert.Nil(t, info.ChannelMeta, "preflight must not mutate request-global relay state")
+		})
+	}
+}
+
+func TestPreflightOpenCodeRequestTransportValidatesContextHeaderOverrideBeforeRelayInit(t *testing.T) {
+	t.Parallel()
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("{}"))
+	rootcommon.SetContextKey(ctx, rootconstant.ContextKeyChannelType, rootconstant.ChannelTypeOpenCodeAPIKey)
+	rootcommon.SetContextKey(ctx, rootconstant.ContextKeyChannelHeaderOverride, map[string]any{
+		"Authorization": "Bearer operator-value",
+	})
+
+	apiErr := PreflightOpenCodeRequestTransport(&relaycommon.RelayInfo{}, ctx)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, types.ErrorOriginGatewayConfig, apiErr.Provenance().Origin)
+	assert.Equal(t, "header_override", apiErr.Provenance().Subtype)
 }
 
 func TestProcessHeaderOverride_RuntimeOverrideIsFinalHeaderMap(t *testing.T) {

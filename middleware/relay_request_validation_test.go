@@ -15,9 +15,147 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPreValidateRelayRequestScansUnknownRawStringsBeforeNext(t *testing.T) {
+	var logBuffer bytes.Buffer
+	common.LogWriterMu.Lock()
+	previousErrorWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logBuffer
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = previousErrorWriter
+		common.LogWriterMu.Unlock()
+	})
+
+	previousCheckSensitive := setting.CheckSensitiveEnabled
+	previousCheckPrompt := setting.CheckSensitiveOnPromptEnabled
+	previousWords := append([]string(nil), setting.SensitiveWords...)
+	setting.CheckSensitiveEnabled = true
+	setting.CheckSensitiveOnPromptEnabled = true
+	setting.SensitiveWords = []string{"raw-only-sensitive-value"}
+	t.Cleanup(func() {
+		setting.CheckSensitiveEnabled = previousCheckSensitive
+		setting.CheckSensitiveOnPromptEnabled = previousCheckPrompt
+		setting.SensitiveWords = previousWords
+	})
+
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "messages unknown extension",
+			path: "/v1/messages",
+			body: `{"model":"test-model","messages":[{"role":"user","content":"hello"}],"provider_extension":{"opaque":"raw-only-sensitive-value"}}`,
+		},
+		{
+			name: "chat unknown extension",
+			path: "/v1/chat/completions",
+			body: `{"model":"test-model","messages":[{"role":"user","content":"hello"}],"provider_extension":{"opaque":"raw-only-sensitive-value"}}`,
+		},
+		{
+			name: "responses unknown extension",
+			path: "/v1/responses",
+			body: `{"model":"test-model","input":"hello","provider_extension":{"opaque":"raw-only-sensitive-value"}}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			nextCalled := false
+			engine := gin.New()
+			engine.Use(RequestId(), BodyStorageCleanup(), PreValidateRelayRequest())
+			engine.POST(test.path, func(c *gin.Context) {
+				nextCalled = true
+				c.Status(http.StatusNoContent)
+			})
+
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, test.path, bytes.NewBufferString(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			engine.ServeHTTP(recorder, request)
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+			require.False(t, nextCalled)
+			if test.path == "/v1/messages" {
+				require.Contains(t, recorder.Body.String(), `"type":"invalid_request_error"`)
+			} else {
+				require.Contains(t, recorder.Body.String(), string(types.ErrorCodeSensitiveWordsDetected))
+			}
+			require.NotContains(t, recorder.Body.String(), "raw-only-sensitive-value")
+			require.NotContains(t, recorder.Body.String(), "provider_extension")
+		})
+	}
+
+	require.Contains(t, logBuffer.String(), "rule_id="+RelayRawSensitiveScanRuleID)
+	require.Contains(t, logBuffer.String(), "match_count=1")
+	require.NotContains(t, logBuffer.String(), "raw-only-sensitive-value")
+	require.NotContains(t, logBuffer.String(), "provider_extension")
+}
+
+func TestPreValidateRelayRequestMarksCompletedRawSensitiveScan(t *testing.T) {
+	previousCheckSensitive := setting.CheckSensitiveEnabled
+	previousCheckPrompt := setting.CheckSensitiveOnPromptEnabled
+	setting.CheckSensitiveEnabled = true
+	setting.CheckSensitiveOnPromptEnabled = true
+	t.Cleanup(func() {
+		setting.CheckSensitiveEnabled = previousCheckSensitive
+		setting.CheckSensitiveOnPromptEnabled = previousCheckPrompt
+	})
+
+	engine := gin.New()
+	engine.Use(BodyStorageCleanup(), PreValidateRelayRequest())
+	engine.POST("/v1/messages", func(c *gin.Context) {
+		require.True(t, ValidatedRelayRequestSensitiveScanComplete(c))
+		c.Status(http.StatusNoContent)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/messages",
+		bytes.NewBufferString(`{"model":"test-model","messages":[{"role":"user","content":"hello"}]}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+}
+
+func TestRenderRelaySensitiveScanErrorUsesOnlyLocalMessages(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantText   string
+	}{
+		{name: "cancel", err: context.Canceled, wantStatus: 499, wantText: "request was canceled"},
+		{name: "deadline", err: context.DeadlineExceeded, wantStatus: http.StatusGatewayTimeout, wantText: "request validation timed out"},
+		{name: "storage", err: errors.New("private storage path and customer value"), wantStatus: http.StatusInternalServerError, wantText: "request security validation failed"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			c.Set(common.RequestIdKey, "local-scan-request-id")
+
+			renderRelaySensitiveScanError(c, types.RelayFormatOpenAI, test.err)
+
+			require.Equal(t, test.wantStatus, recorder.Code)
+			require.Contains(t, recorder.Body.String(), test.wantText)
+			require.NotContains(t, recorder.Body.String(), "private storage path")
+			require.NotContains(t, recorder.Body.String(), "customer value")
+		})
+	}
+}
 
 func TestPreValidateRelayRequestRendersProtocolSpecificErrorsBeforeNext(t *testing.T) {
 	gin.SetMode(gin.TestMode)

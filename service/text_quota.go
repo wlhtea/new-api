@@ -20,15 +20,12 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 )
 
 var scheduleTextRelaySuccessSample = func(relayInfo *relaycommon.RelayInfo, completionTokens int) {
-	gopool.Go(func() {
-		perfmetrics.RecordRelaySample(relayInfo, true, int64(completionTokens))
-	})
+	perfmetrics.ScheduleRelaySample(relayInfo, true, int64(completionTokens))
 }
 
 // ToolSurchargeItem is one billable tool-call line for consume logs.

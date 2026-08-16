@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestWrapAsViolationFeeGrokCSAMPreservesOpenCodeGoUpstreamOrigin(t *testing.T) {
+func TestWrapAsViolationFeeGrokCSAMRejectsFreeTextEvidence(t *testing.T) {
 	message := "provider rejected content: " + CSAMViolationMarker
 	upstreamErr := types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponse, http.StatusBadRequest)
 	MarkOpenCodeGoUpstreamRelayError(upstreamErr)
@@ -21,9 +21,9 @@ func TestWrapAsViolationFeeGrokCSAMPreservesOpenCodeGoUpstreamOrigin(t *testing.
 	require.NotNil(t, normalized)
 	assert.Equal(t, message, normalized.Error())
 	assert.True(t, IsOpenCodeGoUpstreamRelayError(normalized))
-	assert.Equal(t, types.ErrorCodeViolationFeeGrokCSAM, normalized.GetErrorCode())
-	assert.True(t, types.IsSkipRetryError(normalized))
-	assert.Equal(t, http.StatusTooManyRequests, PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, normalized).StatusCode)
+	assert.Equal(t, types.ErrorCodeBadResponse, normalized.GetErrorCode())
+	assert.False(t, types.IsSkipRetryError(normalized))
+	assert.Equal(t, http.StatusBadRequest, PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, normalized).StatusCode)
 	assert.Equal(t, message, upstreamErr.Error())
 }
 
@@ -33,18 +33,10 @@ func TestNormalizeViolationFeeErrorPreservesOpenCodeGoUpstreamOrigin(t *testing.
 		err  *types.NewAPIError
 	}{
 		{
-			name: "CSAM marker",
-			err: types.NewOpenAIError(
-				errors.New("provider rejected content: "+CSAMViolationMarker),
-				types.ErrorCodeBadResponse,
-				http.StatusBadRequest,
-			),
-		},
-		{
-			name: "existing violation fee code",
+			name: "trusted stable violation fee code",
 			err: types.NewOpenAIError(
 				errors.New("upstream policy rejection"),
-				types.ErrorCode(ViolationFeeCodePrefix+"provider_policy"),
+				types.ErrorCodeViolationFeeGrokCSAM,
 				http.StatusBadRequest,
 			),
 		},
@@ -61,7 +53,7 @@ func TestNormalizeViolationFeeErrorPreservesOpenCodeGoUpstreamOrigin(t *testing.
 			assert.Equal(t, originalMessage, normalized.Error())
 			assert.True(t, IsOpenCodeGoUpstreamRelayError(normalized))
 			assert.True(t, types.IsSkipRetryError(normalized))
-			assert.Equal(t, http.StatusTooManyRequests, PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, normalized).StatusCode)
+			assert.Equal(t, http.StatusBadRequest, PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, normalized).StatusCode)
 			assert.Equal(t, originalMessage, test.err.Error())
 		})
 	}
@@ -83,5 +75,27 @@ func TestNormalizeViolationFeeErrorPreservesRawOpenCodeGoUpstreamStatus(t *testi
 	require.True(t, ok)
 	assert.Equal(t, http.StatusServiceUnavailable, statusCode)
 	assert.Equal(t, http.StatusBadRequest, normalized.StatusCode)
-	assert.False(t, ShouldRetryOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, normalized))
+	assert.True(t, ShouldRetryOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, normalized))
+}
+
+func TestViolationFeeRequiresTrustedUpstreamOriginAndExactCode(t *testing.T) {
+	localStableCode := types.NewOpenAIError(
+		errors.New("local validation"),
+		types.ErrorCodeViolationFeeGrokCSAM,
+		http.StatusBadRequest,
+	)
+	upstreamTextOnly := MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
+		errors.New("provider rejected content: "+CSAMViolationMarker),
+		types.ErrorCodeBadResponse,
+		http.StatusBadRequest,
+	))
+	trusted := MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
+		errors.New("upstream policy rejection"),
+		types.ErrorCodeViolationFeeGrokCSAM,
+		http.StatusBadRequest,
+	))
+
+	assert.False(t, shouldChargeViolationFee(localStableCode))
+	assert.False(t, shouldChargeViolationFee(upstreamTextOnly))
+	assert.True(t, shouldChargeViolationFee(trusted))
 }

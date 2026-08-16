@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	rootcommon "github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
@@ -18,6 +19,20 @@ import (
 func TestOpenCodeChannelTypesSupportStreaming(t *testing.T) {
 	assert.True(t, streamSupportedChannels[constant.ChannelTypeOpenCodeGo])
 	assert.True(t, streamSupportedChannels[constant.ChannelTypeOpenCodeAPIKey])
+}
+
+func TestResolveSelectionGroupUsesConcreteAutoGroupBeforeRequestGroup(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	rootcommon.SetContextKey(c, constant.ContextKeyUsingGroup, "auto")
+	rootcommon.SetContextKey(c, constant.ContextKeyTokenGroup, "auto")
+	rootcommon.SetContextKey(c, constant.ContextKeyAutoGroup, "group-b")
+	info := &RelayInfo{UsingGroup: "auto", TokenGroup: "auto"}
+
+	assert.Equal(t, "group-b", ResolveSelectionGroup(c, info))
+
+	rootcommon.SetContextKey(c, constant.ContextKeyAutoGroup, "")
+	info.UsingGroup = "default"
+	assert.Equal(t, "default", ResolveSelectionGroup(c, info))
 }
 
 func TestOpenCodeStreamReadyForFinalization(t *testing.T) {
@@ -98,6 +113,79 @@ func TestRestoreUnwrittenStreamAttemptRestoresResponseState(t *testing.T) {
 	assert.Equal(t, 2, info.ClaudeConvertInfo.Index)
 	assert.False(t, info.ClaudeConvertInfo.Done)
 	assert.Equal(t, 1, info.ResponsesUsageInfo.BuiltInTools["web_search"].CallCount)
+}
+
+func TestRestoreRelayAttemptRebuildsAllAttemptLocalState(t *testing.T) {
+	start := time.Now()
+	info := &RelayInfo{
+		RelayMode:              2,
+		RequestURLPath:         "/v1/chat/completions",
+		IsStream:               false,
+		StartTime:              start,
+		FirstResponseTime:      start.Add(-time.Second),
+		isFirstResponse:        true,
+		ShouldIncludeUsage:     false,
+		ReasoningEffort:        "high",
+		RequestConversionChain: []types.RelayFormat{types.RelayFormatOpenAI},
+		RuntimeHeadersOverride: map[string]interface{}{
+			"x-safe": "baseline",
+			"nested": map[string]interface{}{"value": "baseline"},
+		},
+		UseRuntimeHeadersOverride: true,
+		ParamOverrideAudit:        []string{"baseline-audit"},
+		ResponsesUsageInfo: &ResponsesUsageInfo{BuiltInTools: map[string]*BuildInToolInfo{
+			"web_search": {ToolName: "web_search", CallCount: 0},
+		}},
+	}
+	baseline := info.SnapshotRelayAttempt()
+
+	info.RelayMode = 9
+	info.RequestURLPath = "/v1/responses"
+	info.IsStream = true
+	info.FirstResponseTime = start.Add(time.Second)
+	info.isFirstResponse = false
+	info.ShouldIncludeUsage = true
+	info.DisablePing = true
+	info.ReasoningEffort = "low"
+	info.ChannelMeta = &ChannelMeta{
+		ChannelType:       constant.ChannelTypeOpenCodeAPIKey,
+		ChannelId:         99,
+		UpstreamModelName: "attempt-model",
+		ParamOverride:     map[string]interface{}{"attempt": true},
+	}
+	info.RequestConversionChain = []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses}
+	info.FinalRequestRelayFormat = types.RelayFormatOpenAIResponses
+	info.RuntimeHeadersOverride["x-safe"] = "dirty"
+	info.RuntimeHeadersOverride["nested"].(map[string]interface{})["value"] = "dirty"
+	info.UseRuntimeHeadersOverride = false
+	info.ParamOverrideAudit[0] = "dirty-audit"
+	info.UpstreamRequestBodySize = 1234
+	info.StreamStatus = NewStreamStatus()
+	info.StreamStatus.RecordError("attempt error")
+	info.ReceivedResponseCount = 7
+	info.ResponsesUsageInfo.BuiltInTools["web_search"].CallCount = 4
+
+	info.RestoreRelayAttempt(baseline)
+
+	assert.Equal(t, 2, info.RelayMode)
+	assert.Equal(t, "/v1/chat/completions", info.RequestURLPath)
+	assert.False(t, info.IsStream)
+	assert.Equal(t, start.Add(-time.Second), info.FirstResponseTime)
+	assert.True(t, info.isFirstResponse)
+	assert.False(t, info.ShouldIncludeUsage)
+	assert.False(t, info.DisablePing)
+	assert.Equal(t, "high", info.ReasoningEffort)
+	assert.Nil(t, info.ChannelMeta)
+	assert.Equal(t, []types.RelayFormat{types.RelayFormatOpenAI}, info.RequestConversionChain)
+	assert.Empty(t, info.FinalRequestRelayFormat)
+	assert.Equal(t, "baseline", info.RuntimeHeadersOverride["x-safe"])
+	assert.Equal(t, "baseline", info.RuntimeHeadersOverride["nested"].(map[string]interface{})["value"])
+	assert.True(t, info.UseRuntimeHeadersOverride)
+	assert.Equal(t, []string{"baseline-audit"}, info.ParamOverrideAudit)
+	assert.Zero(t, info.UpstreamRequestBodySize)
+	assert.Nil(t, info.StreamStatus)
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.Zero(t, info.ResponsesUsageInfo.BuiltInTools["web_search"].CallCount)
 }
 
 func TestRelayInfoGetFinalRequestRelayFormatPrefersExplicitFinal(t *testing.T) {

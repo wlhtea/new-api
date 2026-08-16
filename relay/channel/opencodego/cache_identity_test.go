@@ -38,6 +38,10 @@ func TestCacheIdentityPreservesExplicitShortValues(t *testing.T) {
 }
 
 func TestCacheIdentityHashesLongAndUserDerivedValues(t *testing.T) {
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "test-cache-identity-secret"
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
 	infoA := &relaycommon.RelayInfo{
 		OriginModelName: "public-model",
 		UserId:          17,
@@ -54,21 +58,30 @@ func TestCacheIdentityHashesLongAndUserDerivedValues(t *testing.T) {
 	identity := cacheIdentityForRequest(newCacheIdentityContext(longValue), infoA, nil)
 
 	assert.True(t, strings.HasPrefix(identity, cacheIdentityPrefix))
-	assert.LessOrEqual(t, len(identity), cacheIdentityMaxLength)
-	assert.NotContains(t, identity, "long-session")
+	assert.Len(t, identity, 26)
+	assert.NotEqual(t, longValue, identity)
+	assert.NotContains(t, identity, longValue)
 	assert.Equal(t, identity, cacheIdentityForRequest(newCacheIdentityContext(longValue), infoB, nil))
 
 	metadata, err := json.Marshal(dto.ClaudeMetadata{UserId: "customer-plain-id"})
 	require.NoError(t, err)
 	claudeIdentity := cacheIdentityForRequest(newCacheIdentityContext(""), infoA, &dto.ClaudeRequest{Metadata: metadata})
 	assert.True(t, strings.HasPrefix(claudeIdentity, cacheIdentityPrefix))
+	assert.Len(t, claudeIdentity, 26)
+	assert.NotEqual(t, "customer-plain-id", claudeIdentity)
 	assert.NotContains(t, claudeIdentity, "customer-plain-id")
+	assert.Equal(t, claudeIdentity, cacheIdentityForRequest(newCacheIdentityContext(""), infoB, &dto.ClaudeRequest{Metadata: metadata}))
+	assert.NotEqual(t, claudeIdentity, hashCacheIdentity("fallback", "customer-plain-id"))
 
 	fallbackA := cacheIdentityForRequest(newCacheIdentityContext(""), infoA, nil)
 	fallbackB := cacheIdentityForRequest(newCacheIdentityContext(""), infoB, nil)
+	fallbackSeed := "17\x0029\x00public-model"
 	assert.Equal(t, fallbackA, fallbackB)
-	assert.NotContains(t, fallbackA, "17")
-	assert.NotContains(t, fallbackA, "29")
+	assert.True(t, strings.HasPrefix(fallbackA, cacheIdentityPrefix))
+	assert.Len(t, fallbackA, 26)
+	assert.NotEqual(t, fallbackSeed, fallbackA)
+	assert.NotContains(t, fallbackA, fallbackSeed)
+	assert.NotEqual(t, fallbackA, hashCacheIdentity("messages", fallbackSeed))
 }
 
 func TestClaudeCodeSessionIdentityDrivesCacheAndAffinity(t *testing.T) {

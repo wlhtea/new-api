@@ -8,11 +8,13 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -62,6 +64,106 @@ func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
 	require.Equal(t, "stream", info.TieredBillingSnapshot.EstimatedTier)
 	require.Equal(t, billing_setting.BillingModeTieredExpr, info.TieredBillingSnapshot.BillingMode)
 	require.Equal(t, common.QuotaPerUnit, info.TieredBillingSnapshot.QuotaPerUnit)
+}
+
+func TestModelPriceHelperForCandidatesUsesMaximumFinalizedTieredView(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		saved[key] = value
+		return nil
+	}))
+	t.Cleanup(func() { require.NoError(t, config.GlobalConfig.LoadFromDB(saved)) })
+
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode":    `{"candidate-tiered-model":"tiered_expr"}`,
+		"billing_setting.billing_expr":    `{"candidate-tiered-model":"param(\"service_tier\") == \"fast\" ? tier(\"fast\", p * 4 + c * 20) : tier(\"normal\", p * 2 + c * 10)"}`,
+		"group_ratio_setting.group_ratio": `{"default":1,"premium":2}`,
+	}))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "candidate-tiered-model",
+		UserGroup:       "default",
+		UsingGroup:      "default",
+		RequestHeaders:  map[string]string{"Content-Type": "application/json"},
+	}
+
+	price, err := ModelPriceHelperForCandidates(
+		ctx,
+		info,
+		1_000,
+		&types.TokenCountMeta{MaxTokens: 100},
+		[]BillingCandidateView{
+			{
+				SelectionGroup:        "default",
+				Body:                  []byte(`{"service_tier":"normal"}`),
+				EstimatedPromptTokens: 1_200,
+			},
+			{
+				SelectionGroup:            "premium",
+				Body:                      []byte(`{"service_tier":"fast"}`),
+				EstimatedPromptTokens:     1_500,
+				EstimatedCompletionTokens: 200,
+			},
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 10_000, price.QuotaToPreConsume)
+	require.NotNil(t, info.TieredBillingSnapshot)
+	assert.Equal(t, "fast", info.TieredBillingSnapshot.EstimatedTier)
+	assert.Equal(t, 2.0, info.TieredBillingSnapshot.GroupRatio)
+	assert.Equal(t, 1_500, info.TieredBillingSnapshot.EstimatedPromptTokens)
+	assert.Equal(t, 200, info.TieredBillingSnapshot.EstimatedCompletionTokens)
+	require.NotNil(t, info.BillingRequestInput)
+	assert.JSONEq(t, `{"service_tier":"fast"}`, string(info.BillingRequestInput.Body))
+}
+
+func TestModelPriceHelperForCandidatesUsesMaximumNonTieredGroup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	savedRatios := ratio_setting.ModelRatio2JSONString()
+	savedGroups := ratio_setting.GroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(savedGroups))
+	})
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"candidate-ratio-model":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"premium":2}`))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	baseInfo := &relaycommon.RelayInfo{
+		OriginModelName: "candidate-ratio-model",
+		UserGroup:       "default",
+		UsingGroup:      "default",
+		UserSetting:     dto.UserSetting{AcceptUnsetRatioModel: true},
+	}
+	base, err := modelPriceHelperWithGroupRatio(
+		ctx,
+		baseInfo,
+		1_000,
+		&types.TokenCountMeta{},
+		ResolveGroupRatioInfo("default", "default"),
+	)
+	require.NoError(t, err)
+
+	info := *baseInfo
+	price, err := ModelPriceHelperForCandidates(
+		ctx,
+		&info,
+		1_000,
+		&types.TokenCountMeta{},
+		[]BillingCandidateView{
+			{SelectionGroup: "default", Body: []byte(`{}`)},
+			{SelectionGroup: "premium", Body: []byte(`{}`), EstimatedPromptTokens: 2_000},
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, base.QuotaToPreConsume*4, price.QuotaToPreConsume)
+	assert.Equal(t, 2.0, price.GroupRatioInfo.GroupRatio)
 }
 
 func TestModelPriceHelperTieredPreConsumeMaxTokensFallback(t *testing.T) {

@@ -35,3 +35,21 @@ func TestNewReplayableBodyReaderKeepsStorageLifecycleWithCaller(t *testing.T) {
 	_, err = body.NewReader()
 	require.ErrorIs(t, err, ErrStorageClosed)
 }
+
+func TestMemoryBodyStorageDoesNotExposeMutableBackingData(t *testing.T) {
+	input := []byte(`{"model":"immutable"}`)
+	storage, err := CreateBodyStorage(input)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = storage.Close() })
+	require.False(t, storage.IsDisk())
+
+	input[10] = 'X'
+	first, err := storage.Bytes()
+	require.NoError(t, err)
+	assert.Equal(t, `{"model":"immutable"}`, string(first))
+
+	first[10] = 'Y'
+	second, err := storage.Bytes()
+	require.NoError(t, err)
+	assert.Equal(t, `{"model":"immutable"}`, string(second))
+}

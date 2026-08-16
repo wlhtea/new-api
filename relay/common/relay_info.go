@@ -68,9 +68,29 @@ type UnwrittenStreamAttemptSnapshot struct {
 	responsesUsageInfo             *ResponsesUsageInfo
 }
 
+// RelayAttemptSnapshot contains only state that a physical relay attempt may
+// mutate. Request identity, authentication, billing, affinity input, and the
+// immutable typed request remain owned by RelayInfo itself.
+type RelayAttemptSnapshot struct {
+	stream                    UnwrittenStreamAttemptSnapshot
+	relayMode                 int
+	requestURLPath            string
+	shouldIncludeUsage        bool
+	disablePing               bool
+	reasoningEffort           string
+	channelMeta               *ChannelMeta
+	requestConversionChain    []types.RelayFormat
+	finalRequestRelayFormat   types.RelayFormat
+	runtimeHeadersOverride    map[string]interface{}
+	useRuntimeHeadersOverride bool
+	paramOverrideAudit        []string
+	upstreamRequestBodySize   int64
+}
+
 type ChannelMeta struct {
 	ChannelType          int
 	ChannelId            int
+	SelectionGroup       string
 	ChannelIsMultiKey    bool
 	ChannelMultiKeyIndex int
 	ChannelBaseUrl       string
@@ -217,6 +237,7 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	channelMeta := &ChannelMeta{
 		ChannelType:          channelType,
 		ChannelId:            common.GetContextKeyInt(c, constant.ContextKeyChannelId),
+		SelectionGroup:       ResolveSelectionGroup(c, info),
 		ChannelIsMultiKey:    common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey),
 		ChannelMultiKeyIndex: common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex),
 		ChannelBaseUrl:       common.GetContextKeyString(c, constant.ContextKeyChannelBaseUrl),
@@ -269,6 +290,35 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	if info.Request != nil {
 		info.Request.SetModelName(info.OriginModelName)
 	}
+}
+
+// ResolveSelectionGroup returns the concrete group that selected the current
+// channel. Auto-group requests must use the resolved group, because one channel
+// row may be eligible in more than one group and each selection is a distinct
+// preflight candidate.
+func ResolveSelectionGroup(c *gin.Context, info *RelayInfo) string {
+	if c != nil {
+		if group := strings.TrimSpace(common.GetContextKeyString(c, constant.ContextKeyAutoGroup)); group != "" {
+			return group
+		}
+	}
+	if info != nil {
+		if group := strings.TrimSpace(info.UsingGroup); group != "" && group != "auto" {
+			return group
+		}
+		if group := strings.TrimSpace(info.TokenGroup); group != "" && group != "auto" {
+			return group
+		}
+	}
+	if c != nil {
+		if group := strings.TrimSpace(common.GetContextKeyString(c, constant.ContextKeyUsingGroup)); group != "" && group != "auto" {
+			return group
+		}
+		if group := strings.TrimSpace(common.GetContextKeyString(c, constant.ContextKeyTokenGroup)); group != "" && group != "auto" {
+			return group
+		}
+	}
+	return ""
 }
 
 func (info *RelayInfo) ToString() string {
@@ -928,6 +978,90 @@ func (info *RelayInfo) RestoreUnwrittenStreamAttempt(snapshot UnwrittenStreamAtt
 	info.ThinkingContentInfo = snapshot.thinkingContentInfo
 	info.ClaudeConvertInfo = cloneClaudeConvertInfo(snapshot.claudeConvertInfo)
 	info.ResponsesUsageInfo = cloneResponsesUsageInfo(snapshot.responsesUsageInfo)
+}
+
+// SnapshotRelayAttempt captures the clean request baseline before channel
+// selection. Generic retries restore this baseline before selecting and
+// materializing a new candidate.
+func (info *RelayInfo) SnapshotRelayAttempt() RelayAttemptSnapshot {
+	if info == nil {
+		return RelayAttemptSnapshot{}
+	}
+	return RelayAttemptSnapshot{
+		stream:                    info.SnapshotUnwrittenStreamAttempt(),
+		relayMode:                 info.RelayMode,
+		requestURLPath:            info.RequestURLPath,
+		shouldIncludeUsage:        info.ShouldIncludeUsage,
+		disablePing:               info.DisablePing,
+		reasoningEffort:           info.ReasoningEffort,
+		channelMeta:               cloneChannelMeta(info.ChannelMeta),
+		requestConversionChain:    append([]types.RelayFormat(nil), info.RequestConversionChain...),
+		finalRequestRelayFormat:   info.FinalRequestRelayFormat,
+		runtimeHeadersOverride:    cloneRelayAttemptMap(info.RuntimeHeadersOverride),
+		useRuntimeHeadersOverride: info.UseRuntimeHeadersOverride,
+		paramOverrideAudit:        append([]string(nil), info.ParamOverrideAudit...),
+		upstreamRequestBodySize:   info.UpstreamRequestBodySize,
+	}
+}
+
+// RestoreRelayAttempt discards every response/conversion/channel mutation from
+// a failed physical attempt. It must only be called before downstream output.
+func (info *RelayInfo) RestoreRelayAttempt(snapshot RelayAttemptSnapshot) {
+	if info == nil {
+		return
+	}
+	info.RestoreUnwrittenStreamAttempt(snapshot.stream)
+	info.RelayMode = snapshot.relayMode
+	info.RequestURLPath = snapshot.requestURLPath
+	info.ShouldIncludeUsage = snapshot.shouldIncludeUsage
+	info.DisablePing = snapshot.disablePing
+	info.ReasoningEffort = snapshot.reasoningEffort
+	info.ChannelMeta = cloneChannelMeta(snapshot.channelMeta)
+	info.RequestConversionChain = append([]types.RelayFormat(nil), snapshot.requestConversionChain...)
+	info.FinalRequestRelayFormat = snapshot.finalRequestRelayFormat
+	info.RuntimeHeadersOverride = cloneRelayAttemptMap(snapshot.runtimeHeadersOverride)
+	info.UseRuntimeHeadersOverride = snapshot.useRuntimeHeadersOverride
+	info.ParamOverrideAudit = append([]string(nil), snapshot.paramOverrideAudit...)
+	info.UpstreamRequestBodySize = snapshot.upstreamRequestBodySize
+	info.convOptions = nil
+}
+
+func cloneChannelMeta(source *ChannelMeta) *ChannelMeta {
+	if source == nil {
+		return nil
+	}
+	clone := *source
+	clone.ParamOverride = cloneRelayAttemptMap(source.ParamOverride)
+	clone.HeadersOverride = cloneRelayAttemptMap(source.HeadersOverride)
+	return &clone
+}
+
+func cloneRelayAttemptMap(source map[string]interface{}) map[string]interface{} {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]interface{}, len(source))
+	for key, value := range source {
+		clone[key] = cloneRelayAttemptValue(value)
+	}
+	return clone
+}
+
+func cloneRelayAttemptValue(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		return cloneRelayAttemptMap(typed)
+	case []interface{}:
+		clone := make([]interface{}, len(typed))
+		for index, item := range typed {
+			clone[index] = cloneRelayAttemptValue(item)
+		}
+		return clone
+	case []string:
+		return append([]string(nil), typed...)
+	default:
+		return typed
+	}
 }
 
 func cloneClaudeConvertInfo(source *ClaudeConvertInfo) *ClaudeConvertInfo {

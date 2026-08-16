@@ -560,6 +560,53 @@ func tryParseOperations(paramOverride map[string]interface{}) ([]ParamOperation,
 	return operations, true
 }
 
+// ValidateParamOverrideRequestStable rejects conditions whose result can
+// change between pre-billing candidate planning and a later physical retry.
+// OpenCode candidate plans are immutable for the request, so attempt-local
+// retry state cannot participate in the body or runtime-header finalizer.
+func ValidateParamOverrideRequestStable(paramOverride map[string]interface{}) error {
+	if len(paramOverride) == 0 {
+		return nil
+	}
+	operations, ok := tryParseOperations(paramOverride)
+	if !ok {
+		// Without a valid operations array the override follows the legacy,
+		// unconditional map path and has no condition context.
+		return nil
+	}
+	for _, operation := range operations {
+		if paramOverrideConditionsUseAttemptState(operation.Conditions) {
+			return errors.New("parameter override depends on attempt-local retry state")
+		}
+		if !strings.EqualFold(strings.TrimSpace(operation.Mode), "prune_objects") {
+			continue
+		}
+		options, err := parsePruneObjectsOptions(operation.Value)
+		if err != nil {
+			// The normal finalizer reports malformed operation configuration.
+			// Preserve that error path instead of changing its classification here.
+			continue
+		}
+		if paramOverrideConditionsUseAttemptState(options.conditions) {
+			return errors.New("parameter override depends on attempt-local retry state")
+		}
+	}
+	return nil
+}
+
+func paramOverrideConditionsUseAttemptState(conditions []ConditionOperation) bool {
+	for _, condition := range conditions {
+		path := strings.TrimSpace(condition.Path)
+		switch {
+		case path == "retry_index", path == "is_retry", path == "retry",
+			strings.HasPrefix(path, "retry."), path == "last_error",
+			strings.HasPrefix(path, "last_error."), strings.HasPrefix(path, "last_error_"):
+			return true
+		}
+	}
+	return false
+}
+
 func checkConditions(data []byte, contextJSON string, conditions []ConditionOperation, logic string) (bool, error) {
 	if len(conditions) == 0 {
 		return true, nil // 没有条件，直接通过

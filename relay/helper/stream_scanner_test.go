@@ -37,15 +37,49 @@ func setupStreamTest(t *testing.T, body io.Reader) (*gin.Context, *http.Response
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
-	resp := &http.Response{
-		Body: io.NopCloser(body),
+	responseBody, ok := body.(io.ReadCloser)
+	if !ok {
+		responseBody = io.NopCloser(body)
 	}
+	resp := &http.Response{Body: responseBody}
 
 	info := &relaycommon.RelayInfo{
 		ChannelMeta: &relaycommon.ChannelMeta{},
 	}
 
 	return c, resp, info
+}
+
+type deadlineTrackingWriter struct {
+	header   http.Header
+	deadline time.Time
+}
+
+func (w *deadlineTrackingWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *deadlineTrackingWriter) Write(data []byte) (int, error) {
+	return len(data), nil
+}
+
+func (w *deadlineTrackingWriter) WriteHeader(int) {}
+
+func (w *deadlineTrackingWriter) SetWriteDeadline(deadline time.Time) error {
+	w.deadline = deadline
+	return nil
+}
+
+func TestExtendWriteDeadlineUsesBoundedPerWriteDeadline(t *testing.T) {
+	writer := &deadlineTrackingWriter{header: make(http.Header)}
+	c, _ := gin.CreateTestContext(writer)
+	startedAt := time.Now()
+
+	ExtendWriteDeadline(c)
+
+	require.False(t, writer.deadline.IsZero())
+	assert.GreaterOrEqual(t, writer.deadline.Sub(startedAt), streamWriteTimeout-time.Second)
+	assert.LessOrEqual(t, writer.deadline.Sub(startedAt), streamWriteTimeout+time.Second)
 }
 
 func buildSSEBody(n int) string {
@@ -86,6 +120,43 @@ func TestNewStreamScanner_AllowsLargeStreamLine(t *testing.T) {
 	require.True(t, scanner.Scan())
 	assert.Equal(t, "data: "+payload, scanner.Text())
 	require.NoError(t, scanner.Err())
+}
+
+func TestNewStreamScannerWithLimitRejectsOneByteOver(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		lineSize int
+		wantScan bool
+	}{
+		{name: "at limit", lineSize: 32, wantScan: true},
+		{name: "one byte over", lineSize: 33, wantScan: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scanner := newStreamScannerWithLimit(strings.NewReader(strings.Repeat("x", test.lineSize)), 32)
+			scanner.Split(bufio.ScanLines)
+
+			assert.Equal(t, test.wantScan, scanner.Scan())
+			if test.wantScan {
+				require.NoError(t, scanner.Err())
+				assert.Len(t, scanner.Text(), test.lineSize)
+				return
+			}
+			require.Error(t, scanner.Err())
+		})
+	}
+}
+
+func TestOpenCodeStreamQueueHasExplicitByteCeiling(t *testing.T) {
+	options := normalizedStreamScannerOptions(streamScannerOptions{
+		maxLineBytes:   64,
+		maxEventBytes:  16,
+		maxQueuedBytes: 32,
+		queueItems:     10,
+		idleTimeout:    time.Second,
+	})
+
+	assert.Equal(t, 2, options.queueItems)
+	assert.LessOrEqual(t, options.queueItems*options.maxEventBytes, options.maxQueuedBytes)
 }
 
 func TestStreamScannerHandler_EmptyBody(t *testing.T) {
@@ -550,6 +621,108 @@ func TestStreamScannerHandler_StreamStatus_Timeout(t *testing.T) {
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
 	assert.False(t, info.StreamStatus.IsNormalEnd())
+}
+
+func TestOpenCodeStreamIdleIgnoresBlankAndCommentLines(t *testing.T) {
+	pr, pw := io.Pipe()
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		defer pw.Close()
+		for i := 0; i < 30; i++ {
+			if _, err := fmt.Fprint(pw, ": keepalive\n\n"); err != nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	c, resp, info := setupStreamTest(t, pr)
+	info.ChannelMeta.ChannelType = constant.ChannelTypeOpenCodeAPIKey
+	started := time.Now()
+	streamScannerHandlerWithOptions(c, resp, info, func(data string, sr *StreamResult) {
+		t.Fatalf("comment traffic must not reach the semantic handler: %q", data)
+	}, streamScannerOptions{
+		maxLineBytes:   128,
+		maxEventBytes:  64,
+		maxQueuedBytes: 64,
+		queueItems:     10,
+		idleTimeout:    35 * time.Millisecond,
+		semanticIdle:   true,
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
+	assert.Less(t, time.Since(started), 120*time.Millisecond)
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("comment writer did not stop after stream timeout")
+	}
+}
+
+func TestOpenCodeStreamSemanticEventsRenewIdleDeadline(t *testing.T) {
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		for i := 0; i < 4; i++ {
+			_, _ = fmt.Fprintf(pw, "data: {\"id\":%d}\n", i)
+			time.Sleep(15 * time.Millisecond)
+		}
+		_, _ = fmt.Fprint(pw, "data: [DONE]\n")
+	}()
+
+	c, resp, info := setupStreamTest(t, pr)
+	info.ChannelMeta.ChannelType = constant.ChannelTypeOpenCodeAPIKey
+	var count atomic.Int64
+	streamScannerHandlerWithOptions(c, resp, info, func(data string, sr *StreamResult) {
+		count.Add(1)
+	}, streamScannerOptions{
+		maxLineBytes:   128,
+		maxEventBytes:  64,
+		maxQueuedBytes: 64,
+		queueItems:     10,
+		idleTimeout:    30 * time.Millisecond,
+		semanticIdle:   true,
+	})
+
+	assert.Equal(t, int64(4), count.Load())
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+}
+
+func TestOpenCodeStreamEventLimitExactAndOneByteOver(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		eventBytes    int
+		wantHandled   bool
+		wantEndReason relaycommon.StreamEndReason
+	}{
+		{name: "at limit", eventBytes: 8, wantHandled: true, wantEndReason: relaycommon.StreamEndReasonDone},
+		{name: "one byte over", eventBytes: 9, wantEndReason: relaycommon.StreamEndReasonScannerErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := "data: " + strings.Repeat("x", test.eventBytes) + "\ndata: [DONE]\n"
+			c, resp, info := setupStreamTest(t, strings.NewReader(body))
+			info.ChannelMeta.ChannelType = constant.ChannelTypeOpenCodeAPIKey
+			var handled atomic.Bool
+
+			streamScannerHandlerWithOptions(c, resp, info, func(data string, sr *StreamResult) {
+				handled.Store(true)
+			}, streamScannerOptions{
+				maxLineBytes:   64,
+				maxEventBytes:  8,
+				maxQueuedBytes: 8,
+				queueItems:     10,
+				idleTimeout:    time.Second,
+				semanticIdle:   true,
+			})
+
+			assert.Equal(t, test.wantHandled, handled.Load())
+			require.NotNil(t, info.StreamStatus)
+			assert.Equal(t, test.wantEndReason, info.StreamStatus.EndReason)
+		})
+	}
 }
 
 func TestStreamScannerHandler_StreamStatus_SoftErrors(t *testing.T) {

@@ -112,7 +112,7 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 // acquireInFlight registers the per-workspace in-flight slot for this request
 // after a workspace is selected. It must be balanced by exactly one
 // releaseInFlight call; releaseOnce guards the three terminal paths.
-func (a *Adaptor) acquireInFlight(channelID int, workspaceUID string) {
+func (a *Adaptor) acquireInFlight(c *gin.Context, channelID int, workspaceUID string) {
 	if channelID <= 0 || strings.TrimSpace(workspaceUID) == "" {
 		return
 	}
@@ -120,6 +120,7 @@ func (a *Adaptor) acquireInFlight(channelID int, workspaceUID string) {
 	a.releaseInFlightFn = func() {
 		service.ReleaseOpenCodeGoWorkspaceInFlight(channelID, workspaceUID)
 	}
+	common.RegisterRequestCleanup(c, a.releaseInFlight)
 }
 
 func (a *Adaptor) releaseInFlight() {
@@ -182,9 +183,11 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 		header.Set("x-opencode-client", "new-api")
 		if protocol == ProtocolMessages {
 			setupOpenCodeMessagesRequestHeader(c, header, info.ApiKey)
+			setupCanonicalOpenCodeRequestHeaders(header, a.requestUpstreamStream)
 			return nil
 		}
 		header.Set("Authorization", "Bearer "+info.ApiKey)
+		setupCanonicalOpenCodeRequestHeaders(header, a.requestUpstreamStream)
 		return nil
 	}
 	if !a.workspaceSelected {
@@ -220,7 +223,7 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 		a.selectedProxyGeneration = selection.IdentityProxyGeneration
 		a.failoverAttempt = selection.FailoverAttempt
 		a.workspaceSelected = true
-		a.acquireInFlight(info.ChannelId, selection.WorkspaceUID)
+		a.acquireInFlight(c, info.ChannelId, selection.WorkspaceUID)
 		common.SetContextKey(c, constant.ContextKeyOpenCodeGoWorkspaceUID, selection.WorkspaceUID)
 		if selection.FailoverActive {
 			leaseRemaining := time.Until(selection.FailoverLeaseExpiresAt).Round(time.Second)
@@ -254,10 +257,29 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 
 	if protocol == ProtocolMessages {
 		setupOpenCodeMessagesRequestHeader(c, header, info.ApiKey)
+		setupCanonicalOpenCodeRequestHeaders(header, a.requestUpstreamStream)
 		return nil
 	}
 	header.Set("Authorization", "Bearer "+info.ApiKey)
+	setupCanonicalOpenCodeRequestHeaders(header, a.requestUpstreamStream)
 	return nil
+}
+
+func setupCanonicalOpenCodeRequestHeaders(header *http.Header, upstreamStream bool) {
+	if header == nil {
+		return
+	}
+	header.Set("Content-Type", "application/json")
+	if upstreamStream {
+		header.Set("Accept", "text/event-stream")
+	} else {
+		header.Set("Accept", "application/json")
+	}
+	header.Del("Content-Encoding")
+	header.Del("Accept-Encoding")
+	header.Del("Transfer-Encoding")
+	header.Del("Connection")
+	header.Del("Expect")
 }
 
 func setupOpenCodeMessagesRequestHeader(c *gin.Context, header *http.Header, apiKey string) {
@@ -271,8 +293,10 @@ func setupOpenCodeMessagesRequestHeader(c *gin.Context, header *http.Header, api
 	if version == "" {
 		version = "2023-06-01"
 	}
-	header.Set("anthropic-version", version)
-	if beta != "" {
+	if header.Get("anthropic-version") == "" {
+		header.Set("anthropic-version", version)
+	}
+	if beta != "" && header.Get("anthropic-beta") == "" {
 		header.Set("anthropic-beta", beta)
 	}
 }
@@ -308,16 +332,15 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	}
 	usesFunctionTools := requestUsesFunctionTools(request)
 	a.statefulResponses = requestUsesStatefulResponses(request)
-	// Claude tool turns must stay on Chat for Chat-family models. Console Go's
-	// Responses bridge drops oa-compatible reasoning_content from the first
-	// tool response, so Claude Code cannot replay the provider reasoning on the
-	// following tool-result turn. The buffered Chat path below already solves
-	// the incomplete streamed-tool-arguments problem without changing protocol.
-	if protocol == ProtocolChat && usesFunctionTools && info.RelayFormat != types.RelayFormatClaude &&
-		!requestContainsAssistantReasoning(request) {
-		protocol = ProtocolResponses
-		a.protocol = protocol
+	protocol, _ = effectiveRequestProtocol(protocol, info.RelayFormat, request)
+	plan, planned, err := AssertRequestPreflightPlan(c, info, request)
+	if err != nil {
+		return nil, err
 	}
+	if planned {
+		protocol = plan.FinalProtocol
+	}
+	a.protocol = protocol
 
 	a.cacheIdentity = cacheIdentityForRequest(c, info, request)
 	a.affinityIdentity, a.affinitySource = affinityIdentityForRequest(c, info, request)
@@ -438,9 +461,18 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 	} else {
 		response, err = channel.DoApiRequest(a, c, info, requestBody)
 	}
+	service.OwnResponseBodyForRequest(c, response)
 	if err != nil {
 		a.releaseInFlight()
-		if constant.IsOpenCodeGoPoolChannelType(info.GetChannelType()) && a.workspaceSelected && !openCodeGoCallerCancelled(c, err) && info != nil {
+		if localErr := openCodeGoLocalContextError(c, err); localErr != nil {
+			return response, localErr
+		}
+		var relayErr *types.NewAPIError
+		if errors.As(err, &relayErr) && relayErr != nil &&
+			(relayErr.Provenance().IsLocal() || relayErr.Provenance().IsGateway()) {
+			return response, relayErr
+		}
+		if constant.IsOpenCodeGoPoolChannelType(info.GetChannelType()) && a.workspaceSelected && info != nil {
 			reason := sanitizeErrorMessage(err.Error())
 			if _, observeErr := observeOpenCodeGoTransportFailure(
 				info.ChannelId,
@@ -458,8 +490,8 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 			}
 		}
 	}
-	if err != nil && constant.IsOpenCodeChannelType(info.GetChannelType()) && !openCodeGoCallerCancelled(c, err) {
-		return response, service.MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
+	if err != nil && constant.IsOpenCodeChannelType(info.GetChannelType()) {
+		return response, service.MarkOpenCodeGoUpstreamTransportError(types.NewOpenAIError(
 			err,
 			types.ErrorCodeDoRequestFailed,
 			http.StatusBadGateway,
@@ -470,10 +502,35 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 }
 
 func openCodeGoCallerCancelled(c *gin.Context, err error) bool {
-	if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
-		return true
+	return c != nil && c.Request != nil && c.Request.Context().Err() != nil
+}
+
+func openCodeGoLocalContextError(c *gin.Context, cause error) *types.NewAPIError {
+	if c == nil || c.Request == nil {
+		return nil
 	}
-	return errors.Is(err, context.Canceled)
+	contextErr := c.Request.Context().Err()
+	if contextErr == nil {
+		return nil
+	}
+	if cause == nil {
+		cause = contextErr
+	}
+	statusCode := 499
+	origin := types.ErrorOriginLocalCancel
+	subtype := "downstream_cancelled"
+	if errors.Is(contextErr, context.DeadlineExceeded) {
+		statusCode = http.StatusGatewayTimeout
+		origin = types.ErrorOriginLocalDeadline
+		subtype = "gateway_deadline"
+	}
+	return types.NewOpenAIError(
+		cause,
+		types.ErrorCodeBadResponse,
+		statusCode,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithProvenance(types.ErrorProvenance{Origin: origin, Subtype: subtype}),
+	)
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
@@ -506,15 +563,34 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		namespaceTools:       a.namespaceTools,
 		estimatedInputTokens: info.GetEstimatePromptTokens(),
 	}
-	if err := prepareResponseForRelay(resp, state, info.IsStream && !a.bufferClaudeToolCall); err != nil {
-		// The body is read from the selected OpenCode Go upstream. A read
-		// failure is therefore a bad-gateway condition, not a gateway bug.
-		return nil, service.MarkOpenCodeGoUpstreamRelayError(types.NewOpenAIError(
+	responseContext := context.Background()
+	if c != nil && c.Request != nil {
+		responseContext = c.Request.Context()
+	}
+	if err := prepareResponseForRelayWithContextAndLimits(
+		responseContext,
+		resp,
+		state,
+		info.IsStream && !a.bufferClaudeToolCall,
+		defaultOpenCodeGoResponseLimits,
+	); err != nil {
+		if localErr := openCodeGoLocalContextError(c, err); localErr != nil {
+			return nil, localErr
+		}
+		if errors.Is(err, errOpenCodeGoResponseLimitExceeded) {
+			return nil, newOpenCodeGoResponseLimitError(err)
+		}
+		if errors.Is(err, errOpenCodeGoResponseReadTimeout) {
+			return nil, newOpenCodeGoResponseReadTimeoutError(err)
+		}
+		// No new HTTP status is observed while reading a successful response
+		// body, so transport provenance must not synthesize a raw 502.
+		return nil, service.MarkOpenCodeGoUpstreamTransportErrorWithSubtype(types.NewOpenAIError(
 			err,
 			types.ErrorCodeReadResponseBodyFailed,
 			http.StatusBadGateway,
 			openCodeUpstreamErrorOptions(c, info)...,
-		))
+		), "response_body_read")
 	}
 
 	upstreamModel := info.UpstreamModelName
@@ -587,6 +663,18 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		responseErr.SetMessage(string(state.upstreamErrorPayload))
 		responseErr = service.MarkOpenCodeGoUpstreamRelayErrorWithStatus(responseErr, upstreamStatusCode)
 	}
+	streamEndErr := error(nil)
+	if info.StreamStatus != nil {
+		streamEndErr = info.StreamStatus.EndCause()
+	}
+	if (responseErr != nil && errors.Is(responseErr, errOpenCodeGoResponseLimitExceeded)) ||
+		errors.Is(streamEndErr, errOpenCodeGoResponseLimitExceeded) {
+		cause := error(responseErr)
+		if cause == nil || !errors.Is(cause, errOpenCodeGoResponseLimitExceeded) {
+			cause = streamEndErr
+		}
+		responseErr = newOpenCodeGoResponseLimitError(cause)
+	}
 	streamFailureReason := ""
 	if constant.IsOpenCodeGoPoolChannelType(info.GetChannelType()) {
 		streamFailureReason = a.openCodeGoStreamFailureReason(c, info, responseErr)
@@ -595,7 +683,9 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		}
 	}
 	if responseErr != nil {
-		if !openCodeGoCallerCancelled(c, responseErr) &&
+		provenance := responseErr.Provenance()
+		if !provenance.IsLocal() && !provenance.IsGateway() &&
+			!openCodeGoCallerCancelled(c, responseErr) &&
 			service.ResponseBodyWriteError(c) == nil &&
 			!a.openCodeGoStreamHasLocalErrors(info) {
 			switch responseErr.GetErrorCode() {
@@ -614,11 +704,18 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		return nil, responseErr
 	}
 	if writeErr := service.ResponseBodyWriteError(c); writeErr != nil {
+		if errors.Is(writeErr, service.ErrOpenCodeGoResponseBodyLimitExceeded) {
+			return nil, newOpenCodeGoTransformedResponseLimitError(writeErr)
+		}
 		return nil, types.NewOpenAIError(
 			writeErr,
 			types.ErrorCodeBadResponse,
 			http.StatusInternalServerError,
 			types.ErrOptionWithSkipRetry(),
+			types.ErrOptionWithProvenance(types.ErrorProvenance{
+				Origin:  types.ErrorOriginLocalWriter,
+				Subtype: "downstream_write",
+			}),
 		)
 	}
 	if settlementErr := a.openCodeGoStreamSettlementError(c, info, upstreamStatusCode); settlementErr != nil {
@@ -663,6 +760,10 @@ func (a *Adaptor) openCodeGoStreamSettlementError(c *gin.Context, info *relaycom
 			types.ErrorCodeBadResponse,
 			499,
 			types.ErrOptionWithSkipRetry(),
+			types.ErrOptionWithProvenance(types.ErrorProvenance{
+				Origin:  types.ErrorOriginLocalCancel,
+				Subtype: "downstream_stream_cancelled",
+			}),
 		)
 	}
 	if a.openCodeGoStreamHasLocalErrors(info) {
@@ -671,6 +772,10 @@ func (a *Adaptor) openCodeGoStreamSettlementError(c *gin.Context, info *relaycom
 			types.ErrorCodeBadResponse,
 			http.StatusInternalServerError,
 			types.ErrOptionWithSkipRetry(),
+			types.ErrOptionWithProvenance(types.ErrorProvenance{
+				Origin:  types.ErrorOriginLocalWriter,
+				Subtype: "downstream_stream_failure",
+			}),
 		)
 	}
 	if a.openCodeGoStreamIncomplete(c, info) {
@@ -710,6 +815,12 @@ func (a *Adaptor) openCodeGoStreamFailureReason(c *gin.Context, info *relaycommo
 		(info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone) {
 		return ""
 	}
+	if responseErr != nil {
+		provenance := responseErr.Provenance()
+		if provenance.IsLocal() || provenance.IsGateway() {
+			return ""
+		}
+	}
 	if info.StreamStatus != nil && info.StreamStatus.UpstreamFailureObserved() {
 		return "upstream_stream_error"
 	}
@@ -731,6 +842,45 @@ func (a *Adaptor) openCodeGoStreamFailureReason(c *gin.Context, info *relaycommo
 		return "upstream_stream_incomplete"
 	}
 	return ""
+}
+
+func newOpenCodeGoResponseLimitError(cause error) *types.NewAPIError {
+	return types.NewOpenAIError(
+		cause,
+		types.ErrorCodeReadResponseBodyFailed,
+		http.StatusBadGateway,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithProvenance(types.ErrorProvenance{
+			Origin:  types.ErrorOriginGatewayInvariant,
+			Subtype: "response_limit",
+		}),
+	)
+}
+
+func newOpenCodeGoResponseReadTimeoutError(cause error) *types.NewAPIError {
+	return types.NewOpenAIError(
+		cause,
+		types.ErrorCodeReadResponseBodyFailed,
+		http.StatusGatewayTimeout,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithProvenance(types.ErrorProvenance{
+			Origin:  types.ErrorOriginLocalDeadline,
+			Subtype: "response_body_timeout",
+		}),
+	)
+}
+
+func newOpenCodeGoTransformedResponseLimitError(cause error) *types.NewAPIError {
+	return types.NewOpenAIError(
+		cause,
+		types.ErrorCodeBadResponseBody,
+		http.StatusBadGateway,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithProvenance(types.ErrorProvenance{
+			Origin:  types.ErrorOriginGatewayInvariant,
+			Subtype: "transformed_response_limit",
+		}),
+	)
 }
 
 func openCodeGoStreamEndedUpstream(status *relaycommon.StreamStatus) bool {

@@ -12,9 +12,11 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
+	"github.com/bytedance/gopkg/util/gopool"
 )
 
 var hotBuckets sync.Map
+var scheduledRelaySamples sync.WaitGroup
 
 // seriesSchema is a stable client cache/schema marker. Do not change it when
 // hiding fields or making response-only privacy hardening changes.
@@ -52,6 +54,22 @@ func RecordRelaySample(info *relaycommon.RelayInfo, success bool, outputTokens i
 		OutputTokens: outputTokens,
 		GenerationMs: generationMs,
 	})
+}
+
+// ScheduleRelaySample keeps relay metric writes asynchronous while making their
+// lifecycle observable to shutdown and deterministic test cleanup.
+func ScheduleRelaySample(info *relaycommon.RelayInfo, success bool, outputTokens int64) {
+	scheduledRelaySamples.Add(1)
+	gopool.Go(func() {
+		defer scheduledRelaySamples.Done()
+		RecordRelaySample(info, success, outputTokens)
+	})
+}
+
+// WaitForScheduledRelaySamples waits for relay samples submitted before this
+// call. Callers must stop submitting new relay samples before waiting.
+func WaitForScheduledRelaySamples() {
+	scheduledRelaySamples.Wait()
 }
 
 func Record(sample Sample) {

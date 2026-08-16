@@ -55,7 +55,7 @@ func TestRenderRelayErrorHidesOpenCodeGoPoolExhaustion(t *testing.T) {
 	assert.ErrorContains(t, internalErr, "setup request header failed")
 }
 
-func TestRenderRelayErrorDoesNotRewriteOtherOpenCodeGoFailures(t *testing.T) {
+func TestRenderRelayErrorFailsClosedForUnprovenancedOpenCodeGoFailures(t *testing.T) {
 	internalErr := types.NewOpenAIError(
 		errors.New("request setup failed"),
 		types.ErrorCodeDoRequestFailed,
@@ -68,9 +68,11 @@ func TestRenderRelayErrorDoesNotRewriteOtherOpenCodeGoFailures(t *testing.T) {
 
 	renderRelayError(c, types.RelayFormatOpenAI, nil, internalErr, "request-id")
 
-	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
-	assert.Contains(t, recorder.Body.String(), "request setup failed")
-	assert.NotContains(t, recorder.Body.String(), groupUpstreamOverloadedMessage)
+	assert.Equal(t, http.StatusTooManyRequests, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), groupUpstreamOverloadedMessage)
+	assert.NotContains(t, recorder.Body.String(), "request setup failed")
+	assert.Equal(t, http.StatusInternalServerError, internalErr.StatusCode)
+	assert.Equal(t, "request setup failed", internalErr.Error())
 }
 
 func TestRenderRelayErrorHidesOpenCodeGoEndpointUnavailable(t *testing.T) {
@@ -188,7 +190,7 @@ func TestRenderRelayErrorHidesMarkedUnknownOpenCodeGoUpstreamError(t *testing.T)
 	}
 }
 
-func TestRenderRelayErrorKeepsNonStreamResponseHeaders(t *testing.T) {
+func TestRenderRelayErrorDropsUntrustedNonStreamResponseHeaders(t *testing.T) {
 	internalErr := types.NewOpenAIError(
 		errors.New("OpenCode Go workspace is unavailable"),
 		types.ErrorCodeBadResponse,
@@ -204,7 +206,8 @@ func TestRenderRelayErrorKeepsNonStreamResponseHeaders(t *testing.T) {
 	renderRelayError(c, types.RelayFormatOpenAI, nil, internalErr, "request-id")
 
 	assert.Equal(t, http.StatusTooManyRequests, recorder.Code)
-	assert.Equal(t, "private, max-age=30", recorder.Header().Get("Cache-Control"))
+	assert.Empty(t, recorder.Header().Get("Cache-Control"))
+	assert.Equal(t, "request-id", recorder.Header().Get(common.RequestIdKey))
 }
 
 func TestPublicRelayErrorDoesNotRewriteOtherChannelFailures(t *testing.T) {

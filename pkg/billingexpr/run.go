@@ -53,6 +53,7 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, params TokenP
 		RequestRules: append([]RequestRuleTrace(nil), requestRules...),
 	}
 	headers := normalizeHeaders(request.Headers)
+	var requestParamErr error
 
 	env := map[string]interface{}{
 		"p":     params.P,
@@ -93,7 +94,23 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, params TokenP
 		},
 		"param": func(path string) interface{} {
 			path = strings.TrimSpace(path)
-			if path == "" || len(request.Body) == 0 {
+			if path == "" {
+				return nil
+			}
+			if request.ResolveParam != nil {
+				value, found, err := request.ResolveParam(path)
+				if err != nil {
+					if requestParamErr == nil {
+						requestParamErr = err
+					}
+					return nil
+				}
+				if !found {
+					return nil
+				}
+				return value
+			}
+			if len(request.Body) == 0 {
 				return nil
 			}
 			result := gjson.GetBytes(request.Body, path)
@@ -121,6 +138,9 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, params TokenP
 	}
 
 	out, err := expr.Run(prog, env)
+	if requestParamErr != nil {
+		return 0, trace, fmt.Errorf("resolve request parameter: %w", requestParamErr)
+	}
 	if err != nil {
 		return 0, trace, fmt.Errorf("expr run error: %w", err)
 	}

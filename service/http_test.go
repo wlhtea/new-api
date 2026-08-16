@@ -2,15 +2,61 @@ package service
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+type countingResponseBody struct {
+	reader     io.Reader
+	closeCalls atomic.Int32
+}
+
+func (b *countingResponseBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *countingResponseBody) Close() error {
+	b.closeCalls.Add(1)
+	return nil
+}
+
+func TestOwnResponseBodyForRequestClosesUnderlyingBodyExactlyOnce(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	body := &countingResponseBody{reader: strings.NewReader("response")}
+	response := &http.Response{Body: body}
+
+	OwnResponseBodyForRequest(c, response)
+	require.NoError(t, response.Body.Close())
+	require.NoError(t, response.Body.Close())
+	common.RunRequestCleanups(c)
+	common.RunRequestCleanups(c)
+
+	assert.Equal(t, int32(1), body.closeCalls.Load())
+}
+
+func TestOwnResponseBodyForRequestCleanupClosesUnclaimedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	body := &countingResponseBody{reader: strings.NewReader("response")}
+	response := &http.Response{Body: body}
+
+	OwnResponseBodyForRequest(c, response)
+	common.RunRequestCleanups(c)
+
+	assert.Equal(t, int32(1), body.closeCalls.Load())
+}
 
 type responseBodyFailingWriter struct {
 	gin.ResponseWriter
@@ -35,6 +81,35 @@ func TestIOCopyBytesGracefullyRecordsFirstWriteError(t *testing.T) {
 
 	if got := ResponseBodyWriteError(c); !errors.Is(got, firstErr) {
 		t.Fatalf("ResponseBodyWriteError() = %v, want first error %v", got, firstErr)
+	}
+}
+
+func TestIOCopyBytesGracefullyBoundsOpenCodePayloadAtExactLimit(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		body        string
+		wantError   bool
+		wantWritten bool
+	}{
+		{name: "at limit", body: "12345678", wantWritten: true},
+		{name: "one byte over", body: "123456789", wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenCodeAPIKey)
+
+			ioCopyBytesGracefullyWithLimit(c, nil, []byte(test.body), 8)
+
+			assert.Equal(t, test.wantWritten, c.Writer.Written())
+			if test.wantError {
+				assert.ErrorIs(t, ResponseBodyWriteError(c), ErrOpenCodeGoResponseBodyLimitExceeded)
+				assert.Empty(t, recorder.Body.String())
+				return
+			}
+			require.NoError(t, ResponseBodyWriteError(c))
+			assert.Equal(t, test.body, recorder.Body.String())
+		})
 	}
 }
 

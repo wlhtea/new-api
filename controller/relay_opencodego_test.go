@@ -3,14 +3,19 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -18,6 +23,202 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRenderRelayErrorUsesFixedRawUpstream400ContractForBothOpenCodeTypes(t *testing.T) {
+	oldRetryRanges := append([]operation_setting.StatusCodeRange(nil), operation_setting.AutomaticRetryStatusCodeRanges...)
+	oldDisableRanges := append([]operation_setting.StatusCodeRange(nil), operation_setting.AutomaticDisableStatusCodeRanges...)
+	oldDisableEnabled := common.AutomaticDisableChannelEnabled
+	operation_setting.AutomaticRetryStatusCodeRanges = []operation_setting.StatusCodeRange{{Start: 400, End: 422}}
+	operation_setting.AutomaticDisableStatusCodeRanges = []operation_setting.StatusCodeRange{{Start: 400, End: 422}}
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() {
+		operation_setting.AutomaticRetryStatusCodeRanges = oldRetryRanges
+		operation_setting.AutomaticDisableStatusCodeRanges = oldDisableRanges
+		common.AutomaticDisableChannelEnabled = oldDisableEnabled
+	})
+
+	endpoints := []struct {
+		path   string
+		format types.RelayFormat
+	}{
+		{path: "/v1/messages", format: types.RelayFormatClaude},
+		{path: "/v1/chat/completions", format: types.RelayFormatOpenAI},
+		{path: "/v1/responses", format: types.RelayFormatOpenAIResponses},
+	}
+	streamStates := []struct {
+		name string
+		body string
+	}{
+		{name: "absent", body: `{}`},
+		{name: "false", body: `{"stream":false}`},
+		{name: "true", body: `{"stream":true}`},
+	}
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		for _, endpoint := range endpoints {
+			for _, stream := range streamStates {
+				for _, rawStatus := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
+					name := fmt.Sprintf("type-%d:%s:stream-%s:raw-%d", channelType, endpoint.path, stream.name, rawStatus)
+					t.Run(name, func(t *testing.T) {
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Request = httptest.NewRequest(http.MethodPost, endpoint.path, strings.NewReader(stream.body))
+						if stream.name == "true" {
+							c.Request.Header.Set("Accept", "text/event-stream")
+						}
+						common.SetContextKey(c, constant.ContextKeyChannelType, channelType)
+						for header, value := range map[string]string{
+							"Retry-After":           "workspace=private",
+							"Location":              "http://internal.invalid/private",
+							"Server":                "private-provider",
+							"Set-Cookie":            "session=private",
+							"WWW-Authenticate":      "Bearer private",
+							"X-Upstream-Request-Id": "upstream-private-id",
+							"X-Upstream-Secret":     "private-value",
+						} {
+							c.Writer.Header().Set(header, value)
+						}
+
+						internal := service.MarkOpenCodeGoUpstreamRelayErrorWithStatus(types.WithOpenAIError(types.OpenAIError{
+							Message:  "credential=private endpoint=http://internal.invalid workspace=private",
+							Type:     "provider_private_type",
+							Code:     "provider_private_code",
+							Param:    "private_param",
+							Metadata: json.RawMessage(`{"private":"metadata"}`),
+						}, rawStatus), rawStatus)
+						service.ResetStatusCode(internal, fmt.Sprintf(`{"%d":503}`, rawStatus))
+						originalMessage := internal.Error()
+
+						renderRelayError(c, endpoint.format, nil, internal, "local-request-id")
+
+						assert.Equal(t, http.StatusBadRequest, recorder.Code)
+						assert.Equal(t, "local-request-id", recorder.Header().Get(common.RequestIdKey))
+						for _, header := range []string{"Retry-After", "Location", "Server", "Set-Cookie", "WWW-Authenticate", "X-Upstream-Request-Id", "X-Upstream-Secret"} {
+							assert.Empty(t, recorder.Header().Values(header), header)
+						}
+						assert.NotContains(t, recorder.Body.String(), "local-request-id")
+						assert.NotContains(t, recorder.Body.String(), "private")
+						var actual map[string]any
+						require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &actual))
+						if endpoint.format == types.RelayFormatClaude {
+							assert.Equal(t, map[string]any{
+								"type": "error",
+								"error": map[string]any{
+									"type":    constant.OpenCodeGoPublicInvalidRequestCode,
+									"message": constant.OpenCodeGoPublicInvalidRequestMessage,
+								},
+							}, actual)
+						} else {
+							assert.Equal(t, map[string]any{
+								"error": map[string]any{
+									"message": constant.OpenCodeGoPublicInvalidRequestMessage,
+									"type":    constant.OpenCodeGoPublicInvalidRequestCode,
+									"code":    constant.OpenCodeGoPublicInvalidRequestCode,
+								},
+							}, actual)
+						}
+						assert.Equal(t, originalMessage, internal.Error())
+						assert.Equal(t, http.StatusServiceUnavailable, internal.StatusCode)
+						assert.False(t, shouldRetry(c, internal, 3))
+						assert.False(t, shouldDisableWholeChannel(channelType, internal))
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestOpenCodeAPIKeyRetryResetDiscardsResponsesSSEAttemptBeforeChatJSON(t *testing.T) {
+	start := time.Now()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	c.Set(common.RequestIdKey, "local-request-id")
+	c.Header(common.RequestIdKey, "local-request-id")
+	common.SetContextKey(c, constant.ContextKeyIsStream, false)
+	common.SetContextKey(c, constant.ContextKeyOpenCodeGoAffinitySource, "token")
+	common.SetContextKey(c, constant.ContextKeyOpenCodeGoAffinityKey, "safe-affinity")
+
+	info := &relaycommon.RelayInfo{
+		RelayFormat:            types.RelayFormatOpenAI,
+		RelayMode:              relayconstant.RelayModeChatCompletions,
+		RequestURLPath:         "/v1/chat/completions",
+		StartTime:              start,
+		FirstResponseTime:      start.Add(-time.Second),
+		IsStream:               false,
+		RequestConversionChain: []types.RelayFormat{types.RelayFormatOpenAI},
+		ResponsesUsageInfo:     &relaycommon.ResponsesUsageInfo{BuiltInTools: map[string]*relaycommon.BuildInToolInfo{}},
+	}
+	baseline := info.SnapshotRelayAttempt()
+	contextBaseline := snapshotRelayAttemptContext(c)
+
+	// Attempt A resolved to Responses and returned malformed SSE before any
+	// public byte. These are exactly the fields that previously contaminated B.
+	info.IsStream = true
+	info.ChannelMeta = &relaycommon.ChannelMeta{
+		ChannelType:       constant.ChannelTypeOpenCodeAPIKey,
+		ChannelId:         63,
+		UpstreamModelName: "attempt-a-model",
+	}
+	info.FinalRequestRelayFormat = types.RelayFormatOpenAIResponses
+	info.RequestConversionChain = append(info.RequestConversionChain, types.RelayFormatOpenAIResponses)
+	info.RuntimeHeadersOverride = map[string]interface{}{"x-attempt-a": "private"}
+	info.UseRuntimeHeadersOverride = true
+	info.ParamOverrideAudit = []string{"attempt-a-audit"}
+	info.UpstreamRequestBodySize = 4096
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.RecordError("malformed SSE")
+	info.StreamProtocolTerminalRequired = true
+	info.SendResponseCount = 3
+	info.ReceivedResponseCount = 4
+	info.ResponsesUsageInfo.BuiltInTools["web_search"] = &relaycommon.BuildInToolInfo{ToolName: "web_search", CallCount: 2}
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Retry-After", "attempt-a-private")
+	c.Writer.Header().Set("X-Codex-Turn-State", "attempt-a")
+	c.Set(common.UpstreamRequestIdKey, "attempt-a-upstream-id")
+	c.Set("claude_web_search_requests", 7)
+	c.Set("gemini_google_search_call", true)
+	c.Set("chat_completion_web_search_context_size", "large")
+	common.SetContextKey(c, constant.ContextKeyIsStream, true)
+	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, true)
+	common.SetContextKey(c, constant.ContextKeyRelayFailed, true)
+
+	resetOpenCodeAPIKeyRelayAttempt(c, info, baseline, contextBaseline)
+
+	assert.False(t, info.IsStream)
+	assert.Nil(t, info.ChannelMeta)
+	assert.Equal(t, []types.RelayFormat{types.RelayFormatOpenAI}, info.RequestConversionChain)
+	assert.Empty(t, info.FinalRequestRelayFormat)
+	assert.Nil(t, info.RuntimeHeadersOverride)
+	assert.False(t, info.UseRuntimeHeadersOverride)
+	assert.Nil(t, info.ParamOverrideAudit)
+	assert.Zero(t, info.UpstreamRequestBodySize)
+	assert.Nil(t, info.StreamStatus)
+	assert.False(t, info.StreamProtocolTerminalRequired)
+	assert.Zero(t, info.SendResponseCount)
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.Empty(t, info.ResponsesUsageInfo.BuiltInTools)
+	assert.Equal(t, "local-request-id", recorder.Header().Get(common.RequestIdKey))
+	assert.Empty(t, recorder.Header().Get("Content-Type"))
+	assert.Empty(t, recorder.Header().Get("Retry-After"))
+	assert.Empty(t, recorder.Header().Get("X-Codex-Turn-State"))
+	upstreamID, exists := c.Get(common.UpstreamRequestIdKey)
+	require.True(t, exists)
+	assert.Nil(t, upstreamID)
+	assert.Zero(t, c.GetInt("claude_web_search_requests"))
+	assert.False(t, c.GetBool("gemini_google_search_call"))
+	assert.Nil(t, c.MustGet("chat_completion_web_search_context_size"))
+	assert.False(t, common.GetContextKeyBool(c, constant.ContextKeyIsStream))
+	assert.False(t, common.GetContextKeyBool(c, constant.ContextKeySystemPromptOverride))
+	assert.False(t, common.GetContextKeyBool(c, constant.ContextKeyRelayFailed))
+	assert.Equal(t, "token", common.GetContextKeyString(c, constant.ContextKeyOpenCodeGoAffinitySource))
+	assert.Equal(t, "safe-affinity", common.GetContextKeyString(c, constant.ContextKeyOpenCodeGoAffinityKey))
+
+	// Candidate B may now select Chat and consume a normal JSON response without
+	// being routed through the SSE scanner by A's media type.
+	info.FinalRequestRelayFormat = types.RelayFormatOpenAI
+	assert.Equal(t, types.RelayFormatOpenAI, info.GetFinalRequestRelayFormat())
+	assert.False(t, info.IsStream)
+}
 
 func TestRenderRelayErrorRedactsOpenCodeHTTP200EnvelopeBeforeServerLog(t *testing.T) {
 	previousWriter := gin.DefaultErrorWriter
@@ -65,13 +266,14 @@ func TestRenderRelayErrorMarksCommittedRelayFailure(t *testing.T) {
 
 type postResponseSettlementBilling struct {
 	refundCalls int
+	needsRefund bool
 }
 
 func (*postResponseSettlementBilling) Settle(int) error { return nil }
 
 func (b *postResponseSettlementBilling) Refund(*gin.Context) { b.refundCalls++ }
 
-func (*postResponseSettlementBilling) NeedsRefund() bool { return true }
+func (b *postResponseSettlementBilling) NeedsRefund() bool { return b.needsRefund }
 
 func (*postResponseSettlementBilling) GetPreConsumedQuota() int { return 50 }
 
@@ -95,6 +297,25 @@ func TestOpenCodeGoFailuresNeverDisableWholePoolChannel(t *testing.T) {
 	assert.True(t, shouldDisableWholeChannel(constant.ChannelTypeOpenAI, err))
 	assert.True(t, shouldDisableWholeChannel(constant.ChannelTypeOpenCodeAPIKey, err))
 	assert.False(t, shouldDisableWholeChannel(constant.ChannelTypeOpenCodeGo, err))
+
+	localWriterErr := types.NewOpenAIError(
+		errors.New("downstream writer failed"),
+		types.ErrorCodeChannelInvalidKey,
+		http.StatusUnauthorized,
+		types.ErrOptionWithProvenance(types.ErrorProvenance{
+			Origin:  types.ErrorOriginLocalWriter,
+			Subtype: "downstream_write",
+		}),
+	)
+	assert.False(t, shouldDisableWholeChannel(constant.ChannelTypeOpenCodeAPIKey, localWriterErr))
+	assert.False(t, shouldRetry(newOpenCodeAPIKeyRetryContext(), localWriterErr, 3))
+}
+
+func newOpenCodeAPIKeyRetryContext() *gin.Context {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenCodeAPIKey)
+	return c
 }
 
 func TestOpenCodeAPIKeyAutoDisableUsesRawUpstreamStatusBeforePublicProjection(t *testing.T) {
@@ -169,6 +390,41 @@ func TestOpenCodeAPIKeyGenericRetryUsesRawUpstreamStatusBeforeMapping(t *testing
 	service.ResetStatusCode(rawClientErr, `{"400":503}`)
 	require.Equal(t, http.StatusServiceUnavailable, rawClientErr.StatusCode)
 	assert.False(t, shouldRetry(c, rawClientErr, 1), "a mapped 503 must not turn the raw upstream 400 into a retry")
+}
+
+func TestOpenCodeAPIKeyResponseLimitDoesNotRetryAsFabricatedBadGateway(t *testing.T) {
+	oldRetryRanges := append([]operation_setting.StatusCodeRange(nil), operation_setting.AutomaticRetryStatusCodeRanges...)
+	operation_setting.AutomaticRetryStatusCodeRanges = []operation_setting.StatusCodeRange{{
+		Start: http.StatusBadGateway,
+		End:   http.StatusBadGateway,
+	}}
+	t.Cleanup(func() { operation_setting.AutomaticRetryStatusCodeRanges = oldRetryRanges })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenCodeAPIKey)
+
+	limitErr := types.NewOpenAIError(
+		errors.New("response exceeded local limit"),
+		types.ErrorCodeReadResponseBodyFailed,
+		http.StatusBadGateway,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithProvenance(types.ErrorProvenance{
+			Origin:  types.ErrorOriginGatewayInvariant,
+			Subtype: "response_limit",
+		}),
+	)
+	assert.False(t, shouldRetry(c, limitErr, 1))
+	assert.False(t, service.IsOpenCodeGoUpstreamRelayError(limitErr))
+	assert.Zero(t, limitErr.Provenance().RawStatusCode)
+
+	rawBadGateway := service.MarkOpenCodeGoUpstreamRelayErrorWithStatus(types.NewOpenAIError(
+		errors.New("trusted upstream HTTP failure"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusBadGateway,
+	), http.StatusBadGateway)
+	assert.True(t, shouldRetry(c, rawBadGateway, 1), "the control proves the retry range is reachable")
 }
 
 func TestOpenCodeAPIKeyGenericRetryClassifiesHTTP200ErrorEnvelope(t *testing.T) {
@@ -306,7 +562,11 @@ func TestPostResponseSettlementFailureRefundsWithoutRetryDisableOrResponseAppend
 	assert.False(t, shouldRetry(c, apiErr, 3))
 	assert.False(t, shouldDisableWholeChannel(constant.ChannelTypeOpenAI, apiErr))
 
-	billing := &postResponseSettlementBilling{}
+	billing := &postResponseSettlementBilling{needsRefund: true}
 	refundRelayBilling(c, &relaycommon.RelayInfo{Billing: billing})
 	assert.Equal(t, 1, billing.refundCalls)
+
+	settledBilling := &postResponseSettlementBilling{needsRefund: false}
+	refundRelayBilling(c, &relaycommon.RelayInfo{Billing: settledBilling})
+	assert.Equal(t, 0, settledBilling.refundCalls)
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	common2 "github.com/QuantumNous/new-api/common"
@@ -1258,6 +1259,81 @@ func TestApplyParamOverrideConditionFromRetryAndLastErrorContext(t *testing.T) {
 		t.Fatalf("ApplyParamOverride returned error: %v", err)
 	}
 	assertJSONEqual(t, `{"temperature":0.1}`, string(out))
+}
+
+func TestValidateParamOverrideRequestStableRejectsAttemptLocalConditions(t *testing.T) {
+	tests := []struct {
+		name     string
+		override map[string]interface{}
+	}{
+		{
+			name: "retry index",
+			override: map[string]interface{}{
+				"operations": []interface{}{
+					map[string]interface{}{
+						"path": "temperature", "mode": "set", "value": 0.1,
+						"conditions": []interface{}{
+							map[string]interface{}{"path": "retry.index", "mode": "gte", "value": 1},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "last error shorthand",
+			override: map[string]interface{}{
+				"operations": []interface{}{
+					map[string]interface{}{
+						"path": "temperature", "mode": "set", "value": 0.1,
+						"conditions": map[string]interface{}{"last_error_code": "bad_request"},
+					},
+				},
+			},
+		},
+		{
+			name: "prune condition",
+			override: map[string]interface{}{
+				"operations": []interface{}{
+					map[string]interface{}{
+						"path": "messages", "mode": "prune_objects",
+						"value": map[string]interface{}{
+							"conditions": map[string]interface{}{"is_retry": true},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateParamOverrideRequestStable(test.override)
+			if err == nil {
+				t.Fatal("expected attempt-local override rejection")
+			}
+			if strings.Contains(err.Error(), "bad_request") {
+				t.Fatalf("validation error exposed configured value: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateParamOverrideRequestStableAllowsRequestGlobalConditions(t *testing.T) {
+	override := map[string]interface{}{
+		"operations": []interface{}{
+			map[string]interface{}{
+				"path": "temperature", "mode": "set", "value": 0.1,
+				"conditions": []interface{}{
+					map[string]interface{}{"path": "using_group", "mode": "full", "value": "premium"},
+					map[string]interface{}{"path": "request_headers.x-mode", "mode": "full", "value": "safe"},
+				},
+			},
+		},
+	}
+
+	if err := ValidateParamOverrideRequestStable(override); err != nil {
+		t.Fatalf("request-global override rejected: %v", err)
+	}
 }
 
 func TestApplyParamOverrideConditionByUserAndGPTModel(t *testing.T) {

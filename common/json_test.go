@@ -2,10 +2,38 @@ package common
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestDecodeJsonUseNumberPreservesLargeIntegerLexeme(t *testing.T) {
+	const integer = "900719925474099312345678901234567890"
+	var decoded map[string]any
+
+	err := DecodeJsonUseNumber(strings.NewReader(`{"value":`+integer+`}`), &decoded)
+
+	require.NoError(t, err)
+	number, ok := decoded["value"].(json.Number)
+	require.True(t, ok)
+	require.Equal(t, integer, number.String())
+}
+
+func TestNewJsonDecoderUseNumberPreservesTokenLexeme(t *testing.T) {
+	const integer = "9007199254740993"
+	decoder := NewJsonDecoderUseNumber(strings.NewReader(`[` + integer + `]`))
+
+	opening, err := decoder.Token()
+	require.NoError(t, err)
+	require.Equal(t, json.Delim('['), opening)
+
+	value, err := decoder.Token()
+	require.NoError(t, err)
+	number, ok := value.(json.Number)
+	require.True(t, ok)
+	require.Equal(t, integer, number.String())
+}
 
 func TestJsonRawMessageToString(t *testing.T) {
 	tests := []struct {

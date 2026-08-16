@@ -365,6 +365,74 @@ func TestPrepareTieredBillingForSelectedGroupUpdatesReservation(t *testing.T) {
 	assert.Equal(t, 100_000, relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
 }
 
+func TestBindTieredBillingCandidateRefreshesFinalRequestEstimate(t *testing.T) {
+	relayInfo := &relaycommon.RelayInfo{
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:               "tiered_expr",
+			ExprString:                probeExpr,
+			EstimatedPromptTokens:     1_000,
+			EstimatedCompletionTokens: 100,
+			QuotaPerUnit:              testQuotaPerUnit,
+		},
+		PriceData: types.PriceData{
+			GroupRatioInfo:    types.GroupRatioInfo{GroupRatio: 2},
+			QuotaToPreConsume: 6_000,
+		},
+	}
+	input := billingexpr.RequestInput{Body: []byte(`{"service_tier":"fast"}`)}
+
+	require.NoError(t, BindTieredBillingCandidate(relayInfo, input, 1_000, 100))
+	require.NotNil(t, relayInfo.BillingRequestInput)
+	assert.Equal(t, "fast", relayInfo.TieredBillingSnapshot.EstimatedTier)
+	assert.Equal(t, 3_000.0, relayInfo.TieredBillingSnapshot.EstimatedQuotaBeforeGroup)
+	assert.Equal(t, 6_000, relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
+
+	input.Body[17] = 'x'
+	assert.JSONEq(t, `{"service_tier":"fast"}`, string(relayInfo.BillingRequestInput.Body))
+}
+
+func TestBindTieredBillingCandidateRejectsEstimateAbovePreBilledMaximum(t *testing.T) {
+	relayInfo := &relaycommon.RelayInfo{
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:  "tiered_expr",
+			ExprString:   `tier("base", p)`,
+			QuotaPerUnit: testQuotaPerUnit,
+		},
+		PriceData: types.PriceData{
+			GroupRatioInfo:    types.GroupRatioInfo{GroupRatio: 1},
+			QuotaToPreConsume: 50,
+		},
+	}
+
+	err := BindTieredBillingCandidate(relayInfo, billingexpr.RequestInput{}, 200, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pre-billed maximum")
+}
+
+func TestPrepareTieredBillingForSelectedCandidateDoesNotReserveAgain(t *testing.T) {
+	billing := &recordingBillingSettler{preConsumedQuota: 8_000}
+	relayInfo := &relaycommon.RelayInfo{
+		Billing:               billing,
+		FinalPreConsumedQuota: 8_000,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:               "tiered_expr",
+			ExprString:                `tier("base", p)`,
+			GroupRatio:                1,
+			EstimatedQuotaBeforeGroup: 6_000,
+			EstimatedQuotaAfterGroup:  6_000,
+			QuotaPerUnit:              testQuotaPerUnit,
+		},
+		PriceData: types.PriceData{
+			GroupRatioInfo:    types.GroupRatioInfo{GroupRatio: 1},
+			QuotaToPreConsume: 8_000,
+		},
+	}
+
+	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
+	assert.Empty(t, billing.reserveTargets)
+	assert.Equal(t, 8_000, relayInfo.FinalPreConsumedQuota)
+}
+
 func TestPrepareTieredBillingForSelectedGroupStartsBillingAfterFreeGroup(t *testing.T) {
 	truncate(t)
 	gin.SetMode(gin.TestMode)

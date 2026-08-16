@@ -85,6 +85,9 @@ func TestOpenCodeGoImmediateRetrySucceedsOnSecondAttemptAndResetsState(t *testin
 				info.StreamStatus = relaycommon.NewStreamStatus()
 				info.StreamProtocolTerminalRequired = true
 				info.ReceivedResponseCount = 7
+				info.RuntimeHeadersOverride = map[string]interface{}{"x-first-attempt": "private"}
+				info.UseRuntimeHeadersOverride = true
+				info.ParamOverrideAudit = []string{"first-attempt-audit"}
 				info.ResponsesUsageInfo.BuiltInTools["web_search"].CallCount = 3
 				c.Set("claude_web_search_requests", 5)
 				c.Set("gemini_google_search_call", true)
@@ -104,6 +107,9 @@ func TestOpenCodeGoImmediateRetrySucceedsOnSecondAttemptAndResetsState(t *testin
 			assert.Nil(t, info.StreamStatus)
 			assert.False(t, info.StreamProtocolTerminalRequired)
 			assert.Zero(t, info.ReceivedResponseCount)
+			assert.Nil(t, info.RuntimeHeadersOverride)
+			assert.False(t, info.UseRuntimeHeadersOverride)
+			assert.Nil(t, info.ParamOverrideAudit)
 			assert.Equal(t, 1, info.ResponsesUsageInfo.BuiltInTools["web_search"].CallCount)
 			assert.Equal(t, 2, c.GetInt("claude_web_search_requests"))
 			assert.False(t, c.GetBool("gemini_google_search_call"))

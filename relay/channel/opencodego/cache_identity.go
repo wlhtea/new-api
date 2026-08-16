@@ -50,6 +50,7 @@ const (
 	AffinitySourceClaudeMetadata    = constant.OpenCodeGoAffinitySourceClaudeMetadataSession
 	AffinitySourceOpenCodeSession   = constant.OpenCodeGoAffinitySourceOpenCodeSession
 	AffinitySourcePromptCacheKey    = constant.OpenCodeGoAffinitySourcePromptCacheKey
+	AffinitySourceMetadataUserID    = constant.OpenCodeGoAffinitySourceMetadataUserID
 )
 
 // affinityIdentityForRequest resolves the account-affinity key and its source.

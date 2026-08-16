@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -97,12 +98,24 @@ func renderRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websock
 		common.SetContextKey(c, constant.ContextKeyRelayFailed, true)
 		return
 	}
+	channelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
 	publicError := publicRelayError(c, newAPIError)
-	if publicError != newAPIError {
+	projectedOpenCodeError := publicError != newAPIError && constant.IsOpenCodeChannelType(channelType)
+	if projectedOpenCodeError {
+		resetOpenCodePublicResponseHeaders(c, requestID)
+	} else if publicError != newAPIError {
 		clearUnwrittenEventStreamHeaders(c)
 	}
 	newAPIError = publicError
-	newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestID))
+	if constant.IsOpenCodeChannelType(channelType) {
+		c.Header(common.RequestIdKey, requestID)
+	} else {
+		newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestID))
+	}
+	if service.IsOpenCodeGoFixedInvalidRequestProjection(newAPIError) {
+		renderOpenCodeFixedInvalidRequest(c, relayFormat, newAPIError)
+		return
+	}
 	switch relayFormat {
 	case types.RelayFormatOpenAIRealtime:
 		helper.WssError(c, ws, newAPIError.ToOpenAIError())
@@ -115,6 +128,55 @@ func renderRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websock
 		c.JSON(newAPIError.StatusCode, gin.H{
 			"error": newAPIError.ToOpenAIError(),
 		})
+	}
+}
+
+func renderOpenCodeFixedInvalidRequest(c *gin.Context, relayFormat types.RelayFormat, relayErr *types.NewAPIError) {
+	if relayFormat == types.RelayFormatClaude {
+		c.JSON(relayErr.StatusCode, gin.H{
+			"type": "error",
+			"error": gin.H{
+				"type":    constant.OpenCodeGoPublicInvalidRequestCode,
+				"message": constant.OpenCodeGoPublicInvalidRequestMessage,
+			},
+		})
+		return
+	}
+	c.JSON(relayErr.StatusCode, gin.H{
+		"error": gin.H{
+			"message": constant.OpenCodeGoPublicInvalidRequestMessage,
+			"type":    constant.OpenCodeGoPublicInvalidRequestCode,
+			"code":    constant.OpenCodeGoPublicInvalidRequestCode,
+		},
+	})
+}
+
+func resetOpenCodePublicResponseHeaders(c *gin.Context, requestID string) {
+	if c == nil || c.Writer == nil || c.Writer.Written() {
+		return
+	}
+	header := c.Writer.Header()
+	localCORS := make(http.Header)
+	for _, name := range []string{
+		"Access-Control-Allow-Credentials",
+		"Access-Control-Allow-Origin",
+		"Access-Control-Expose-Headers",
+		"Vary",
+	} {
+		if values := header.Values(name); len(values) > 0 {
+			localCORS[name] = append([]string(nil), values...)
+		}
+	}
+	for name := range header {
+		header.Del(name)
+	}
+	for name, values := range localCORS {
+		for _, value := range values {
+			header.Add(name, value)
+		}
+	}
+	if requestID != "" {
+		header.Set(common.RequestIdKey, requestID)
 	}
 }
 
@@ -140,7 +202,7 @@ func clearUnwrittenEventStreamHeaders(c *gin.Context) {
 }
 
 func refundRelayBilling(c *gin.Context, relayInfo *relaycommon.RelayInfo) {
-	if relayInfo != nil && relayInfo.Billing != nil {
+	if relayInfo != nil && relayInfo.Billing != nil && relayInfo.Billing.NeedsRefund() {
 		relayInfo.Billing.Refund(c)
 	}
 }
@@ -181,6 +243,23 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				types.ErrorCodeBadResponse,
 				499,
 				types.ErrOptionWithSkipRetry(),
+				types.ErrOptionWithProvenance(types.ErrorProvenance{
+					Origin:  types.ErrorOriginLocalCancel,
+					Subtype: "request_body_cancelled",
+				}),
+			)
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			newAPIError = types.NewOpenAIError(
+				context.DeadlineExceeded,
+				types.ErrorCodeBadResponse,
+				http.StatusGatewayTimeout,
+				types.ErrOptionWithSkipRetry(),
+				types.ErrOptionWithProvenance(types.ErrorProvenance{
+					Origin:  types.ErrorOriginLocalDeadline,
+					Subtype: "request_body_deadline",
+				}),
 			)
 			return
 		}
@@ -192,10 +271,36 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		return
 	}
+	if securityErr := preflightOpenCodeRequestSensitiveValues(c, relayFormat); securityErr != nil {
+		newAPIError = securityErr
+		return
+	}
 
 	relayInfo, err := relaycommon.GenRelayInfo(c, relayFormat, request, ws)
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
+		return
+	}
+	if preflightErr := relaychannel.PreflightOpenCodeRequestTransport(relayInfo, c); preflightErr != nil {
+		newAPIError = preflightErr
+		return
+	}
+	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeOpenCodeAPIKey {
+		if snapshotErr := freezeOpenCodeAPIKeyRetrySnapshot(c, relayInfo); snapshotErr != nil {
+			newAPIError = snapshotErr
+			return
+		}
+	} else if preflightErr := preflightOpenCodeRequest(c, relayInfo); preflightErr != nil {
+		newAPIError = preflightErr
+		return
+	}
+	finalizedCandidates, finalizedErr := prepareOpenCodeFinalizedCandidatePlans(c, relayInfo)
+	if finalizedErr != nil {
+		newAPIError = finalizedErr
+		return
+	}
+	if securityErr := preflightOpenCodeFinalizedCandidateSensitiveValues(c, finalizedCandidates); securityErr != nil {
+		newAPIError = securityErr
 		return
 	}
 
@@ -209,11 +314,24 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		meta = fastTokenCountMetaForPricing(request)
 	}
 
-	if needSensitiveCheck && meta != nil {
+	if needSensitiveCheck && shouldRunTypedSensitiveScan(c) && meta != nil {
 		contains, words := service.CheckSensitiveText(meta.CombineText)
 		if contains {
-			logger.LogWarn(c, fmt.Sprintf("user sensitive words detected: %s", strings.Join(words, ", ")))
-			newAPIError = types.NewError(err, types.ErrorCodeSensitiveWordsDetected)
+			logger.LogWarn(c, fmt.Sprintf(
+				"relay request security rejected: rule_id=request.security.typed-string match_count=%d",
+				len(words),
+			))
+			newAPIError = types.NewOpenAIError(
+				errors.New("request contains sensitive content"),
+				types.ErrorCodeSensitiveWordsDetected,
+				http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+				types.ErrOptionWithNoRecordErrorLog(),
+				types.ErrOptionWithProvenance(types.ErrorProvenance{
+					Origin:  types.ErrorOriginLocalValidation,
+					Subtype: "request.security.typed-string",
+				}),
+			)
 			return
 		}
 	}
@@ -226,11 +344,25 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	relayInfo.SetEstimatePromptTokens(tokens)
 
-	priceData, err := helper.ModelPriceHelper(c, relayInfo, tokens, meta)
+	var billingCandidates []helper.BillingCandidateView
+	if finalizedCandidates != nil {
+		billingCandidates = finalizedCandidates.billingViews(tokens)
+	}
+	priceData, err := helper.ModelPriceHelperForCandidates(c, relayInfo, tokens, meta, billingCandidates)
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest))
 		return
 	}
+
+	defer func() {
+		if newAPIError != nil {
+			newAPIError = service.NormalizeViolationFeeError(newAPIError)
+			service.ChargeViolationFeeIfNeeded(c, relayInfo, newAPIError)
+		}
+		// Billing state, rather than the presence of a returned error, owns
+		// refund eligibility. This also runs while a panic unwinds.
+		refundRelayBilling(c, relayInfo)
+	}()
 
 	// common.SetContextKey(c, constant.ContextKeyTokenCountMeta, meta)
 
@@ -243,15 +375,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}
 
-	defer func() {
-		// Only return quota if downstream failed and quota was actually pre-consumed
-		if newAPIError != nil {
-			newAPIError = service.NormalizeViolationFeeError(newAPIError)
-			refundRelayBilling(c, relayInfo)
-			service.ChargeViolationFeeIfNeeded(c, relayInfo, newAPIError)
-		}
-	}()
-
 	retryParam := &service.RetryParam{
 		Ctx:         c,
 		TokenGroup:  relayInfo.TokenGroup,
@@ -261,16 +384,54 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	attemptBaseline := relayInfo.SnapshotRelayAttempt()
+	attemptContextBaseline := snapshotRelayAttemptContext(c)
+	retrySnapshot, hasRetrySnapshot, snapshotErr := getOpenCodeAPIKeyRetrySnapshot(c)
+	if snapshotErr != nil {
+		newAPIError = newOpenCodeRetrySnapshotAPIError(c, snapshotErr)
+		return
+	}
+	physicalAttempt := 0
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
-		relayInfo.RetryIndex = retryParam.GetRetry()
-		channel, channelErr := getChannel(c, relayInfo, retryParam)
+	for {
+		if hasRetrySnapshot {
+			if physicalAttempt >= len(retrySnapshot.selections) {
+				break
+			}
+		} else if retryParam.GetRetry() > common.RetryTimes {
+			break
+		}
+
+		var (
+			channel    *model.Channel
+			channelErr *types.NewAPIError
+		)
+		if hasRetrySnapshot {
+			if physicalAttempt > 0 {
+				resetOpenCodeAPIKeyRelayAttempt(c, relayInfo, attemptBaseline, attemptContextBaseline)
+			}
+			relayInfo.RetryIndex = physicalAttempt
+			selected, selectErr := retrySnapshot.selectAttempt(c, physicalAttempt)
+			if selectErr != nil {
+				channelErr = newOpenCodeRetrySnapshotAPIError(c, selectErr)
+			} else {
+				channel = selected
+				relayInfo.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, relayInfo)
+			}
+		} else {
+			relayInfo.RetryIndex = retryParam.GetRetry()
+			channel, channelErr = getChannel(c, relayInfo, retryParam)
+		}
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
 			break
 		}
 		addUsedChannel(c, channel.Id)
+		if billingErr := bindOpenCodeFinalizedCandidateBilling(c, relayInfo); billingErr != nil {
+			newAPIError = billingErr
+			break
+		}
 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
 			newAPIError = billingErr
 			break
@@ -299,8 +460,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 
-		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
+		remainingRetries := common.RetryTimes - retryParam.GetRetry()
+		if hasRetrySnapshot {
+			remainingRetries = len(retrySnapshot.selections) - physicalAttempt - 1
+		}
+		if !shouldRetry(c, newAPIError, remainingRetries) {
 			break
+		}
+		if hasRetrySnapshot {
+			physicalAttempt++
+		} else {
+			retryParam.IncreaseRetry()
 		}
 	}
 
@@ -310,10 +480,66 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		logger.LogInfo(c, retryLogStr)
 	}
 	if newAPIError != nil {
-		gopool.Go(func() {
-			perfmetrics.RecordRelaySample(relayInfo, false, 0)
-		})
+		perfmetrics.ScheduleRelaySample(relayInfo, false, 0)
 	}
+}
+
+type relayAttemptContextSnapshot struct {
+	requestIsStream          bool
+	claudeWebSearchRequests  int
+	geminiGoogleSearchCall   bool
+	chatWebSearchContextSize interface{}
+	systemPromptOverride     bool
+	openCodeGoAffinitySource interface{}
+	openCodeGoAffinityKey    interface{}
+	openCodeGoWorkspaceUID   interface{}
+}
+
+func snapshotRelayAttemptContext(c *gin.Context) relayAttemptContextSnapshot {
+	if c == nil {
+		return relayAttemptContextSnapshot{}
+	}
+	chatWebSearchContextSize, _ := c.Get("chat_completion_web_search_context_size")
+	affinitySource, _ := c.Get(string(constant.ContextKeyOpenCodeGoAffinitySource))
+	affinityKey, _ := c.Get(string(constant.ContextKeyOpenCodeGoAffinityKey))
+	workspaceUID, _ := c.Get(string(constant.ContextKeyOpenCodeGoWorkspaceUID))
+	return relayAttemptContextSnapshot{
+		requestIsStream:          common.GetContextKeyBool(c, constant.ContextKeyIsStream),
+		claudeWebSearchRequests:  c.GetInt("claude_web_search_requests"),
+		geminiGoogleSearchCall:   c.GetBool("gemini_google_search_call"),
+		chatWebSearchContextSize: chatWebSearchContextSize,
+		systemPromptOverride:     common.GetContextKeyBool(c, constant.ContextKeySystemPromptOverride),
+		openCodeGoAffinitySource: affinitySource,
+		openCodeGoAffinityKey:    affinityKey,
+		openCodeGoWorkspaceUID:   workspaceUID,
+	}
+}
+
+func resetOpenCodeAPIKeyRelayAttempt(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	baseline relaycommon.RelayAttemptSnapshot,
+	contextBaseline relayAttemptContextSnapshot,
+) {
+	if relayInfo != nil {
+		relayInfo.RestoreRelayAttempt(baseline)
+	}
+	if c == nil {
+		return
+	}
+	resetOpenCodePublicResponseHeaders(c, c.GetString(common.RequestIdKey))
+	c.Set(common.UpstreamRequestIdKey, nil)
+	c.Set("claude_web_search_requests", contextBaseline.claudeWebSearchRequests)
+	c.Set("gemini_google_search_call", contextBaseline.geminiGoogleSearchCall)
+	c.Set("chat_completion_web_search_context_size", contextBaseline.chatWebSearchContextSize)
+	common.SetContextKey(c, constant.ContextKeyIsStream, contextBaseline.requestIsStream)
+	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, contextBaseline.systemPromptOverride)
+	common.SetContextKey(c, constant.ContextKeyOpenCodeGoAffinitySource, contextBaseline.openCodeGoAffinitySource)
+	common.SetContextKey(c, constant.ContextKeyOpenCodeGoAffinityKey, contextBaseline.openCodeGoAffinityKey)
+	common.SetContextKey(c, constant.ContextKeyOpenCodeGoWorkspaceUID, contextBaseline.openCodeGoWorkspaceUID)
+	common.SetContextKey(c, constant.ContextKeyRelayFailed, false)
+	service.ResetResponseBodyWriteError(c)
+	helper.ResetEventStreamHeaders(c)
 }
 
 func relaySelectedChannel(c *gin.Context, relayFormat types.RelayFormat, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
@@ -345,7 +571,7 @@ func relaySelectedChannelWithOpenCodeGoRetry(
 
 	service.BeginOpenCodeGoImmediateRetry(c)
 	defer service.EndOpenCodeGoImmediateRetry(c)
-	attemptSnapshot := relayInfo.SnapshotUnwrittenStreamAttempt()
+	attemptSnapshot := relayInfo.SnapshotRelayAttempt()
 	claudeWebSearchRequests := c.GetInt("claude_web_search_requests")
 	geminiGoogleSearchCall := c.GetBool("gemini_google_search_call")
 
@@ -365,9 +591,21 @@ func relaySelectedChannelWithOpenCodeGoRetry(
 	logger.LogWarn(c, fmt.Sprintf(
 		"OpenCode Go transient upstream failure; retrying once on the selected workspace: status=%d error=%s",
 		firstErr.StatusCode,
-		common.LocalLogPreview(firstErr.Error()),
+		service.SanitizeOpenCodeGoAdminError(firstErr),
 	))
 	service.PrepareOpenCodeGoImmediateRetry(c)
+	if err := relay.PrepareOpenCodeGoOutboundPlanReplay(c, relayInfo); err != nil {
+		service.DiscardOpenCodeGoImmediateRetryFailover(c)
+		return types.NewError(
+			err,
+			types.ErrorCodeConvertRequestFailed,
+			types.ErrOptionWithSkipRetry(),
+			types.ErrOptionWithProvenance(types.ErrorProvenance{
+				Origin:  types.ErrorOriginGatewayInvariant,
+				Subtype: "request.finalized-body-replay",
+			}),
+		)
+	}
 	resetOpenCodeGoRelayAttempt(c, relayInfo, attemptSnapshot, claudeWebSearchRequests, geminiGoogleSearchCall)
 	return service.NormalizeViolationFeeError(attempt())
 }
@@ -395,7 +633,7 @@ func openCodeGoImmediateRetryEndedLocally(c *gin.Context) bool {
 func resetOpenCodeGoRelayAttempt(
 	c *gin.Context,
 	relayInfo *relaycommon.RelayInfo,
-	attemptSnapshot relaycommon.UnwrittenStreamAttemptSnapshot,
+	attemptSnapshot relaycommon.RelayAttemptSnapshot,
 	claudeWebSearchRequests int,
 	geminiGoogleSearchCall bool,
 ) {
@@ -422,7 +660,7 @@ func resetOpenCodeGoRelayAttempt(
 		helper.ResetEventStreamHeaders(c)
 	}
 	if relayInfo != nil {
-		relayInfo.RestoreUnwrittenStreamAttempt(attemptSnapshot)
+		relayInfo.RestoreRelayAttempt(attemptSnapshot)
 	}
 }
 
@@ -505,6 +743,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if openaiErr == nil {
 		return false
 	}
+	if openaiErr.Provenance().IsLocal() || openaiErr.Provenance().IsGateway() {
+		return false
+	}
 	channelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
 	if channelType == constant.ChannelTypeOpenCodeGo {
 		return false
@@ -517,6 +758,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 			return false
 		}
 		if service.ResponseBodyWriteError(c) != nil {
+			return false
+		}
+		if service.IsOpenCodeGoRawInvalidRequestError(openaiErr) {
 			return false
 		}
 	}
@@ -591,6 +835,10 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		service.AppendOpenCodeGoWorkspaceAdminInfo(c, adminInfo)
 		if upstreamStatusCode, ok := service.OpenCodeGoUpstreamRelayStatusCode(err); ok {
 			adminInfo["upstream_status_code"] = upstreamStatusCode
+		}
+		if provenance := err.Provenance(); !provenance.IsZero() {
+			adminInfo["error_origin"] = provenance.Origin
+			adminInfo["error_subtype"] = provenance.Subtype
 		}
 		other["admin_info"] = adminInfo
 		startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)

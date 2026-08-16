@@ -19,6 +19,8 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+const relayMaxResponseHeaderBytes int64 = 1 << 20
+
 var (
 	httpClient              *http.Client
 	ssrfProtectedHTTPClient *http.Client
@@ -91,6 +93,7 @@ func newRelayHTTPTransport() *http.Transport {
 	transport.MaxIdleConns = common.RelayMaxIdleConns
 	transport.MaxIdleConnsPerHost = common.RelayMaxIdleConnsPerHost
 	transport.IdleConnTimeout = time.Duration(common.RelayIdleConnTimeout) * time.Second
+	transport.MaxResponseHeaderBytes = relayMaxResponseHeaderBytes
 	transport.ForceAttemptHTTP2 = true
 	if common.TLSInsecureSkipVerify {
 		transport.TLSClientConfig = common.InsecureTLSConfig

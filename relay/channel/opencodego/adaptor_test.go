@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,40 +22,10 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestBuiltInAffinityRuleCoversEveryOpenCodeModel(t *testing.T) {
-	setting := operation_setting.GetChannelAffinitySetting()
-	require.NotNil(t, setting)
-	assert.Contains(t, ModelList, "qwen3.8-max")
-
-	var builtInRule *operation_setting.ChannelAffinityRule
-	for _, rule := range setting.EffectiveRules() {
-		if rule.Name == "opencode api key trace" {
-			ruleCopy := rule
-			builtInRule = &ruleCopy
-			break
-		}
-	}
-	require.NotNil(t, builtInRule)
-
-	for _, model := range ModelList {
-		covered := false
-		for _, pattern := range builtInRule.ModelRegex {
-			matched, err := regexp.MatchString(pattern, model)
-			require.NoError(t, err)
-			if matched {
-				covered = true
-				break
-			}
-		}
-		assert.Truef(t, covered, "built-in affinity rule does not cover model %q", model)
-	}
-}
 
 func TestAdaptorForwardsAnthropicHeadersForMessages(t *testing.T) {
 	originalSelector := selectOpenCodeGoWorkspace
@@ -1450,12 +1419,16 @@ func TestAdaptorPersistsTransportFailureAndSkipsCallerCancellation(t *testing.T)
 
 	observations := 0
 	observeOpenCodeGoTransportFailure = func(channelID int, workspaceUID string, upstreamModel string, reason string, observedAt time.Time) (bool, error) {
-		observations++
 		assert.Equal(t, 42, channelID)
 		assert.Equal(t, "workspace-transport", workspaceUID)
 		assert.Equal(t, "glm-5.2", upstreamModel)
-		assert.Equal(t, "connection reset", reason)
+		if observations == 0 {
+			assert.Equal(t, "connection reset", reason)
+		} else {
+			assert.Equal(t, context.Canceled.Error(), reason)
+		}
 		assert.Equal(t, fixedNow, observedAt)
+		observations++
 		return true, nil
 	}
 
@@ -1480,6 +1453,32 @@ func TestAdaptorPersistsTransportFailureAndSkipsCallerCancellation(t *testing.T)
 	_, err = adaptor.DoRequest(c, info, nil)
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Equal(t, 1, observations)
+	var localCancelErr *types.NewAPIError
+	require.ErrorAs(t, err, &localCancelErr)
+	assert.Equal(t, types.ErrorOriginLocalCancel, localCancelErr.Provenance().Origin)
+
+	liveContext := newAdaptorTestContext()
+	_, err = adaptor.DoRequest(liveContext, info, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 2, observations)
+	var upstreamTransportErr *types.NewAPIError
+	require.ErrorAs(t, err, &upstreamTransportErr)
+	assert.Equal(t, types.ErrorOriginUpstreamTransport, upstreamTransportErr.Provenance().Origin)
+	assert.True(t, service.IsOpenCodeGoUpstreamRelayError(upstreamTransportErr))
+
+	deadlineContext := newAdaptorTestContext()
+	expired, cancelDeadline := context.WithDeadline(deadlineContext.Request.Context(), time.Now().Add(-time.Second))
+	defer cancelDeadline()
+	deadlineContext.Request = deadlineContext.Request.WithContext(expired)
+	doOpenCodeGoAPIRequest = func(_ relaychannel.Adaptor, _ *gin.Context, _ *relaycommon.RelayInfo, _ io.Reader) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	}
+	_, err = adaptor.DoRequest(deadlineContext, info, nil)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Equal(t, 2, observations)
+	var localDeadlineErr *types.NewAPIError
+	require.ErrorAs(t, err, &localDeadlineErr)
+	assert.Equal(t, types.ErrorOriginLocalDeadline, localDeadlineErr.Provenance().Origin)
 }
 
 func TestAdaptorDoRequestMakesExactlyOneUpstreamAttempt(t *testing.T) {

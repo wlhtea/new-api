@@ -11,11 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -217,9 +219,195 @@ func TestHandleNon2xxResponseBoundsUnstructuredBody(t *testing.T) {
 	apiErr, observation := (&Adaptor{}).HandleNon2xxResponse(c, resp, nil)
 
 	require.NotNil(t, apiErr)
-	require.NotNil(t, observation)
-	assert.Equal(t, "OpenCode Go returned status 502", observation.Message)
+	require.Nil(t, observation)
+	assert.ErrorIs(t, apiErr, errOpenCodeGoResponseLimitExceeded)
+	assert.Equal(t, types.ErrorOriginUpstreamHTTP, apiErr.Provenance().Origin)
+	assert.Equal(t, "error_body_limit", apiErr.Provenance().Subtype)
+	assert.Equal(t, http.StatusBadGateway, apiErr.Provenance().RawStatusCode)
+	assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
 	assert.NotContains(t, apiErr.Error(), strings.Repeat("x", 100))
+}
+
+func TestHandleNon2xxResponseBoundsFailedErrorBodyReadsWithoutLeakingContent(t *testing.T) {
+	oldDisableEnabled := common.AutomaticDisableChannelEnabled
+	oldDisableRanges := append([]operation_setting.StatusCodeRange(nil), operation_setting.AutomaticDisableStatusCodeRanges...)
+	oldRetryRanges := append([]operation_setting.StatusCodeRange(nil), operation_setting.AutomaticRetryStatusCodeRanges...)
+	common.AutomaticDisableChannelEnabled = true
+	operation_setting.AutomaticDisableStatusCodeRanges = []operation_setting.StatusCodeRange{{Start: 400, End: 599}}
+	operation_setting.AutomaticRetryStatusCodeRanges = []operation_setting.StatusCodeRange{{Start: 400, End: 599}}
+	t.Cleanup(func() {
+		common.AutomaticDisableChannelEnabled = oldDisableEnabled
+		operation_setting.AutomaticDisableStatusCodeRanges = oldDisableRanges
+		operation_setting.AutomaticRetryStatusCodeRanges = oldRetryRanges
+	})
+
+	const privateBody = "private-upstream-body"
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		for _, statusCode := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusServiceUnavailable} {
+			for _, failureKind := range []string{"timeout", "limit"} {
+				name := fmt.Sprintf("channel_%d_status_%d_%s", channelType, statusCode, failureKind)
+				t.Run(name, func(t *testing.T) {
+					info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType}}
+					limits := openCodeGoErrorResponseLimits{
+						bodyBytes:   int64(len(privateBody) - 1),
+						readTimeout: time.Second,
+					}
+					var source io.ReadCloser
+					var closeCalls func() int32
+					if failureKind == "timeout" {
+						blocking := newCloseBlockingResponseBody()
+						source = blocking
+						closeCalls = blocking.closeCalls.Load
+						limits.readTimeout = 20 * time.Millisecond
+					} else {
+						bounded := &responseLimitTestBody{reader: strings.NewReader(privateBody)}
+						source = bounded
+						closeCalls = func() int32 { return int32(bounded.closeCalls) }
+					}
+					response := &http.Response{
+						StatusCode: statusCode,
+						Header:     http.Header{"Retry-After": []string{"120"}},
+						Body:       source,
+					}
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+					apiErr, observation := (&Adaptor{}).handleNon2xxResponseWithLimits(
+						c,
+						response,
+						info,
+						limits,
+					)
+
+					require.NotNil(t, apiErr)
+					require.Nil(t, observation)
+					wantSubtype := "error_body_limit"
+					wantCause := errOpenCodeGoResponseLimitExceeded
+					if failureKind == "timeout" {
+						wantSubtype = "error_body_timeout"
+						wantCause = errOpenCodeGoResponseReadTimeout
+					}
+					assert.ErrorIs(t, apiErr, wantCause)
+					assert.Equal(t, statusCode, apiErr.StatusCode)
+					assert.Equal(t, types.ErrorOriginUpstreamHTTP, apiErr.Provenance().Origin)
+					assert.Equal(t, wantSubtype, apiErr.Provenance().Subtype)
+					assert.Equal(t, statusCode, apiErr.Provenance().RawStatusCode)
+					rawStatus, hasRawStatus := service.OpenCodeGoUpstreamRelayStatusCode(apiErr)
+					require.True(t, hasRawStatus)
+					assert.Equal(t, statusCode, rawStatus)
+					assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+					assert.Equal(t, channelType == constant.ChannelTypeOpenCodeGo, types.IsSkipRetryError(apiErr))
+					assert.Equal(t, statusCode, service.OpenCodeGoRelayPolicyStatusCode(apiErr))
+					assert.NotContains(t, apiErr.Error(), privateBody)
+					assert.Empty(t, recorder.Header().Get("Retry-After"))
+					assert.Equal(t, int32(1), closeCalls())
+
+					wantDedicatedRetry := channelType == constant.ChannelTypeOpenCodeGo && statusCode == http.StatusServiceUnavailable
+					assert.Equal(t, wantDedicatedRetry, service.ShouldRetryOpenCodeGoRelayError(channelType, apiErr))
+					genericRetryEligible := !service.IsOpenCodeGoRawInvalidRequestError(apiErr) &&
+						!types.IsSkipRetryError(apiErr) &&
+						!operation_setting.IsAlwaysSkipRetryCode(apiErr.GetErrorCode()) &&
+						operation_setting.ShouldRetryByStatusCode(service.OpenCodeGoRelayPolicyStatusCode(apiErr))
+					assert.Equal(t, channelType == constant.ChannelTypeOpenCodeAPIKey && statusCode == http.StatusServiceUnavailable, genericRetryEligible)
+
+					publicErr := service.PublicOpenCodeGoRelayError(channelType, apiErr)
+					require.NotNil(t, publicErr)
+					require.NotSame(t, apiErr, publicErr)
+					assert.NotContains(t, publicErr.Error(), privateBody)
+					if statusCode == http.StatusBadRequest || statusCode == http.StatusUnprocessableEntity {
+						assert.True(t, service.IsOpenCodeGoRawInvalidRequestError(apiErr))
+						assert.False(t, service.ShouldDisableChannel(apiErr))
+						assert.Equal(t, http.StatusBadRequest, publicErr.StatusCode)
+						assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestMessage, publicErr.Error())
+						assert.True(t, service.IsOpenCodeGoFixedInvalidRequestProjection(publicErr))
+						publicBody := publicErr.ToOpenAIError()
+						assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestCode, publicBody.Type)
+						assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestCode, publicBody.Code)
+						return
+					}
+					assert.False(t, service.IsOpenCodeGoRawInvalidRequestError(apiErr))
+					assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+					assert.Equal(t, service.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+					assert.False(t, service.IsOpenCodeGoFixedInvalidRequestProjection(publicErr))
+				})
+			}
+		}
+	}
+}
+
+func TestHandleNon2xxResponseErrorBodyExactLimitAndOneByteOver(t *testing.T) {
+	body := `{"error":{"type":"invalid_request_error","message":"invalid"}}`
+	for _, test := range []struct {
+		name      string
+		payload   string
+		wantLimit bool
+	}{
+		{name: "at limit", payload: body},
+		{name: "one byte over", payload: body + " ", wantLimit: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			source := &responseLimitTestBody{reader: strings.NewReader(test.payload)}
+			response := &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header:     http.Header{},
+				Body:       source,
+			}
+
+			apiErr, observation := (&Adaptor{}).handleNon2xxResponseWithLimits(
+				newAdaptorTestContext(),
+				response,
+				nil,
+				openCodeGoErrorResponseLimits{bodyBytes: int64(len(body)), readTimeout: time.Second},
+			)
+
+			require.NotNil(t, apiErr)
+			assert.Equal(t, 1, source.closeCalls)
+			if test.wantLimit {
+				require.Nil(t, observation)
+				assert.Equal(t, "error_body_limit", apiErr.Provenance().Subtype)
+				assert.Equal(t, types.ErrorOriginUpstreamHTTP, apiErr.Provenance().Origin)
+				assert.Equal(t, http.StatusBadRequest, apiErr.Provenance().RawStatusCode)
+				assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+				publicErr := service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr)
+				require.NotNil(t, publicErr)
+				assert.True(t, service.IsOpenCodeGoFixedInvalidRequestProjection(publicErr))
+				return
+			}
+			require.NotNil(t, observation)
+			assert.Equal(t, types.ErrorOriginUpstreamHTTP, apiErr.Provenance().Origin)
+			assert.Equal(t, http.StatusBadRequest, apiErr.Provenance().RawStatusCode)
+		})
+	}
+}
+
+func TestHandleNon2xxResponseSlowDripUsesWholeErrorBodyDeadline(t *testing.T) {
+	source := newSlowDripResponseBody(`{"error":{"message":"private"}}`, 10*time.Millisecond)
+	response := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     http.Header{},
+		Body:       source,
+	}
+	startedAt := time.Now()
+
+	apiErr, observation := (&Adaptor{}).handleNon2xxResponseWithLimits(
+		newAdaptorTestContext(),
+		response,
+		nil,
+		openCodeGoErrorResponseLimits{bodyBytes: 128, readTimeout: 25 * time.Millisecond},
+	)
+
+	require.NotNil(t, apiErr)
+	require.Nil(t, observation)
+	assert.ErrorIs(t, apiErr, errOpenCodeGoResponseReadTimeout)
+	assert.Equal(t, types.ErrorOriginUpstreamHTTP, apiErr.Provenance().Origin)
+	assert.Equal(t, "error_body_timeout", apiErr.Provenance().Subtype)
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.Provenance().RawStatusCode)
+	assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+	assert.True(t, service.ShouldRetryOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr))
+	assert.NotContains(t, apiErr.Error(), "private")
+	assert.Less(t, time.Since(startedAt), 250*time.Millisecond)
+	assert.Equal(t, int32(1), source.closeCalls.Load())
 }
 
 func TestHandleNon2xxResponsePersistsSelectedWorkspaceObservation(t *testing.T) {
@@ -372,6 +560,89 @@ func TestHandleNon2xxResponseReadFailureStillClassifiesKnownStatus(t *testing.T)
 	}
 }
 
+func TestHandleNon2xxResponseRawClientStatusReadFailuresDoNotMutateHealthOrFailover(t *testing.T) {
+	originalProviderObserver := observeOpenCodeGoProviderFailure
+	originalFailoverObserver := observeOpenCodeGoFailoverFailure
+	t.Cleanup(func() {
+		observeOpenCodeGoProviderFailure = originalProviderObserver
+		observeOpenCodeGoFailoverFailure = originalFailoverObserver
+	})
+
+	providerCalls := 0
+	failoverCalls := 0
+	observeOpenCodeGoProviderFailure = func(_ int, _ string, _ string, _ service.OpenCodeGoProviderFailure, _ time.Time) (bool, error) {
+		providerCalls++
+		return false, nil
+	}
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failoverCalls++
+		return service.OpenCodeGoFailoverObservation{}, nil
+	}
+
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType:       constant.ChannelTypeOpenCodeGo,
+		ChannelId:         42,
+		UpstreamModelName: "kimi-k3",
+	}}
+	readFailures := []struct {
+		name     string
+		body     func() io.ReadCloser
+		limits   openCodeGoErrorResponseLimits
+		wantRule string
+	}{
+		{
+			name:     "body limit",
+			body:     func() io.ReadCloser { return io.NopCloser(strings.NewReader("too-large")) },
+			limits:   openCodeGoErrorResponseLimits{bodyBytes: 4, readTimeout: time.Second},
+			wantRule: "error_body_limit",
+		},
+		{
+			name:     "body timeout",
+			body:     func() io.ReadCloser { return newCloseBlockingResponseBody() },
+			limits:   openCodeGoErrorResponseLimits{bodyBytes: 64, readTimeout: 20 * time.Millisecond},
+			wantRule: "error_body_timeout",
+		},
+	}
+	for _, statusCode := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
+		for _, readFailure := range readFailures {
+			name := fmt.Sprintf("status_%d_%s", statusCode, readFailure.name)
+			t.Run(name, func(t *testing.T) {
+				adaptor := &Adaptor{
+					protocol:             ProtocolResponses,
+					workspaceSelected:    true,
+					selectedWorkspaceUID: "workspace-provider",
+					failoverAttempt:      &service.OpenCodeGoFailoverAttempt{},
+				}
+				apiErr, observation := adaptor.handleNon2xxResponseWithLimits(
+					newAdaptorTestContext(),
+					&http.Response{
+						StatusCode: statusCode,
+						Header:     http.Header{"Retry-After": []string{"120"}},
+						Body:       readFailure.body(),
+					},
+					info,
+					readFailure.limits,
+				)
+
+				require.NotNil(t, apiErr)
+				require.Nil(t, observation)
+				assert.Equal(t, types.ErrorOriginUpstreamHTTP, apiErr.Provenance().Origin)
+				assert.Equal(t, readFailure.wantRule, apiErr.Provenance().Subtype)
+				assert.Equal(t, statusCode, apiErr.Provenance().RawStatusCode)
+				assert.True(t, types.IsSkipRetryError(apiErr))
+				assert.True(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+				assert.False(t, service.ShouldRetryOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr))
+				assert.False(t, service.ShouldDisableChannel(apiErr))
+				assert.True(t, service.IsOpenCodeGoFixedInvalidRequestProjection(
+					service.PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr),
+				))
+				assert.Zero(t, providerCalls)
+				assert.Zero(t, failoverCalls)
+			})
+		}
+	}
+}
+
 func TestHandleNon2xxResponseCancellationDoesNotMutateHealthOrFailover(t *testing.T) {
 	originalProviderObserver := observeOpenCodeGoProviderFailure
 	originalFailoverObserver := observeOpenCodeGoFailoverFailure
@@ -409,7 +680,8 @@ func TestHandleNon2xxResponseCancellationDoesNotMutateHealthOrFailover(t *testin
 		Body:       io.NopCloser(strings.NewReader(`{"type":"upstream_error"}`)),
 	}, info)
 	require.NotNil(t, apiErr)
-	require.NotNil(t, observation)
+	require.Nil(t, observation)
+	assert.Equal(t, types.ErrorOriginLocalCancel, apiErr.Provenance().Origin)
 
 	activeContext := newAdaptorTestContext()
 	apiErr, observation = adaptor.HandleNon2xxResponse(activeContext, &http.Response{
@@ -420,6 +692,7 @@ func TestHandleNon2xxResponseCancellationDoesNotMutateHealthOrFailover(t *testin
 	require.NotNil(t, apiErr)
 	require.NotNil(t, observation)
 
-	assert.Zero(t, providerCalls)
-	assert.Zero(t, failoverCalls)
+	assert.Equal(t, 1, providerCalls)
+	assert.Equal(t, 1, failoverCalls)
+	assert.Equal(t, types.ErrorOriginUpstreamHTTP, apiErr.Provenance().Origin)
 }

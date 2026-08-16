@@ -100,6 +100,217 @@ func TestPublicOpenCodeGoRelayErrorHidesPrivateDetails(t *testing.T) {
 	}
 }
 
+func TestPublicOpenCodeGoRelayErrorProjectsTypedLocalTermination(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		origin     types.ErrorOrigin
+		wantStatus int
+		wantType   string
+		wantText   string
+	}{
+		{name: "cancel", origin: types.ErrorOriginLocalCancel, wantStatus: 499, wantType: constant.OpenCodeGoPublicRequestCanceledCode, wantText: openCodeGoPublicCancelMessage},
+		{name: "deadline", origin: types.ErrorOriginLocalDeadline, wantStatus: http.StatusGatewayTimeout, wantType: "gateway_timeout", wantText: openCodeGoPublicDeadlineMessage},
+		{name: "writer", origin: types.ErrorOriginLocalWriter, wantStatus: http.StatusInternalServerError, wantType: "internal_server_error", wantText: openCodeGoPublicWriterMessage},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			internal := types.NewOpenAIError(
+				errors.New("private local cause with workspace=hidden"),
+				types.ErrorCodeBadResponse,
+				http.StatusInternalServerError,
+				types.ErrOptionWithProvenance(types.ErrorProvenance{Origin: test.origin, Subtype: "test"}),
+			)
+
+			publicErr := PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeAPIKey, internal)
+
+			require.NotSame(t, internal, publicErr)
+			assert.Equal(t, test.wantStatus, publicErr.StatusCode)
+			assert.Equal(t, test.wantText, publicErr.ToOpenAIError().Message)
+			assert.Equal(t, test.wantType, publicErr.ToOpenAIError().Type)
+			assert.Equal(t, test.wantType, publicErr.ToOpenAIError().Code)
+			assert.Equal(t, internal.Provenance(), publicErr.Provenance())
+			assert.NotContains(t, publicErr.Error(), "workspace")
+		})
+	}
+}
+
+func TestPublicOpenCodeGoRelayErrorPreservesControlledLocalValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		message     string
+		wantMessage string
+	}{
+		{
+			name:        "fixed message survives masker",
+			message:     "The selected model does not support disabling reasoning",
+			wantMessage: "The selected model does not support disabling reasoning",
+		},
+		{
+			name:        "domain-like parameter path falls back to fixed message",
+			message:     "thinking.type=disabled is not supported for the selected model",
+			wantMessage: constant.OpenCodeGoPublicInvalidRequestMessage,
+		},
+	}
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		for _, test := range tests {
+			t.Run(fmt.Sprintf("type-%d/%s", channelType, test.name), func(t *testing.T) {
+				internal := types.NewOpenAIError(
+					errors.New(test.message),
+					types.ErrorCodeInvalidRequest,
+					http.StatusBadRequest,
+					types.ErrOptionWithProvenance(types.ErrorProvenance{
+						Origin:  types.ErrorOriginLocalValidation,
+						Subtype: "model.glm-5.3.chat.thinking-disabled",
+					}),
+				)
+
+				publicErr := PublicOpenCodeGoRelayError(channelType, internal)
+
+				require.NotSame(t, internal, publicErr)
+				assert.Equal(t, http.StatusBadRequest, publicErr.StatusCode)
+				assert.Equal(t, test.wantMessage, publicErr.ToOpenAIError().Message)
+				assert.NotContains(t, publicErr.ToOpenAIError().Message, "***")
+				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestCode, publicErr.ToOpenAIError().Type)
+				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestCode, publicErr.ToOpenAIError().Code)
+				assert.Equal(t, internal.Provenance(), publicErr.Provenance())
+				assert.Equal(t, test.message, internal.Error())
+			})
+		}
+	}
+}
+
+func TestPublicOpenCodeGoRelayErrorUsesTypedUpstreamProvenanceWithoutWrapper(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		provenance types.ErrorProvenance
+		wantStatus int
+		wantText   string
+	}{
+		{
+			name: "raw upstream 400",
+			provenance: types.ErrorProvenance{
+				Origin:        types.ErrorOriginUpstreamHTTP,
+				Subtype:       "non_2xx",
+				RawStatusCode: http.StatusBadRequest,
+			},
+			wantStatus: http.StatusBadRequest,
+			wantText:   constant.OpenCodeGoPublicInvalidRequestMessage,
+		},
+		{
+			name: "upstream transport",
+			provenance: types.ErrorProvenance{
+				Origin:  types.ErrorOriginUpstreamTransport,
+				Subtype: "request_transport",
+			},
+			wantStatus: http.StatusTooManyRequests,
+			wantText:   constant.OpenCodeGoPublicOverloadMessage,
+		},
+		{
+			name: "transport cannot forge raw 400",
+			provenance: types.ErrorProvenance{
+				Origin:        types.ErrorOriginUpstreamTransport,
+				Subtype:       "request_transport",
+				RawStatusCode: http.StatusBadRequest,
+			},
+			wantStatus: http.StatusTooManyRequests,
+			wantText:   constant.OpenCodeGoPublicOverloadMessage,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			internal := types.NewOpenAIError(
+				errors.New("private upstream diagnostic workspace=hidden"),
+				types.ErrorCodeBadResponse,
+				http.StatusBadGateway,
+				types.ErrOptionWithProvenance(test.provenance),
+			)
+
+			publicErr := PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeAPIKey, internal)
+
+			require.NotSame(t, internal, publicErr)
+			assert.True(t, IsOpenCodeGoUpstreamRelayError(internal))
+			assert.Equal(t, test.wantStatus, publicErr.StatusCode)
+			assert.Equal(t, test.wantText, publicErr.Error())
+			assert.NotContains(t, publicErr.Error(), "workspace")
+		})
+	}
+}
+
+func TestMarkOpenCodeGoUpstreamRelayErrorDoesNotOverrideLocalProvenance(t *testing.T) {
+	localProvenance := types.ErrorProvenance{
+		Origin:  types.ErrorOriginLocalValidation,
+		Subtype: "request_contract",
+	}
+	localErr := types.NewOpenAIError(
+		errors.New("controlled local validation"),
+		types.ErrorCodeInvalidRequest,
+		http.StatusBadRequest,
+		types.ErrOptionWithProvenance(localProvenance),
+	)
+
+	marked := MarkOpenCodeGoUpstreamRelayErrorWithStatus(localErr, http.StatusBadRequest)
+
+	assert.Same(t, localErr, marked)
+	assert.Equal(t, localProvenance, marked.Provenance())
+	assert.False(t, IsOpenCodeGoUpstreamRelayError(marked))
+}
+
+func TestPublicOpenCodeGoRelayErrorProjectsGatewayErrorsWithoutInternalCause(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		origin     types.ErrorOrigin
+		wantStatus int
+		wantType   string
+		wantText   string
+	}{
+		{
+			name:       "config",
+			origin:     types.ErrorOriginGatewayConfig,
+			wantStatus: http.StatusServiceUnavailable,
+			wantType:   "service_unavailable",
+			wantText:   openCodeGoPublicConfigMessage,
+		},
+		{
+			name:       "invariant",
+			origin:     types.ErrorOriginGatewayInvariant,
+			wantStatus: http.StatusInternalServerError,
+			wantType:   "internal_server_error",
+			wantText:   openCodeGoPublicInvariantMessage,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			internal := types.NewOpenAIError(
+				errors.New("private config cause with workspace=hidden"),
+				types.ErrorCodeGetChannelFailed,
+				http.StatusInternalServerError,
+				types.ErrOptionWithProvenance(types.ErrorProvenance{Origin: test.origin, Subtype: "test"}),
+			)
+
+			publicErr := PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, internal)
+
+			require.NotSame(t, internal, publicErr)
+			assert.Equal(t, test.wantStatus, publicErr.StatusCode)
+			assert.Equal(t, test.wantText, publicErr.ToOpenAIError().Message)
+			assert.Equal(t, test.wantType, publicErr.ToOpenAIError().Type)
+			assert.Equal(t, test.wantType, publicErr.ToOpenAIError().Code)
+			assert.NotContains(t, publicErr.Error(), "workspace")
+			assert.Contains(t, internal.Error(), "workspace")
+		})
+	}
+}
+
+func TestMarkOpenCodeGoUpstreamTransportErrorHasNoInventedRawStatus(t *testing.T) {
+	transportErr := MarkOpenCodeGoUpstreamTransportError(types.NewOpenAIError(
+		context.Canceled,
+		types.ErrorCodeDoRequestFailed,
+		http.StatusBadGateway,
+	))
+
+	assert.True(t, IsOpenCodeGoUpstreamRelayError(transportErr))
+	assert.Equal(t, types.ErrorOriginUpstreamTransport, transportErr.Provenance().Origin)
+	assert.Equal(t, 0, transportErr.Provenance().RawStatusCode)
+	_, hasRawStatus := OpenCodeGoUpstreamRelayStatusCode(transportErr)
+	assert.False(t, hasRawStatus)
+}
+
 func TestOpenCodeGoErrorHasPrivateDetailDecodesJSONEscapes(t *testing.T) {
 	assert.True(t, OpenCodeGoErrorHasPrivateDetail(`{"message":"Console G\u006f is unavailable"}`))
 	assert.True(t, OpenCodeGoErrorHasPrivateDetail(`{"work\u0073pace":"wrk\u005fprivate"}`))
@@ -125,14 +336,19 @@ func TestOpenCodeGoErrorHasPrivateDetailDecodesJSONEscapes(t *testing.T) {
 	assert.False(t, OpenCodeGoErrorHasPrivateDetail(`{"message":"provider request timed out"}`))
 }
 
-func TestPublicOpenCodeGoRelayErrorPreservesPublicProviderErrors(t *testing.T) {
+func TestPublicOpenCodeGoRelayErrorFailsClosedWithoutProvenance(t *testing.T) {
 	providerErr := types.WithOpenAIError(types.OpenAIError{
 		Message: "provider request timed out",
 		Type:    "upstream_error",
 		Code:    "timeout",
 	}, http.StatusGatewayTimeout)
 
-	assert.Same(t, providerErr, PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, providerErr))
+	publicErr := PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, providerErr)
+
+	require.NotSame(t, providerErr, publicErr)
+	assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+	assert.Equal(t, constant.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+	assert.Equal(t, "provider request timed out", providerErr.Error())
 }
 
 func TestPublicOpenCodeGoRelayErrorHidesMarkedUpstreamWithoutKnownMarkers(t *testing.T) {
@@ -153,6 +369,7 @@ func TestPublicOpenCodeGoRelayErrorHidesMarkedUpstreamWithoutKnownMarkers(t *tes
 	assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
 	assert.Equal(t, OpenCodeGoPublicOverloadMessage, publicErr.Error())
 	assert.False(t, IsOpenCodeGoUpstreamRelayError(publicErr))
+	assert.False(t, errors.Is(publicErr, errOpenCodeGoUpstreamOrigin), "the private unwrap marker must not cross the public boundary")
 }
 
 func TestMarkOpenCodeGoUpstreamRelayErrorIsIdempotent(t *testing.T) {
@@ -228,6 +445,28 @@ func TestOpenCodeGoAdminErrorRedactsQuotedAndEscapedJSONFields(t *testing.T) {
 	assert.Contains(t, adminMessage, "[redacted]")
 }
 
+func TestOpenCodeGoAdminErrorRedactsWorkspaceAndEndpointIdentifiers(t *testing.T) {
+	relayErr := types.WithOpenAIError(types.OpenAIError{
+		Message: "invalid request",
+		Type:    "invalid_request_error",
+		Code:    "invalid_request_error",
+	}, http.StatusBadGateway)
+	relayErr.SetMessage(
+		"workspace=novel-workspace-value endpoint=novel-provider.example/v1 upstream_request_id=novel-request-value",
+	)
+	MarkOpenCodeGoUpstreamRelayErrorWithStatus(relayErr, http.StatusBadRequest)
+
+	adminMessage := OpenCodeGoAdminErrorWithStatusCode(relayErr)
+
+	assert.Contains(t, adminMessage, "status_code=502")
+	for _, privateValue := range []string{
+		"novel-workspace-value", "novel-provider.example", "novel-request-value",
+	} {
+		assert.NotContains(t, adminMessage, privateValue)
+	}
+	assert.Contains(t, adminMessage, "[redacted]")
+}
+
 func TestPublicOpenCodeGoRelayErrorUsesNeutralMessageForAdditionalPrivateClientDetails(t *testing.T) {
 	for _, message := range []string{
 		"invalid tool schema request_id=req_private",
@@ -299,15 +538,19 @@ func TestPublicOpenCodeGoRelayErrorHidesPrivatePoolSentinelTextForAPIKeyChannel(
 	assert.Equal(t, constant.OpenCodeGoPublicOverloadMessage, publicErr.Error())
 }
 
-func TestPublicOpenCodeGoRelayErrorDoesNotUsePoolSentinelBranchForAPIKeyChannel(t *testing.T) {
+func TestPublicOpenCodeGoRelayErrorFailsClosedForUnprovenancedAPIKeyError(t *testing.T) {
 	internalErr := types.NewOpenAIError(
 		opaqueOpenCodeGoPoolSentinelError{cause: ErrOpenCodeGoNoEligibleWorkspace},
 		types.ErrorCodeDoRequestFailed,
 		http.StatusInternalServerError,
 	)
 
+	publicErr := PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeAPIKey, internalErr)
+
 	assert.ErrorIs(t, internalErr, ErrOpenCodeGoNoEligibleWorkspace)
-	assert.Same(t, internalErr, PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeAPIKey, internalErr))
+	require.NotSame(t, internalErr, publicErr)
+	assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+	assert.Equal(t, constant.OpenCodeGoPublicOverloadMessage, publicErr.Error())
 }
 
 func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
@@ -332,6 +575,10 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 				errors.New("invalid JSON request body"),
 				types.ErrorCodeInvalidRequest,
 				http.StatusInternalServerError,
+				types.ErrOptionWithProvenance(types.ErrorProvenance{
+					Origin:  types.ErrorOriginLocalValidation,
+					Subtype: "request_body",
+				}),
 			),
 			wantStatus: http.StatusBadRequest,
 			wantCode:   constant.OpenCodeGoPublicInvalidRequestCode,
@@ -342,6 +589,10 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 				errors.New("channel parameter override is invalid"),
 				types.ErrorCodeChannelParamOverrideInvalid,
 				http.StatusInternalServerError,
+				types.ErrOptionWithProvenance(types.ErrorProvenance{
+					Origin:  types.ErrorOriginLocalValidation,
+					Subtype: "channel_parameter_override",
+				}),
 			),
 			wantStatus: http.StatusBadRequest,
 			wantCode:   constant.OpenCodeGoPublicInvalidRequestCode,
@@ -357,7 +608,7 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 			wantCode:   constant.OpenCodeGoPublicInvalidRequestCode,
 		},
 		{
-			name: "provider invalid request keeps actionable safe detail",
+			name: "provider invalid request uses fixed detail",
 			err: MarkOpenCodeGoUpstreamRelayError(types.WithOpenAIError(types.OpenAIError{
 				Message: "Error from provider (Console Go): Upstream request failed: [invalid_request_error] Failed to deserialize the JSON body: messages[0].role is required",
 				Type:    "invalid_request_error",
@@ -365,10 +616,10 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 			}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())),
 			wantStatus:  http.StatusBadRequest,
 			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
-			wantMessage: "Failed to deserialize the JSON body: messages[0].role is required",
+			wantMessage: constant.OpenCodeGoPublicInvalidRequestMessage,
 		},
 		{
-			name: "provider validation wrapper keeps actionable safe detail",
+			name: "provider validation wrapper uses fixed detail",
 			err: MarkOpenCodeGoUpstreamRelayError(types.WithOpenAIError(types.OpenAIError{
 				Message: "OpenCode Go rejected messages[0].role: Unsupported role",
 				Type:    "validation_error",
@@ -376,10 +627,10 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 			}, http.StatusUnprocessableEntity, types.ErrOptionWithSkipRetry())),
 			wantStatus:  http.StatusBadRequest,
 			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
-			wantMessage: "messages[0].role: Unsupported role",
+			wantMessage: constant.OpenCodeGoPublicInvalidRequestMessage,
 		},
 		{
-			name: "provider OpenCode wrapper keeps actionable safe detail",
+			name: "provider OpenCode wrapper uses fixed detail",
 			err: MarkOpenCodeGoUpstreamRelayError(types.WithOpenAIError(types.OpenAIError{
 				Message: "Error from provider (OpenCode): [validation_error] messages[0].content is required",
 				Type:    "validation_error",
@@ -387,10 +638,10 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 			}, http.StatusUnprocessableEntity, types.ErrOptionWithSkipRetry())),
 			wantStatus:  http.StatusBadRequest,
 			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
-			wantMessage: "messages[0].content is required",
+			wantMessage: constant.OpenCodeGoPublicInvalidRequestMessage,
 		},
 		{
-			name: "provider ConsoleGo wrapper keeps actionable safe detail",
+			name: "provider ConsoleGo wrapper uses fixed detail",
 			err: MarkOpenCodeGoUpstreamRelayError(types.WithOpenAIError(types.OpenAIError{
 				Message: "ConsoleGo rejected input[0].content: expected a string",
 				Type:    "validation_error",
@@ -398,7 +649,7 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 			}, http.StatusUnprocessableEntity, types.ErrOptionWithSkipRetry())),
 			wantStatus:  http.StatusBadRequest,
 			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
-			wantMessage: "input[0].content: expected a string",
+			wantMessage: constant.OpenCodeGoPublicInvalidRequestMessage,
 		},
 		{
 			name: "provider invalid request hides private detail",
@@ -417,6 +668,10 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 				fmt.Errorf("request context done: %w", context.Canceled),
 				types.ErrorCodeBadResponse,
 				http.StatusInternalServerError,
+				types.ErrOptionWithProvenance(types.ErrorProvenance{
+					Origin:  types.ErrorOriginLocalCancel,
+					Subtype: "downstream_context",
+				}),
 			),
 			wantStatus: 499,
 			wantCode:   constant.OpenCodeGoPublicRequestCanceledCode,
@@ -437,17 +692,21 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 				errors.New("OpenCode Go protocol is not configured"),
 				types.ErrorCodeInvalidRequest,
 				http.StatusBadRequest,
+				types.ErrOptionWithProvenance(types.ErrorProvenance{
+					Origin:  types.ErrorOriginGatewayConfig,
+					Subtype: "protocol_configuration",
+				}),
 			),
-			wantStatus: http.StatusTooManyRequests,
-			wantCode:   constant.OpenCodeGoPublicRateLimitErrorCode,
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "service_unavailable",
 		},
 		{
 			name: "upstream transport failure",
-			err: types.NewOpenAIError(
+			err: MarkOpenCodeGoUpstreamTransportError(types.NewOpenAIError(
 				errors.New("upstream error: do request failed"),
 				types.ErrorCodeDoRequestFailed,
 				http.StatusInternalServerError,
-			),
+			)),
 			wantStatus: http.StatusTooManyRequests,
 			wantCode:   constant.OpenCodeGoPublicRateLimitErrorCode,
 		},
@@ -459,11 +718,11 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 		},
 		{
 			name: "upstream JSON truncated",
-			err: types.NewOpenAIError(
+			err: MarkOpenCodeGoUpstreamMalformedError(types.NewOpenAIError(
 				errors.New("unexpected end of JSON input"),
 				types.ErrorCodeBadResponseBody,
 				http.StatusInternalServerError,
-			),
+			), "truncated_json"),
 			wantStatus: http.StatusTooManyRequests,
 			wantCode:   constant.OpenCodeGoPublicRateLimitErrorCode,
 		},
@@ -492,14 +751,20 @@ func TestPublicOpenCodeGoRelayErrorMatrix(t *testing.T) {
 	}
 }
 
-func TestPublicOpenCodeGoRelayErrorKeepsUnmarkedLocalFailure(t *testing.T) {
+func TestPublicOpenCodeGoRelayErrorFailsClosedForUnmarkedLocalFailure(t *testing.T) {
 	localErr := types.NewOpenAIError(
 		errors.New("request setup failed"),
 		types.ErrorCodeDoRequestFailed,
 		http.StatusInternalServerError,
 	)
 
-	assert.Same(t, localErr, PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, localErr))
+	publicErr := PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, localErr)
+
+	require.NotSame(t, localErr, publicErr)
+	assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+	assert.Equal(t, constant.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+	assert.Equal(t, http.StatusInternalServerError, localErr.StatusCode)
+	assert.Equal(t, "request setup failed", localErr.Error())
 }
 
 func TestPublicOpenCodeGoRelayErrorDoesNotProjectStaleSentinelForOtherChannel(t *testing.T) {
@@ -532,7 +797,7 @@ func TestPublicOpenCodeGoRelayErrorProjectsAPIKeyChannelUpstreamErrors(t *testin
 			wantMessage: constant.OpenCodeGoPublicOverloadMessage,
 		},
 		{
-			name: "explicit client request keeps safe detail",
+			name: "explicit client request uses fixed detail",
 			err: MarkOpenCodeGoUpstreamRelayError(types.WithOpenAIError(types.OpenAIError{
 				Message: "Error from provider (Console Go): [invalid_request_error] messages[0].role is required",
 				Type:    "invalid_request_error",
@@ -540,7 +805,7 @@ func TestPublicOpenCodeGoRelayErrorProjectsAPIKeyChannelUpstreamErrors(t *testin
 			}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())),
 			wantStatus:  http.StatusBadRequest,
 			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
-			wantMessage: "messages[0].role is required",
+			wantMessage: constant.OpenCodeGoPublicInvalidRequestMessage,
 		},
 		{
 			name: "explicit client request with private detail uses neutral message",
@@ -651,16 +916,23 @@ func TestPublicOpenCodeGoRelayErrorRejectsConflictingUpstreamClientClassificatio
 			publicErr := PublicOpenCodeGoRelayError(constant.ChannelTypeOpenCodeAPIKey, internalErr)
 
 			require.NotSame(t, internalErr, publicErr)
-			assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
-			assert.Equal(t, constant.OpenCodeGoPublicRateLimitErrorCode, fmt.Sprint(publicErr.ToOpenAIError().Code))
-			assert.Equal(t, constant.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+			if test.upstreamStatusCode == http.StatusBadRequest || test.upstreamStatusCode == http.StatusUnprocessableEntity {
+				assert.Equal(t, http.StatusBadRequest, publicErr.StatusCode)
+				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestCode, fmt.Sprint(publicErr.ToOpenAIError().Code))
+				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestMessage, publicErr.Error())
+				assert.True(t, IsOpenCodeGoFixedInvalidRequestProjection(publicErr))
+			} else {
+				assert.Equal(t, http.StatusTooManyRequests, publicErr.StatusCode)
+				assert.Equal(t, constant.OpenCodeGoPublicRateLimitErrorCode, fmt.Sprint(publicErr.ToOpenAIError().Code))
+				assert.Equal(t, constant.OpenCodeGoPublicOverloadMessage, publicErr.Error())
+			}
 			assert.Equal(t, originalStatus, internalErr.StatusCode)
 			assert.Equal(t, originalMessage, internalErr.Error())
 		})
 	}
 }
 
-func TestPublicOpenCodeGoRelayErrorKeepsSafeUpstreamClientErrorsOnlyForRaw400Or422(t *testing.T) {
+func TestPublicOpenCodeGoRelayErrorUsesFixedBodyOnlyForRaw400Or422(t *testing.T) {
 	newUpstreamError := func(upstreamStatusCode int) *types.NewAPIError {
 		relayErr := types.WithOpenAIError(types.OpenAIError{
 			Message: "messages[0].role is required",
@@ -687,7 +959,8 @@ func TestPublicOpenCodeGoRelayErrorKeepsSafeUpstreamClientErrorsOnlyForRaw400Or4
 
 			assert.Equal(t, test.wantStatus, publicErr.StatusCode)
 			if test.wantStatus == http.StatusBadRequest {
-				assert.Equal(t, "messages[0].role is required", publicErr.Error())
+				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestMessage, publicErr.Error())
+				assert.True(t, IsOpenCodeGoFixedInvalidRequestProjection(publicErr))
 			} else {
 				assert.Equal(t, constant.OpenCodeGoPublicOverloadMessage, publicErr.Error())
 			}

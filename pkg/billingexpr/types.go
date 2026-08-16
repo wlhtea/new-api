@@ -7,9 +7,14 @@ import (
 	"github.com/QuantumNous/new-api/common"
 )
 
+// ParamResolver supplies an immutable request-view lookup without requiring a
+// complete request body allocation. found distinguishes JSON null from absence.
+type ParamResolver func(path string) (value interface{}, found bool, err error)
+
 type RequestInput struct {
-	Headers map[string]string
-	Body    []byte
+	Headers      map[string]string
+	Body         []byte
+	ResolveParam ParamResolver `json:"-"`
 }
 
 // TokenParams holds all token dimensions passed into an Expr evaluation.

@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	common2 "github.com/QuantumNous/new-api/common"
@@ -24,7 +25,31 @@ import (
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/http/httpguts"
 )
+
+const openCodeResponseHeaderTimeout = 5 * time.Minute
+
+var errOpenCodeResponseHeaderTimeout = errors.New("OpenCode upstream response header timed out")
+
+type openCodeResponseHeaderBody struct {
+	source   io.ReadCloser
+	cancel   context.CancelFunc
+	once     sync.Once
+	closeErr error
+}
+
+func (body *openCodeResponseHeaderBody) Read(p []byte) (int, error) {
+	return body.source.Read(p)
+}
+
+func (body *openCodeResponseHeaderBody) Close() error {
+	body.once.Do(func() {
+		body.closeErr = body.source.Close()
+		body.cancel()
+	})
+	return body.closeErr
+}
 
 // ApplyUpstreamBodyMetadata restores metadata that net/http cannot infer from
 // a ReplayableBody. Callers must pass the original body because NewRequest
@@ -105,6 +130,42 @@ var passthroughSkipHeaderNamesLower = map[string]struct{}{
 	"sec-websocket-key":        {},
 	"sec-websocket-version":    {},
 	"sec-websocket-extensions": {},
+}
+
+var openCodeClientSemanticHeaderNamesLower = map[string]struct{}{
+	"anthropic-beta":    {},
+	"anthropic-version": {},
+}
+
+var openCodeForbiddenOverrideHeaderNamesLower = map[string]struct{}{
+	"accept":              {},
+	"accept-encoding":     {},
+	"authorization":       {},
+	"connection":          {},
+	"content-encoding":    {},
+	"content-length":      {},
+	"content-type":        {},
+	"cookie":              {},
+	"expect":              {},
+	"forwarded":           {},
+	"host":                {},
+	"keep-alive":          {},
+	"proxy-authenticate":  {},
+	"proxy-authorization": {},
+	"proxy-connection":    {},
+	"te":                  {},
+	"trailer":             {},
+	"transfer-encoding":   {},
+	"upgrade":             {},
+	"user-agent":          {},
+	"x-api-key":           {},
+	"x-forwarded-for":     {},
+	"x-forwarded-host":    {},
+	"x-forwarded-proto":   {},
+	"x-goog-api-key":      {},
+	"x-opencode-client":   {},
+	"x-opencode-session":  {},
+	"x-real-ip":           {},
 }
 
 var headerPassthroughRegexCache sync.Map // map[string]*regexp.Regexp
@@ -208,6 +269,8 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 	}
 
 	headerOverrideSource := common.GetEffectiveHeaderOverride(info)
+	isOpenCode := rootconstant.IsOpenCodeChannelType(info.GetChannelType())
+	connectionNominated := connectionNominatedHeaderNames(c)
 
 	passAll := false
 	var passthroughRegex []*regexp.Regexp
@@ -233,11 +296,11 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 			}
 
 			if pattern == "" {
-				return nil, types.NewError(fmt.Errorf("header passthrough regex pattern is empty: %q", k), types.ErrorCodeChannelHeaderOverrideInvalid)
+				return nil, newHeaderOverrideError(info, fmt.Errorf("header passthrough regex pattern is empty: %q", k))
 			}
 			compiled, err := getHeaderPassthroughRegex(pattern)
 			if err != nil {
-				return nil, types.NewError(err, types.ErrorCodeChannelHeaderOverrideInvalid)
+				return nil, newHeaderOverrideError(info, err)
 			}
 			passthroughRegex = append(passthroughRegex, compiled)
 		}
@@ -245,11 +308,20 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 
 	if passAll || len(passthroughRegex) > 0 {
 		if c == nil || c.Request == nil {
-			return nil, types.NewError(fmt.Errorf("missing request context for header passthrough"), types.ErrorCodeChannelHeaderOverrideInvalid)
+			return nil, newHeaderOverrideError(info, errors.New("missing request context for header passthrough"))
 		}
 		for name := range c.Request.Header {
 			if shouldSkipPassthroughHeader(name) {
 				continue
+			}
+			nameLower := strings.ToLower(strings.TrimSpace(name))
+			if isOpenCode {
+				if _, allowed := openCodeClientSemanticHeaderNamesLower[nameLower]; !allowed {
+					continue
+				}
+				if _, nominated := connectionNominated[nameLower]; nominated {
+					continue
+				}
 			}
 			if !passAll {
 				matched := false
@@ -267,7 +339,12 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 			if value == "" {
 				continue
 			}
-			headerOverride[strings.ToLower(strings.TrimSpace(name))] = value
+			if isOpenCode && !httpguts.ValidHeaderFieldValue(value) {
+				return nil, newOpenCodeHeaderOverrideError(
+					fmt.Errorf("OpenCode semantic header %q has an invalid value", nameLower),
+				)
+			}
+			headerOverride[nameLower] = value
 		}
 	}
 
@@ -279,10 +356,15 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 		if key == "" {
 			continue
 		}
+		if isOpenCode {
+			if err := validateOpenCodeOperatorHeaderName(key); err != nil {
+				return nil, newOpenCodeHeaderOverrideError(err)
+			}
+		}
 
 		str, ok := v.(string)
 		if !ok {
-			return nil, types.NewError(nil, types.ErrorCodeChannelHeaderOverrideInvalid)
+			return nil, newHeaderOverrideError(info, errors.New("header override value must be a string"))
 		}
 		if info.IsChannelTest && strings.HasPrefix(strings.TrimSpace(str), clientHeaderPlaceholderPrefix) {
 			continue
@@ -290,28 +372,167 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 
 		value, include, err := applyHeaderOverridePlaceholders(str, c, info.ApiKey)
 		if err != nil {
-			return nil, types.NewError(err, types.ErrorCodeChannelHeaderOverrideInvalid)
+			return nil, newHeaderOverrideError(info, err)
 		}
 		if !include {
 			continue
 		}
+		if isOpenCode && !httpguts.ValidHeaderFieldValue(value) {
+			return nil, newOpenCodeHeaderOverrideError(
+				fmt.Errorf("OpenCode header override %q has an invalid value", key),
+			)
+		}
 
 		headerOverride[key] = value
-	}
-	if info.GetChannelType() == rootconstant.ChannelTypeOpenCodeAPIKey {
-		// The adaptor owns account credentials and the normalized OpenCode cache
-		// identity for a one-key row. Header overrides are applied after adaptor
-		// setup on HTTP, form, and WebSocket paths, so these must be removed from
-		// the final override map rather than from an individual caller.
-		delete(headerOverride, "authorization")
-		delete(headerOverride, "x-api-key")
-		delete(headerOverride, "x-opencode-session")
 	}
 	return headerOverride, nil
 }
 
+func newHeaderOverrideError(info *common.RelayInfo, err error) *types.NewAPIError {
+	if info != nil && rootconstant.IsOpenCodeChannelType(info.GetChannelType()) {
+		return newOpenCodeHeaderOverrideError(err)
+	}
+	return types.NewError(err, types.ErrorCodeChannelHeaderOverrideInvalid)
+}
+
+func newOpenCodeHeaderOverrideError(err error) *types.NewAPIError {
+	return types.NewError(
+		err,
+		types.ErrorCodeChannelHeaderOverrideInvalid,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithProvenance(types.ErrorProvenance{
+			Origin:  types.ErrorOriginGatewayConfig,
+			Subtype: "header_override",
+		}),
+	)
+}
+
+func connectionNominatedHeaderNames(c *gin.Context) map[string]struct{} {
+	nominated := make(map[string]struct{})
+	if c == nil || c.Request == nil {
+		return nominated
+	}
+	for _, value := range c.Request.Header.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name != "" {
+				nominated[name] = struct{}{}
+			}
+		}
+	}
+	return nominated
+}
+
+func validateOpenCodeOperatorHeaderName(name string) error {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" || strings.HasPrefix(name, ":") || !httpguts.ValidHeaderFieldName(name) {
+		return fmt.Errorf("OpenCode header override name %q is invalid", name)
+	}
+	if _, forbidden := openCodeForbiddenOverrideHeaderNamesLower[name]; forbidden {
+		return fmt.Errorf("OpenCode header override %q is gateway-owned or forbidden", name)
+	}
+	return nil
+}
+
 func ResolveHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]string, error) {
 	return processHeaderOverride(info, c)
+}
+
+// PreflightOpenCodeRequestTransport validates request metadata that is not part
+// of the JSON body. It is side-effect free and must run before billing or
+// workspace acquisition. OpenCode currently has no declared query/trailer
+// forwarding contract for the three inference endpoints.
+func PreflightOpenCodeRequestTransport(info *common.RelayInfo, c *gin.Context) *types.NewAPIError {
+	preflightInfo, isOpenCode := openCodePreflightRelayInfo(info, c)
+	if !isOpenCode {
+		return nil
+	}
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return types.NewOpenAIError(
+			errors.New("OpenCode request transport metadata is unavailable"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusInternalServerError,
+			types.ErrOptionWithSkipRetry(),
+			types.ErrOptionWithProvenance(types.ErrorProvenance{
+				Origin:  types.ErrorOriginGatewayInvariant,
+				Subtype: "request_transport",
+			}),
+		)
+	}
+	if c.Request.URL.RawQuery != "" {
+		return newOpenCodeClientTransportError(
+			http.StatusBadRequest,
+			"query_parameters",
+			"query parameters are not supported for this OpenCode relay endpoint",
+		)
+	}
+	if len(c.Request.Trailer) != 0 || strings.TrimSpace(c.Request.Header.Get("Trailer")) != "" {
+		return newOpenCodeClientTransportError(
+			http.StatusBadRequest,
+			"request_trailers",
+			"request trailers are not supported for this OpenCode relay endpoint",
+		)
+	}
+	contentEncoding := strings.TrimSpace(c.Request.Header.Get("Content-Encoding"))
+	if contentEncoding != "" && !strings.EqualFold(contentEncoding, "identity") {
+		return newOpenCodeClientTransportError(
+			http.StatusUnsupportedMediaType,
+			"content_encoding",
+			"request Content-Encoding is unsupported or was not decoded",
+		)
+	}
+	if _, err := processHeaderOverride(preflightInfo, c); err != nil {
+		var apiErr *types.NewAPIError
+		if errors.As(err, &apiErr) {
+			return apiErr
+		}
+		return newOpenCodeHeaderOverrideError(err)
+	}
+	return nil
+}
+
+// The distributor selects the first channel before RelayInfo initializes its
+// attempt-local ChannelMeta. Build a read-only view from the selected-channel
+// context so pre-billing validation cannot silently skip the first attempt.
+func openCodePreflightRelayInfo(info *common.RelayInfo, c *gin.Context) (*common.RelayInfo, bool) {
+	channelType := 0
+	if info != nil {
+		channelType = info.GetChannelType()
+	}
+	if channelType == 0 && c != nil {
+		channelType = common2.GetContextKeyInt(c, rootconstant.ContextKeyChannelType)
+	}
+	if !rootconstant.IsOpenCodeChannelType(channelType) {
+		return nil, false
+	}
+
+	if info == nil {
+		info = &common.RelayInfo{}
+	}
+	view := *info
+	channelMeta := common.ChannelMeta{ChannelType: channelType}
+	if info.ChannelMeta != nil {
+		channelMeta = *info.ChannelMeta
+		channelMeta.ChannelType = channelType
+	}
+	if channelMeta.HeadersOverride == nil && c != nil {
+		channelMeta.HeadersOverride = common2.GetContextKeyStringMap(c, rootconstant.ContextKeyChannelHeaderOverride)
+	}
+	view.ChannelMeta = &channelMeta
+	return &view, true
+}
+
+func newOpenCodeClientTransportError(statusCode int, subtype string, message string) *types.NewAPIError {
+	return types.NewOpenAIError(
+		errors.New(message),
+		types.ErrorCodeInvalidRequest,
+		statusCode,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithProvenance(types.ErrorProvenance{
+			Origin:  types.ErrorOriginLocalValidation,
+			Subtype: subtype,
+		}),
+	)
 }
 
 func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]string) {
@@ -399,6 +620,14 @@ func doApiRequest(
 	}
 	ApplyUpstreamBodyMetadata(req, requestBody)
 	recordUpstreamRequestBodySize(info, req)
+	// Validate OpenCode operator configuration before SetupRequestHeader can
+	// select a workspace or acquire an in-flight slot. Materialization runs
+	// again after setup because Type 62 obtains its request-local API key there.
+	if rootconstant.IsOpenCodeChannelType(info.GetChannelType()) {
+		if _, err := processHeaderOverride(info, c); err != nil {
+			return nil, err
+		}
+	}
 	headers := req.Header
 	err = a.SetupRequestHeader(c, &headers, info)
 	if err != nil {
@@ -411,6 +640,11 @@ func doApiRequest(
 		return nil, err
 	}
 	applyHeaderOverrideToRequest(req, headerOverride)
+	if rootconstant.IsOpenCodeChannelType(info.GetChannelType()) {
+		if err := finalizeOpenCodeRequestHeaders(a, c, info, req); err != nil {
+			return nil, err
+		}
+	}
 	var client *http.Client
 	if resolveClient != nil {
 		client, err = resolveClient()
@@ -428,6 +662,66 @@ func doApiRequest(
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}
 	return resp, nil
+}
+
+func finalizeOpenCodeRequestHeaders(a Adaptor, c *gin.Context, info *common.RelayInfo, req *http.Request) error {
+	if a == nil || info == nil || req == nil {
+		return newOpenCodeHeaderOverrideError(errors.New("OpenCode outbound request is incomplete"))
+	}
+	// Gateway-owned authentication/session values are installed after every
+	// permitted operator override.
+	if err := a.SetupRequestHeader(c, &req.Header, info); err != nil {
+		return fmt.Errorf("reassert OpenCode request headers: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if req.Header.Get("Accept") == "" {
+		if info.IsStream {
+			req.Header.Set("Accept", "text/event-stream")
+		} else {
+			req.Header.Set("Accept", "application/json")
+		}
+	}
+	if err := validateFinalOpenCodeRequestHeaders(req); err != nil {
+		return newOpenCodeHeaderOverrideError(err)
+	}
+	return nil
+}
+
+func validateFinalOpenCodeRequestHeaders(req *http.Request) error {
+	if req == nil {
+		return errors.New("OpenCode outbound request is nil")
+	}
+	if req.Host != "" && req.Host != req.URL.Host {
+		return errors.New("OpenCode outbound Host override is forbidden")
+	}
+	if len(req.Trailer) != 0 {
+		return errors.New("OpenCode outbound trailers are forbidden")
+	}
+	for name, values := range req.Header {
+		nameLower := strings.ToLower(strings.TrimSpace(name))
+		if !httpguts.ValidHeaderFieldName(name) || strings.HasPrefix(nameLower, ":") {
+			return fmt.Errorf("OpenCode outbound header name %q is invalid", name)
+		}
+		switch nameLower {
+		case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+			"proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
+			"accept-encoding", "content-encoding", "expect", "cookie":
+			return fmt.Errorf("OpenCode outbound header %q is forbidden", name)
+		}
+		for _, value := range values {
+			if !httpguts.ValidHeaderFieldValue(value) {
+				return fmt.Errorf("OpenCode outbound header %q has an invalid value", name)
+			}
+		}
+	}
+	if !strings.EqualFold(strings.TrimSpace(req.Header.Get("Content-Type")), "application/json") {
+		return errors.New("OpenCode outbound Content-Type must be application/json")
+	}
+	accept := strings.ToLower(strings.TrimSpace(req.Header.Get("Accept")))
+	if accept != "application/json" && accept != "text/event-stream" {
+		return errors.New("OpenCode outbound Accept is not canonical")
+	}
+	return nil
 }
 
 func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
@@ -590,6 +884,57 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	return doRequestWithClient(c, req, info, client)
 }
 
+func doOpenCodeRequestWithResponseHeaderTimeout(
+	client *http.Client,
+	req *http.Request,
+	timeout time.Duration,
+) (*http.Response, error) {
+	if client == nil {
+		return nil, errors.New("http client is nil")
+	}
+	if req == nil {
+		return nil, errors.New("http request is nil")
+	}
+	if timeout <= 0 {
+		return client.Do(req)
+	}
+
+	requestContext, cancel := context.WithCancel(req.Context())
+	timedRequest := req.Clone(requestContext)
+	var timedOut atomic.Bool
+	timerDone := make(chan struct{})
+	timer := time.AfterFunc(timeout, func() {
+		timedOut.Store(true)
+		cancel()
+		close(timerDone)
+	})
+
+	response, err := client.Do(timedRequest)
+	if !timer.Stop() {
+		<-timerDone
+	}
+	if timedOut.Load() {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		cancel()
+		return nil, errOpenCodeResponseHeaderTimeout
+	}
+	if err != nil {
+		cancel()
+		return response, err
+	}
+	if response == nil || response.Body == nil {
+		cancel()
+		return response, nil
+	}
+	response.Body = &openCodeResponseHeaderBody{
+		source: response.Body,
+		cancel: cancel,
+	}
+	return response, nil
+}
+
 func doRequestWithClient(c *gin.Context, req *http.Request, info *common.RelayInfo, client *http.Client) (*http.Response, error) {
 	if client == nil {
 		return nil, errors.New("http client is nil")
@@ -613,7 +958,10 @@ func doRequestWithClient(c *gin.Context, req *http.Request, info *common.RelayIn
 
 	var stopPinger context.CancelFunc
 	var pingerDone <-chan struct{}
-	if info.IsStream {
+	// OpenCode must classify the upstream HTTP status before any downstream
+	// write. Its post-status StreamScannerHandler owns SSE headers and pings.
+	// Starting this pinger here could commit a false 200 before a delayed 400.
+	if info.IsStream && !rootconstant.IsOpenCodeChannelType(info.GetChannelType()) {
 		helper.SetEventStreamHeaders(c)
 		// 处理流式请求的 ping 保活
 		generalSettings := operation_setting.GetGeneralSetting()
@@ -631,14 +979,37 @@ func doRequestWithClient(c *gin.Context, req *http.Request, info *common.RelayIn
 		}
 	}
 
-	resp, err := relayClient.Do(req)
+	var resp *http.Response
+	var err error
+	if info != nil && rootconstant.IsOpenCodeChannelType(info.GetChannelType()) {
+		// The shared client timeout covers the complete response lifetime and
+		// would therefore terminate otherwise healthy long-running SSE streams.
+		// OpenCode owns bounded response-header, error-body, non-stream body, and
+		// stream-idle phases separately.
+		relayClient.Timeout = 0
+		resp, err = doOpenCodeRequestWithResponseHeaderTimeout(&relayClient, req, openCodeResponseHeaderTimeout)
+	} else {
+		resp, err = relayClient.Do(req)
+	}
 	if err != nil {
 		logMessage := err.Error()
 		if info != nil && rootconstant.IsOpenCodeChannelType(info.GetChannelType()) {
 			logMessage = service.SanitizeOpenCodeGoAdminError(err)
 		}
 		logger.LogError(c, "do request failed: "+common2.LocalLogPreview(logMessage))
-		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
+		options := []types.NewAPIErrorOptions{
+			types.ErrOptionWithHideErrMsg("upstream error: do request failed"),
+		}
+		if errors.Is(err, errOpenCodeResponseHeaderTimeout) {
+			options = append(options,
+				types.ErrOptionWithSkipRetry(),
+				types.ErrOptionWithProvenance(types.ErrorProvenance{
+					Origin:  types.ErrorOriginLocalDeadline,
+					Subtype: "response_header_timeout",
+				}),
+			)
+		}
+		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, options...)
 	}
 	if resp == nil {
 		return nil, errors.New("resp is nil")

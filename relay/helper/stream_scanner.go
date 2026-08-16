@@ -33,6 +33,15 @@ const (
 	streamWriteTimeout = 30 * time.Second
 )
 
+type streamScannerOptions struct {
+	maxLineBytes   int
+	maxEventBytes  int
+	maxQueuedBytes int
+	queueItems     int
+	idleTimeout    time.Duration
+	semanticIdle   bool
+}
+
 func getScannerBufferSize() int {
 	if constant.StreamScannerMaxBufferMB > 0 {
 		return constant.StreamScannerMaxBufferMB << 20
@@ -41,9 +50,62 @@ func getScannerBufferSize() int {
 }
 
 func NewStreamScanner(reader io.Reader) *bufio.Scanner {
+	return newStreamScannerWithLimit(reader, getScannerBufferSize())
+}
+
+func newStreamScannerWithLimit(reader io.Reader, maxBytes int) *bufio.Scanner {
+	if maxBytes <= 0 {
+		maxBytes = getScannerBufferSize()
+	}
+	// Scanner's max token size includes the byte needed to discover a delimiter
+	// or EOF. Reserve that one probe byte so a token exactly at the semantic
+	// limit is accepted while limit+1 is still rejected.
+	scannerMaxBytes := maxBytes
+	if scannerMaxBytes < int(^uint(0)>>1) {
+		scannerMaxBytes++
+	}
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, InitialScannerBufferSize), getScannerBufferSize())
+	initialBytes := min(InitialScannerBufferSize, scannerMaxBytes)
+	scanner.Buffer(make([]byte, initialBytes), scannerMaxBytes)
 	return scanner
+}
+
+func streamScannerOptionsForInfo(info *relaycommon.RelayInfo) streamScannerOptions {
+	options := streamScannerOptions{
+		maxLineBytes: getScannerBufferSize(),
+		queueItems:   10,
+	}
+	if info != nil && constant.IsOpenCodeChannelType(info.GetChannelType()) {
+		options.maxLineBytes = min(options.maxLineBytes, constant.OpenCodeGoMaxSSEEventBytes)
+		options.maxEventBytes = constant.OpenCodeGoMaxSSEEventBytes
+		options.maxQueuedBytes = constant.OpenCodeGoMaxSSEQueuedBytes
+		options.semanticIdle = true
+	}
+	return options
+}
+
+func normalizedStreamScannerOptions(options streamScannerOptions) streamScannerOptions {
+	if options.maxLineBytes <= 0 {
+		options.maxLineBytes = getScannerBufferSize()
+	}
+	if options.queueItems <= 0 {
+		options.queueItems = 10
+	}
+	if options.maxEventBytes > 0 && options.maxQueuedBytes > 0 {
+		options.maxEventBytes = min(options.maxEventBytes, options.maxQueuedBytes)
+		byteBoundedItems := options.maxQueuedBytes / options.maxEventBytes
+		if byteBoundedItems < 1 {
+			byteBoundedItems = 1
+		}
+		options.queueItems = min(options.queueItems, byteBoundedItems)
+	}
+	if options.idleTimeout <= 0 {
+		options.idleTimeout = time.Duration(constant.StreamingTimeout) * time.Second
+	}
+	if options.idleTimeout <= 0 {
+		options.idleTimeout = 5 * time.Minute
+	}
+	return options
 }
 
 func copyCodexSSEHeaders(c *gin.Context, resp *http.Response) {
@@ -75,10 +137,21 @@ func ExtendWriteDeadline(c *gin.Context) {
 }
 
 func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
+	streamScannerHandlerWithOptions(c, resp, info, dataHandler, streamScannerOptionsForInfo(info))
+}
 
-	if resp == nil || dataHandler == nil {
+func streamScannerHandlerWithOptions(
+	c *gin.Context,
+	resp *http.Response,
+	info *relaycommon.RelayInfo,
+	dataHandler func(data string, sr *StreamResult),
+	options streamScannerOptions,
+) {
+
+	if c == nil || info == nil || resp == nil || dataHandler == nil {
 		return
 	}
+	options = normalizedStreamScannerOptions(options)
 
 	// 无条件新建 StreamStatus
 	info.StreamStatus = relaycommon.NewStreamStatus()
@@ -88,11 +161,11 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	streamingTimeout := time.Duration(constant.StreamingTimeout) * time.Second
+	streamingTimeout := options.idleTimeout
 
 	var (
 		stopChan    = make(chan bool, 3) // 增加缓冲区避免阻塞
-		scanner     = NewStreamScanner(resp.Body)
+		scanner     = newStreamScannerWithLimit(resp.Body, options.maxLineBytes)
 		ticker      = time.NewTicker(streamingTimeout)
 		pingTicker  *time.Ticker
 		writeMutex  sync.Mutex     // Mutex to protect concurrent writes
@@ -201,7 +274,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		})
 	}
 
-	dataChan := make(chan string, 10)
+	dataChan := make(chan string, options.queueItems)
 
 	wg.Add(1)
 	gopool.Go(func() {
@@ -254,8 +327,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			default:
 			}
 
-			ticker.Reset(streamingTimeout)
 			rawData := strings.TrimSpace(scanner.Text())
+			if !options.semanticIdle {
+				ticker.Reset(streamingTimeout)
+			}
 			if info != nil && constant.IsOpenCodeChannelType(info.GetChannelType()) {
 				// OpenCode response envelopes can contain upstream credentials,
 				// proxy URLs, session identifiers, or private endpoints. The
@@ -279,6 +354,14 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			}
 			if data == "" {
 				continue
+			}
+			if options.maxEventBytes > 0 && len(data) > options.maxEventBytes {
+				err := fmt.Errorf("stream event exceeds %d-byte relay limit", options.maxEventBytes)
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
+				return
+			}
+			if options.semanticIdle {
+				ticker.Reset(streamingTimeout)
 			}
 			if data != "[DONE]" {
 				info.SetFirstResponseTime()

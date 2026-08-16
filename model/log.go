@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -168,94 +169,79 @@ func classifyUserLogOpenCodeGoError(log *Log, other map[string]interface{}) cons
 	if log == nil {
 		return constant.ClassifyOpenCodeGoPublicError(http.StatusBadGateway, "", "", "")
 	}
-	statusCode := userLogStatusCode(other, log.Content)
-	if upstreamStatusCode, hasUpstreamStatus := userLogUpstreamStatusCode(other); hasUpstreamStatus {
-		// A marked relay error persists its raw upstream status in admin_info.
-		// Use it rather than a post-mapping public status when deciding whether
-		// a historical upstream error can remain a user-facing 400.
-		statusCode = upstreamStatusCode
+	provenance, hasProvenance := userLogErrorProvenance(other)
+	if hasProvenance {
+		switch {
+		case provenance.Origin == relaytypes.ErrorOriginUpstreamHTTP &&
+			(provenance.RawStatusCode == http.StatusBadRequest || provenance.RawStatusCode == http.StatusUnprocessableEntity):
+			return constant.ClassifyOpenCodeGoPublicError(
+				http.StatusBadRequest,
+				constant.OpenCodeGoPublicInvalidRequestCode,
+				constant.OpenCodeGoPublicInvalidRequestCode,
+				constant.OpenCodeGoPublicInvalidRequestMessage,
+			)
+		case provenance.IsUpstream():
+			return constant.ClassifyOpenCodeGoPublicError(
+				http.StatusTooManyRequests,
+				constant.OpenCodeGoPublicRateLimitErrorCode,
+				constant.OpenCodeGoPublicRateLimitErrorCode,
+				"",
+			)
+		case provenance.Origin == relaytypes.ErrorOriginLocalValidation:
+			projection := constant.ClassifyOpenCodeGoPublicError(
+				http.StatusBadRequest,
+				constant.OpenCodeGoPublicInvalidRequestCode,
+				constant.OpenCodeGoPublicInvalidRequestCode,
+				constant.OpenCodeGoPublicInvalidRequestMessage,
+			)
+			projection.Message = userLogSafeLocalValidationMessage(log.Content)
+			return projection
+		case provenance.Origin == relaytypes.ErrorOriginLocalCancel:
+			return constant.ClassifyOpenCodeGoPublicError(499, "", "", "")
+		}
 	}
-	errorType := userLogStringValue(other, "error_type")
-	errorCode := userLogStringValue(other, "error_code")
-	if constant.IsOpenCodeGoSafeUpstreamClientRequestError(statusCode, errorType, errorCode, log.Content) {
-		projection := constant.ClassifyOpenCodeGoPublicError(
-			http.StatusBadRequest,
-			constant.OpenCodeGoPublicInvalidRequestCode,
-			constant.OpenCodeGoPublicInvalidRequestCode,
-			log.Content,
-		)
-		projection.Message = common.OpenCodeGoPublicClientRequestMessage(log.Content)
-		return projection
-	}
-	projection := constant.ClassifyOpenCodeGoPublicError(statusCode, errorType, errorCode, log.Content)
-	if projection.StatusCode != 499 {
-		// A raw upstream 400 is not sufficient evidence of a user mistake. Only
-		// the explicit allowlist above may keep client-error semantics.
-		return constant.ClassifyOpenCodeGoPublicError(
-			http.StatusTooManyRequests,
-			constant.OpenCodeGoPublicRateLimitErrorCode,
-			constant.OpenCodeGoPublicRateLimitErrorCode,
-			log.Content,
-		)
-	}
-	return projection
+	// Missing, malformed, unknown, local non-validation, and gateway
+	// provenance all fail closed. In particular, a raw-looking status or error
+	// string is not evidence that a record came from upstream HTTP.
+	return constant.ClassifyOpenCodeGoPublicError(
+		http.StatusTooManyRequests,
+		constant.OpenCodeGoPublicRateLimitErrorCode,
+		constant.OpenCodeGoPublicRateLimitErrorCode,
+		"",
+	)
 }
 
-func userLogUpstreamStatusCode(other map[string]interface{}) (int, bool) {
+func userLogErrorProvenance(other map[string]interface{}) (relaytypes.ErrorProvenance, bool) {
 	if other == nil {
-		return 0, false
+		return relaytypes.ErrorProvenance{}, false
 	}
 	adminInfo, ok := other["admin_info"].(map[string]interface{})
 	if !ok {
-		return 0, false
+		return relaytypes.ErrorProvenance{}, false
 	}
-	rawStatus, exists := adminInfo["upstream_status_code"]
-	if !exists {
-		return 0, false
+	originValue, ok := adminInfo["error_origin"].(string)
+	if !ok || strings.TrimSpace(originValue) == "" {
+		return relaytypes.ErrorProvenance{}, false
 	}
-	statusCode, ok := parseUserLogInt(rawStatus)
-	if !ok || statusCode < 100 || statusCode > 599 {
-		return 0, true
+	provenance := relaytypes.ErrorProvenance{Origin: relaytypes.ErrorOrigin(strings.TrimSpace(originValue))}
+	if subtype, ok := adminInfo["error_subtype"].(string); ok {
+		provenance.Subtype = strings.TrimSpace(subtype)
 	}
-	return statusCode, true
+	if rawStatus, exists := adminInfo["upstream_status_code"]; exists {
+		if statusCode, valid := parseUserLogInt(rawStatus); valid && statusCode >= 100 && statusCode <= 599 {
+			provenance.RawStatusCode = statusCode
+		}
+	}
+	return provenance, true
 }
 
-func userLogStatusCode(other map[string]interface{}, content string) int {
-	if other != nil {
-		if status, ok := parseUserLogInt(other["status_code"]); ok && status >= 100 && status <= 599 {
-			return status
-		}
+func userLogSafeLocalValidationMessage(content string) string {
+	message := common.OpenCodeGoPublicClientRequestMessage(content)
+	if strings.TrimSpace(message) == "" || strings.Contains(message, "***") ||
+		common.MaskSensitiveInfo(message) != message {
+		return constant.OpenCodeGoPublicInvalidRequestMessage
 	}
-	lower := strings.ToLower(content)
-	const prefix = "status_code="
-	index := strings.Index(lower, prefix)
-	if index >= 0 {
-		value := lower[index+len(prefix):]
-		end := 0
-		for end < len(value) && value[end] >= '0' && value[end] <= '9' {
-			end++
-		}
-		if end > 0 {
-			if status, err := strconv.Atoi(value[:end]); err == nil && status >= 100 && status <= 599 {
-				return status
-			}
-		}
-	}
-	return http.StatusInternalServerError
-}
-
-func userLogStringValue(other map[string]interface{}, key string) string {
-	if other == nil {
-		return ""
-	}
-	value, ok := other[key]
-	if !ok || value == nil {
-		return ""
-	}
-	if text, ok := value.(string); ok {
-		return text
-	}
-	return fmt.Sprint(value)
+	return message
 }
 
 func parseUserLogInt(value interface{}) (int, bool) {

@@ -3,20 +3,81 @@ package opencodego
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+const (
+	// OpenCode Go serves text/code models. Sixteen MiB leaves substantial room
+	// above a 128K-token JSON response, while a four MiB SSE line bounds queued
+	// tool arguments without inheriting the shared scanner's 128 MiB ceiling.
+	maxOpenCodeGoNonStreamResponseBytes int64 = constant.OpenCodeGoMaxNonStreamResponseBytes
+	maxOpenCodeGoSSELineBytes                 = constant.OpenCodeGoMaxSSEEventBytes
+	openCodeGoNonStreamReadTimeout            = 5 * time.Minute
+)
+
+var (
+	errOpenCodeGoResponseLimitExceeded = errors.New("OpenCode response exceeds relay limit")
+	errOpenCodeGoResponseReadTimeout   = errors.New("OpenCode response body read timed out")
+)
+
+type openCodeGoResponseLimits struct {
+	nonStreamBytes       int64
+	streamLineBytes      int
+	nonStreamReadTimeout time.Duration
+}
+
+var defaultOpenCodeGoResponseLimits = openCodeGoResponseLimits{
+	nonStreamBytes:       maxOpenCodeGoNonStreamResponseBytes,
+	streamLineBytes:      maxOpenCodeGoSSELineBytes,
+	nonStreamReadTimeout: openCodeGoNonStreamReadTimeout,
+}
+
+type openCodeGoReadBody struct {
+	source   io.ReadCloser
+	once     sync.Once
+	closeErr error
+}
+
+func (body *openCodeGoReadBody) Read(p []byte) (int, error) {
+	return body.source.Read(p)
+}
+
+func (body *openCodeGoReadBody) Close() error {
+	body.once.Do(func() {
+		body.closeErr = body.source.Close()
+	})
+	return body.closeErr
+}
+
+func ownOpenCodeGoReadBody(response *http.Response) *openCodeGoReadBody {
+	if response == nil || response.Body == nil {
+		return nil
+	}
+	if body, ok := response.Body.(*openCodeGoReadBody); ok {
+		return body
+	}
+	body := &openCodeGoReadBody{source: response.Body}
+	response.Body = body
+	return body
+}
 
 type normalizedCostUsage struct {
 	InputTokens        int `json:"inputTokens"`
@@ -44,48 +105,144 @@ type responseTransformState struct {
 }
 
 func prepareResponseForRelay(resp *http.Response, state *responseTransformState, stream bool) error {
+	return prepareResponseForRelayWithContextAndLimits(context.Background(), resp, state, stream, defaultOpenCodeGoResponseLimits)
+}
+
+func prepareResponseForRelayWithLimits(
+	resp *http.Response,
+	state *responseTransformState,
+	stream bool,
+	limits openCodeGoResponseLimits,
+) error {
+	return prepareResponseForRelayWithContextAndLimits(context.Background(), resp, state, stream, limits)
+}
+
+func prepareResponseForRelayWithContextAndLimits(
+	ctx context.Context,
+	resp *http.Response,
+	state *responseTransformState,
+	stream bool,
+	limits openCodeGoResponseLimits,
+) error {
 	if resp == nil || resp.Body == nil || state == nil {
 		return nil
 	}
 	if stream || strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-		resp.Body = newTransformingReadCloser(resp.Body, state)
+		resp.Body = newTransformingReadCloserWithLimit(resp.Body, state, limits.streamLineBytes)
 		resp.ContentLength = -1
 		resp.Header.Del("Content-Length")
 		return nil
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	source := ownOpenCodeGoReadBody(resp)
+	body, err := readOpenCodeGoBoundedResponseWithTimeout(ctx, source, limits.nonStreamBytes, limits.nonStreamReadTimeout)
 	if err != nil {
 		return err
 	}
-	_ = resp.Body.Close()
 	body = state.transformJSON(body, false)
+	if int64(len(body)) > limits.nonStreamBytes {
+		return errOpenCodeGoResponseLimitExceeded
+	}
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	return nil
 }
 
+func readOpenCodeGoBoundedResponse(reader io.Reader, limit int64) ([]byte, error) {
+	if reader == nil {
+		return nil, nil
+	}
+	if limit <= 0 {
+		return nil, errOpenCodeGoResponseLimitExceeded
+	}
+	body, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, errOpenCodeGoResponseLimitExceeded
+	}
+	return body, nil
+}
+
+func readOpenCodeGoBoundedResponseWithTimeout(
+	ctx context.Context,
+	body *openCodeGoReadBody,
+	limit int64,
+	timeout time.Duration,
+) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var timedOut atomic.Bool
+	var timeoutTimer *time.Timer
+	if timeout > 0 {
+		timeoutTimer = time.AfterFunc(timeout, func() {
+			timedOut.Store(true)
+			_ = body.Close()
+		})
+	}
+	stopContextClose := context.AfterFunc(ctx, func() {
+		_ = body.Close()
+	})
+
+	payload, readErr := readOpenCodeGoBoundedResponse(body, limit)
+	if timeoutTimer != nil {
+		timeoutTimer.Stop()
+	}
+	stopContextClose()
+	closeErr := body.Close()
+
+	if contextErr := ctx.Err(); contextErr != nil {
+		return nil, contextErr
+	}
+	if timedOut.Load() {
+		return nil, errOpenCodeGoResponseReadTimeout
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close OpenCode response body: %w", closeErr)
+	}
+	return payload, nil
+}
+
 type transformingReadCloser struct {
-	source  io.ReadCloser
-	reader  *bufio.Reader
-	state   *responseTransformState
-	pending []byte
+	source    io.ReadCloser
+	reader    *bufio.Reader
+	state     *responseTransformState
+	lineLimit int
+	pending   []byte
 }
 
 func newTransformingReadCloser(source io.ReadCloser, state *responseTransformState) io.ReadCloser {
+	return newTransformingReadCloserWithLimit(source, state, maxOpenCodeGoSSELineBytes)
+}
+
+func newTransformingReadCloserWithLimit(source io.ReadCloser, state *responseTransformState, lineLimit int) io.ReadCloser {
 	return &transformingReadCloser{
-		source: source,
-		reader: bufio.NewReader(source),
-		state:  state,
+		source:    source,
+		reader:    bufio.NewReader(source),
+		state:     state,
+		lineLimit: lineLimit,
 	}
 }
 
 func (r *transformingReadCloser) Read(p []byte) (int, error) {
 	for len(r.pending) == 0 {
-		line, err := r.reader.ReadBytes('\n')
+		line, err := readOpenCodeGoBoundedLine(r.reader, r.lineLimit)
 		if len(line) > 0 {
-			r.pending = r.transformLine(line)
+			var transformErr error
+			r.pending, transformErr = r.transformLine(line)
+			if transformErr != nil {
+				return 0, transformErr
+			}
 		}
 		if len(r.pending) > 0 {
 			break
@@ -99,11 +256,29 @@ func (r *transformingReadCloser) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+func readOpenCodeGoBoundedLine(reader *bufio.Reader, limit int) ([]byte, error) {
+	if reader == nil || limit <= 0 {
+		return nil, errOpenCodeGoResponseLimitExceeded
+	}
+	line := make([]byte, 0, min(limit, reader.Size()))
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(line) > limit-len(fragment) {
+			return nil, errOpenCodeGoResponseLimitExceeded
+		}
+		line = append(line, fragment...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return line, err
+	}
+}
+
 func (r *transformingReadCloser) Close() error {
 	return r.source.Close()
 }
 
-func (r *transformingReadCloser) transformLine(line []byte) []byte {
+func (r *transformingReadCloser) transformLine(line []byte) ([]byte, error) {
 	ending := []byte{}
 	content := line
 	if bytes.HasSuffix(content, []byte("\n")) {
@@ -119,22 +294,25 @@ func (r *transformingReadCloser) transformLine(line []byte) []byte {
 	// marking with whitespace before the SSE data field.
 	content = bytes.TrimSpace(content)
 	if !bytes.HasPrefix(content, []byte("data:")) {
-		return line
+		return line, nil
 	}
 	payload := bytes.TrimSpace(content[len("data:"):])
 	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !gjson.ValidBytes(payload) {
-		return line
+		return line, nil
 	}
 
 	transformed := r.state.transformJSON(payload, true)
 	if transformed == nil {
-		return nil
+		return nil, nil
 	}
 	result := make([]byte, 0, len(transformed)+len(ending)+6)
 	result = append(result, "data: "...)
 	result = append(result, transformed...)
 	result = append(result, ending...)
-	return result
+	if len(result) > r.lineLimit {
+		return nil, errOpenCodeGoResponseLimitExceeded
+	}
+	return result, nil
 }
 
 func (s *responseTransformState) transformJSON(data []byte, stream bool) []byte {

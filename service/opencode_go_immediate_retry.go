@@ -36,7 +36,7 @@ func ShouldRetryOpenCodeGoRelayError(channelType int, relayErr *types.NewAPIErro
 	}
 	upstreamStatusCode, ok := openCodeGoUpstreamRelayStatusCode(relayErr)
 	if !ok {
-		upstreamStatusCode = relayErr.StatusCode
+		return false
 	}
 	return IsOpenCodeGoGenericFailoverStatus(upstreamStatusCode)
 }

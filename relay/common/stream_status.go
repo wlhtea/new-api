@@ -60,6 +60,18 @@ func (s *StreamStatus) SetEndReason(reason StreamEndReason, err error) {
 	})
 }
 
+// EndCause returns the immutable first terminal error recorded for the stream.
+// Callers use it after scanner cleanup to preserve typed read/limit causes that
+// a protocol handler may otherwise collapse into a generic incomplete stream.
+func (s *StreamStatus) EndCause() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.EndError
+}
+
 func (s *StreamStatus) RecordError(msg string) {
 	if s == nil {
 		return

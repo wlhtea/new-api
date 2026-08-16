@@ -39,30 +39,21 @@ func HasCSAMViolationMarker(err *types.NewAPIError) bool {
 }
 
 func WrapAsViolationFeeGrokCSAM(err *types.NewAPIError) *types.NewAPIError {
-	if err == nil {
-		return nil
+	if !trustedViolationFeeError(err) {
+		return err
 	}
 	oai := err.ToOpenAIError()
-	oai.Type = string(types.ErrorCodeViolationFeeGrokCSAM)
-	oai.Code = string(types.ErrorCodeViolationFeeGrokCSAM)
 	return preserveOpenCodeGoUpstreamOrigin(err, types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry()))
 }
 
-// NormalizeViolationFeeError ensures:
-// - if the CSAM marker is present, error.code is set to a stable violation-fee code and skip-retry is enabled.
-// - if error.code already has the violation-fee prefix, skip-retry is enabled.
-//
-// It must be called before retry decision logic.
+// NormalizeViolationFeeError only accepts typed upstream provenance plus a
+// stable policy code. Free-form provider or local text is never fee evidence.
 func NormalizeViolationFeeError(err *types.NewAPIError) *types.NewAPIError {
 	if err == nil {
 		return nil
 	}
 
-	if HasCSAMViolationMarker(err) {
-		return WrapAsViolationFeeGrokCSAM(err)
-	}
-
-	if IsViolationFeeCode(err.GetErrorCode()) {
+	if trustedViolationFeeError(err) {
 		oai := err.ToOpenAIError()
 		return preserveOpenCodeGoUpstreamOrigin(err, types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry()))
 	}
@@ -81,14 +72,14 @@ func preserveOpenCodeGoUpstreamOrigin(source, rebuilt *types.NewAPIError) *types
 }
 
 func shouldChargeViolationFee(err *types.NewAPIError) bool {
-	if err == nil {
+	return trustedViolationFeeError(err)
+}
+
+func trustedViolationFeeError(err *types.NewAPIError) bool {
+	if err == nil || err.GetErrorCode() != types.ErrorCodeViolationFeeGrokCSAM {
 		return false
 	}
-	if err.GetErrorCode() == types.ErrorCodeViolationFeeGrokCSAM {
-		return true
-	}
-	// In case some callers didn't normalize, keep a safety net.
-	return HasCSAMViolationMarker(err)
+	return err.Provenance().IsUpstream() || IsOpenCodeGoUpstreamRelayError(err)
 }
 
 func calcViolationFeeQuota(amount, groupRatio float64) int {

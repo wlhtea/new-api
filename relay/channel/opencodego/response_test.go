@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -201,21 +203,31 @@ func (w *failAfterDoneResponseWriter) Flush() {
 }
 
 type closeBlockingResponseBody struct {
-	closed chan struct{}
-	once   sync.Once
+	closed      chan struct{}
+	readStarted chan struct{}
+	readOnce    sync.Once
+	closeOnce   sync.Once
+	closeCalls  atomic.Int32
 }
 
 func newCloseBlockingResponseBody() *closeBlockingResponseBody {
-	return &closeBlockingResponseBody{closed: make(chan struct{})}
+	return &closeBlockingResponseBody{
+		closed:      make(chan struct{}),
+		readStarted: make(chan struct{}),
+	}
 }
 
 func (b *closeBlockingResponseBody) Read([]byte) (int, error) {
+	b.readOnce.Do(func() { close(b.readStarted) })
 	<-b.closed
 	return 0, io.EOF
 }
 
 func (b *closeBlockingResponseBody) Close() error {
-	b.once.Do(func() { close(b.closed) })
+	b.closeOnce.Do(func() {
+		b.closeCalls.Add(1)
+		close(b.closed)
+	})
 	return nil
 }
 
@@ -1925,4 +1937,385 @@ func TestChatCostExtensionBecomesUsageFallback(t *testing.T) {
 	assert.Equal(t, 3, usage.CompletionTokens)
 	assert.Equal(t, 88, usage.PromptTokensDetails.CachedTokens)
 	assert.Equal(t, 2, usage.CompletionTokenDetails.ReasoningTokens)
+}
+
+type responseLimitTestBody struct {
+	reader     io.Reader
+	closeCalls int
+}
+
+func (b *responseLimitTestBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *responseLimitTestBody) Close() error {
+	b.closeCalls++
+	return nil
+}
+
+type slowDripResponseBody struct {
+	data       []byte
+	delay      time.Duration
+	index      int
+	closed     chan struct{}
+	closeOnce  sync.Once
+	closeCalls atomic.Int32
+}
+
+func newSlowDripResponseBody(data string, delay time.Duration) *slowDripResponseBody {
+	return &slowDripResponseBody{
+		data:   []byte(data),
+		delay:  delay,
+		closed: make(chan struct{}),
+	}
+}
+
+func (b *slowDripResponseBody) Read(p []byte) (int, error) {
+	if b.index >= len(b.data) {
+		return 0, io.EOF
+	}
+	timer := time.NewTimer(b.delay)
+	defer timer.Stop()
+	select {
+	case <-b.closed:
+		return 0, io.ErrClosedPipe
+	case <-timer.C:
+	}
+	select {
+	case <-b.closed:
+		return 0, io.ErrClosedPipe
+	default:
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	p[0] = b.data[b.index]
+	b.index++
+	return 1, nil
+}
+
+func (b *slowDripResponseBody) Close() error {
+	b.closeOnce.Do(func() {
+		b.closeCalls.Add(1)
+		close(b.closed)
+	})
+	return nil
+}
+
+func TestPrepareResponseForRelayBoundsNonStreamBodyAtExactLimit(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		body      string
+		limit     int64
+		wantError bool
+	}{
+		{name: "at limit", body: `{"x":1}`, limit: int64(len(`{"x":1}`))},
+		{name: "one byte over", body: `{"x":1} `, limit: int64(len(`{"x":1}`)), wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			source := &responseLimitTestBody{reader: strings.NewReader(test.body)}
+			response := &http.Response{Header: http.Header{"Content-Type": []string{"application/json"}}, Body: source}
+			state := &responseTransformState{protocol: ProtocolChat}
+
+			err := prepareResponseForRelayWithLimits(response, state, false, openCodeGoResponseLimits{
+				nonStreamBytes:  test.limit,
+				streamLineBytes: 64,
+			})
+
+			assert.Equal(t, 1, source.closeCalls)
+			if test.wantError {
+				assert.ErrorIs(t, err, errOpenCodeGoResponseLimitExceeded)
+				return
+			}
+			require.NoError(t, err)
+			got, readErr := io.ReadAll(response.Body)
+			require.NoError(t, readErr)
+			assert.JSONEq(t, test.body, string(got))
+		})
+	}
+}
+
+func TestPrepareResponseForRelayNonStreamTimeoutClosesSourceExactlyOnce(t *testing.T) {
+	source := newCloseBlockingResponseBody()
+	response := &http.Response{
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   source,
+	}
+
+	err := prepareResponseForRelayWithContextAndLimits(
+		context.Background(),
+		response,
+		&responseTransformState{protocol: ProtocolChat},
+		false,
+		openCodeGoResponseLimits{
+			nonStreamBytes:       64,
+			streamLineBytes:      64,
+			nonStreamReadTimeout: 20 * time.Millisecond,
+		},
+	)
+
+	assert.ErrorIs(t, err, errOpenCodeGoResponseReadTimeout)
+	assert.Equal(t, int32(1), source.closeCalls.Load())
+}
+
+func TestPrepareResponseForRelayNonStreamSlowDripUsesWholeBodyDeadline(t *testing.T) {
+	source := newSlowDripResponseBody(`{"slow":true}`, 10*time.Millisecond)
+	response := &http.Response{
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   source,
+	}
+	startedAt := time.Now()
+
+	err := prepareResponseForRelayWithContextAndLimits(
+		context.Background(),
+		response,
+		&responseTransformState{protocol: ProtocolChat},
+		false,
+		openCodeGoResponseLimits{
+			nonStreamBytes:       64,
+			streamLineBytes:      64,
+			nonStreamReadTimeout: 25 * time.Millisecond,
+		},
+	)
+
+	assert.ErrorIs(t, err, errOpenCodeGoResponseReadTimeout)
+	assert.Less(t, time.Since(startedAt), 250*time.Millisecond)
+	assert.Equal(t, int32(1), source.closeCalls.Load())
+}
+
+func TestPrepareResponseForRelayDownstreamCancellationWinsOverTimeout(t *testing.T) {
+	requestContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source := newCloseBlockingResponseBody()
+	response := &http.Response{
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   source,
+	}
+	go func() {
+		<-source.readStarted
+		cancel()
+	}()
+
+	err := prepareResponseForRelayWithContextAndLimits(
+		requestContext,
+		response,
+		&responseTransformState{protocol: ProtocolChat},
+		false,
+		openCodeGoResponseLimits{
+			nonStreamBytes:       64,
+			streamLineBytes:      64,
+			nonStreamReadTimeout: time.Second,
+		},
+	)
+
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.NotErrorIs(t, err, errOpenCodeGoResponseReadTimeout)
+	assert.Equal(t, int32(1), source.closeCalls.Load())
+}
+
+func TestAdaptorResponseBodyTimeoutUsesLocalDeadlineProvenance(t *testing.T) {
+	oldDisableEnabled := common.AutomaticDisableChannelEnabled
+	oldDisableRanges := append([]operation_setting.StatusCodeRange(nil), operation_setting.AutomaticDisableStatusCodeRanges...)
+	common.AutomaticDisableChannelEnabled = true
+	operation_setting.AutomaticDisableStatusCodeRanges = []operation_setting.StatusCodeRange{{
+		Start: http.StatusGatewayTimeout,
+		End:   http.StatusGatewayTimeout,
+	}}
+	t.Cleanup(func() {
+		common.AutomaticDisableChannelEnabled = oldDisableEnabled
+		operation_setting.AutomaticDisableStatusCodeRanges = oldDisableRanges
+	})
+
+	oldLimits := defaultOpenCodeGoResponseLimits
+	defaultOpenCodeGoResponseLimits = openCodeGoResponseLimits{
+		nonStreamBytes:       64,
+		streamLineBytes:      64,
+		nonStreamReadTimeout: 20 * time.Millisecond,
+	}
+	t.Cleanup(func() { defaultOpenCodeGoResponseLimits = oldLimits })
+
+	info := responseTestInfo(ProtocolChat, types.RelayFormatOpenAI, false)
+	ctx, recorder := responseTestContext(types.RelayFormatOpenAI)
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+	source := newCloseBlockingResponseBody()
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       source,
+	}
+	service.OwnResponseBodyForRequest(ctx, response)
+
+	usage, apiErr := adaptor.DoResponse(ctx, response, info)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.ErrorIs(t, apiErr, errOpenCodeGoResponseReadTimeout)
+	assert.Equal(t, types.ErrorOriginLocalDeadline, apiErr.Provenance().Origin)
+	assert.Equal(t, "response_body_timeout", apiErr.Provenance().Subtype)
+	assert.Zero(t, apiErr.Provenance().RawStatusCode)
+	assert.True(t, types.IsSkipRetryError(apiErr))
+	assert.False(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+	_, hasRawStatus := service.OpenCodeGoUpstreamRelayStatusCode(apiErr)
+	assert.False(t, hasRawStatus)
+	assert.False(t, service.ShouldRetryOpenCodeGoRelayError(constant.ChannelTypeOpenCodeGo, apiErr))
+	assert.False(t, service.ShouldDisableChannel(apiErr))
+	assert.Equal(t, int32(1), source.closeCalls.Load())
+	assert.False(t, recorder.Flushed)
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestTransformingReadCloserBoundsLineBeforeNewlineAllocation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		body      string
+		limit     int
+		wantError bool
+	}{
+		{name: "at limit", body: "1234567\n", limit: 8},
+		{name: "one byte over", body: "12345678\n", limit: 8, wantError: true},
+		{name: "unterminated one byte over", body: "123456789", limit: 8, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			source := &responseLimitTestBody{reader: strings.NewReader(test.body)}
+			reader := newTransformingReadCloserWithLimit(
+				source,
+				&responseTransformState{protocol: ProtocolChat},
+				test.limit,
+			)
+
+			got, err := io.ReadAll(reader)
+			if test.wantError {
+				assert.ErrorIs(t, err, errOpenCodeGoResponseLimitExceeded)
+				assert.Empty(t, got)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, test.body, string(got))
+			}
+			require.NoError(t, reader.Close())
+			assert.Equal(t, 1, source.closeCalls)
+		})
+	}
+}
+
+func TestAdaptorResponseLimitHasNoFabricatedRawStatusOrPolicySideEffects(t *testing.T) {
+	oldDisableEnabled := common.AutomaticDisableChannelEnabled
+	oldDisableRanges := append([]operation_setting.StatusCodeRange(nil), operation_setting.AutomaticDisableStatusCodeRanges...)
+	common.AutomaticDisableChannelEnabled = true
+	operation_setting.AutomaticDisableStatusCodeRanges = []operation_setting.StatusCodeRange{{
+		Start: http.StatusBadGateway,
+		End:   http.StatusBadGateway,
+	}}
+	t.Cleanup(func() {
+		common.AutomaticDisableChannelEnabled = oldDisableEnabled
+		operation_setting.AutomaticDisableStatusCodeRanges = oldDisableRanges
+	})
+
+	oldLimits := defaultOpenCodeGoResponseLimits
+	defaultOpenCodeGoResponseLimits = openCodeGoResponseLimits{
+		nonStreamBytes:  8,
+		streamLineBytes: 16,
+	}
+	t.Cleanup(func() { defaultOpenCodeGoResponseLimits = oldLimits })
+
+	for _, channelType := range []int{
+		constant.ChannelTypeOpenCodeGo,
+		constant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(constant.GetChannelTypeName(channelType), func(t *testing.T) {
+			info := responseTestInfo(ProtocolChat, types.RelayFormatOpenAI, false)
+			info.ChannelMeta.ChannelType = channelType
+			if channelType == constant.ChannelTypeOpenCodeAPIKey {
+				info.ChannelMeta.ApiType = constant.APITypeOpenCodeAPIKey
+			}
+			ctx, recorder := responseTestContext(types.RelayFormatOpenAI)
+			adaptor := &Adaptor{}
+			adaptor.Init(info)
+			source := &responseLimitTestBody{reader: strings.NewReader(`{"too_large":true}`)}
+			response := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       source,
+			}
+			service.OwnResponseBodyForRequest(ctx, response)
+
+			usage, apiErr := adaptor.DoResponse(ctx, response, info)
+			require.Nil(t, usage)
+			require.NotNil(t, apiErr)
+			assert.ErrorIs(t, apiErr, errOpenCodeGoResponseLimitExceeded)
+			assert.Equal(t, types.ErrorOriginGatewayInvariant, apiErr.Provenance().Origin)
+			assert.Equal(t, "response_limit", apiErr.Provenance().Subtype)
+			assert.Zero(t, apiErr.Provenance().RawStatusCode)
+			assert.True(t, types.IsSkipRetryError(apiErr))
+			assert.False(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+			_, hasRawStatus := service.OpenCodeGoUpstreamRelayStatusCode(apiErr)
+			assert.False(t, hasRawStatus)
+			assert.False(t, service.ShouldRetryOpenCodeGoRelayError(channelType, apiErr))
+			assert.False(t, service.ShouldDisableChannel(apiErr))
+			assert.Equal(t, 1, source.closeCalls)
+			assert.False(t, recorder.Flushed)
+			assert.Empty(t, recorder.Body.String())
+		})
+	}
+}
+
+func TestTransformedResponseLimitUsesGatewayInvariantProvenance(t *testing.T) {
+	apiErr := newOpenCodeGoTransformedResponseLimitError(service.ErrOpenCodeGoResponseBodyLimitExceeded)
+
+	require.NotNil(t, apiErr)
+	assert.ErrorIs(t, apiErr, service.ErrOpenCodeGoResponseBodyLimitExceeded)
+	assert.Equal(t, types.ErrorOriginGatewayInvariant, apiErr.Provenance().Origin)
+	assert.Equal(t, "transformed_response_limit", apiErr.Provenance().Subtype)
+	assert.Zero(t, apiErr.Provenance().RawStatusCode)
+	assert.True(t, types.IsSkipRetryError(apiErr))
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		assert.False(t, service.ShouldRetryOpenCodeGoRelayError(channelType, apiErr))
+	}
+}
+
+func TestAdaptorStreamLineLimitDoesNotCreateWorkspaceFailoverEvidence(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	oldLimits := defaultOpenCodeGoResponseLimits
+	defaultOpenCodeGoResponseLimits = openCodeGoResponseLimits{
+		nonStreamBytes:  64,
+		streamLineBytes: 16,
+	}
+	t.Cleanup(func() { defaultOpenCodeGoResponseLimits = oldLimits })
+
+	originalFailureObserver := observeOpenCodeGoFailoverFailure
+	failures := 0
+	observeOpenCodeGoFailoverFailure = func(_ *service.OpenCodeGoFailoverAttempt, _ time.Time) (service.OpenCodeGoFailoverObservation, error) {
+		failures++
+		return service.OpenCodeGoFailoverObservation{Action: service.OpenCodeGoFailoverActionSuspect}, nil
+	}
+	t.Cleanup(func() { observeOpenCodeGoFailoverFailure = originalFailureObserver })
+
+	info := responseTestInfo(ProtocolChat, types.RelayFormatOpenAI, true)
+	ctx, _ := responseTestContext(types.RelayFormatOpenAI)
+	adaptor := &Adaptor{}
+	adaptor.Init(info)
+	adaptor.requestUpstreamStream = true
+	adaptor.failoverAttempt = &service.OpenCodeGoFailoverAttempt{}
+	source := &responseLimitTestBody{reader: strings.NewReader("data: " + strings.Repeat("x", 32) + "\n")}
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       source,
+	}
+	service.OwnResponseBodyForRequest(ctx, response)
+
+	usage, apiErr := adaptor.DoResponse(ctx, response, info)
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.ErrorIs(t, apiErr, errOpenCodeGoResponseLimitExceeded)
+	assert.Equal(t, types.ErrorOriginGatewayInvariant, apiErr.Provenance().Origin)
+	assert.Equal(t, "response_limit", apiErr.Provenance().Subtype)
+	assert.Zero(t, apiErr.Provenance().RawStatusCode)
+	assert.True(t, types.IsSkipRetryError(apiErr))
+	assert.False(t, service.IsOpenCodeGoUpstreamRelayError(apiErr))
+	assert.Zero(t, failures)
+	assert.Equal(t, 1, source.closeCalls)
 }

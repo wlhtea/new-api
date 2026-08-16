@@ -1,8 +1,10 @@
 package service
 
 import (
+	"errors"
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -127,6 +129,79 @@ func refreshTieredBillingGroup(relayInfo *relaycommon.RelayInfo) (*billingexpr.B
 	return snap, nil
 }
 
+// BindTieredBillingCandidate installs the finalized request view for the next
+// physical attempt and refreshes its request-dependent estimate. Candidate
+// pricing has already reserved the maximum, so a selected view that exceeds
+// that ceiling is an invariant failure rather than an attempt-time top-up.
+func BindTieredBillingCandidate(
+	relayInfo *relaycommon.RelayInfo,
+	requestInput billingexpr.RequestInput,
+	estimatedPromptTokens int,
+	estimatedCompletionTokens int,
+) error {
+	if relayInfo == nil {
+		return nil
+	}
+	if estimatedPromptTokens < 0 || estimatedCompletionTokens < 0 {
+		return errors.New("finalized candidate token estimate is invalid")
+	}
+	input := cloneTieredRequestInput(requestInput)
+	relayInfo.BillingRequestInput = &input
+	relayInfo.SetEstimatePromptTokens(estimatedPromptTokens)
+
+	snap := relayInfo.TieredBillingSnapshot
+	if snap == nil || snap.BillingMode != "tiered_expr" {
+		return nil
+	}
+	rawCost, trace, err := billingexpr.RunExprWithRequest(
+		snap.ExprString,
+		billingexpr.TokenParams{
+			P:   float64(estimatedPromptTokens),
+			C:   float64(estimatedCompletionTokens),
+			Len: float64(estimatedPromptTokens),
+		},
+		input,
+	)
+	if err != nil {
+		return err
+	}
+	quotaPerUnit := snap.QuotaPerUnit
+	if quotaPerUnit == 0 {
+		quotaPerUnit = common.QuotaPerUnit
+	}
+	quotaBeforeGroup := rawCost / 1_000_000 * quotaPerUnit
+	quotaAfterGroup, err := billingexpr.QuotaRoundStrict(
+		quotaBeforeGroup * relayInfo.PriceData.GroupRatioInfo.GroupRatio,
+	)
+	if err != nil {
+		return err
+	}
+	if quotaAfterGroup > relayInfo.PriceData.QuotaToPreConsume {
+		return errors.New("selected finalized candidate exceeds the pre-billed maximum")
+	}
+	snap.EstimatedPromptTokens = estimatedPromptTokens
+	snap.EstimatedCompletionTokens = estimatedCompletionTokens
+	snap.EstimatedQuotaBeforeGroup = quotaBeforeGroup
+	snap.EstimatedQuotaAfterGroup = quotaAfterGroup
+	snap.EstimatedTier = trace.MatchedTier
+	snap.GroupRatio = relayInfo.PriceData.GroupRatioInfo.GroupRatio
+	return nil
+}
+
+func cloneTieredRequestInput(source billingexpr.RequestInput) billingexpr.RequestInput {
+	clone := billingexpr.RequestInput{ResolveParam: source.ResolveParam}
+	if len(source.Body) > 0 {
+		clone.Body = append([]byte(nil), source.Body...)
+	}
+	if len(source.Headers) > 0 {
+		clone.Headers = make(map[string]string, len(source.Headers))
+		for key, value := range source.Headers {
+			clone.Headers[key] = value
+		}
+	}
+	return clone
+}
+
 // PrepareTieredBillingForSelectedGroup refreshes routing-dependent billing
 // state before an upstream attempt. An existing session reserves any higher
 // estimate before sending. If the initial group was free and skipped
@@ -157,6 +232,12 @@ func PrepareTieredBillingForSelectedGroup(c *gin.Context, relayInfo *relaycommon
 
 	if relayInfo.Billing == nil {
 		return PreConsumeBilling(c, snap.EstimatedQuotaAfterGroup, relayInfo)
+	}
+	if snap.EstimatedQuotaAfterGroup <= relayInfo.PriceData.QuotaToPreConsume {
+		// Candidate-aware pricing already reserved the maximum before the first
+		// physical attempt. Binding a winner only selects its settlement view.
+		relayInfo.FinalPreConsumedQuota = relayInfo.Billing.GetPreConsumedQuota()
+		return nil
 	}
 	if err := relayInfo.Billing.Reserve(snap.EstimatedQuotaAfterGroup); err != nil {
 		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())

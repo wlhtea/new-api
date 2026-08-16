@@ -1,14 +1,17 @@
 package model
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 
 	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
@@ -372,7 +375,7 @@ func TestFormatUserLogsProjectsOpenCodeAPIKeyWithoutMutatingStoredRecord(t *test
 	require.Contains(t, raw.Other, "private.example")
 }
 
-func TestFormatUserLogsKeepsOnlySafeExplicitOpenCodeClientDetails(t *testing.T) {
+func TestFormatUserLogsFailClosedWithoutRawUpstreamProvenance(t *testing.T) {
 	tests := []struct {
 		name        string
 		content     string
@@ -385,25 +388,25 @@ func TestFormatUserLogsKeepsOnlySafeExplicitOpenCodeClientDetails(t *testing.T) 
 			name:        "safe explicit client error",
 			content:     "status_code=400, Error from provider (Console Go): Upstream request failed: [invalid_request_error] messages[0].role is required",
 			errorCode:   "invalid_request_error",
-			wantStatus:  http.StatusBadRequest,
-			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
-			wantContent: "messages[0].role is required",
+			wantStatus:  http.StatusTooManyRequests,
+			wantCode:    constant.OpenCodeGoPublicRateLimitErrorCode,
+			wantContent: constant.OpenCodeGoPublicOverloadMessage,
 		},
 		{
 			name:        "private explicit client error",
 			content:     "status_code=400, invalid request for workspace wrk_private",
 			errorCode:   "invalid_request_error",
-			wantStatus:  http.StatusBadRequest,
-			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
-			wantContent: constant.OpenCodeGoPublicInvalidRequestMessage,
+			wantStatus:  http.StatusTooManyRequests,
+			wantCode:    constant.OpenCodeGoPublicRateLimitErrorCode,
+			wantContent: constant.OpenCodeGoPublicOverloadMessage,
 		},
 		{
 			name:        "credential explicit client error",
 			content:     "status_code=400, invalid request: Authorization: Bearer private-upstream-token; proxy socks5://proxy-user:proxy-password@10.0.0.8:1080",
 			errorCode:   "invalid_request_error",
-			wantStatus:  http.StatusBadRequest,
-			wantCode:    constant.OpenCodeGoPublicInvalidRequestCode,
-			wantContent: constant.OpenCodeGoPublicInvalidRequestMessage,
+			wantStatus:  http.StatusTooManyRequests,
+			wantCode:    constant.OpenCodeGoPublicRateLimitErrorCode,
+			wantContent: constant.OpenCodeGoPublicOverloadMessage,
 		},
 		{
 			name:        "ambiguous upstream 400",
@@ -446,41 +449,165 @@ func TestFormatUserLogsUsesRawUpstreamStatusForOpenCodeClientProjection(t *testi
 		name               string
 		upstreamStatusCode int
 		wantStatus         int
+		wantCode           string
 	}{
-		{name: "raw 400 preserves safe client detail", upstreamStatusCode: http.StatusBadRequest, wantStatus: http.StatusBadRequest},
-		{name: "raw 422 preserves safe client detail", upstreamStatusCode: http.StatusUnprocessableEntity, wantStatus: http.StatusBadRequest},
-		{name: "raw 401 fails closed", upstreamStatusCode: http.StatusUnauthorized, wantStatus: http.StatusTooManyRequests},
-		{name: "raw 429 fails closed", upstreamStatusCode: http.StatusTooManyRequests, wantStatus: http.StatusTooManyRequests},
-		{name: "raw 200 envelope fails closed", upstreamStatusCode: http.StatusOK, wantStatus: http.StatusTooManyRequests},
+		{name: "raw 400 uses fixed client detail", upstreamStatusCode: http.StatusBadRequest, wantStatus: http.StatusBadRequest, wantCode: constant.OpenCodeGoPublicInvalidRequestCode},
+		{name: "raw 422 uses fixed client detail", upstreamStatusCode: http.StatusUnprocessableEntity, wantStatus: http.StatusBadRequest, wantCode: constant.OpenCodeGoPublicInvalidRequestCode},
+		{name: "raw 401 fails closed", upstreamStatusCode: http.StatusUnauthorized, wantStatus: http.StatusTooManyRequests, wantCode: constant.OpenCodeGoPublicRateLimitErrorCode},
+		{name: "raw 429 fails closed", upstreamStatusCode: http.StatusTooManyRequests, wantStatus: http.StatusTooManyRequests, wantCode: constant.OpenCodeGoPublicRateLimitErrorCode},
+		{name: "raw 200 envelope fails closed", upstreamStatusCode: http.StatusOK, wantStatus: http.StatusTooManyRequests, wantCode: constant.OpenCodeGoPublicRateLimitErrorCode},
 	}
 
-	for _, test := range tests {
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		for _, test := range tests {
+			t.Run(fmt.Sprintf("type-%d/%s", channelType, test.name), func(t *testing.T) {
+				log := &Log{
+					Type:      LogTypeError,
+					Content:   "messages[0].role is required",
+					ChannelId: 81,
+					Other: common.MapToJsonStr(map[string]interface{}{
+						"channel_type": channelType,
+						"error_type":   "invalid_request_error",
+						"error_code":   "invalid_request_error",
+						"status_code":  http.StatusBadRequest,
+						"admin_info": map[string]interface{}{
+							"upstream_status_code": test.upstreamStatusCode,
+							"error_origin":         relaytypes.ErrorOriginUpstreamHTTP,
+							"error_subtype":        "non_2xx",
+						},
+					}),
+				}
+
+				formatUserLogs([]*Log{log}, 0)
+
+				other, err := common.StrToMap(log.Other)
+				require.NoError(t, err)
+				require.Equal(t, float64(test.wantStatus), other["status_code"])
+				require.Equal(t, test.wantCode, other["error_type"])
+				require.Equal(t, test.wantCode, other["error_code"])
+				if test.wantStatus == http.StatusBadRequest {
+					require.Equal(t, constant.OpenCodeGoPublicInvalidRequestMessage, log.Content)
+				} else {
+					require.Equal(t, constant.OpenCodeGoPublicOverloadMessage, log.Content)
+				}
+			})
+		}
+	}
+}
+
+func TestFormatUserLogsRequiresTypedOriginForFixedUpstream400(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		adminInfo   map[string]interface{}
+		wantStatus  int
+		wantContent string
+	}{
+		{
+			name: "raw status without origin fails closed",
+			adminInfo: map[string]interface{}{
+				"upstream_status_code": http.StatusBadRequest,
+			},
+			wantStatus:  http.StatusTooManyRequests,
+			wantContent: constant.OpenCodeGoPublicOverloadMessage,
+		},
+		{
+			name: "transport origin cannot forge raw status",
+			adminInfo: map[string]interface{}{
+				"error_origin":         relaytypes.ErrorOriginUpstreamTransport,
+				"error_subtype":        "request_transport",
+				"upstream_status_code": http.StatusBadRequest,
+			},
+			wantStatus:  http.StatusTooManyRequests,
+			wantContent: constant.OpenCodeGoPublicOverloadMessage,
+		},
+		{
+			name: "typed upstream http 400 uses fixed content",
+			adminInfo: map[string]interface{}{
+				"error_origin":         relaytypes.ErrorOriginUpstreamHTTP,
+				"error_subtype":        "non_2xx",
+				"upstream_status_code": http.StatusBadRequest,
+			},
+			wantStatus:  http.StatusBadRequest,
+			wantContent: constant.OpenCodeGoPublicInvalidRequestMessage,
+		},
+	} {
 		t.Run(test.name, func(t *testing.T) {
-			log := &Log{
+			raw := Log{
 				Type:      LogTypeError,
-				Content:   "messages[0].role is required",
+				Content:   "upstream secret workspace=hidden",
 				ChannelId: 81,
 				Other: common.MapToJsonStr(map[string]interface{}{
 					"channel_type": constant.ChannelTypeOpenCodeAPIKey,
 					"error_type":   "invalid_request_error",
 					"error_code":   "invalid_request_error",
 					"status_code":  http.StatusBadRequest,
-					"admin_info": map[string]interface{}{
-						"upstream_status_code": test.upstreamStatusCode,
-					},
+					"admin_info":   test.adminInfo,
 				}),
 			}
+			public := raw
 
-			formatUserLogs([]*Log{log}, 0)
+			formatUserLogs([]*Log{&public}, 0)
 
-			other, err := common.StrToMap(log.Other)
+			publicOther, err := common.StrToMap(public.Other)
 			require.NoError(t, err)
-			require.Equal(t, float64(test.wantStatus), other["status_code"])
-			if test.wantStatus == http.StatusBadRequest {
-				require.Equal(t, "messages[0].role is required", log.Content)
-			} else {
-				require.Equal(t, constant.OpenCodeGoPublicOverloadMessage, log.Content)
-			}
+			assert.Equal(t, float64(test.wantStatus), publicOther["status_code"])
+			assert.Equal(t, test.wantContent, public.Content)
+			assert.NotContains(t, public.Content, "workspace")
+			assert.Equal(t, "upstream secret workspace=hidden", raw.Content)
+			assert.Contains(t, raw.Other, "admin_info")
 		})
+	}
+}
+
+func TestFormatUserLogsPreservesOnlyMaskerSafeTypedLocalValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantContent string
+	}{
+		{
+			name:        "safe fixed message",
+			content:     "status_code=400, The selected model does not support disabling reasoning",
+			wantContent: "The selected model does not support disabling reasoning",
+		},
+		{
+			name:        "domain-like path falls back",
+			content:     "status_code=400, thinking.type=disabled is not supported for the selected model",
+			wantContent: constant.OpenCodeGoPublicInvalidRequestMessage,
+		},
+	}
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		for _, test := range tests {
+			t.Run(fmt.Sprintf("type-%d/%s", channelType, test.name), func(t *testing.T) {
+				raw := Log{
+					Type:      LogTypeError,
+					Content:   test.content,
+					ChannelId: 81,
+					Other: common.MapToJsonStr(map[string]interface{}{
+						"channel_type": channelType,
+						"error_type":   "invalid_request_error",
+						"error_code":   "invalid_request_error",
+						"status_code":  http.StatusBadRequest,
+						"admin_info": map[string]interface{}{
+							"error_origin":  relaytypes.ErrorOriginLocalValidation,
+							"error_subtype": "model.glm-5.3.chat.thinking-disabled",
+						},
+					}),
+				}
+				public := raw
+
+				formatUserLogs([]*Log{&public}, 0)
+
+				publicOther, err := common.StrToMap(public.Other)
+				require.NoError(t, err)
+				assert.Equal(t, float64(http.StatusBadRequest), publicOther["status_code"])
+				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestCode, publicOther["error_type"])
+				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestCode, publicOther["error_code"])
+				assert.Equal(t, test.wantContent, public.Content)
+				assert.NotContains(t, public.Content, "***")
+				assert.Equal(t, test.content, raw.Content)
+				assert.Contains(t, raw.Other, string(relaytypes.ErrorOriginLocalValidation))
+			})
+		}
 	}
 }

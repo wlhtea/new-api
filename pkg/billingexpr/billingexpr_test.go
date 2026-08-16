@@ -1,6 +1,7 @@
 package billingexpr_test
 
 import (
+	"errors"
 	"math"
 	"testing"
 
@@ -159,6 +160,38 @@ func TestRequestProbeHelpers(t *testing.T) {
 	if math.Abs(cost-want) > 1e-6 {
 		t.Errorf("cost = %f, want %f", cost, want)
 	}
+}
+
+func TestRequestProbeUsesResolverWithoutMaterializedBody(t *testing.T) {
+	var paths []string
+	cost, _, err := billingexpr.RunExprWithRequest(
+		`p * (param("service_tier") == "fast" ? 2 : 1)`,
+		billingexpr.TokenParams{P: 100},
+		billingexpr.RequestInput{
+			ResolveParam: func(path string) (interface{}, bool, error) {
+				paths = append(paths, path)
+				return "fast", true, nil
+			},
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 200.0, cost)
+	assert.Equal(t, []string{"service_tier"}, paths)
+}
+
+func TestRequestProbeResolverFailureFailsEvaluation(t *testing.T) {
+	resolverErr := errors.New("request view unavailable")
+	_, _, err := billingexpr.RunExprWithRequest(
+		`param("service_tier") == "fast" ? 2 : 1`,
+		billingexpr.TokenParams{},
+		billingexpr.RequestInput{
+			Body: []byte(`{"service_tier":"fast"}`),
+			ResolveParam: func(string) (interface{}, bool, error) {
+				return nil, false, resolverErr
+			},
+		},
+	)
+	require.ErrorIs(t, err, resolverErr)
 }
 
 func TestHeaderProbeHelper(t *testing.T) {

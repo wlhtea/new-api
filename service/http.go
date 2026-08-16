@@ -2,10 +2,12 @@ package service
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -15,6 +17,43 @@ import (
 )
 
 const responseBodyWriteErrorKey = "oneapi_response_body_write_error"
+
+var ErrOpenCodeGoResponseBodyLimitExceeded = errors.New("OpenCode response exceeds public body limit")
+
+type requestOwnedResponseBody struct {
+	source io.ReadCloser
+	once   sync.Once
+	err    error
+}
+
+func (b *requestOwnedResponseBody) Read(p []byte) (int, error) {
+	return b.source.Read(p)
+}
+
+func (b *requestOwnedResponseBody) Close() error {
+	b.once.Do(func() {
+		b.err = b.source.Close()
+	})
+	return b.err
+}
+
+// OwnResponseBodyForRequest makes the network response body exactly-once and
+// registers a panic-safe fallback close with the request cleanup middleware.
+func OwnResponseBodyForRequest(c *gin.Context, response *http.Response) {
+	if c == nil || response == nil || response.Body == nil {
+		return
+	}
+	if _, ok := response.Body.(*requestOwnedResponseBody); ok {
+		return
+	}
+	body := &requestOwnedResponseBody{source: response.Body}
+	response.Body = body
+	common.RegisterRequestCleanup(c, func() {
+		if err := body.Close(); err != nil {
+			common.SysError("failed to close request-owned response body: " + SanitizeOpenCodeGoAdminError(err))
+		}
+	})
+}
 
 // ResetResponseBodyWriteError clears response-copy state before a response
 // handler starts writing to a potentially reused Gin context.
@@ -77,7 +116,16 @@ func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
 }
 
 func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
+	ioCopyBytesGracefullyWithLimit(c, src, data, constant.OpenCodeGoMaxNonStreamResponseBytes)
+}
+
+func ioCopyBytesGracefullyWithLimit(c *gin.Context, src *http.Response, data []byte, openCodeLimit int) {
 	if c.Writer == nil {
+		return
+	}
+	if constant.IsOpenCodeChannelType(common.GetContextKeyInt(c, constant.ContextKeyChannelType)) &&
+		(openCodeLimit <= 0 || len(data) > openCodeLimit) {
+		recordResponseBodyWriteError(c, ErrOpenCodeGoResponseBodyLimitExceeded)
 		return
 	}
 

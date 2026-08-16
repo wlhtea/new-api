@@ -1,13 +1,13 @@
 package helper
 
 import (
-	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"mime"
 	"net/http"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -20,10 +20,12 @@ import (
 const cachedValidatedRequestKey = "relay_helper_cached_validated_request"
 
 type cachedValidatedRequest struct {
-	format  types.RelayFormat
-	path    string
-	model   string
-	request dto.Request
+	format   types.RelayFormat
+	method   string
+	path     string
+	model    string
+	request  dto.Request
+	envelope *ValidatedRequestEnvelope
 }
 
 type responsesRequestDefault struct {
@@ -61,6 +63,8 @@ func (n *responsesRequestNormalization) apply(request *dto.OpenAIResponsesReques
 type ClientRequestValidationError struct {
 	StatusCode int
 	Message    string
+	RuleID     string
+	StageID    string
 }
 
 func (e *ClientRequestValidationError) Error() string {
@@ -140,6 +144,15 @@ func getCachedValidatedRequest(c *gin.Context) (*cachedValidatedRequest, bool, e
 	if cached.model == "" || requestModel != cached.model {
 		return nil, true, errors.New("cached validated request model is invalid")
 	}
+	if !isStrictRelayValidationTarget(http.MethodPost, cached.path, cached.format) {
+		return nil, true, errors.New("cached validated request format does not match current request")
+	}
+	if cached.envelope == nil {
+		return nil, true, errors.New("cached validated request envelope is invalid")
+	}
+	if err := cached.envelope.validateCache(c, cached.format, cached.method, cached.path, cached.model, cached.request); err != nil {
+		return nil, true, err
+	}
 	return cached, true, nil
 }
 
@@ -201,19 +214,23 @@ func parseAndCacheStrictRelayRequest(c *gin.Context, format types.RelayFormat) (
 	if err != nil {
 		return nil, err
 	}
-	body, err := storage.Bytes()
+	envelope, err := parseValidatedRequestEnvelope(
+		c.Request.Context(),
+		storage,
+		c.Request.Method,
+		c.Request.URL.Path,
+		format,
+		defaultStrictJSONLimits,
+	)
 	if err != nil {
 		return nil, err
 	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return nil, newClientRequestValidationError(http.StatusBadRequest, "request body must be a JSON object")
-	}
-	if !utf8.Valid(body) {
-		return nil, newClientRequestValidationError(http.StatusBadRequest, "request body must contain valid UTF-8")
-	}
 
 	var raw map[string]any
-	if err := common.Unmarshal(body, &raw); err != nil {
+	if err := decodeBodyStorageUseNumber(c.Request.Context(), storage, &raw); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		return nil, newClientRequestValidationError(http.StatusBadRequest, "request body must contain exactly one valid JSON object")
 	}
 	if raw == nil {
@@ -231,7 +248,10 @@ func parseAndCacheStrictRelayRequest(c *gin.Context, format types.RelayFormat) (
 			return nil, err
 		}
 		typed := &dto.ClaudeRequest{}
-		if err := common.Unmarshal(body, typed); err != nil {
+		if err := decodeBodyStorage(c.Request.Context(), storage, typed); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
 			return nil, newClientRequestValidationError(http.StatusBadRequest, "request body does not match the Messages schema")
 		}
 		request, err = validateClaudeRequest(typed)
@@ -240,7 +260,10 @@ func parseAndCacheStrictRelayRequest(c *gin.Context, format types.RelayFormat) (
 			return nil, err
 		}
 		typed := &dto.GeneralOpenAIRequest{}
-		if err := common.Unmarshal(body, typed); err != nil {
+		if err := decodeBodyStorage(c.Request.Context(), storage, typed); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
 			return nil, newClientRequestValidationError(http.StatusBadRequest, "request body does not match the Chat Completions schema")
 		}
 		request, err = validateTextRequest(c, typed, relayconstant.RelayModeChatCompletions)
@@ -250,7 +273,10 @@ func parseAndCacheStrictRelayRequest(c *gin.Context, format types.RelayFormat) (
 			return nil, err
 		}
 		typed := &dto.OpenAIResponsesRequest{}
-		if err := common.Unmarshal(body, typed); err != nil {
+		if err := decodeBodyStorage(c.Request.Context(), storage, typed); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
 			return nil, newClientRequestValidationError(http.StatusBadRequest, "request body does not match the Responses schema")
 		}
 		if err := normalization.apply(typed); err != nil {
@@ -270,12 +296,20 @@ func parseAndCacheStrictRelayRequest(c *gin.Context, format types.RelayFormat) (
 	if err != nil || typedModel != model {
 		return nil, errors.New("validated request model does not match parsed model")
 	}
+	if err := envelope.bindTypedRequest(model, request); err != nil {
+		return nil, err
+	}
+	if err := envelope.validateCache(c, format, c.Request.Method, c.Request.URL.Path, model, request); err != nil {
+		return nil, fmt.Errorf("validate strict request envelope: %w", err)
+	}
 
 	c.Set(cachedValidatedRequestKey, &cachedValidatedRequest{
-		format:  format,
-		path:    c.Request.URL.Path,
-		model:   model,
-		request: request,
+		format:   format,
+		method:   c.Request.Method,
+		path:     c.Request.URL.Path,
+		model:    model,
+		request:  request,
+		envelope: envelope,
 	})
 	return request, nil
 }
@@ -386,7 +420,7 @@ func validateNumberArray(value any, path string) error {
 		return newClientRequestValidationError(http.StatusBadRequest, "%s must be an array", path)
 	}
 	for index, item := range items {
-		if _, ok := item.(float64); !ok {
+		if !isDecodedJSONNumber(item) {
 			return newClientRequestValidationError(http.StatusBadRequest, "%s[%d] must be a number", path, index)
 		}
 	}
@@ -751,10 +785,19 @@ func validateRequiredNumberField(object map[string]any, field, path string) erro
 	if !found || value == nil {
 		return newClientRequestValidationError(http.StatusBadRequest, "%s is required", path)
 	}
-	if _, ok := value.(float64); !ok {
+	if !isDecodedJSONNumber(value) {
 		return newClientRequestValidationError(http.StatusBadRequest, "%s must be a number", path)
 	}
 	return nil
+}
+
+func isDecodedJSONNumber(value any) bool {
+	switch value.(type) {
+	case json.Number, float64:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateResponsesLogprob(logprob map[string]any, path string) error {

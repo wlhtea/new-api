@@ -77,13 +77,21 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	if err == nil {
 		return false
 	}
+	if err.Provenance().IsLocal() || err.Provenance().IsGateway() {
+		return false
+	}
+	if IsOpenCodeGoRawInvalidRequestError(err) {
+		return false
+	}
 	if types.IsChannelError(err) {
 		return true
 	}
 	statusCode := OpenCodeGoRelayPolicyStatusCode(err)
 	// skipRetry protects replay safety, but it must not discard authoritative
 	// upstream health evidence such as a rejected API key after bytes were sent.
-	if IsOpenCodeGoUpstreamRelayError(err) && operation_setting.ShouldDisableByStatusCode(statusCode) {
+	provenance := err.Provenance()
+	if IsOpenCodeGoUpstreamRelayError(err) && provenance.RawStatusCode > 0 &&
+		operation_setting.ShouldDisableByStatusCode(statusCode) {
 		return true
 	}
 	if types.IsSkipRetryError(err) {

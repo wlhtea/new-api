@@ -36,7 +36,7 @@ var (
 	openCodeGoProxyUserinfoPattern   = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^/@\s]+@[^/\s]+`)
 	openCodeGoAuthorizationPattern   = regexp.MustCompile(`(?i)(\b(?:proxy-)?authorization\s*[:=]\s*)[^\r\n]+`)
 	openCodeGoHeaderSecretPattern    = regexp.MustCompile(`(?i)(\b(?:x-(?:api|goog)-key|api[_ -]?key|(?:set-)?cookie)\s*[:=]\s*)[^\r\n]+`)
-	openCodeGoCredentialFieldPattern = regexp.MustCompile(`(?i)(\b(?:access[_ -]?token|refresh[_ -]?token|id[_ -]?token|session(?:[_ -]?id)?|token[_ -]?id|x[_ -]?opencode[_ -]?session|password|credential|secret)\s*[:=]\s*)[^\s,;\]}]+`)
+	openCodeGoCredentialFieldPattern = regexp.MustCompile(`(?i)(\b(?:access[_ -]?token|refresh[_ -]?token|id[_ -]?token|session(?:[_ -]?id)?|token[_ -]?id|x[_ -]?opencode[_ -]?session|request[_ -]?id|upstream[_ -]?request[_ -]?id|trace[_ -]?id|correlation[_ -]?id|workspace(?:[_ -]?id)?|endpoint(?:[_ -]?(?:url|host))?|proxy(?:[_ -]?(?:url|host))?|password|credential|secret)\s*[:=]\s*)[^\s,;\]}]+`)
 )
 
 type openCodeGoConsoleReader interface {

@@ -282,9 +282,7 @@ func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData hosttypes.PriceD
 }
 
 var scheduleAudioRelaySuccessSample = func(relayInfo *relaycommon.RelayInfo, completionTokens int) {
-	gopool.Go(func() {
-		perfmetrics.RecordRelaySample(relayInfo, true, int64(completionTokens))
-	})
+	perfmetrics.ScheduleRelaySample(relayInfo, true, int64(completionTokens))
 }
 
 func hasBillableAudioUsage(usage *dto.Usage) bool {

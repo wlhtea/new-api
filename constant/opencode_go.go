@@ -13,11 +13,20 @@ const (
 	OpenCodeGoPublicRequestCanceledMessage = "请求已取消"
 	OpenCodeGoPublicRequestCanceledCode    = "request_canceled"
 
+	// OpenCode response transforms enforce the same per-event ceiling before
+	// the shared SSE scanner. The scanner queue is sized from bytes, not just
+	// item count, so several maximum-sized tool events cannot accumulate an
+	// unbounded amount of memory behind a slow downstream writer.
+	OpenCodeGoMaxSSEEventBytes          = 4 << 20
+	OpenCodeGoMaxSSEQueuedBytes         = 8 << 20
+	OpenCodeGoMaxNonStreamResponseBytes = 16 << 20
+
 	OpenCodeGoAffinitySourceToken                 = "token"
 	OpenCodeGoAffinitySourceClaudeCodeSession     = "claude-code-session"
 	OpenCodeGoAffinitySourceClaudeMetadataSession = "claude-metadata-session"
 	OpenCodeGoAffinitySourceOpenCodeSession       = "opencode-session"
 	OpenCodeGoAffinitySourcePromptCacheKey        = "prompt_cache_key"
+	OpenCodeGoAffinitySourceMetadataUserID        = "metadata-user-id"
 	OpenCodeGoAffinitySourceNone                  = "none"
 )
 

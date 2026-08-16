@@ -1,11 +1,12 @@
 package opencodego
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -18,9 +19,20 @@ import (
 )
 
 const (
-	maxErrorBodyBytes    = 64 << 10
-	maxErrorMessageBytes = 512
+	maxErrorBodyBytes              = 64 << 10
+	maxErrorMessageBytes           = 512
+	openCodeGoErrorBodyReadTimeout = 30 * time.Second
 )
+
+type openCodeGoErrorResponseLimits struct {
+	bodyBytes   int64
+	readTimeout time.Duration
+}
+
+var defaultOpenCodeGoErrorResponseLimits = openCodeGoErrorResponseLimits{
+	bodyBytes:   maxErrorBodyBytes,
+	readTimeout: openCodeGoErrorBodyReadTimeout,
+}
 
 var observeOpenCodeGoProviderFailure = service.ObserveOpenCodeGoProviderFailure
 
@@ -32,16 +44,71 @@ func openCodeUpstreamErrorOptions(c *gin.Context, info *relaycommon.RelayInfo) [
 	return nil
 }
 
+func newOpenCodeGoErrorBodyLimitError(c *gin.Context, info *relaycommon.RelayInfo, rawStatusCode int, cause error) *types.NewAPIError {
+	err := types.NewOpenAIError(
+		cause,
+		types.ErrorCodeReadResponseBodyFailed,
+		rawStatusCode,
+		openCodeUpstreamErrorOptions(c, info)...,
+	)
+	return service.MarkOpenCodeGoUpstreamHTTPErrorWithSubtype(err, rawStatusCode, "error_body_limit")
+}
+
+func newOpenCodeGoErrorBodyTimeoutError(c *gin.Context, info *relaycommon.RelayInfo, rawStatusCode int, cause error) *types.NewAPIError {
+	err := types.NewOpenAIError(
+		cause,
+		types.ErrorCodeReadResponseBodyFailed,
+		rawStatusCode,
+		openCodeUpstreamErrorOptions(c, info)...,
+	)
+	return service.MarkOpenCodeGoUpstreamHTTPErrorWithSubtype(err, rawStatusCode, "error_body_timeout")
+}
+
 func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*types.NewAPIError, *channel.Non2xxResponseObservation) {
+	return a.handleNon2xxResponseWithLimits(c, resp, info, defaultOpenCodeGoErrorResponseLimits)
+}
+
+func (a *Adaptor) handleNon2xxResponseWithLimits(
+	c *gin.Context,
+	resp *http.Response,
+	info *relaycommon.RelayInfo,
+	limits openCodeGoErrorResponseLimits,
+) (*types.NewAPIError, *channel.Non2xxResponseObservation) {
+	if localErr := openCodeGoLocalContextError(c, nil); localErr != nil {
+		if resp != nil {
+			defer service.CloseResponseBodyGracefully(resp)
+		}
+		defer a.releaseInFlight()
+		return localErr, nil
+	}
 	if resp == nil {
 		err := types.NewOpenAIError(errors.New("OpenCode Go returned no response"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway, openCodeUpstreamErrorOptions(c, info)...)
 		return service.MarkOpenCodeGoUpstreamRelayError(err), &channel.Non2xxResponseObservation{Provider: ChannelName, StatusCode: http.StatusBadGateway, ErrorCode: string(types.ErrorCodeBadResponseStatusCode)}
 	}
 	defer a.releaseInFlight()
+	ownOpenCodeGoReadBody(resp)
 	defer service.CloseResponseBodyGracefully(resp)
 
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes+1))
+	responseContext := context.Background()
+	if c != nil && c.Request != nil {
+		responseContext = c.Request.Context()
+	}
+	body, readErr := readOpenCodeGoBoundedResponseWithTimeout(
+		responseContext,
+		ownOpenCodeGoReadBody(resp),
+		limits.bodyBytes,
+		limits.readTimeout,
+	)
 	if readErr != nil {
+		if localErr := openCodeGoLocalContextError(c, readErr); localErr != nil {
+			return localErr, nil
+		}
+		switch {
+		case errors.Is(readErr, errOpenCodeGoResponseLimitExceeded):
+			return newOpenCodeGoErrorBodyLimitError(c, info, resp.StatusCode, readErr), nil
+		case errors.Is(readErr, errOpenCodeGoResponseReadTimeout):
+			return newOpenCodeGoErrorBodyTimeoutError(c, info, resp.StatusCode, readErr), nil
+		}
 		failure := service.ParseOpenCodeGoProviderFailure(resp.StatusCode, resp.Header, nil)
 		if failure.RetryAfter != "" && c != nil {
 			c.Header("Retry-After", failure.RetryAfter)
@@ -60,10 +127,7 @@ func (a *Adaptor) HandleNon2xxResponse(c *gin.Context, resp *http.Response, info
 			a.persistProviderFailure(c, info, failure, observation)
 		}
 		err := types.NewOpenAIError(errors.New("failed to read OpenCode Go error response"), types.ErrorCodeReadResponseBodyFailed, resp.StatusCode, openCodeUpstreamErrorOptions(c, info)...)
-		return service.MarkOpenCodeGoUpstreamRelayError(err), observation
-	}
-	if len(body) > maxErrorBodyBytes {
-		body = body[:maxErrorBodyBytes]
+		return service.MarkOpenCodeGoUpstreamHTTPErrorWithSubtype(err, resp.StatusCode, "error_body_read"), observation
 	}
 
 	failure := service.ParseOpenCodeGoProviderFailure(resp.StatusCode, resp.Header, body)
@@ -134,6 +198,9 @@ func (a *Adaptor) logProviderFailureDiagnostics(c *gin.Context, statusCode int, 
 
 func (a *Adaptor) persistProviderFailure(c *gin.Context, info *relaycommon.RelayInfo, failure service.OpenCodeGoProviderFailure, observation *channel.Non2xxResponseObservation) {
 	if a == nil || !a.workspaceSelected || a.selectedWorkspaceUID == "" || info == nil || observation == nil || openCodeGoCallerCancelled(c, nil) {
+		return
+	}
+	if observation.StatusCode == http.StatusBadRequest || observation.StatusCode == http.StatusUnprocessableEntity {
 		return
 	}
 	observedAt := openCodeGoHealthNow()

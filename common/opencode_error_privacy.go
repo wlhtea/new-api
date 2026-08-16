@@ -11,7 +11,7 @@ var (
 	openCodeGoPrivateErrorHeaderPattern     = regexp.MustCompile(`(?i)\b(?:proxy-)?authorization\s*[:=]|\b(?:x-(?:api|goog)-key|api[_ -]?key|(?:set-)?cookie)\s*[:=]`)
 	openCodeGoPrivateErrorCredentialPattern = regexp.MustCompile(`(?i)\b(?:bearer|basic)\s+[a-z0-9._~+/=-]{6,}`)
 	openCodeGoPrivateErrorAPIKeyPattern     = regexp.MustCompile(`(?i)\bsk-[a-z0-9][a-z0-9._-]{3,}\b`)
-	openCodeGoPrivateErrorIdentifierPattern = regexp.MustCompile(`(?i)\b(?:access[_ -]?token|refresh[_ -]?token|id[_ -]?token|session(?:[_ -]?id)?|token[_ -]?id|x[_ -]?opencode[_ -]?session|request[_ -]?id|trace[_ -]?id|correlation[_ -]?id|proxy(?:[_ -]?(?:url|host))?|password|credential|secret)\s*[:=]\s*[^\s,;]+`)
+	openCodeGoPrivateErrorIdentifierPattern = regexp.MustCompile(`(?i)\b(?:access[_ -]?token|refresh[_ -]?token|id[_ -]?token|session(?:[_ -]?id)?|token[_ -]?id|x[_ -]?opencode[_ -]?session|request[_ -]?id|upstream[_ -]?request[_ -]?id|trace[_ -]?id|correlation[_ -]?id|workspace(?:[_ -]?id)?|endpoint(?:[_ -]?(?:url|host))?|proxy(?:[_ -]?(?:url|host))?|password|credential|secret)\s*[:=]\s*[^\s,;]+`)
 	openCodeGoPrivateErrorURLPattern        = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^\s"'<>]+`)
 	openCodeGoPrivateErrorHostPattern       = regexp.MustCompile(`(?i)\b(?:localhost|(?:10|127)\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(?::\d{1,5})?\b|\b[a-z0-9][a-z0-9.-]*\.(?:internal|local|localhost|lan)\b`)
 )
@@ -155,7 +155,9 @@ func openCodeGoJSONKeyHasPrivateDetail(key string) bool {
 		"refresh_token", "id_token", "session", "session_id", "token_id",
 		"x_opencode_session", "request_id", "requestid", "x_request_id",
 		"trace_id", "traceid", "x_trace_id", "correlation_id", "correlationid",
-		"upstream_request_id", "proxy", "proxy_url", "proxy_host", "proxyhost",
+		"upstream_request_id", "upstreamrequestid", "workspace", "workspace_id", "workspaceid",
+		"endpoint", "endpoint_url", "endpointurl", "endpoint_host", "endpointhost",
+		"proxy", "proxy_url", "proxy_host", "proxyhost",
 		"password", "credential", "secret":
 		return true
 	}

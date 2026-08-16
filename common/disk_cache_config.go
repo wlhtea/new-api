@@ -111,6 +111,48 @@ func IncrementDiskFiles(size int64) {
 	atomic.AddInt64(&diskCacheStats.CurrentDiskUsageBytes, size)
 }
 
+// ReserveDiskCacheBytes atomically admits bytes before a cache file is
+// written. CurrentDiskUsageBytes includes in-progress reservations so
+// concurrent writers cannot all pass an advisory capacity check.
+func ReserveDiskCacheBytes(size int64) bool {
+	if size < 0 || !IsDiskCacheEnabled() {
+		return false
+	}
+	maxBytes := GetDiskCacheMaxSizeBytes()
+	if maxBytes < 0 {
+		return false
+	}
+	for {
+		current := atomic.LoadInt64(&diskCacheStats.CurrentDiskUsageBytes)
+		if current < 0 || size > maxBytes-current {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(&diskCacheStats.CurrentDiskUsageBytes, current, current+size) {
+			return true
+		}
+	}
+}
+
+func releaseDiskCacheBytes(size int64) {
+	if size <= 0 {
+		return
+	}
+	if atomic.AddInt64(&diskCacheStats.CurrentDiskUsageBytes, -size) < 0 {
+		atomic.StoreInt64(&diskCacheStats.CurrentDiskUsageBytes, 0)
+	}
+}
+
+func commitReservedDiskFile() {
+	atomic.AddInt64(&diskCacheStats.ActiveDiskFiles, 1)
+}
+
+func releaseReservedDiskFile(size int64) {
+	if atomic.AddInt64(&diskCacheStats.ActiveDiskFiles, -1) < 0 {
+		atomic.StoreInt64(&diskCacheStats.ActiveDiskFiles, 0)
+	}
+	releaseDiskCacheBytes(size)
+}
+
 // DecrementDiskFiles 减少磁盘文件计数
 func DecrementDiskFiles(size int64) {
 	if atomic.AddInt64(&diskCacheStats.ActiveDiskFiles, -1) < 0 {
@@ -173,5 +215,5 @@ func IsDiskCacheAvailable(requestSize int64) bool {
 	}
 	maxBytes := GetDiskCacheMaxSizeBytes()
 	currentUsage := atomic.LoadInt64(&diskCacheStats.CurrentDiskUsageBytes)
-	return currentUsage+requestSize <= maxBytes
+	return requestSize >= 0 && currentUsage >= 0 && requestSize <= maxBytes-currentUsage
 }

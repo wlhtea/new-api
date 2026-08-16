@@ -41,22 +41,37 @@ const claudeCacheCreation1hMultiplier = 6 / 3.75
 // the pre-consumed quota still reflects a plausible output cost in paid groups.
 const defaultTieredPreConsumeMaxTokens = 8192
 
+// BillingCandidateView is the side-effect-free billing projection of one
+// preflighted OpenCode route. Body is the finalized JSON after conversion,
+// merge, operator overrides, and the provider safety fence.
+type BillingCandidateView struct {
+	SelectionGroup            string
+	Body                      []byte
+	EstimatedPromptTokens     int
+	EstimatedCompletionTokens int
+}
+
 // HandleGroupRatio checks for "auto_group" in the context and updates the group ratio and relayInfo.UsingGroup if present
 func HandleGroupRatio(ctx *gin.Context, relayInfo *relaycommon.RelayInfo) hosttypes.GroupRatioInfo {
-	groupRatioInfo := hosttypes.GroupRatioInfo{
-		GroupRatio:        1.0, // default ratio
-		GroupSpecialRatio: -1,
-	}
-
 	// check auto group
 	autoGroup, exists := ctx.Get("auto_group")
 	if exists {
 		logger.LogDebug(ctx, "final group: %s", autoGroup)
 		relayInfo.UsingGroup = autoGroup.(string)
 	}
+	return ResolveGroupRatioInfo(relayInfo.UserGroup, relayInfo.UsingGroup)
+}
+
+// ResolveGroupRatioInfo computes the effective ratio without mutating routing
+// state. Candidate planning uses it before any physical attempt is selected.
+func ResolveGroupRatioInfo(userGroup, usingGroup string) hosttypes.GroupRatioInfo {
+	groupRatioInfo := hosttypes.GroupRatioInfo{
+		GroupRatio:        1.0,
+		GroupSpecialRatio: -1,
+	}
 
 	// check user group special ratio
-	userGroupRatio, ok := ratio_setting.GetGroupGroupRatio(relayInfo.UserGroup, relayInfo.UsingGroup)
+	userGroupRatio, ok := ratio_setting.GetGroupGroupRatio(userGroup, usingGroup)
 	if ok {
 		// user group special ratio
 		groupRatioInfo.GroupSpecialRatio = userGroupRatio
@@ -64,16 +79,126 @@ func HandleGroupRatio(ctx *gin.Context, relayInfo *relaycommon.RelayInfo) hostty
 		groupRatioInfo.HasSpecialRatio = true
 	} else {
 		// normal group ratio
-		groupRatioInfo.GroupRatio = ratio_setting.GetGroupRatio(relayInfo.UsingGroup)
+		groupRatioInfo.GroupRatio = ratio_setting.GetGroupRatio(usingGroup)
 	}
 
 	return groupRatioInfo
 }
 
 func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens int, meta *types.TokenCountMeta) (hosttypes.PriceData, error) {
-	modelPrice, usePrice := ratio_setting.GetModelPrice(info.OriginModelName, false)
-
 	groupRatioInfo := HandleGroupRatio(c, info)
+	return modelPriceHelperWithGroupRatio(c, info, promptTokens, meta, groupRatioInfo)
+}
+
+// ModelPriceHelperForCandidates reserves against the highest estimate across
+// the immutable finalized candidate set. It leaves the request's selected
+// routing group unchanged; each physical attempt installs its winning billing
+// view immediately before transport.
+func ModelPriceHelperForCandidates(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	promptTokens int,
+	meta *types.TokenCountMeta,
+	candidates []BillingCandidateView,
+) (hosttypes.PriceData, error) {
+	if len(candidates) == 0 {
+		return ModelPriceHelper(c, info, promptTokens, meta)
+	}
+
+	if billing_setting.GetBillingMode(info.OriginModelName) == billing_setting.BillingModeTieredExpr {
+		var selected *tieredPriceEstimate
+		for index, candidate := range candidates {
+			group := strings.TrimSpace(candidate.SelectionGroup)
+			if group == "" {
+				group = info.UsingGroup
+			}
+			requestInput := billingexpr.RequestInput{
+				Headers: cloneStringMap(info.RequestHeaders),
+				Body:    append([]byte(nil), candidate.Body...),
+			}
+			candidateMeta := billingCandidateTokenMeta(meta, candidate)
+			candidatePromptTokens := max(promptTokens, candidate.EstimatedPromptTokens)
+			estimate, err := evaluateTieredPrice(
+				info,
+				candidatePromptTokens,
+				candidateMeta,
+				ResolveGroupRatioInfo(info.UserGroup, group),
+				requestInput,
+			)
+			if err != nil {
+				return hosttypes.PriceData{}, fmt.Errorf("candidate %d tiered billing: %w", index, err)
+			}
+			if selected == nil || estimate.price.QuotaToPreConsume > selected.price.QuotaToPreConsume ||
+				(estimate.price.QuotaToPreConsume == selected.price.QuotaToPreConsume &&
+					selected.price.FreeModel && !estimate.price.FreeModel) {
+				selected = &estimate
+			}
+		}
+		if selected == nil {
+			return hosttypes.PriceData{}, fmt.Errorf("OpenCode finalized candidate billing set is empty")
+		}
+		applyTieredPriceEstimate(info, *selected)
+		logTieredPriceEstimate(c, info, *selected)
+		return selected.price, nil
+	}
+
+	var selectedPrice *hosttypes.PriceData
+	for index, candidate := range candidates {
+		group := strings.TrimSpace(candidate.SelectionGroup)
+		if group == "" {
+			group = info.UsingGroup
+		}
+		candidateMeta := billingCandidateTokenMeta(meta, candidate)
+		candidatePromptTokens := max(promptTokens, candidate.EstimatedPromptTokens)
+		candidateInfo := *info
+		price, err := modelPriceHelperWithGroupRatio(
+			c,
+			&candidateInfo,
+			candidatePromptTokens,
+			candidateMeta,
+			ResolveGroupRatioInfo(info.UserGroup, group),
+		)
+		if err != nil {
+			return hosttypes.PriceData{}, fmt.Errorf("candidate %d billing: %w", index, err)
+		}
+		if selectedPrice == nil || price.QuotaToPreConsume > selectedPrice.QuotaToPreConsume ||
+			(price.QuotaToPreConsume == selectedPrice.QuotaToPreConsume && selectedPrice.FreeModel && !price.FreeModel) {
+			copy := price
+			selectedPrice = &copy
+		}
+	}
+	if selectedPrice == nil {
+		return hosttypes.PriceData{}, fmt.Errorf("OpenCode finalized candidate billing set is empty")
+	}
+	info.PriceData = *selectedPrice
+	return *selectedPrice, nil
+}
+
+func billingCandidateTokenMeta(meta *types.TokenCountMeta, candidate BillingCandidateView) *types.TokenCountMeta {
+	clone := types.TokenCountMeta{}
+	if meta != nil {
+		clone = *meta
+		if meta.BillingRatios != nil {
+			clone.BillingRatios = make(map[string]float64, len(meta.BillingRatios))
+			for key, value := range meta.BillingRatios {
+				clone.BillingRatios[key] = value
+			}
+		}
+	}
+	if candidate.EstimatedCompletionTokens > clone.MaxTokens {
+		clone.MaxTokens = candidate.EstimatedCompletionTokens
+	}
+	return &clone
+}
+
+func modelPriceHelperWithGroupRatio(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	promptTokens int,
+	meta *types.TokenCountMeta,
+	groupRatioInfo hosttypes.GroupRatioInfo,
+) (hosttypes.PriceData, error) {
+	modelPrice, usePrice := ratio_setting.GetModelPrice(info.OriginModelName, false)
 
 	// Check if this model uses tiered_expr billing
 	if billing_setting.GetBillingMode(info.OriginModelName) == billing_setting.BillingModeTieredExpr {
@@ -267,19 +392,40 @@ func HasModelBillingConfig(modelName string) bool {
 }
 
 func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptTokens int, meta *types.TokenCountMeta, groupRatioInfo hosttypes.GroupRatioInfo) (hosttypes.PriceData, error) {
+	requestInput, err := ResolveIncomingBillingExprRequestInput(c, info)
+	if err != nil {
+		return hosttypes.PriceData{}, err
+	}
+	estimate, err := evaluateTieredPrice(info, promptTokens, meta, groupRatioInfo, requestInput)
+	if err != nil {
+		return hosttypes.PriceData{}, err
+	}
+	applyTieredPriceEstimate(info, estimate)
+	logTieredPriceEstimate(c, info, estimate)
+	return estimate.price, nil
+}
+
+type tieredPriceEstimate struct {
+	price        hosttypes.PriceData
+	snapshot     billingexpr.BillingSnapshot
+	requestInput billingexpr.RequestInput
+}
+
+func evaluateTieredPrice(
+	info *relaycommon.RelayInfo,
+	promptTokens int,
+	meta *types.TokenCountMeta,
+	groupRatioInfo hosttypes.GroupRatioInfo,
+	requestInput billingexpr.RequestInput,
+) (tieredPriceEstimate, error) {
 	exprStr, ok := billing_setting.GetBillingExpr(info.OriginModelName)
 	if !ok {
-		return hosttypes.PriceData{}, fmt.Errorf("model %s is configured as tiered_expr but has no billing expression", info.OriginModelName)
+		return tieredPriceEstimate{}, fmt.Errorf("model %s is configured as tiered_expr but has no billing expression", info.OriginModelName)
 	}
 
 	estimatedCompletionTokens := meta.MaxTokens
 	if estimatedCompletionTokens == 0 && groupRatioInfo.GroupRatio != 0 {
 		estimatedCompletionTokens = defaultTieredPreConsumeMaxTokens
-	}
-
-	requestInput, err := ResolveIncomingBillingExprRequestInput(c, info)
-	if err != nil {
-		return hosttypes.PriceData{}, err
 	}
 
 	rawCost, trace, err := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{
@@ -288,14 +434,14 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 		Len: float64(promptTokens),
 	}, requestInput)
 	if err != nil {
-		return hosttypes.PriceData{}, fmt.Errorf("model %s tiered expr run failed: %w", info.OriginModelName, err)
+		return tieredPriceEstimate{}, fmt.Errorf("model %s tiered expr run failed: %w", info.OriginModelName, err)
 	}
 
 	// Expression coefficients are $/1M tokens prices; convert to quota the same way per-call billing does.
 	quotaBeforeGroup := rawCost / 1_000_000 * common.QuotaPerUnit
 	preConsumedQuota, err := billingexpr.QuotaRoundStrict(quotaBeforeGroup * groupRatioInfo.GroupRatio)
 	if err != nil {
-		return hosttypes.PriceData{}, err
+		return tieredPriceEstimate{}, err
 	}
 
 	freeModel := false
@@ -307,7 +453,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 	}
 
 	exprHash := billingexpr.ExprHashString(exprStr)
-	snapshot := &billingexpr.BillingSnapshot{
+	snapshot := billingexpr.BillingSnapshot{
 		BillingMode:               billing_setting.BillingModeTieredExpr,
 		ModelName:                 info.OriginModelName,
 		ExprString:                exprStr,
@@ -321,17 +467,35 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 		QuotaPerUnit:              common.QuotaPerUnit,
 		ExprVersion:               billingexpr.ExprVersion(exprStr),
 	}
-	info.TieredBillingSnapshot = snapshot
-	info.BillingRequestInput = &requestInput
-
 	priceData := hosttypes.PriceData{
 		FreeModel:         freeModel,
 		GroupRatioInfo:    groupRatioInfo,
 		QuotaToPreConsume: preConsumedQuota,
 	}
 
-	logger.LogDebug(c, "model_price_helper_tiered result: model=%s preConsume=%d quotaBeforeGroup=%.2f groupRatio=%.2f tier=%s", info.OriginModelName, preConsumedQuota, quotaBeforeGroup, groupRatioInfo.GroupRatio, trace.MatchedTier)
+	return tieredPriceEstimate{
+		price:        priceData,
+		snapshot:     snapshot,
+		requestInput: cloneRequestInput(requestInput),
+	}, nil
+}
 
-	info.PriceData = priceData
-	return priceData, nil
+func applyTieredPriceEstimate(info *relaycommon.RelayInfo, estimate tieredPriceEstimate) {
+	snapshot := estimate.snapshot
+	requestInput := cloneRequestInput(estimate.requestInput)
+	info.TieredBillingSnapshot = &snapshot
+	info.BillingRequestInput = &requestInput
+	info.PriceData = estimate.price
+}
+
+func logTieredPriceEstimate(c *gin.Context, info *relaycommon.RelayInfo, estimate tieredPriceEstimate) {
+	logger.LogDebug(
+		c,
+		"model_price_helper_tiered result: model=%s preConsume=%d quotaBeforeGroup=%.2f groupRatio=%.2f tier=%s",
+		info.OriginModelName,
+		estimate.price.QuotaToPreConsume,
+		estimate.snapshot.EstimatedQuotaBeforeGroup,
+		estimate.snapshot.GroupRatio,
+		estimate.snapshot.EstimatedTier,
+	)
 }

@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 
@@ -31,6 +32,53 @@ type Adaptor interface {
 	GetChannelName() string
 	ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error)
 	ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error)
+}
+
+// OutboundRequestFinalizer lets an adaptor materialize the final JSON after
+// typed conversion and handler-owned mutations such as system prompts. Most
+// adaptors use the relay's legacy marshal/fence/override sequence; providers
+// that need immutable raw-field semantics can implement this optional hook.
+type OutboundRequestFinalizer interface {
+	FinalizeOutboundRequest(
+		c *gin.Context,
+		info *relaycommon.RelayInfo,
+		convertedRequest any,
+	) ([]byte, error)
+}
+
+// OutboundParamOverrideError preserves the existing public classification for
+// an override failure that occurs inside an adaptor finalizer.
+type OutboundParamOverrideError struct {
+	err error
+}
+
+func NewOutboundParamOverrideError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &OutboundParamOverrideError{err: err}
+}
+
+func (e *OutboundParamOverrideError) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *OutboundParamOverrideError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func AsOutboundParamOverrideError(err error) (error, bool) {
+	var overrideErr *OutboundParamOverrideError
+	if !errors.As(err, &overrideErr) || overrideErr.err == nil {
+		return nil, false
+	}
+	return overrideErr.err, true
 }
 
 const ContextKeyNon2xxResponseObservation = "non_2xx_response_observation"

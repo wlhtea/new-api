@@ -18,6 +18,21 @@ func DecodeJson(reader io.Reader, v any) error {
 	return json.NewDecoder(reader).Decode(v)
 }
 
+// NewJsonDecoderUseNumber returns a streaming decoder that preserves JSON
+// number lexemes in untyped destinations and token streams.
+func NewJsonDecoderUseNumber(reader io.Reader) *json.Decoder {
+	decoder := json.NewDecoder(reader)
+	decoder.UseNumber()
+	return decoder
+}
+
+// DecodeJsonUseNumber preserves JSON number lexemes in untyped destinations.
+// Callers that need schema validation should still decode into their typed DTO
+// separately; this wrapper keeps decoder configuration at the common boundary.
+func DecodeJsonUseNumber(reader io.Reader, v any) error {
+	return NewJsonDecoderUseNumber(reader).Decode(v)
+}
+
 func Marshal(v any) ([]byte, error) {
 	return json.Marshal(v)
 }

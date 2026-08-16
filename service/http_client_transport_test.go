@@ -46,6 +46,15 @@ func initDefaultHTTPClientFixture(t *testing.T) *http.Client {
 	return httpClient
 }
 
+func TestNewRelayHTTPTransportBoundsResponseHeaders(t *testing.T) {
+	withRelayHTTPTransportSettings(t)
+
+	transport := newRelayHTTPTransport()
+
+	assert.Equal(t, relayMaxResponseHeaderBytes, transport.MaxResponseHeaderBytes)
+	assert.Equal(t, int64(1<<20), transport.MaxResponseHeaderBytes)
+}
+
 func TestShardedRoundTripperPerOriginRotation(t *testing.T) {
 	s := &shardedRoundTripper{n: 4}
 	originA := "https://a.example:443"
