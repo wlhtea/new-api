@@ -225,3 +225,34 @@ func TestDistributorSkipsUnsupportedOpenCodeGoAffinityHit(t *testing.T) {
 	assert.Equal(t, fixture.fallbackID, selectedChannelID)
 	assert.True(t, nextCalled)
 }
+
+func TestSetupContextForSelectedChannelPlanningDefersAPIKeyPolling(t *testing.T) {
+	channel := &model.Channel{
+		Id:   6301,
+		Type: constant.ChannelTypeOpenCodeAPIKey,
+		Key:  "planning-key-a\nplanning-key-b",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:           true,
+			MultiKeySize:         2,
+			MultiKeyMode:         constant.MultiKeyModePolling,
+			MultiKeyPollingIndex: 1,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusEnabled,
+				1: common.ChannelStatusEnabled,
+			},
+		},
+	}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	relayErr := SetupContextForSelectedChannelPlanning(c, channel, "planning-model")
+
+	require.Nil(t, relayErr)
+	assert.Empty(t, common.GetContextKeyString(c, constant.ContextKeyChannelKey))
+	assert.False(t, common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey))
+	assert.Equal(t, 1, channel.ChannelInfo.MultiKeyPollingIndex)
+	source, found := SelectedChannelPlanningSource(c)
+	require.True(t, found)
+	require.NotSame(t, channel, source)
+	assert.Equal(t, channel.ChannelInfo, source.ChannelInfo)
+}

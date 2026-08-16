@@ -191,7 +191,7 @@ func TestPrepareOpenCodeCandidatePlansReplacesStaleInitialConfigFromDatabase(t *
 	require.NotNil(t, plans)
 	require.Len(t, plans.plans, 1)
 	assert.Equal(t, persisted.Id, plans.plans[0].key.ChannelID)
-	assert.Equal(t, "snapshot-database-key", common.GetContextKeyString(c, constant.ContextKeyChannelKey))
+	assert.Empty(t, common.GetContextKeyString(c, constant.ContextKeyChannelKey))
 	assert.Equal(t, "database", common.GetContextKeyStringMap(c, constant.ContextKeyChannelHeaderOverride)["X-Snapshot-Config"])
 
 	plan, found, err := opencodego.GetRequestPreflightPlanForSelection(c, "default", persisted.Id)
@@ -203,8 +203,13 @@ func TestPrepareOpenCodeCandidatePlansReplacesStaleInitialConfigFromDatabase(t *
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Len(t, snapshot.topology, 1)
-	assert.Equal(t, "snapshot-database-key", snapshot.topology[0].channelKey)
+	assert.Empty(t, snapshot.topology[0].channelKey)
 	assert.Equal(t, "database", snapshot.topology[0].headerOverride["X-Snapshot-Config"])
+	selected, err := snapshot.selectAttempt(c, 0)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, "snapshot-database-key", common.GetContextKeyString(c, constant.ContextKeyChannelKey))
+	assert.Equal(t, "snapshot-database-key", snapshot.topology[0].channelKey)
 }
 
 func TestPrepareOpenCodeCandidatePlansFiltersInvalidCandidateConfig(t *testing.T) {
@@ -240,4 +245,59 @@ func TestPrepareOpenCodeCandidatePlansFiltersInvalidCandidateConfig(t *testing.T
 	for _, selection := range snapshot.selections {
 		assert.Equal(t, initial.Id, selection.channelID)
 	}
+}
+
+func TestOpenCodeAPIKeyRetrySnapshotMaterializesPollingKeyOncePerCandidate(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+
+	channel := newOpenCodeAPIKeySnapshotTestChannel(
+		"snapshot-key-materialization",
+		"snapshot-key-materialization-model",
+		10,
+		dto.OpenCodeGoProtocolChat,
+	)
+	channel.Key = "materialized-key-a\nmaterialized-key-b"
+	channel.ChannelInfo = model.ChannelInfo{
+		IsMultiKey:           true,
+		MultiKeySize:         2,
+		MultiKeyMode:         constant.MultiKeyModePolling,
+		MultiKeyPollingIndex: 0,
+		MultiKeyStatusList: map[int]int{
+			0: common.ChannelStatusEnabled,
+			1: common.ChannelStatusEnabled,
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	key := opencodego.RequestPreflightPlanKey{SelectionGroup: "default", ChannelID: channel.Id}
+	selection := frozenOpenCodeAPIKeySelection{
+		selectionGroup: "default",
+		channelID:      channel.Id,
+		channelName:    channel.Name,
+	}
+	snapshot := &openCodeAPIKeyRetrySnapshot{
+		version:      openCodeAPIKeyRetrySnapshotVersion,
+		topology:     []frozenOpenCodeAPIKeySelection{selection},
+		selections:   []frozenOpenCodeAPIKeySelection{selection, selection},
+		keySources:   map[opencodego.RequestPreflightPlanKey]*model.Channel{key: &channel},
+		materialized: make(map[opencodego.RequestPreflightPlanKey]frozenOpenCodeAPIKeyCredential),
+	}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	first, err := snapshot.selectAttempt(c, 0)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, "materialized-key-a", common.GetContextKeyString(c, constant.ContextKeyChannelKey))
+	assert.True(t, common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey))
+	assert.Zero(t, common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex))
+
+	second, err := snapshot.selectAttempt(c, 1)
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	assert.Equal(t, "materialized-key-a", common.GetContextKeyString(c, constant.ContextKeyChannelKey))
+	var persisted model.Channel
+	require.NoError(t, db.First(&persisted, channel.Id).Error)
+	assert.Equal(t, 1, persisted.ChannelInfo.MultiKeyPollingIndex)
 }

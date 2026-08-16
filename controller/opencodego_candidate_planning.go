@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/opencodego"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -40,6 +41,7 @@ type openCodeCandidateFailure struct {
 type openCodeCandidateDraft struct {
 	key       opencodego.RequestPreflightPlanKey
 	selection *frozenOpenCodeAPIKeySelection
+	channel   *model.Channel
 }
 
 type openCodeRetainedCandidate struct {
@@ -128,7 +130,16 @@ func enumerateOpenCodeCandidateDrafts(
 		if err != nil {
 			return nil, initialKey, nil, true, nil, err
 		}
-		return []openCodeCandidateDraft{{key: initialKey, selection: &selection}}, initialKey,
+		var channel *model.Channel
+		if strings.TrimSpace(selection.channelKey) == "" {
+			var found bool
+			channel, found = middleware.SelectedChannelPlanningSource(c)
+			if !found || channel.Id != initialKey.ChannelID {
+				return nil, initialKey, nil, true, nil,
+					errors.New("selected OpenCode API-key planning source is unavailable")
+			}
+		}
+		return []openCodeCandidateDraft{{key: initialKey, selection: &selection, channel: channel}}, initialKey,
 			[]string{initialKey.SelectionGroup}, true, nil, nil
 	}
 
@@ -196,7 +207,7 @@ func enumerateOpenCodeCandidateDrafts(
 			continue
 		}
 		candidateContext := c.Copy()
-		if setupErr := middleware.SetupContextForSelectedChannel(
+		if setupErr := middleware.SetupContextForSelectedChannelPlanning(
 			candidateContext,
 			candidate.Channel,
 			info.OriginModelName,
@@ -222,7 +233,11 @@ func enumerateOpenCodeCandidateDrafts(
 			SelectionGroup: selectionGroup,
 			ChannelID:      candidate.Channel.Id,
 		}
-		drafts = append(drafts, openCodeCandidateDraft{key: key, selection: &selection})
+		drafts = append(drafts, openCodeCandidateDraft{
+			key:       key,
+			selection: &selection,
+			channel:   candidate.Channel,
+		})
 	}
 	return drafts, initialKey, permittedGroups, false, failures, nil
 }
@@ -389,6 +404,7 @@ func commitOpenCodeCandidatePlans(
 	preflightPlans := make([]opencodego.RequestPreflightPlan, 0, len(retained))
 	result := &openCodeFinalizedCandidatePlans{plans: make([]openCodeFinalizedCandidatePlan, 0, len(retained))}
 	topology := make([]frozenOpenCodeAPIKeySelection, 0, len(retained))
+	keySources := make(map[opencodego.RequestPreflightPlanKey]*model.Channel, len(retained))
 	seen := make(map[opencodego.RequestPreflightPlanKey]struct{}, len(retained))
 	var initialSelection frozenOpenCodeAPIKeySelection
 	initialFound := false
@@ -406,6 +422,9 @@ func commitOpenCodeCandidatePlans(
 		result.plans = append(result.plans, candidate.finalized)
 		if candidate.draft.selection != nil {
 			topology = append(topology, *candidate.draft.selection)
+			if candidate.draft.channel != nil {
+				keySources[candidate.draft.key] = candidate.draft.channel
+			}
 			if candidate.draft.key == initialKey {
 				initialSelection = *candidate.draft.selection
 				initialFound = true
@@ -461,9 +480,11 @@ func commitOpenCodeCandidatePlans(
 			}
 		}
 		retrySnapshot = &openCodeAPIKeyRetrySnapshot{
-			version:    openCodeAPIKeyRetrySnapshotVersion,
-			topology:   topology,
-			selections: selections,
+			version:      openCodeAPIKeyRetrySnapshotVersion,
+			topology:     topology,
+			selections:   selections,
+			keySources:   keySources,
+			materialized: make(map[opencodego.RequestPreflightPlanKey]frozenOpenCodeAPIKeyCredential),
 		}
 	}
 

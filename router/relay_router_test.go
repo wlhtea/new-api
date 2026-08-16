@@ -161,34 +161,34 @@ func TestRelayRouterValidatesClientBodiesBeforeModelAuthorizationAndDistribution
 	SetRelayRouter(engine)
 
 	tests := []struct {
-		name       string
-		path       string
-		body       string
-		wantDetail string
+		name           string
+		path           string
+		body           string
+		rejectedDetail string
 	}{
 		{
-			name:       "messages missing model is 400 instead of token 403",
-			path:       "/v1/messages",
-			body:       `{"messages":[{"role":"user","content":"hello"}]}`,
-			wantDetail: "model is required",
+			name:           "messages missing model is 400 instead of token 403",
+			path:           "/v1/messages",
+			body:           `{"messages":[{"role":"user","content":"hello"}]}`,
+			rejectedDetail: "model is required",
 		},
 		{
-			name:       "messages missing role is 400 instead of no-channel 503",
-			path:       "/v1/messages",
-			body:       `{"model":"allowed-model","messages":[{"content":"hello"}]}`,
-			wantDetail: "messages[0].role",
+			name:           "messages missing role is 400 instead of no-channel 503",
+			path:           "/v1/messages",
+			body:           `{"model":"allowed-model","messages":[{"content":"hello"}]}`,
+			rejectedDetail: "messages[0].role",
 		},
 		{
-			name:       "chat missing content is 400 instead of no-channel 503",
-			path:       "/v1/chat/completions",
-			body:       `{"model":"allowed-model","messages":[{"role":"user"}]}`,
-			wantDetail: "messages[0].content",
+			name:           "chat missing content is 400 instead of no-channel 503",
+			path:           "/v1/chat/completions",
+			body:           `{"model":"allowed-model","messages":[{"role":"user"}]}`,
+			rejectedDetail: "messages[0].content",
 		},
 		{
-			name:       "responses unknown type is 400 instead of no-channel 503",
-			path:       "/v1/responses",
-			body:       `{"model":"allowed-model","input":[{"type":"future_private_item"}]}`,
-			wantDetail: "input[0].type",
+			name:           "responses unknown type is 400 instead of no-channel 503",
+			path:           "/v1/responses",
+			body:           `{"model":"allowed-model","input":[{"type":"future_private_item"}]}`,
+			rejectedDetail: "input[0].type",
 		},
 	}
 
@@ -202,8 +202,8 @@ func TestRelayRouterValidatesClientBodiesBeforeModelAuthorizationAndDistribution
 			engine.ServeHTTP(recorder, request)
 
 			require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-			require.Contains(t, recorder.Body.String(), "invalid_request_error")
-			require.Contains(t, recorder.Body.String(), test.wantDetail)
+			assertFixedRelayRouterInvalidRequest(t, test.path, recorder.Body.Bytes())
+			require.NotContains(t, recorder.Body.String(), test.rejectedDetail)
 			require.NotContains(t, recorder.Body.String(), "rate_limit_error")
 			require.NotContains(t, recorder.Body.String(), "model_not_found")
 		})
@@ -430,6 +430,7 @@ type relayRouterPreflightSideEffects struct {
 	tokenUsedQuota         int
 	channelUsedQuota       int64
 	channelStatus          int
+	channelPollingIndex    int
 	abilityEnabled         map[string]bool
 	errorLogCount          int64
 	workspaceState         string
@@ -577,6 +578,19 @@ func setupRelayRouterOpenCodePreflightFixture(t *testing.T, channelType int) (mo
 		Models:       "glm-5.2,glm-5.3,client-glm",
 		Group:        "default",
 		ModelMapping: &mapping,
+	}
+	if channelType == constant.ChannelTypeOpenCodeAPIKey {
+		channel.Key = "router-static-api-key-a\nrouter-static-api-key-b"
+		channel.ChannelInfo = model.ChannelInfo{
+			IsMultiKey:           true,
+			MultiKeySize:         2,
+			MultiKeyMode:         constant.MultiKeyModePolling,
+			MultiKeyPollingIndex: 0,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusEnabled,
+				1: common.ChannelStatusEnabled,
+			},
+		}
 	}
 	require.NoError(t, model.DB.Create(&channel).Error)
 	for _, modelName := range []string{"glm-5.2", "glm-5.3", "client-glm"} {
@@ -730,15 +744,16 @@ func snapshotRelayRouterPreflightSideEffects(t *testing.T, userID int, tokenID i
 	var errorLogCount int64
 	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("type = ?", model.LogTypeError).Count(&errorLogCount).Error)
 	snapshot := relayRouterPreflightSideEffects{
-		userQuota:        user.Quota,
-		userUsedQuota:    user.UsedQuota,
-		userRequestCount: user.RequestCount,
-		tokenRemainQuota: token.RemainQuota,
-		tokenUsedQuota:   token.UsedQuota,
-		channelUsedQuota: channel.UsedQuota,
-		channelStatus:    channel.Status,
-		abilityEnabled:   abilityEnabled,
-		errorLogCount:    errorLogCount,
+		userQuota:           user.Quota,
+		userUsedQuota:       user.UsedQuota,
+		userRequestCount:    user.RequestCount,
+		tokenRemainQuota:    token.RemainQuota,
+		tokenUsedQuota:      token.UsedQuota,
+		channelUsedQuota:    channel.UsedQuota,
+		channelStatus:       channel.Status,
+		channelPollingIndex: channel.ChannelInfo.MultiKeyPollingIndex,
+		abilityEnabled:      abilityEnabled,
+		errorLogCount:       errorLogCount,
 	}
 	if workspaceUID == "" {
 		return snapshot

@@ -168,7 +168,12 @@ func Distribute() func(c *gin.Context) {
 			return
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil &&
+		setupSelectedChannel := SetupContextForSelectedChannel
+		if channel != nil && channel.Type == constant.ChannelTypeOpenCodeAPIKey &&
+			model.IsOpenCodeSupportedRequestPath(c.Request.URL.Path) {
+			setupSelectedChannel = SetupContextForSelectedChannelPlanning
+		}
+		if setupErr := setupSelectedChannel(c, channel, modelRequest.Model); setupErr != nil &&
 			channel != nil && constant.IsOpenCodeChannelType(channel.Type) {
 			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, setupErr.MaskSensitiveError(), setupErr.GetErrorCode())
 			return
@@ -444,6 +449,45 @@ func getTaskOriginModelName(c *gin.Context) string {
 }
 
 func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
+	return setupContextForSelectedChannel(c, channel, modelName, true)
+}
+
+const selectedChannelPlanningSourceContextKey = "selected_channel_planning_source_v1"
+
+// SetupContextForSelectedChannelPlanning installs a frozen Type-63 candidate's
+// configuration without consuming a multi-key polling slot. Candidate planning
+// materializes a key only after the request contract and model capability have
+// retained that candidate.
+func SetupContextForSelectedChannelPlanning(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
+	if channel == nil || channel.Type != constant.ChannelTypeOpenCodeAPIKey {
+		return types.NewError(
+			errors.New("planning setup requires an OpenCode API-key channel"),
+			types.ErrorCodeGetChannelFailed,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	channelCopy, err := common.DeepCopy(channel)
+	if err != nil {
+		return types.NewError(
+			errors.New("OpenCode API-key planning channel copy failed"),
+			types.ErrorCodeGetChannelFailed,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	c.Set(selectedChannelPlanningSourceContextKey, channelCopy)
+	return setupContextForSelectedChannel(c, channelCopy, modelName, false)
+}
+
+func SelectedChannelPlanningSource(c *gin.Context) (*model.Channel, bool) {
+	if c == nil {
+		return nil, false
+	}
+	value, found := c.Get(selectedChannelPlanningSourceContextKey)
+	channel, ok := value.(*model.Channel)
+	return channel, found && ok && channel != nil
+}
+
+func setupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string, selectKey bool) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
@@ -500,16 +544,24 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
-	if newAPIError != nil {
-		return newAPIError
-	}
-	if channel.ChannelInfo.IsMultiKey {
-		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
-		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
+	key := ""
+	if selectKey {
+		var index int
+		var newAPIError *types.NewAPIError
+		key, index, newAPIError = channel.GetNextEnabledKey()
+		if newAPIError != nil {
+			return newAPIError
+		}
+		if channel.ChannelInfo.IsMultiKey {
+			common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
+			common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
+		} else {
+			// 必须设置为 false，否则在重试到单个 key 的时候会导致日志显示错误
+			common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+		}
 	} else {
-		// 必须设置为 false，否则在重试到单个 key 的时候会导致日志显示错误
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, 0)
 	}
 	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 	common.SetContextKey(c, constant.ContextKeyChannelKey, key)

@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -159,10 +160,22 @@ func renderRelayTransportValidationError(c *gin.Context, format types.RelayForma
 }
 
 func renderRelayValidationError(c *gin.Context, format types.RelayFormat, statusCode int, message, errorType string, errorCode types.ErrorCode) {
-	message = common.MessageWithRequestId(message, c.GetString(common.RequestIdKey))
+	if statusCode == http.StatusBadRequest || statusCode == http.StatusUnprocessableEntity {
+		statusCode = http.StatusBadRequest
+		message = constant.OpenCodeGoPublicInvalidRequestMessage
+		errorType = constant.OpenCodeGoPublicInvalidRequestCode
+		errorCode = types.ErrorCode(constant.OpenCodeGoPublicInvalidRequestCode)
+	} else {
+		message = common.MessageWithRequestId(message, c.GetString(common.RequestIdKey))
+	}
 	logger.LogWarn(
 		c.Request.Context(),
-		fmt.Sprintf("relay request validation failed: format=%s status=%d error=%s", format, statusCode, common.LocalLogPreview(message)),
+		fmt.Sprintf(
+			"relay request validation failed: format=%s status=%d error_code=%s",
+			format,
+			statusCode,
+			errorCode,
+		),
 	)
 
 	if format == types.RelayFormatClaude {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -32,6 +33,8 @@ type frozenOpenCodeAPIKeySelection struct {
 	channelAutoBan       bool
 	channelBaseURL       string
 	channelKey           string
+	channelIsMultiKey    bool
+	channelMultiKeyIndex int
 	organization         string
 	modelMapping         string
 	statusCodeMapping    string
@@ -44,9 +47,18 @@ type frozenOpenCodeAPIKeySelection struct {
 }
 
 type openCodeAPIKeyRetrySnapshot struct {
-	version    string
-	topology   []frozenOpenCodeAPIKeySelection
-	selections []frozenOpenCodeAPIKeySelection
+	version      string
+	topology     []frozenOpenCodeAPIKeySelection
+	selections   []frozenOpenCodeAPIKeySelection
+	keyMutex     sync.Mutex
+	keySources   map[opencodego.RequestPreflightPlanKey]*model.Channel
+	materialized map[opencodego.RequestPreflightPlanKey]frozenOpenCodeAPIKeyCredential
+}
+
+type frozenOpenCodeAPIKeyCredential struct {
+	key      string
+	isMulti  bool
+	keyIndex int
 }
 
 func newOpenCodeRetrySnapshotAPIError(c *gin.Context, err error) *types.NewAPIError {
@@ -317,6 +329,15 @@ func (snapshot *openCodeAPIKeyRetrySnapshot) selectAttempt(c *gin.Context, curso
 		return nil, errors.New("OpenCode API-key physical attempt cursor is out of range")
 	}
 	selection := snapshot.selections[cursor]
+	if strings.TrimSpace(selection.channelKey) == "" {
+		credential, err := snapshot.materializeCredential(selection)
+		if err != nil {
+			return nil, err
+		}
+		selection.channelKey = credential.key
+		selection.channelIsMultiKey = credential.isMulti
+		selection.channelMultiKeyIndex = credential.keyIndex
+	}
 	if err := selection.apply(c); err != nil {
 		return nil, err
 	}
@@ -329,7 +350,60 @@ func (snapshot *openCodeAPIKeyRetrySnapshot) selectAttempt(c *gin.Context, curso
 		Type:    constant.ChannelTypeOpenCodeAPIKey,
 		Name:    selection.channelName,
 		AutoBan: &autoBan,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: selection.channelIsMultiKey,
+		},
 	}, nil
+}
+
+func (snapshot *openCodeAPIKeyRetrySnapshot) materializeCredential(
+	selection frozenOpenCodeAPIKeySelection,
+) (frozenOpenCodeAPIKeyCredential, error) {
+	key := opencodego.RequestPreflightPlanKey{
+		SelectionGroup: selection.selectionGroup,
+		ChannelID:      selection.channelID,
+	}
+	snapshot.keyMutex.Lock()
+	defer snapshot.keyMutex.Unlock()
+	if credential, found := snapshot.materialized[key]; found {
+		return credential, nil
+	}
+	source := snapshot.keySources[key]
+	if source == nil {
+		return frozenOpenCodeAPIKeyCredential{}, errors.New("OpenCode API-key planning source is unavailable")
+	}
+	apiKey, index, relayErr := source.GetNextEnabledKey()
+	if relayErr != nil || strings.TrimSpace(apiKey) == "" {
+		return frozenOpenCodeAPIKeyCredential{}, opencodego.NewRequestPreflightCandidateConfigError(
+			errors.New("OpenCode API-key selection failed"),
+		)
+	}
+	credential := frozenOpenCodeAPIKeyCredential{
+		key:      apiKey,
+		isMulti:  source.ChannelInfo.IsMultiKey,
+		keyIndex: index,
+	}
+	if snapshot.materialized == nil {
+		snapshot.materialized = make(map[opencodego.RequestPreflightPlanKey]frozenOpenCodeAPIKeyCredential)
+	}
+	snapshot.materialized[key] = credential
+	for index := range snapshot.topology {
+		candidate := &snapshot.topology[index]
+		if candidate.selectionGroup == key.SelectionGroup && candidate.channelID == key.ChannelID {
+			candidate.channelKey = credential.key
+			candidate.channelIsMultiKey = credential.isMulti
+			candidate.channelMultiKeyIndex = credential.keyIndex
+		}
+	}
+	for index := range snapshot.selections {
+		candidate := &snapshot.selections[index]
+		if candidate.selectionGroup == key.SelectionGroup && candidate.channelID == key.ChannelID {
+			candidate.channelKey = credential.key
+			candidate.channelIsMultiKey = credential.isMulti
+			candidate.channelMultiKeyIndex = credential.keyIndex
+		}
+	}
+	return credential, nil
 }
 
 func captureFrozenOpenCodeAPIKeySelection(c *gin.Context, selectionGroup string) (frozenOpenCodeAPIKeySelection, error) {
@@ -362,6 +436,8 @@ func captureFrozenOpenCodeAPIKeySelection(c *gin.Context, selectionGroup string)
 		channelAutoBan:       common.GetContextKeyBool(c, constant.ContextKeyChannelAutoBan),
 		channelBaseURL:       common.GetContextKeyString(c, constant.ContextKeyChannelBaseUrl),
 		channelKey:           common.GetContextKeyString(c, constant.ContextKeyChannelKey),
+		channelIsMultiKey:    common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey),
+		channelMultiKeyIndex: common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex),
 		organization:         common.GetContextKeyString(c, constant.ContextKeyChannelOrganization),
 		modelMapping:         common.GetContextKeyString(c, constant.ContextKeyChannelModelMapping),
 		statusCodeMapping:    common.GetContextKeyString(c, constant.ContextKeyChannelStatusCodeMapping),
@@ -410,8 +486,8 @@ func (selection frozenOpenCodeAPIKeySelection) apply(c *gin.Context) error {
 	common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, channelOther)
 	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, paramOverride)
 	common.SetContextKey(c, constant.ContextKeyChannelHeaderOverride, headerOverride)
-	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
-	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, 0)
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, selection.channelIsMultiKey)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, selection.channelMultiKeyIndex)
 	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, selection.systemPromptOverride)
 	common.SetContextKey(c, constant.ContextKeyOpenCodeGoWorkspaceUID, nil)
 	return nil

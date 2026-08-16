@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
@@ -62,7 +63,7 @@ func encodeMiddlewareTestBody(t *testing.T, encoding string, payload []byte) []b
 	return encoded.Bytes()
 }
 
-func requireEncodingErrorEnvelope(t *testing.T, body []byte, claude bool) {
+func requireEncodingErrorEnvelope(t *testing.T, body []byte, claude bool, fixed400 bool) {
 	t.Helper()
 
 	var envelope map[string]any
@@ -72,12 +73,21 @@ func requireEncodingErrorEnvelope(t *testing.T, body []byte, claude bool) {
 		errorObject, ok := envelope["error"].(map[string]any)
 		require.True(t, ok)
 		require.Equal(t, "invalid_request_error", errorObject["type"])
+		if fixed400 {
+			require.Equal(t, constant.OpenCodeGoPublicInvalidRequestMessage, errorObject["message"])
+		}
 		return
 	}
 	errorObject, ok := envelope["error"].(map[string]any)
 	require.True(t, ok)
 	require.Equal(t, "invalid_request_error", errorObject["type"])
-	require.Equal(t, "invalid_request", errorObject["code"])
+	if fixed400 {
+		require.Equal(t, "invalid_request_error", errorObject["code"])
+		require.Equal(t, "", errorObject["param"])
+		require.Equal(t, constant.OpenCodeGoPublicInvalidRequestMessage, errorObject["message"])
+	} else {
+		require.Equal(t, "invalid_request", errorObject["code"])
+	}
 }
 
 func TestNormalizedRequestContentEncoding(t *testing.T) {
@@ -238,7 +248,7 @@ func TestDecompressRequestMiddlewareRejectsUnsupportedAndStackedEncodings(t *tes
 				require.Equal(t, http.StatusUnsupportedMediaType, recorder.Code)
 				require.False(t, nextCalled)
 				require.Equal(t, 1, closedBody.closes)
-				requireEncodingErrorEnvelope(t, recorder.Body.Bytes(), path.claude)
+				requireEncodingErrorEnvelope(t, recorder.Body.Bytes(), path.claude, false)
 			})
 		}
 	}
@@ -289,8 +299,8 @@ func TestDecompressRequestMiddlewareRejectsMalformedTruncatedAndMultiMemberBodie
 
 			require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
 			require.False(t, nextCalled)
-			requireEncodingErrorEnvelope(t, recorder.Body.Bytes(), test.claude)
-			require.Contains(t, recorder.Body.String(), test.message)
+			requireEncodingErrorEnvelope(t, recorder.Body.Bytes(), test.claude, true)
+			require.NotContains(t, recorder.Body.String(), test.message)
 			require.NotContains(t, recorder.Body.String(), "not-gzip")
 		})
 	}

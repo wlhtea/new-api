@@ -19,6 +19,7 @@ import (
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/opencodego"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -405,7 +406,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			relayInfo.RetryIndex = physicalAttempt
 			selected, selectErr := retrySnapshot.selectAttempt(c, physicalAttempt)
 			if selectErr != nil {
-				channelErr = newOpenCodeRetrySnapshotAPIError(c, selectErr)
+				if _, typed := opencodego.AsRequestPreflightError(selectErr); typed {
+					channelErr = newOpenCodeRequestPreflightAPIError(c, selectErr)
+				} else {
+					channelErr = newOpenCodeRetrySnapshotAPIError(c, selectErr)
+				}
 			} else {
 				channel = selected
 				relayInfo.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, relayInfo)
@@ -436,7 +441,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
 					return types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
 				}
-				return types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				return newRelayInvalidRequestError(bodyErr)
 			}
 			c.Request.Body = io.NopCloser(bodyStorage)
 			return relaySelectedChannel(c, relayFormat, relayInfo)
@@ -477,22 +482,21 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 }
 
 func newRelayInvalidRequestError(err error) *types.NewAPIError {
-	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
+	subtype := "request.body.invalid"
 	if validationErr, ok := helper.AsClientRequestValidationError(err); ok {
-		subtype := strings.TrimSpace(validationErr.RuleID)
-		if subtype == "" {
-			subtype = "request.body.invalid"
+		if ruleID := strings.TrimSpace(validationErr.RuleID); ruleID != "" {
+			subtype = ruleID
 		}
-		options = append(options, types.ErrOptionWithProvenance(types.ErrorProvenance{
-			Origin:  types.ErrorOriginLocalValidation,
-			Subtype: subtype,
-		}))
 	}
 	return types.NewErrorWithStatusCode(
 		err,
 		types.ErrorCodeInvalidRequest,
 		http.StatusBadRequest,
-		options...,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithProvenance(types.ErrorProvenance{
+			Origin:  types.ErrorOriginLocalValidation,
+			Subtype: subtype,
+		}),
 	)
 }
 

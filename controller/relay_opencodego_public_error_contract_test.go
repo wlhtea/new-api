@@ -20,19 +20,38 @@ import (
 )
 
 func TestNewRelayInvalidRequestErrorMarksTypedValidationForFixedOpenCode400(t *testing.T) {
-	internal := newRelayInvalidRequestError(&helper.ClientRequestValidationError{
-		StatusCode: http.StatusBadRequest,
-		Message:    "private malformed request detail",
-	})
-	require.Equal(t, types.ErrorOriginLocalValidation, internal.Provenance().Origin)
-	assert.Equal(t, "request.body.invalid", internal.Provenance().Subtype)
+	for _, test := range []struct {
+		name string
+		err  error
+		rule string
+	}{
+		{
+			name: "typed validation",
+			err: &helper.ClientRequestValidationError{
+				StatusCode: http.StatusBadRequest,
+				Message:    "private malformed request detail",
+			},
+			rule: "request.body.invalid",
+		},
+		{
+			name: "generic body storage failure",
+			err:  errors.New("private body storage path"),
+			rule: "request.body.invalid",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			internal := newRelayInvalidRequestError(test.err)
+			require.Equal(t, types.ErrorOriginLocalValidation, internal.Provenance().Origin)
+			assert.Equal(t, test.rule, internal.Provenance().Subtype)
 
-	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
-		projected := service.PublicOpenCodeGoRelayError(channelType, internal)
-		require.NotSame(t, internal, projected)
-		assert.Equal(t, http.StatusBadRequest, projected.StatusCode)
-		assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestMessage, projected.Error())
-		assert.NotContains(t, projected.Error(), "private")
+			for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+				projected := service.PublicOpenCodeGoRelayError(channelType, internal)
+				require.NotSame(t, internal, projected)
+				assert.Equal(t, http.StatusBadRequest, projected.StatusCode)
+				assert.Equal(t, constant.OpenCodeGoPublicInvalidRequestMessage, projected.Error())
+				assert.NotContains(t, projected.Error(), "private")
+			}
+		})
 	}
 }
 

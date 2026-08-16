@@ -83,11 +83,7 @@ func TestPreValidateRelayRequestScansUnknownRawStringsBeforeNext(t *testing.T) {
 
 			require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
 			require.False(t, nextCalled)
-			if test.path == "/v1/messages" {
-				require.Contains(t, recorder.Body.String(), `"type":"invalid_request_error"`)
-			} else {
-				require.Contains(t, recorder.Body.String(), string(types.ErrorCodeSensitiveWordsDetected))
-			}
+			requireFixedRelayValidationEnvelope(t, test.path, recorder.Body.Bytes())
 			require.NotContains(t, recorder.Body.String(), "raw-only-sensitive-value")
 			require.NotContains(t, recorder.Body.String(), "provider_extension")
 		})
@@ -203,9 +199,10 @@ func TestPreValidateRelayRequestRendersProtocolSpecificErrorsBeforeNext(t *testi
 
 			require.Equal(t, http.StatusBadRequest, recorder.Code)
 			require.False(t, nextCalled)
+			requireFixedRelayValidationEnvelope(t, test.path, recorder.Body.Bytes())
 			require.Contains(t, recorder.Body.String(), test.wantType)
 			require.NotContains(t, recorder.Body.String(), "new_api_error")
-			require.Contains(t, recorder.Body.String(), "request id:")
+			require.NotContains(t, recorder.Body.String(), "request id:")
 			require.NotContains(t, recorder.Body.String(), "Invalid request: Invalid request:")
 		})
 	}
@@ -427,6 +424,30 @@ func TestRenderRelayRequestValidationErrorDoesNotExposeUncontrolledError(t *test
 	engine.ServeHTTP(recorder, request)
 
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
-	require.Contains(t, recorder.Body.String(), "request body could not be read")
+	requireFixedRelayValidationEnvelope(t, "/v1/messages", recorder.Body.Bytes())
 	require.NotContains(t, recorder.Body.String(), "private workspace upstream detail")
+}
+
+func requireFixedRelayValidationEnvelope(t *testing.T, path string, body []byte) {
+	t.Helper()
+	var payload map[string]any
+	require.NoError(t, common.Unmarshal(body, &payload))
+	if path == "/v1/messages" {
+		require.Equal(t, map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    constant.OpenCodeGoPublicInvalidRequestCode,
+				"message": constant.OpenCodeGoPublicInvalidRequestMessage,
+			},
+		}, payload)
+		return
+	}
+	require.Equal(t, map[string]any{
+		"error": map[string]any{
+			"message": constant.OpenCodeGoPublicInvalidRequestMessage,
+			"type":    constant.OpenCodeGoPublicInvalidRequestCode,
+			"param":   "",
+			"code":    constant.OpenCodeGoPublicInvalidRequestCode,
+		},
+	}, payload)
 }

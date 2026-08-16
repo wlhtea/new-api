@@ -195,6 +195,64 @@ func TestPrepareOpenCodeCandidatePlansRejectsUnsupportedXHighWithoutCommittedSta
 	}
 }
 
+func TestPrepareOpenCodeCandidatePlansRejectedSetDoesNotAdvanceCandidateKeyPolling(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	requireFreshOpenCodeCandidatePlannerCapability(t)
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+
+	newPollingChannel := func(name string, priority int64) model.Channel {
+		channel := newOpenCodeAPIKeySnapshotTestChannel(
+			name,
+			openCodeCandidatePlannerCapabilityModel,
+			priority,
+			dto.OpenCodeGoProtocolChat,
+		)
+		channel.Key = name + "-key-a\n" + name + "-key-b"
+		channel.ChannelInfo = model.ChannelInfo{
+			IsMultiKey:           true,
+			MultiKeySize:         2,
+			MultiKeyMode:         constant.MultiKeyModePolling,
+			MultiKeyPollingIndex: 0,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusEnabled,
+				1: common.ChannelStatusEnabled,
+			},
+		}
+		return channel
+	}
+
+	initial := newPollingChannel("planner-polling-initial", 20)
+	persistOpenCodeAPIKeySnapshotTestChannel(t, db, &initial)
+	sibling := newPollingChannel("planner-polling-sibling", 10)
+	persistOpenCodeAPIKeySnapshotTestChannel(t, db, &sibling)
+
+	c, info := newOpenCodeAPIKeySnapshotTestFixtureWithExtra(
+		t,
+		&initial,
+		openCodeCandidatePlannerCapabilityModel,
+		`,"reasoning_effort":"xhigh"`,
+	)
+	loadPollingIndexes := func() map[int]int {
+		var channels []model.Channel
+		require.NoError(t, db.Where("id IN ?", []int{initial.Id, sibling.Id}).Find(&channels).Error)
+		indexes := make(map[int]int, len(channels))
+		for _, channel := range channels {
+			indexes[channel.Id] = channel.ChannelInfo.MultiKeyPollingIndex
+		}
+		return indexes
+	}
+	before := loadPollingIndexes()
+
+	plans, relayErr := prepareAndFreezeOpenCodeCandidatePlans(c, info)
+
+	assert.Nil(t, plans)
+	require.NotNil(t, relayErr)
+	assert.Equal(t, http.StatusBadRequest, relayErr.StatusCode)
+	assert.Equal(t, before, loadPollingIndexes())
+}
+
 func TestPrepareOpenCodeCandidatePlansRetainedCandidateWinsOverCapabilityUnknown(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	revision := requireFreshOpenCodeCandidatePlannerCapability(t)
