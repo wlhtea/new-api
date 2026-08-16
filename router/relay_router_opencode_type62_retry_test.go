@@ -36,9 +36,10 @@ func (transport *relayRouterType62RetryTransport) RoundTrip(request *http.Reques
 	transport.mutex.Lock()
 	callIndex := len(transport.requests)
 	transport.requests = append(transport.requests, relayRouterCapturedRequest{
-		path:   request.URL.Path,
-		header: request.Header.Clone(),
-		body:   append([]byte(nil), body...),
+		path:     request.URL.Path,
+		rawQuery: request.URL.RawQuery,
+		header:   request.Header.Clone(),
+		body:     append([]byte(nil), body...),
 	})
 	status := http.StatusOK
 	if callIndex < len(transport.statuses) {

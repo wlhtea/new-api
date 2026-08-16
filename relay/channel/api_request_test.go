@@ -728,6 +728,73 @@ func TestPreflightOpenCodeRequestTransportRejectsUnclassifiedMetadata(t *testing
 	}
 }
 
+func TestPreflightOpenCodeRequestTransportAcceptsClaudeCodeBetaQuery(t *testing.T) {
+	t.Parallel()
+
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
+	} {
+		t.Run(rootconstant.GetChannelTypeName(channelType), func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages?beta=true", strings.NewReader("{}"))
+			info := &relaycommon.RelayInfo{
+				RelayFormat: types.RelayFormatClaude,
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType},
+			}
+
+			assert.Nil(t, PreflightOpenCodeRequestTransport(info, ctx))
+			assert.Equal(t, "beta=true", ctx.Request.URL.RawQuery, "preflight must consume the marker logically without mutating the request")
+		})
+	}
+}
+
+func TestPreflightOpenCodeRequestTransportRejectsUnsupportedBetaVariants(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "false", path: "/v1/messages?beta=false"},
+		{name: "uppercase value", path: "/v1/messages?beta=TRUE"},
+		{name: "empty value", path: "/v1/messages?beta="},
+		{name: "duplicate value", path: "/v1/messages?beta=true&beta=true"},
+		{name: "unknown parameter", path: "/v1/messages?client=private-value"},
+		{name: "mixed parameter", path: "/v1/messages?beta=true&client=private-value"},
+		{name: "malformed escape", path: "/v1/messages?beta=%ZZ"},
+		{name: "trailing separator", path: "/v1/messages?beta=true&"},
+		{name: "leading separator", path: "/v1/messages?&beta=true"},
+		{name: "encoded value", path: "/v1/messages?beta=%74rue"},
+		{name: "wrong endpoint", path: "/v1/chat/completions?beta=true"},
+		{name: "responses endpoint", path: "/v1/responses?beta=true"},
+	}
+
+	for _, channelType := range []int{
+		rootconstant.ChannelTypeOpenCodeGo,
+		rootconstant.ChannelTypeOpenCodeAPIKey,
+	} {
+		for _, test := range tests {
+			t.Run(rootconstant.GetChannelTypeName(channelType)+"/"+test.name, func(t *testing.T) {
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodPost, test.path, strings.NewReader("{}"))
+				info := &relaycommon.RelayInfo{
+					RelayFormat: types.RelayFormatClaude,
+					ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType},
+				}
+
+				apiErr := PreflightOpenCodeRequestTransport(info, ctx)
+				require.NotNil(t, apiErr)
+				assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+				assert.Equal(t, types.ErrorOriginLocalValidation, apiErr.Provenance().Origin)
+				assert.Equal(t, "query_parameters", apiErr.Provenance().Subtype)
+				assert.True(t, types.IsSkipRetryError(apiErr))
+				assert.NotContains(t, apiErr.Error(), "private-value")
+			})
+		}
+	}
+}
+
 func TestPreflightOpenCodeRequestTransportHasReachableValidControl(t *testing.T) {
 	t.Parallel()
 

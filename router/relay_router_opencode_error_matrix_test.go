@@ -44,9 +44,10 @@ func (transport *relayRouterRawErrorTransport) RoundTrip(request *http.Request) 
 	transport.mutex.Lock()
 	status := transport.status
 	transport.requests = append(transport.requests, relayRouterCapturedRequest{
-		path:   request.URL.Path,
-		header: request.Header.Clone(),
-		body:   append([]byte(nil), body...),
+		path:     request.URL.Path,
+		rawQuery: request.URL.RawQuery,
+		header:   request.Header.Clone(),
+		body:     append([]byte(nil), body...),
 	})
 	transport.mutex.Unlock()
 
@@ -267,6 +268,12 @@ func assertFixedRelayRouterInvalidRequest(t *testing.T, path string, body []byte
 			},
 		}, payload)
 		return
+	}
+	if errorPayload, ok := payload["error"].(map[string]any); ok {
+		if param, present := errorPayload["param"]; present {
+			assert.Equal(t, "", param, "the public validation envelope may include only an empty param")
+			delete(errorPayload, "param")
+		}
 	}
 	assert.Equal(t, map[string]any{
 		"error": map[string]any{

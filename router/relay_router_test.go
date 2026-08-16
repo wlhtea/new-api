@@ -364,9 +364,10 @@ type relayRouterPreflightObservation struct {
 }
 
 type relayRouterCapturedRequest struct {
-	path   string
-	header http.Header
-	body   []byte
+	path     string
+	rawQuery string
+	header   http.Header
+	body     []byte
 }
 
 type relayRouterCaptureTransport struct {
@@ -384,9 +385,10 @@ func (transport *relayRouterCaptureTransport) RoundTrip(request *http.Request) (
 	}
 	transport.mutex.Lock()
 	transport.requests = append(transport.requests, relayRouterCapturedRequest{
-		path:   request.URL.Path,
-		header: request.Header.Clone(),
-		body:   append([]byte(nil), body...),
+		path:     request.URL.Path,
+		rawQuery: request.URL.RawQuery,
+		header:   request.Header.Clone(),
+		body:     append([]byte(nil), body...),
 	})
 	transport.mutex.Unlock()
 

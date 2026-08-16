@@ -41,6 +41,7 @@ func SetUpLogger(server *gin.Engine) {
 }
 
 func sanitizeAccessLogPath(path string) string {
+	path = common.SanitizeRelayRequestPathForLog(path)
 	if !strings.Contains(path, "/opencode-go/") {
 		return path
 	}

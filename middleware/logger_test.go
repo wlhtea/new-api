@@ -23,3 +23,19 @@ func TestSanitizeAccessLogPathRedactsOpenCodeGoDynamicIdentifiers(t *testing.T) 
 	require.Equal(t, "/api/channel/7/opencode-go/workspaces/non-members", sanitizeAccessLogPath("/api/channel/7/opencode-go/workspaces/non-members"))
 	require.Equal(t, "/v1/messages", sanitizeAccessLogPath("/v1/messages"))
 }
+
+func TestSanitizeAccessLogPathRedactsInferenceQueryValues(t *testing.T) {
+	require.Equal(t, "/v1/messages?beta=true", sanitizeAccessLogPath("/v1/messages?beta=true"))
+
+	for _, path := range []string{
+		"/v1/messages?api_key=client-secret",
+		"/v1/messages?beta=false",
+		"/v1/chat/completions?unknown=private-value",
+		"/v1/responses?broken=%ZZ",
+	} {
+		sanitized := sanitizeAccessLogPath(path)
+		require.NotContains(t, sanitized, "client-secret", path)
+		require.NotContains(t, sanitized, "private-value", path)
+		require.Contains(t, sanitized, "***redacted***", path)
+	}
+}
