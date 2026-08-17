@@ -357,7 +357,7 @@ func validateRequestPathContracts(
 		}
 	}
 	if finalProtocol.RelayFormat() == clientFormat {
-		if clientFormat == types.RelayFormatClaude && cachePlan != nil && len(cachePlan.Entries) > 0 {
+		if clientFormat == types.RelayFormatClaude {
 			if err := validateSameProtocolClaudeCacheParents(envelope, finalProtocol, cachePlan); err != nil {
 				return err
 			}
@@ -923,11 +923,18 @@ func validateClaudeMessages(value any, finalProtocol Protocol, cachePlan *CacheC
 	}
 	for messageIndex, rawMessage := range messages {
 		message, ok := rawMessage.(map[string]any)
-		if !ok || !requestContractMapHasOnlyKeys(message, claudeMessageKeys) {
+		if !ok {
 			return false
 		}
 		role, ok := message["role"].(string)
 		if !ok {
+			return false
+		}
+		// Native Messages preserves user/assistant message objects from the raw
+		// envelope, including provider extensions that the DTO cannot represent.
+		// Cross-protocol conversion and normalized system entries stay closed.
+		if (finalProtocol != ProtocolMessages || role == "system") &&
+			!requestContractMapHasOnlyKeys(message, claudeMessageKeys) {
 			return false
 		}
 		switch role {
@@ -967,8 +974,6 @@ func validateClaudeContent(
 	if !ok {
 		return false
 	}
-	hasToolUse := false
-	hasRegularContent := false
 	for partIndex, rawPart := range parts {
 		part, ok := rawPart.(map[string]any)
 		if !ok {
@@ -980,14 +985,20 @@ func validateClaudeContent(
 			if _, ok := part["text"].(string); !ok {
 				return false
 			}
-			hasRegularContent = true
 			allowed = requestContractKeySet("type", "text")
 		case "image":
 			if role != "user" || !validateClaudeImageSource(part["source"]) {
 				return false
 			}
-			hasRegularContent = true
 			allowed = requestContractKeySet("type", "source")
+		case "document":
+			if role != "user" || finalProtocol != ProtocolMessages {
+				return false
+			}
+			if err := helper.ValidateClaudeDocumentBlock(part, "document"); err != nil {
+				return false
+			}
+			allowed = requestContractKeySet("type", "source", "citations", "context", "title")
 		case "tool_use":
 			id, idOK := part["id"].(string)
 			name, nameOK := part["name"].(string)
@@ -996,7 +1007,6 @@ func validateClaudeContent(
 				!nameOK || strings.TrimSpace(name) == "" || !inputPresent {
 				return false
 			}
-			hasToolUse = true
 			allowed = requestContractKeySet("type", "id", "name", "input")
 		case "tool_result":
 			toolUseID, ok := part["tool_use_id"].(string)
@@ -1004,7 +1014,14 @@ func validateClaudeContent(
 				return false
 			}
 			allowed = requestContractKeySet("type", "tool_use_id", "content")
-			if finalProtocol == ProtocolChat {
+			if rawName, present := part["name"]; present {
+				if finalProtocol == ProtocolResponses {
+					return false
+				}
+				name, ok := rawName.(string)
+				if !ok || strings.TrimSpace(name) == "" {
+					return false
+				}
 				allowed["name"] = struct{}{}
 			}
 			if rawIsError, present := part["is_error"]; present {
@@ -1016,8 +1033,12 @@ func validateClaudeContent(
 				}
 				allowed["is_error"] = struct{}{}
 			}
-			if content, present := part["content"]; present && content != nil {
-				if !validateClaudeToolResultContent(content) {
+			content, contentPresent := part["content"]
+			if finalProtocol != ProtocolMessages && (!contentPresent || content == nil) {
+				return false
+			}
+			if contentPresent && content != nil {
+				if !validateClaudeToolResultContent(content, finalProtocol) {
 					return false
 				}
 			}
@@ -1045,10 +1066,10 @@ func validateClaudeContent(
 			return false
 		}
 	}
-	return finalProtocol == ProtocolMessages || !hasToolUse || !hasRegularContent
+	return true
 }
 
-func validateClaudeToolResultContent(value any) bool {
+func validateClaudeToolResultContent(value any, finalProtocol Protocol) bool {
 	if _, ok := value.(string); ok {
 		return true
 	}
@@ -1070,8 +1091,16 @@ func validateClaudeToolResultContent(value any) bool {
 				return false
 			}
 		case "image":
+			if finalProtocol != ProtocolMessages {
+				return false
+			}
 			if !requestContractMapHasOnlyKeys(part, requestContractKeySet("type", "source")) ||
 				!validateClaudeImageSource(part["source"]) {
+				return false
+			}
+		case "document":
+			if finalProtocol != ProtocolMessages ||
+				helper.ValidateClaudeDocumentBlock(part, "tool_result.document") != nil {
 				return false
 			}
 		default:

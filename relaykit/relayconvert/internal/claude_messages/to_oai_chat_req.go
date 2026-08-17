@@ -147,10 +147,12 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 			var toolCalls []dto.ToolCallRequest
 			reasoningParts := make([]string, 0)
 			mediaMessages := make([]dto.MediaContent, 0, len(content))
+			assistantTextParts := make([]string, 0, len(content))
 
 			for _, mediaMsg := range content {
 				switch mediaMsg.Type {
 				case "text", "input_text":
+					assistantTextParts = append(assistantTextParts, mediaMsg.GetText())
 					message := dto.MediaContent{
 						Type:         "text",
 						Text:         mediaMsg.GetText(),
@@ -188,13 +190,11 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 						Name:       &toolName,
 						ToolCallId: mediaMsg.ToolUseId,
 					}
-					if mediaMsg.IsStringContent() {
-						oaiToolMessage.SetStringContent(mediaMsg.GetStringContent())
-					} else {
-						mediaContents := mediaMsg.ParseMediaContent()
-						encodedJSON, _ := kitutil.Marshal(mediaContents)
-						oaiToolMessage.SetStringContent(string(encodedJSON))
+					toolResultText, err := claudeToolResultText(mediaMsg.Content)
+					if err != nil {
+						return nil, err
 					}
+					oaiToolMessage.SetStringContent(toolResultText)
 					openAIMessages = append(openAIMessages, oaiToolMessage)
 				}
 			}
@@ -206,8 +206,14 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 				reasoningContent := strings.Join(reasoningParts, "\n\n")
 				openAIMessage.ReasoningContent = &reasoningContent
 			}
-			if len(mediaMessages) > 0 && len(toolCalls) == 0 {
-				openAIMessage.SetMediaContent(mediaMessages)
+			if len(mediaMessages) > 0 {
+				if claudeMessage.Role == "assistant" && len(toolCalls) > 0 {
+					if text := strings.Join(assistantTextParts, ""); text != "" {
+						openAIMessage.SetStringContent(text)
+					}
+				} else {
+					openAIMessage.SetMediaContent(mediaMessages)
+				}
 			}
 		}
 		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 || openAIMessage.GetReasoningContent() != "" {
@@ -217,6 +223,29 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 
 	openAIRequest.Messages = openAIMessages
 	return &openAIRequest, nil
+}
+
+func claudeToolResultText(content any) (string, error) {
+	if text, ok := content.(string); ok {
+		return text, nil
+	}
+	parts, ok := content.([]any)
+	if !ok || len(parts) == 0 {
+		return "", fmt.Errorf("Claude tool_result content cannot be represented as Chat tool text")
+	}
+	var text strings.Builder
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]any)
+		if !ok || part["type"] != "text" {
+			return "", fmt.Errorf("Claude tool_result content cannot be represented as Chat tool text")
+		}
+		value, ok := part["text"].(string)
+		if !ok {
+			return "", fmt.Errorf("Claude tool_result text block is invalid")
+		}
+		text.WriteString(value)
+	}
+	return text.String(), nil
 }
 
 func requestToJSONString(v interface{}) string {

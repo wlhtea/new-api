@@ -272,7 +272,7 @@ func captureProtectedOutboundFields(
 		paths = append(paths, append([]string(nil), wireEffort.Path...))
 	}
 	if clientFormat == types.RelayFormatClaude && finalProtocol == ProtocolMessages {
-		for _, path := range []string{"metadata", "output_config", "context_management"} {
+		for _, path := range []string{"messages", "metadata", "output_config", "context_management"} {
 			if _, present := envelope.TopLevelKind(path); present {
 				paths = append(paths, []string{path})
 			}

@@ -327,6 +327,46 @@ func TestBuildRequestPreflightPlanRejectsUnmappedNestedCrossProtocolFields(t *te
 	}
 }
 
+func TestClaudeNativeMessagesContractPreservesOnlyEstablishedMessageExtensions(t *testing.T) {
+	messages := []any{
+		map[string]any{
+			"role": "user", "content": "hello",
+			"provider_extension": map[string]any{"mode": "opaque-user"},
+		},
+		map[string]any{
+			"role": "assistant", "content": "reply",
+			"provider_extension": map[string]any{"mode": "opaque-assistant"},
+		},
+	}
+
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		t.Run(fmt.Sprintf("type-%d/native", channelType), func(t *testing.T) {
+			c, info := newRequestContractFixture(
+				t, channelType, requestPreflightEndpoints[0], ProtocolMessages,
+				map[string]any{"messages": messages},
+			)
+			_, err := BuildRequestPreflightPlan(c, info)
+			require.NoError(t, err)
+		})
+
+		for _, finalProtocol := range []Protocol{ProtocolChat, ProtocolResponses} {
+			t.Run(fmt.Sprintf("type-%d/%s", channelType, finalProtocol), func(t *testing.T) {
+				c, info := newRequestContractFixture(
+					t, channelType, requestPreflightEndpoints[0], finalProtocol,
+					map[string]any{"messages": messages},
+				)
+				_, err := BuildRequestPreflightPlan(c, info)
+				require.Error(t, err)
+				preflightErr, ok := AsRequestPreflightError(err)
+				require.True(t, ok)
+				assert.Equal(t, RequestContractUnmappedNestedRule, preflightErr.RuleID)
+				assert.NotContains(t, err.Error(), "provider_extension")
+				assert.NotContains(t, err.Error(), "opaque")
+			})
+		}
+	}
+}
+
 func TestBuildRequestPreflightPlanRejectsUnknownConverterOwnedFamilyMembers(t *testing.T) {
 	const (
 		unknownMember = "provider_private_nested"
@@ -633,6 +673,158 @@ func TestClaudeMessagesCacheParentContractAcceptsLegalReplayShapes(t *testing.T)
 			var root map[string]any
 			require.NoError(t, common.Unmarshal(body, &root))
 			test.assert(t, root)
+		})
+	}
+}
+
+func TestClaudeMessagesContractPreservesValidatedDocumentBlocks(t *testing.T) {
+	tests := []struct {
+		name   string
+		source map[string]any
+	}{
+		{
+			name: "base64 pdf",
+			source: map[string]any{
+				"type": "base64", "media_type": "application/pdf", "data": "AA==",
+			},
+		},
+		{
+			name: "plain text",
+			source: map[string]any{
+				"type": "text", "media_type": "text/plain", "data": "synthetic document",
+			},
+		},
+		{
+			name:   "url pdf",
+			source: map[string]any{"type": "url", "url": "https://example.invalid/document.pdf"},
+		},
+	}
+
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		for _, test := range tests {
+			t.Run(fmt.Sprintf("type-%d/%s", channelType, test.name), func(t *testing.T) {
+				document := map[string]any{
+					"type": "document", "source": test.source,
+					"citations": map[string]any{"enabled": true},
+					"context":   "synthetic context", "title": "synthetic title",
+				}
+				c, info := newRequestContractFixture(
+					t,
+					channelType,
+					requestPreflightEndpoints[0],
+					ProtocolMessages,
+					map[string]any{
+						"system": []any{map[string]any{
+							"type": "text", "text": "system",
+							"cache_control": map[string]any{"type": "ephemeral"},
+						}},
+						"messages": []any{map[string]any{
+							"role": "user", "content": []any{document},
+						}},
+					},
+				)
+
+				body := convertAndFinalizeRequestForPresenceTest(t, c, info)
+				var root map[string]any
+				require.NoError(t, common.Unmarshal(body, &root))
+				messages := root["messages"].([]any)
+				content := messages[0].(map[string]any)["content"].([]any)
+				assert.Equal(t, document, content[0])
+			})
+		}
+	}
+}
+
+func TestClaudeMessagesContractRejectsDocumentWithoutTargetRepresentation(t *testing.T) {
+	document := map[string]any{
+		"type": "document",
+		"source": map[string]any{
+			"type": "base64", "media_type": "application/pdf", "data": "AA==",
+		},
+	}
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		for _, finalProtocol := range []Protocol{ProtocolChat, ProtocolResponses} {
+			t.Run(fmt.Sprintf("type-%d/%s", channelType, finalProtocol), func(t *testing.T) {
+				c, info := newRequestContractFixture(
+					t,
+					channelType,
+					requestPreflightEndpoints[0],
+					finalProtocol,
+					map[string]any{"messages": []any{map[string]any{
+						"role": "user", "content": []any{document},
+					}}},
+				)
+
+				_, err := BuildRequestPreflightPlan(c, info)
+				require.Error(t, err)
+				preflightErr, ok := AsRequestPreflightError(err)
+				require.True(t, ok)
+				assert.Equal(t, http.StatusBadRequest, preflightErr.StatusCode)
+				assert.Equal(t, RequestContractUnmappedNestedRule, preflightErr.RuleID)
+				assert.Equal(t, RequestContractPublicMessage, preflightErr.Message)
+			})
+		}
+	}
+}
+
+func TestClaudeDocumentFixtureRejectsAfterKnownOptionalCacheDrop(t *testing.T) {
+	marker := map[string]any{"type": "ephemeral"}
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		t.Run(fmt.Sprintf("type-%d", channelType), func(t *testing.T) {
+			c, info := newRequestContractFixture(
+				t,
+				channelType,
+				requestPreflightEndpoints[0],
+				ProtocolChat,
+				map[string]any{
+					"system": []any{map[string]any{
+						"type": "text", "text": "system", "cache_control": marker,
+					}},
+					"tools": []any{map[string]any{
+						"name": "lookup", "input_schema": map[string]any{"type": "object"},
+						"cache_control": marker,
+					}},
+					"messages": []any{map[string]any{
+						"role": "user", "content": []any{
+							map[string]any{"type": "text", "text": "question", "cache_control": marker},
+							map[string]any{
+								"type": "document",
+								"source": map[string]any{
+									"type": "base64", "media_type": "application/pdf", "data": "AA==",
+								},
+							},
+						},
+					}},
+				},
+			)
+			settings := dto.ChannelOtherSettings{OpenCodeGo: &dto.OpenCodeGoConfig{
+				ModelProtocols:                 map[string]string{"glm-5.2": string(ProtocolChat)},
+				UnsupportedOptionalFieldPolicy: dto.OpenCodeGoUnsupportedOptionalFieldDropKnown,
+			}}
+			common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, settings)
+
+			envelope, found, err := helper.GetValidatedRequestEnvelope(c, types.RelayFormatClaude)
+			require.NoError(t, err)
+			require.True(t, found)
+			cachePlan, err := BuildCacheControlDispositionPlan(
+				envelope,
+				types.RelayFormatClaude,
+				ProtocolChat,
+				info.Request,
+				dto.OpenCodeGoUnsupportedOptionalFieldDropKnown,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, 3, cachePlan.DropCount)
+			assert.Zero(t, cachePlan.PreserveCount)
+
+			_, err = BuildRequestPreflightPlan(c, info)
+			require.Error(t, err)
+			preflightErr, ok := AsRequestPreflightError(err)
+			require.True(t, ok)
+			assert.Equal(t, http.StatusBadRequest, preflightErr.StatusCode)
+			assert.Equal(t, RequestContractUnmappedNestedRule, preflightErr.RuleID)
+			assert.Equal(t, RequestContractPreflightStage, preflightErr.StageID)
+			assert.Equal(t, RequestContractPublicMessage, preflightErr.Message)
 		})
 	}
 }

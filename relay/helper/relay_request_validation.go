@@ -2,11 +2,14 @@ package helper
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -480,8 +483,10 @@ func validateClaudeContentPart(part map[string]any, path string) error {
 	switch partType {
 	case "text", "input_text":
 		_, err = presentStringField(part, "text", path+".text")
-	case "image", "document":
+	case "image":
 		err = validateClaudeMediaSource(part, path)
+	case "document":
+		err = ValidateClaudeDocumentBlock(part, path)
 	case "tool_use":
 		if _, err = requiredStringField(part, "id", path+".id"); err == nil {
 			_, err = requiredStringField(part, "name", path+".name")
@@ -538,6 +543,153 @@ func validateClaudeMediaSource(part map[string]any, path string) error {
 	default:
 		return newClientRequestValidationError(http.StatusBadRequest, "%s.type is unsupported", sourcePath)
 	}
+}
+
+const claudeDocumentURLMaxBytes = 8 * 1024
+
+var claudeDocumentBlockKeys = map[string]struct{}{
+	"type": {}, "source": {}, "cache_control": {},
+	"citations": {}, "context": {}, "title": {},
+}
+
+// ValidateClaudeDocumentBlock validates the pinned Claude document shape used
+// by ingress and by same-protocol raw preservation. Target-protocol support is
+// intentionally decided by the caller after this source contract succeeds.
+func ValidateClaudeDocumentBlock(part map[string]any, path string) error {
+	if part == nil || part["type"] != "document" {
+		return newClientRequestValidationError(http.StatusBadRequest, "%s.type must be document", path)
+	}
+	if err := validateClosedObject(part, claudeDocumentBlockKeys, path); err != nil {
+		return err
+	}
+	sourcePath := path + ".source"
+	source, err := requireObject(part, "source", sourcePath)
+	if err != nil {
+		return err
+	}
+	if err := validateClaudeDocumentSource(source, sourcePath); err != nil {
+		return err
+	}
+	if raw, present := part["citations"]; present && raw != nil {
+		citations, ok := raw.(map[string]any)
+		if !ok {
+			return newClientRequestValidationError(http.StatusBadRequest, "%s.citations must be an object or null", path)
+		}
+		if err := validateClosedObject(citations, map[string]struct{}{"enabled": {}}, path+".citations"); err != nil {
+			return err
+		}
+		if enabled, present := citations["enabled"]; present {
+			if _, ok := enabled.(bool); !ok {
+				return newClientRequestValidationError(http.StatusBadRequest, "%s.citations.enabled must be a boolean", path)
+			}
+		}
+	}
+	for _, field := range []string{"context", "title"} {
+		if raw, present := part[field]; present && raw != nil {
+			if _, ok := raw.(string); !ok {
+				return newClientRequestValidationError(http.StatusBadRequest, "%s.%s must be a string or null", path, field)
+			}
+		}
+	}
+	return nil
+}
+
+func validateClaudeDocumentSource(source map[string]any, path string) error {
+	sourceType, err := requiredStringField(source, "type", path+".type")
+	if err != nil {
+		return err
+	}
+	switch sourceType {
+	case "base64":
+		if err := validateClosedObject(source, map[string]struct{}{
+			"type": {}, "media_type": {}, "data": {},
+		}, path); err != nil {
+			return err
+		}
+		mediaType, err := requiredStringField(source, "media_type", path+".media_type")
+		if err != nil {
+			return err
+		}
+		if mediaType != "application/pdf" {
+			return newClientRequestValidationError(http.StatusBadRequest, "%s.media_type is unsupported for base64 document source", path)
+		}
+		data, err := requiredStringField(source, "data", path+".data")
+		if err != nil {
+			return err
+		}
+		if err := validateClaudeDocumentBase64(data); err != nil {
+			return newClientRequestValidationError(http.StatusBadRequest, "%s.data must be valid base64", path)
+		}
+		return nil
+	case "text":
+		if err := validateClosedObject(source, map[string]struct{}{
+			"type": {}, "media_type": {}, "data": {},
+		}, path); err != nil {
+			return err
+		}
+		mediaType, err := requiredStringField(source, "media_type", path+".media_type")
+		if err != nil {
+			return err
+		}
+		if mediaType != "text/plain" {
+			return newClientRequestValidationError(http.StatusBadRequest, "%s.media_type is unsupported for text document source", path)
+		}
+		_, err = requiredStringField(source, "data", path+".data")
+		return err
+	case "url":
+		if err := validateClosedObject(source, map[string]struct{}{
+			"type": {}, "url": {},
+		}, path); err != nil {
+			return err
+		}
+		rawURL, err := requiredStringField(source, "url", path+".url")
+		if err != nil {
+			return err
+		}
+		if len(rawURL) > claudeDocumentURLMaxBytes || strings.IndexFunc(rawURL, func(r rune) bool {
+			return r <= ' ' || r == 0x7f
+		}) >= 0 {
+			return newClientRequestValidationError(http.StatusBadRequest, "%s.url is invalid", path)
+		}
+		parsed, err := url.ParseRequestURI(rawURL)
+		if err != nil || parsed.Host == "" || parsed.User != nil ||
+			(parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return newClientRequestValidationError(http.StatusBadRequest, "%s.url must be an HTTP or HTTPS URL without user information", path)
+		}
+		return nil
+	default:
+		return newClientRequestValidationError(http.StatusBadRequest, "%s.type is unsupported", path)
+	}
+}
+
+func validateClaudeDocumentBase64(data string) error {
+	if strings.ContainsAny(data, "\r\n") {
+		return errors.New("base64 line breaks are unsupported")
+	}
+	decoder := base64.NewDecoder(base64.StdEncoding.Strict(), strings.NewReader(data))
+	var buffer [4 * 1024]byte
+	for {
+		n, err := decoder.Read(buffer[:])
+		if err == nil {
+			if n == 0 {
+				return io.ErrNoProgress
+			}
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+}
+
+func validateClosedObject(object map[string]any, allowed map[string]struct{}, path string) error {
+	for key := range object {
+		if _, ok := allowed[key]; !ok {
+			return newClientRequestValidationError(http.StatusBadRequest, "%s contains an unsupported member", path)
+		}
+	}
+	return nil
 }
 
 func validateURLReference(value any, path string, allowFileID bool) error {
