@@ -116,6 +116,41 @@ export const HTTP_PROTOCOL_AUTO = 'auto'
 export const HTTP_PROTOCOL_HTTP1 = 'http1'
 export const MAX_HTTP2_CONNECTION_SHARDS = 8
 
+export const OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT = 'strict'
+export const OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN =
+  'drop_known_optional'
+export const OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID =
+  '__invalid_persisted_policy__'
+
+export type OpenCodeGoUnsupportedOptionalFieldPolicy =
+  | typeof OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT
+  | typeof OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN
+
+type OpenCodeGoUnsupportedOptionalFieldPolicyFormValue =
+  | OpenCodeGoUnsupportedOptionalFieldPolicy
+  | typeof OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID
+
+const OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_ERROR =
+  'Select a valid unsupported optional field policy'
+
+export function isOpenCodeGoUnsupportedOptionalFieldPolicy(
+  value: unknown
+): value is OpenCodeGoUnsupportedOptionalFieldPolicy {
+  return (
+    value === OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT ||
+    value === OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN
+  )
+}
+
+function requireOpenCodeGoUnsupportedOptionalFieldPolicy(
+  value: OpenCodeGoUnsupportedOptionalFieldPolicyFormValue
+): OpenCodeGoUnsupportedOptionalFieldPolicy {
+  if (!isOpenCodeGoUnsupportedOptionalFieldPolicy(value)) {
+    throw new Error(OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_ERROR)
+  }
+  return value
+}
+
 export function normalizeHttpProtocol(
   value: string | undefined | null
 ): 'auto' | 'http1' {
@@ -332,6 +367,13 @@ export const channelFormSchema = z
     opencode_go_default_protocol: z
       .enum(['', 'chat', 'messages', 'responses'])
       .optional(),
+    opencode_go_unsupported_optional_field_policy: z
+      .enum([
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID,
+      ])
+      .default(OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT),
     opencode_go_billing_usage_conversion_enabled: z.boolean().default(true),
     opencode_go_model_protocols: z
       .string()
@@ -382,6 +424,20 @@ export const channelFormSchema = z
     opencode_go_auto_cancel_subscription_renewal: z.boolean().optional(),
   })
   .superRefine((data, ctx) => {
+    if (
+      (data.type === CHANNEL_TYPE_OPENCODE_GO ||
+        data.type === CHANNEL_TYPE_OPENCODE_API_KEY) &&
+      !isOpenCodeGoUnsupportedOptionalFieldPolicy(
+        data.opencode_go_unsupported_optional_field_policy
+      )
+    ) {
+      addRequiredIssue(
+        ctx,
+        'opencode_go_unsupported_optional_field_policy',
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_ERROR
+      )
+    }
+
     if (!data.models.trim()) {
       addRequiredIssue(ctx, 'models', ERROR_MESSAGES.REQUIRED_MODELS)
     }
@@ -609,6 +665,8 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   opencode_go_identity_proxy_rotate_minutes:
     OPENCODE_GO_IDENTITY_PROXY_DEFAULT_ROTATE_MINUTES,
   opencode_go_default_protocol: '',
+  opencode_go_unsupported_optional_field_policy:
+    OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
   opencode_go_billing_usage_conversion_enabled: true,
   opencode_go_model_protocols: '',
   opencode_go_generic_failover_enabled: false,
@@ -692,6 +750,8 @@ export function transformChannelToFormDefaults(
   let openCodeGoIdentityProxyRotateMinutes =
     OPENCODE_GO_IDENTITY_PROXY_DEFAULT_ROTATE_MINUTES
   let openCodeGoDefaultProtocol: '' | 'chat' | 'messages' | 'responses' = ''
+  let openCodeGoUnsupportedOptionalFieldPolicy: OpenCodeGoUnsupportedOptionalFieldPolicyFormValue =
+    OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT
   let openCodeGoBillingUsageConversionEnabled = true
   let openCodeGoModelProtocols = ''
   let openCodeGoGenericFailoverEnabled = false
@@ -754,6 +814,14 @@ export function transformChannelToFormDefaults(
           openCodeGo.default_protocol === 'responses'
         ) {
           openCodeGoDefaultProtocol = openCodeGo.default_protocol
+        }
+        if (Object.hasOwn(openCodeGo, 'unsupported_optional_field_policy')) {
+          openCodeGoUnsupportedOptionalFieldPolicy =
+            isOpenCodeGoUnsupportedOptionalFieldPolicy(
+              openCodeGo.unsupported_optional_field_policy
+            )
+              ? openCodeGo.unsupported_optional_field_policy
+              : OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID
         }
         if (typeof openCodeGo.billing_usage_conversion_enabled === 'boolean') {
           openCodeGoBillingUsageConversionEnabled =
@@ -875,6 +943,8 @@ export function transformChannelToFormDefaults(
     opencode_go_identity_proxy_rotate_minutes:
       openCodeGoIdentityProxyRotateMinutes,
     opencode_go_default_protocol: openCodeGoDefaultProtocol,
+    opencode_go_unsupported_optional_field_policy:
+      openCodeGoUnsupportedOptionalFieldPolicy,
     opencode_go_billing_usage_conversion_enabled:
       openCodeGoBillingUsageConversionEnabled,
     opencode_go_model_protocols: openCodeGoModelProtocols,
@@ -1076,6 +1146,10 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
         : {}
     openCodeGo.billing_usage_conversion_enabled =
       formData.opencode_go_billing_usage_conversion_enabled !== false
+    openCodeGo.unsupported_optional_field_policy =
+      requireOpenCodeGoUnsupportedOptionalFieldPolicy(
+        formData.opencode_go_unsupported_optional_field_policy
+      )
 
     if (isOpenCodeAPIKeyChannel(formData.type)) {
       for (const key of OPENCODE_GO_POOL_ONLY_SETTING_KEYS) {

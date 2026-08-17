@@ -57,6 +57,7 @@ func prepareAndFreezeOpenCodeCandidatePlans(
 	if c == nil || info == nil || !constant.IsOpenCodeChannelType(common.GetContextKeyInt(c, constant.ContextKeyChannelType)) {
 		return nil, nil
 	}
+	initializeOpenCodeCacheControlDiagnostics(c, info)
 
 	capabilityView := service.CurrentOpenCodeGoCapabilityView()
 	drafts, initialKey, groupOrder, specific, failures, fatalErr := enumerateOpenCodeCandidateDrafts(c, info)
@@ -120,12 +121,14 @@ func enumerateOpenCodeCandidateDrafts(
 		return nil, initialKey, nil, false, nil, errors.New("initial OpenCode selection is invalid")
 	}
 	if channelType != constant.ChannelTypeOpenCodeAPIKey {
+		recordOpenCodeDiagnosticCandidateFromContext(c)
 		return []openCodeCandidateDraft{{key: initialKey}}, initialKey,
 			[]string{initialKey.SelectionGroup}, true, nil, nil
 	}
 
 	_, specific := c.Get(string(constant.ContextKeyTokenSpecificChannelId))
 	if specific {
+		recordOpenCodeDiagnosticCandidateFromContext(c)
 		selection, err := captureFrozenOpenCodeAPIKeySelection(c, initialKey.SelectionGroup)
 		if err != nil {
 			return nil, initialKey, nil, true, nil, err
@@ -206,6 +209,8 @@ func enumerateOpenCodeCandidateDrafts(
 		if _, allowed := permitted[selectionGroup]; !allowed {
 			continue
 		}
+		candidateSettings, settingsErr := candidate.Channel.DecodeOtherSettings()
+		recordOpenCodeDiagnosticCandidate(c, candidateSettings.OpenCodeGo, settingsErr == nil)
 		candidateContext := c.Copy()
 		if setupErr := middleware.SetupContextForSelectedChannelPlanning(
 			candidateContext,
@@ -294,10 +299,12 @@ func planOpenCodeCandidate(
 	); err != nil {
 		return openCodeRetainedCandidate{}, configOpenCodeCandidateFailure(err)
 	}
+	recordOpenCodeDiagnosticRouting(root, candidateContext, candidateInfo)
 	preflightPlan, err := opencodego.BuildRequestPreflightPlan(candidateContext, candidateInfo)
 	if err != nil {
 		return openCodeRetainedCandidate{}, classifyOpenCodeCandidateFailure(err)
 	}
+	recordOpenCodeDiagnosticPlan(root, preflightPlan)
 	preflightPlan.CapabilityRevision = capabilityView.SemanticRevision()
 	if preflightPlan.Key() != draft.key {
 		return openCodeRetainedCandidate{}, fatalOpenCodeCandidateFailure(
@@ -582,6 +589,12 @@ func reduceOpenCodeCandidateFailures(c *gin.Context, failures []openCodeCandidat
 			RuleID:  openCodeCapabilityUnknownRule,
 			StageID: openCodeCapabilityStage,
 		})
+		logOpenCodeRequestPreflightRejection(
+			c,
+			openCodeCapabilityUnknownRule,
+			openCodeCapabilityStage,
+			http.StatusServiceUnavailable,
+		)
 		return types.NewOpenAIError(
 			capabilityErr,
 			types.ErrorCodeGetChannelFailed,

@@ -283,9 +283,11 @@ func TestAssertRequestPreflightPlanDetectsAttemptDrift(t *testing.T) {
 			},
 		},
 		{
-			name: "dynamic route",
-			mutate: func(_ *gin.Context, _ *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) {
-				request.Tools = []dto.ToolCallRequest{{Type: "function", Function: dto.FunctionRequest{Name: "lookup"}}}
+			name: "unsupported optional field policy",
+			mutate: func(_ *gin.Context, info *relaycommon.RelayInfo, _ *dto.GeneralOpenAIRequest) {
+				info.ChannelOtherSettings.OpenCodeGo = &dto.OpenCodeGoConfig{
+					UnsupportedOptionalFieldPolicy: dto.OpenCodeGoUnsupportedOptionalFieldDropKnown,
+				}
 			},
 		},
 	}

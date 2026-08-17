@@ -15,11 +15,15 @@ func preflightOpenCodeRequest(c *gin.Context, info *relaycommon.RelayInfo) *type
 	if c == nil || !constant.IsOpenCodeChannelType(common.GetContextKeyInt(c, constant.ContextKeyChannelType)) {
 		return nil
 	}
+	initializeOpenCodeCacheControlDiagnostics(c, info)
+	recordOpenCodeDiagnosticCandidateFromContext(c)
+	recordOpenCodeDiagnosticRouting(c, c, info)
 
 	plan, err := opencodego.BuildRequestPreflightPlan(c, info)
 	if err != nil {
 		return newOpenCodeRequestPreflightAPIError(c, err)
 	}
+	recordOpenCodeDiagnosticPlan(c, plan)
 	if err := opencodego.StoreRequestPreflightPlan(c, plan); err != nil {
 		return newOpenCodeRequestPreflightAPIError(c, opencodego.NewRequestPreflightPlanStorageError(err))
 	}
@@ -49,6 +53,7 @@ func newOpenCodeRequestPreflightAPIError(c *gin.Context, err error) *types.NewAP
 	if statusCode < 400 || statusCode > 599 {
 		statusCode = http.StatusInternalServerError
 	}
+	logOpenCodeRequestPreflightRejection(c, preflightErr.RuleID, preflightErr.StageID, statusCode)
 	errorCode := types.ErrorCodeGetChannelFailed
 	if preflightErr.Origin == types.ErrorOriginLocalValidation {
 		errorCode = types.ErrorCodeInvalidRequest

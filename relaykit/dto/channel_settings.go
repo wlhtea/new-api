@@ -93,9 +93,11 @@ type ChannelOtherSettings struct {
 }
 
 const (
-	OpenCodeGoProtocolChat      = "chat"
-	OpenCodeGoProtocolMessages  = "messages"
-	OpenCodeGoProtocolResponses = "responses"
+	OpenCodeGoProtocolChat                      = "chat"
+	OpenCodeGoProtocolMessages                  = "messages"
+	OpenCodeGoProtocolResponses                 = "responses"
+	OpenCodeGoUnsupportedOptionalFieldStrict    = "strict"
+	OpenCodeGoUnsupportedOptionalFieldDropKnown = "drop_known_optional"
 
 	OpenCodeGoGenericFailoverDefaultThreshold     = 2
 	OpenCodeGoGenericFailoverDefaultWindowSeconds = 30
@@ -111,28 +113,31 @@ const (
 )
 
 type OpenCodeGoConfig struct {
-	ModelProtocols  map[string]string `json:"model_protocols,omitempty"`
-	DefaultProtocol string            `json:"default_protocol,omitempty"`
+	ModelProtocols                 map[string]string `json:"model_protocols,omitempty"`
+	DefaultProtocol                string            `json:"default_protocol,omitempty"`
+	UnsupportedOptionalFieldPolicy string            `json:"unsupported_optional_field_policy,omitempty"`
 	// BillingUsageConversionEnabled controls only the public usage projection
 	// for OpenCode responses. A nil value preserves the historical default of
 	// enabled while allowing an explicit false to survive JSON round trips.
-	BillingUsageConversionEnabled *bool  `json:"billing_usage_conversion_enabled,omitempty"`
-	GenericFailoverEnabled        bool   `json:"generic_failover_enabled,omitempty"`
-	GenericFailoverThreshold      int    `json:"generic_failover_threshold,omitempty"`
-	GenericFailoverWindowSeconds  int    `json:"generic_failover_window_seconds,omitempty"`
-	GenericFailoverMaxBackups     int    `json:"generic_failover_max_backups,omitempty"`
-	GenericFailoverLeaseSeconds   int    `json:"generic_failover_lease_seconds,omitempty"`
-	AffinityFallback              string `json:"affinity_fallback,omitempty"`
-	LoadAwareEnabled              bool   `json:"load_aware_enabled,omitempty"`
-	AutoEnableChinaModels         *bool  `json:"auto_enable_china_models,omitempty"`
-	AutoApplyReferralRewards      *bool  `json:"auto_apply_referral_rewards,omitempty"`
-	ReferralRewardsMaxPerRun      *int   `json:"referral_rewards_max_per_run,omitempty"`
-	AutoCancelSubscriptionRenewal bool   `json:"auto_cancel_subscription_renewal,omitempty"`
-	IdentityProxyEnabled          bool   `json:"identity_proxy_enabled,omitempty"`
-	IdentityProxyCountry          string `json:"identity_proxy_country,omitempty"`
-	IdentityProxyRotateMinutes    int    `json:"identity_proxy_rotate_minutes,omitempty"`
-	unknownFields                 map[string]json.RawMessage
-	identityProxyRotateMinutesSet bool
+	BillingUsageConversionEnabled            *bool  `json:"billing_usage_conversion_enabled,omitempty"`
+	GenericFailoverEnabled                   bool   `json:"generic_failover_enabled,omitempty"`
+	GenericFailoverThreshold                 int    `json:"generic_failover_threshold,omitempty"`
+	GenericFailoverWindowSeconds             int    `json:"generic_failover_window_seconds,omitempty"`
+	GenericFailoverMaxBackups                int    `json:"generic_failover_max_backups,omitempty"`
+	GenericFailoverLeaseSeconds              int    `json:"generic_failover_lease_seconds,omitempty"`
+	AffinityFallback                         string `json:"affinity_fallback,omitempty"`
+	LoadAwareEnabled                         bool   `json:"load_aware_enabled,omitempty"`
+	AutoEnableChinaModels                    *bool  `json:"auto_enable_china_models,omitempty"`
+	AutoApplyReferralRewards                 *bool  `json:"auto_apply_referral_rewards,omitempty"`
+	ReferralRewardsMaxPerRun                 *int   `json:"referral_rewards_max_per_run,omitempty"`
+	AutoCancelSubscriptionRenewal            bool   `json:"auto_cancel_subscription_renewal,omitempty"`
+	IdentityProxyEnabled                     bool   `json:"identity_proxy_enabled,omitempty"`
+	IdentityProxyCountry                     string `json:"identity_proxy_country,omitempty"`
+	IdentityProxyRotateMinutes               int    `json:"identity_proxy_rotate_minutes,omitempty"`
+	unknownFields                            map[string]json.RawMessage
+	identityProxyRotateMinutesSet            bool
+	unsupportedOptionalFieldPolicySet        bool
+	unsupportedOptionalFieldPolicyInvalidRaw json.RawMessage
 }
 
 // IsBillingUsageConversionEnabled reports the effective OpenCode usage
@@ -164,22 +169,40 @@ func (settings ChannelOtherSettings) MarshalJSON() ([]byte, error) {
 
 func (config *OpenCodeGoConfig) UnmarshalJSON(data []byte) error {
 	type alias OpenCodeGoConfig
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	policyRaw, policySet := raw["unsupported_optional_field_policy"]
+	delete(raw, "unsupported_optional_field_policy")
+	sanitized, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
 	var decoded alias
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := json.Unmarshal(sanitized, &decoded); err != nil {
 		return err
 	}
 	unknown, err := unknownJSONFields(data, reflect.TypeOf(decoded))
 	if err != nil {
 		return err
 	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
+	var invalidPolicyRaw json.RawMessage
+	if policySet {
+		if strings.HasPrefix(strings.TrimSpace(string(policyRaw)), "\"") {
+			if err := json.Unmarshal(policyRaw, &decoded.UnsupportedOptionalFieldPolicy); err != nil {
+				return err
+			}
+		} else {
+			invalidPolicyRaw = append(json.RawMessage(nil), policyRaw...)
+		}
 	}
 	_, rotateMinutesSet := raw["identity_proxy_rotate_minutes"]
 	*config = OpenCodeGoConfig(decoded)
 	config.unknownFields = unknown
 	config.identityProxyRotateMinutesSet = rotateMinutesSet
+	config.unsupportedOptionalFieldPolicySet = policySet
+	config.unsupportedOptionalFieldPolicyInvalidRaw = invalidPolicyRaw
 	return nil
 }
 
@@ -192,6 +215,22 @@ func (config OpenCodeGoConfig) MarshalJSON() ([]byte, error) {
 			return nil, err
 		}
 		force = map[string]json.RawMessage{"identity_proxy_rotate_minutes": encoded}
+	}
+	if config.unsupportedOptionalFieldPolicySet {
+		if force == nil {
+			force = make(map[string]json.RawMessage, 1)
+		}
+		if len(config.unsupportedOptionalFieldPolicyInvalidRaw) > 0 {
+			force["unsupported_optional_field_policy"] = append(
+				json.RawMessage(nil), config.unsupportedOptionalFieldPolicyInvalidRaw...,
+			)
+		} else {
+			encoded, err := json.Marshal(config.UnsupportedOptionalFieldPolicy)
+			if err != nil {
+				return nil, err
+			}
+			force["unsupported_optional_field_policy"] = encoded
+		}
 	}
 	return marshalWithUnknownJSONFields(alias(config), config.unknownFields, force)
 }
@@ -234,6 +273,15 @@ func (c *OpenCodeGoConfig) IdentityProxyRotateMinutesWasSet() bool {
 	return c != nil && c.identityProxyRotateMinutesSet
 }
 
+// EffectiveUnsupportedOptionalFieldPolicy keeps legacy rows fail-closed while
+// preserving explicitly invalid persisted values for validation.
+func (c *OpenCodeGoConfig) EffectiveUnsupportedOptionalFieldPolicy() string {
+	if c == nil || (!c.unsupportedOptionalFieldPolicySet && c.UnsupportedOptionalFieldPolicy == "") {
+		return OpenCodeGoUnsupportedOptionalFieldStrict
+	}
+	return c.UnsupportedOptionalFieldPolicy
+}
+
 // NormalizeIdentityProxy fills enabled-policy defaults and canonicalizes the
 // country code. It returns whether any persisted value changed.
 func (c *OpenCodeGoConfig) NormalizeIdentityProxy() bool {
@@ -257,6 +305,9 @@ func (c *OpenCodeGoConfig) NormalizeIdentityProxy() bool {
 func (c *OpenCodeGoConfig) Validate() error {
 	if c == nil {
 		return nil
+	}
+	if err := c.validateUnsupportedOptionalFieldPolicy(); err != nil {
+		return err
 	}
 	normalized := *c
 	normalized.NormalizeIdentityProxy()
@@ -325,10 +376,35 @@ func (c *OpenCodeGoConfig) ValidateProtocolRouting() error {
 	if c == nil {
 		return nil
 	}
+	if err := c.validateUnsupportedOptionalFieldPolicy(); err != nil {
+		return err
+	}
 	if err := c.validateDefaultProtocol(); err != nil {
 		return err
 	}
 	return c.validateModelProtocols()
+}
+
+func (c *OpenCodeGoConfig) validateUnsupportedOptionalFieldPolicy() error {
+	if c == nil || (!c.unsupportedOptionalFieldPolicySet && c.UnsupportedOptionalFieldPolicy == "") {
+		return nil
+	}
+	if len(c.unsupportedOptionalFieldPolicyInvalidRaw) > 0 {
+		if strings.TrimSpace(string(c.unsupportedOptionalFieldPolicyInvalidRaw)) != "null" {
+			return fmt.Errorf("OpenCode Go unsupported_optional_field_policy must be a JSON string")
+		}
+		return fmt.Errorf("OpenCode Go unsupported_optional_field_policy cannot be null")
+	}
+	switch c.UnsupportedOptionalFieldPolicy {
+	case OpenCodeGoUnsupportedOptionalFieldStrict, OpenCodeGoUnsupportedOptionalFieldDropKnown:
+		return nil
+	default:
+		return fmt.Errorf(
+			"OpenCode Go unsupported_optional_field_policy must be %q or %q",
+			OpenCodeGoUnsupportedOptionalFieldStrict,
+			OpenCodeGoUnsupportedOptionalFieldDropKnown,
+		)
+	}
 }
 
 func (c *OpenCodeGoConfig) validateDefaultProtocol() error {

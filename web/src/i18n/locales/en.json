@@ -5491,6 +5491,12 @@
     "Zero retention": "Zero retention",
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V4",
+    "Unsupported optional field policy": "Unsupported optional field policy",
+    "Strict: reject unrelayable registered hints": "Strict: reject unrelayable registered hints",
+    "Drop known optional hints": "Drop known optional hints",
+    "Invalid stored policy": "Invalid stored policy",
+    "The stored policy is invalid. Select a valid policy before saving.": "The stored policy is invalid. Select a valid policy before saving.",
+    "Malformed, unknown, security-sensitive, and core-semantic fields are always rejected.": "Malformed, unknown, security-sensitive, and core-semantic fields are always rejected.",
     "Zoom": "Zoom"
   }
 }

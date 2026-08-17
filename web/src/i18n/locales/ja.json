@@ -5491,6 +5491,12 @@
     "Zero retention": "データ保持なし",
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V 4",
+    "Unsupported optional field policy": "未対応のオプションフィールドポリシー",
+    "Strict: reject unrelayable registered hints": "厳格: 転送できない登録済みヒントを拒否",
+    "Drop known optional hints": "既知のオプションヒントを破棄",
+    "Invalid stored policy": "保存済みポリシーが無効です",
+    "The stored policy is invalid. Select a valid policy before saving.": "保存されているポリシーは無効です。保存する前に有効なポリシーを選択してください。",
+    "Malformed, unknown, security-sensitive, and core-semantic fields are always rejected.": "不正、未知、セキュリティ上重要、または中核的な意味を持つフィールドは常に拒否されます。",
     "Zoom": "ズーム"
   }
 }

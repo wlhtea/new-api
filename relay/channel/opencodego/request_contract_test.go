@@ -306,23 +306,6 @@ func TestBuildRequestPreflightPlanRejectsUnmappedNestedCrossProtocolFields(t *te
 				}},
 			}}},
 		},
-		{
-			name:          "dynamic chat to responses",
-			endpoint:      requestPreflightEndpoints[1],
-			finalProtocol: ProtocolChat,
-			extraFields: map[string]any{
-				"messages": []any{map[string]any{
-					"role": "user", "content": []any{map[string]any{
-						"type": "text", "text": "hello", "provider_extension": map[string]any{"mode": "opaque"},
-					}},
-				}},
-				"tools": []any{map[string]any{
-					"type": "function", "function": map[string]any{
-						"name": "lookup", "parameters": map[string]any{"type": "object"},
-					},
-				}},
-			},
-		},
 	}
 
 	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
@@ -572,6 +555,197 @@ func TestBuildRequestPreflightPlanKeepsOpaqueConverterFamiliesReachable(t *testi
 	}
 }
 
+func TestClaudeMessagesCacheParentContractAcceptsLegalReplayShapes(t *testing.T) {
+	marker := map[string]any{"type": "ephemeral"}
+	tests := []struct {
+		name     string
+		messages []any
+		assert   func(t *testing.T, root map[string]any)
+	}{
+		{
+			name: "assistant thinking requires and preserves signature",
+			messages: []any{
+				map[string]any{"role": "user", "content": "hello"},
+				map[string]any{"role": "assistant", "content": []any{map[string]any{
+					"type": "thinking", "thinking": "reasoning", "signature": "signed-replay",
+				}}},
+			},
+			assert: func(t *testing.T, root map[string]any) {
+				messages := root["messages"].([]any)
+				thinking := messages[1].(map[string]any)["content"].([]any)[0].(map[string]any)
+				assert.Equal(t, "signed-replay", thinking["signature"])
+			},
+		},
+		{
+			name: "assistant text and tool use may share one native turn",
+			messages: []any{
+				map[string]any{"role": "user", "content": "hello"},
+				map[string]any{"role": "assistant", "content": []any{
+					map[string]any{"type": "text", "text": "calling tool"},
+					map[string]any{
+						"type": "tool_use", "id": "call-1", "name": "lookup",
+						"input": map[string]any{"query": "value"},
+					},
+				}},
+			},
+			assert: func(t *testing.T, root map[string]any) {
+				messages := root["messages"].([]any)
+				content := messages[1].(map[string]any)["content"].([]any)
+				require.Len(t, content, 2)
+				assert.Equal(t, "text", content[0].(map[string]any)["type"])
+				assert.Equal(t, "tool_use", content[1].(map[string]any)["type"])
+			},
+		},
+		{
+			name: "user tool result preserves is error",
+			messages: []any{
+				map[string]any{"role": "assistant", "content": []any{map[string]any{
+					"type": "tool_use", "id": "call-1", "name": "lookup", "input": map[string]any{},
+				}}},
+				map[string]any{"role": "user", "content": []any{map[string]any{
+					"type": "tool_result", "tool_use_id": "call-1", "content": "failed", "is_error": true,
+				}}},
+			},
+			assert: func(t *testing.T, root map[string]any) {
+				messages := root["messages"].([]any)
+				result := messages[1].(map[string]any)["content"].([]any)[0].(map[string]any)
+				assert.Equal(t, true, result["is_error"])
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c, info := newRequestContractFixture(
+				t,
+				constant.ChannelTypeOpenCodeAPIKey,
+				requestPreflightEndpoints[0],
+				ProtocolMessages,
+				map[string]any{
+					"system": []any{map[string]any{
+						"type": "text", "text": "system", "cache_control": marker,
+					}},
+					"messages": test.messages,
+				},
+			)
+
+			body := convertAndFinalizeRequestForPresenceTest(t, c, info)
+			var root map[string]any
+			require.NoError(t, common.Unmarshal(body, &root))
+			test.assert(t, root)
+		})
+	}
+}
+
+func TestClaudeMessagesCacheParentContractRejectsInvalidReplayShapes(t *testing.T) {
+	imageSource := func() map[string]any {
+		return map[string]any{
+			"type": "base64", "media_type": "image/png", "data": "aGVsbG8=",
+		}
+	}
+	tests := []struct {
+		name     string
+		messages []any
+		tools    any
+	}{
+		{
+			name: "assistant image",
+			messages: []any{map[string]any{"role": "assistant", "content": []any{map[string]any{
+				"type": "image", "source": imageSource(),
+			}}}},
+		},
+		{
+			name: "user tool use",
+			messages: []any{map[string]any{"role": "user", "content": []any{map[string]any{
+				"type": "tool_use", "id": "call-1", "name": "lookup", "input": map[string]any{},
+			}}}},
+		},
+		{
+			name: "assistant tool result",
+			messages: []any{map[string]any{"role": "assistant", "content": []any{map[string]any{
+				"type": "tool_result", "tool_use_id": "call-1", "content": "done",
+			}}}},
+		},
+		{
+			name: "user thinking",
+			messages: []any{map[string]any{"role": "user", "content": []any{map[string]any{
+				"type": "thinking", "thinking": "reasoning", "signature": "signed-replay",
+			}}}},
+		},
+		{
+			name: "thinking missing signature",
+			messages: []any{map[string]any{"role": "assistant", "content": []any{map[string]any{
+				"type": "thinking", "thinking": "reasoning",
+			}}}},
+		},
+		{
+			name: "thinking empty signature",
+			messages: []any{map[string]any{"role": "assistant", "content": []any{map[string]any{
+				"type": "thinking", "thinking": "reasoning", "signature": "",
+			}}}},
+		},
+		{
+			name: "tool result is error wrong type",
+			messages: []any{map[string]any{"role": "user", "content": []any{map[string]any{
+				"type": "tool_result", "tool_use_id": "call-1", "content": "failed", "is_error": "yes",
+			}}}},
+		},
+		{
+			name: "image source unsupported media type",
+			messages: []any{map[string]any{"role": "user", "content": []any{map[string]any{
+				"type": "image", "source": map[string]any{
+					"type": "base64", "media_type": "text/plain", "data": "aGVsbG8=",
+				},
+			}}}},
+		},
+		{
+			name:     "tool description wrong type",
+			messages: []any{map[string]any{"role": "user", "content": "hello"}},
+			tools: []any{map[string]any{
+				"name": "lookup", "description": true, "input_schema": map[string]any{"type": "object"},
+			}},
+		},
+		{
+			name:     "tool schema missing object discriminator",
+			messages: []any{map[string]any{"role": "user", "content": "hello"}},
+			tools: []any{map[string]any{
+				"name": "lookup", "input_schema": map[string]any{"properties": map[string]any{}},
+			}},
+		},
+	}
+
+	marker := map[string]any{"type": "ephemeral"}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			extra := map[string]any{
+				"system": []any{map[string]any{
+					"type": "text", "text": "system", "cache_control": marker,
+				}},
+				"messages": test.messages,
+			}
+			if test.tools != nil {
+				extra["tools"] = test.tools
+			}
+			c, info := newRequestContractFixture(
+				t,
+				constant.ChannelTypeOpenCodeAPIKey,
+				requestPreflightEndpoints[0],
+				ProtocolMessages,
+				extra,
+			)
+
+			_, err := BuildRequestPreflightPlan(c, info)
+			require.Error(t, err)
+			preflightErr, ok := AsRequestPreflightError(err)
+			require.True(t, ok)
+			assert.Equal(t, http.StatusBadRequest, preflightErr.StatusCode)
+			assert.Equal(t, RequestContractUnmappedNestedRule, preflightErr.RuleID)
+			assert.Equal(t, RequestContractPreflightStage, preflightErr.StageID)
+			assert.NotContains(t, err.Error(), test.name)
+		})
+	}
+}
+
 func TestBuildRequestPreflightPlanAcceptsMappedNestedCrossProtocolControls(t *testing.T) {
 	claudeFields := map[string]any{
 		"messages": []any{map[string]any{
@@ -627,7 +801,6 @@ func TestBuildRequestPreflightPlanAcceptsMappedNestedCrossProtocolControls(t *te
 		endpoint      requestPreflightEndpoint
 		finalProtocol Protocol
 		extraFields   map[string]any
-		wantDynamic   string
 	}{
 		{name: "messages to chat", endpoint: requestPreflightEndpoints[0], finalProtocol: ProtocolChat, extraFields: claudeFields},
 		{name: "messages to responses", endpoint: requestPreflightEndpoints[0], finalProtocol: ProtocolResponses, extraFields: claudeFields},
@@ -636,8 +809,8 @@ func TestBuildRequestPreflightPlanAcceptsMappedNestedCrossProtocolControls(t *te
 		{name: "responses to chat", endpoint: requestPreflightEndpoints[2], finalProtocol: ProtocolChat, extraFields: responsesFields},
 		{name: "responses to messages", endpoint: requestPreflightEndpoints[2], finalProtocol: ProtocolMessages, extraFields: responsesFields},
 		{
-			name: "dynamic chat to responses", endpoint: requestPreflightEndpoints[1], finalProtocol: ProtocolChat,
-			extraFields: chatFields, wantDynamic: DynamicProtocolReasonChatFunctionTools,
+			name: "chat function tools stay on configured chat", endpoint: requestPreflightEndpoints[1], finalProtocol: ProtocolChat,
+			extraFields: chatFields,
 		},
 	}
 
@@ -647,12 +820,7 @@ func TestBuildRequestPreflightPlanAcceptsMappedNestedCrossProtocolControls(t *te
 				c, info := newRequestContractFixture(t, channelType, test.endpoint, test.finalProtocol, test.extraFields)
 				plan, err := BuildRequestPreflightPlan(c, info)
 				require.NoError(t, err)
-				if test.wantDynamic != "" {
-					assert.Equal(t, ProtocolResponses, plan.FinalProtocol)
-					assert.Equal(t, test.wantDynamic, plan.DynamicReason)
-				} else {
-					assert.Equal(t, test.finalProtocol, plan.FinalProtocol)
-				}
+				assert.Equal(t, test.finalProtocol, plan.FinalProtocol)
 			})
 		}
 	}

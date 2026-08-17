@@ -5491,6 +5491,12 @@
     "Zero retention": "Không lưu dữ liệu",
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V4",
+    "Unsupported optional field policy": "Chính sách trường tùy chọn không được hỗ trợ",
+    "Strict: reject unrelayable registered hints": "Nghiêm ngặt: từ chối gợi ý đã đăng ký không thể chuyển tiếp",
+    "Drop known optional hints": "Loại bỏ gợi ý tùy chọn đã biết",
+    "Invalid stored policy": "Chính sách đã lưu không hợp lệ",
+    "The stored policy is invalid. Select a valid policy before saving.": "Chính sách đã lưu không hợp lệ. Hãy chọn chính sách hợp lệ trước khi lưu.",
+    "Malformed, unknown, security-sensitive, and core-semantic fields are always rejected.": "Các trường sai định dạng, không xác định, nhạy cảm về bảo mật và mang ngữ nghĩa cốt lõi luôn bị từ chối.",
     "Zoom": "Zoom"
   }
 }

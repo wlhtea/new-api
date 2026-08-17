@@ -159,3 +159,110 @@ func TestOpenCodeGoBillingUsageConversionPresenceAndDefault(t *testing.T) {
 	require.NoError(t, err)
 	require.JSONEq(t, `{"billing_usage_conversion_enabled":true}`, string(encoded))
 }
+
+func TestOpenCodeGoUnsupportedOptionalFieldPolicyPresenceAndValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       string
+		effective string
+		wantError bool
+		wantJSON  string
+	}{
+		{
+			name:      "legacy absence defaults to strict",
+			raw:       `{"future_nested":{"preserve":true}}`,
+			effective: OpenCodeGoUnsupportedOptionalFieldStrict,
+			wantJSON:  `{"future_nested":{"preserve":true}}`,
+		},
+		{
+			name:      "explicit strict",
+			raw:       `{"unsupported_optional_field_policy":"strict"}`,
+			effective: OpenCodeGoUnsupportedOptionalFieldStrict,
+			wantJSON:  `{"unsupported_optional_field_policy":"strict"}`,
+		},
+		{
+			name:      "explicit drop known optional",
+			raw:       `{"unsupported_optional_field_policy":"drop_known_optional"}`,
+			effective: OpenCodeGoUnsupportedOptionalFieldDropKnown,
+			wantJSON:  `{"unsupported_optional_field_policy":"drop_known_optional"}`,
+		},
+		{
+			name:      "explicit empty remains invalid",
+			raw:       `{"unsupported_optional_field_policy":""}`,
+			effective: "",
+			wantError: true,
+			wantJSON:  `{"unsupported_optional_field_policy":""}`,
+		},
+		{
+			name:      "explicit null remains invalid",
+			raw:       `{"unsupported_optional_field_policy":null}`,
+			effective: "",
+			wantError: true,
+			wantJSON:  `{"unsupported_optional_field_policy":null}`,
+		},
+		{
+			name:      "unknown value",
+			raw:       `{"unsupported_optional_field_policy":"ignore_all"}`,
+			effective: "ignore_all",
+			wantError: true,
+			wantJSON:  `{"unsupported_optional_field_policy":"ignore_all"}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var config OpenCodeGoConfig
+			require.NoError(t, json.Unmarshal([]byte(test.raw), &config))
+			require.Equal(t, test.effective, config.EffectiveUnsupportedOptionalFieldPolicy())
+
+			validateErr := config.Validate()
+			routingErr := config.ValidateProtocolRouting()
+			if test.wantError {
+				require.ErrorContains(t, validateErr, "unsupported_optional_field_policy")
+				require.ErrorContains(t, routingErr, "unsupported_optional_field_policy")
+			} else {
+				require.NoError(t, validateErr)
+				require.NoError(t, routingErr)
+			}
+
+			encoded, err := json.Marshal(config)
+			require.NoError(t, err)
+			require.JSONEq(t, test.wantJSON, string(encoded))
+		})
+	}
+}
+
+func TestOpenCodeGoUnsupportedOptionalFieldPolicyPreservesWrongJSONTypesForValidation(t *testing.T) {
+	for _, rawValue := range []string{`true`, `1`, `{}`, `[]`} {
+		t.Run(rawValue, func(t *testing.T) {
+			var config OpenCodeGoConfig
+			require.NoError(t, json.Unmarshal(
+				[]byte(`{"unsupported_optional_field_policy":`+rawValue+`}`),
+				&config,
+			))
+			require.Equal(t, "", config.EffectiveUnsupportedOptionalFieldPolicy())
+			require.ErrorContains(t, config.Validate(), "unsupported_optional_field_policy")
+			require.ErrorContains(t, config.ValidateProtocolRouting(), "unsupported_optional_field_policy")
+
+			encoded, err := json.Marshal(config)
+			require.NoError(t, err)
+			require.JSONEq(
+				t,
+				`{"unsupported_optional_field_policy":`+rawValue+`}`,
+				string(encoded),
+			)
+		})
+	}
+}
+
+func TestOpenCodeGoUnsupportedOptionalFieldPolicyProgrammaticValues(t *testing.T) {
+	for _, policy := range []string{
+		OpenCodeGoUnsupportedOptionalFieldStrict,
+		OpenCodeGoUnsupportedOptionalFieldDropKnown,
+	} {
+		config := OpenCodeGoConfig{UnsupportedOptionalFieldPolicy: policy}
+		require.Equal(t, policy, config.EffectiveUnsupportedOptionalFieldPolicy())
+		require.NoError(t, config.Validate())
+		require.NoError(t, config.ValidateProtocolRouting())
+	}
+}

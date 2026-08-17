@@ -482,7 +482,16 @@ func validateClaudeContentPart(part map[string]any, path string) error {
 		_, err = presentStringField(part, "text", path+".text")
 	case "image", "document":
 		err = validateClaudeMediaSource(part, path)
-	case "tool_use", "server_tool_use":
+	case "tool_use":
+		if _, err = requiredStringField(part, "id", path+".id"); err == nil {
+			_, err = requiredStringField(part, "name", path+".name")
+		}
+		if err == nil {
+			if _, found := part["input"]; !found {
+				err = newClientRequestValidationError(http.StatusBadRequest, "%s.input is required", path)
+			}
+		}
+	case "server_tool_use":
 		if _, err = requiredStringField(part, "id", path+".id"); err == nil {
 			_, err = requiredStringField(part, "name", path+".name")
 		}

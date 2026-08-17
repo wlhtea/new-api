@@ -56,12 +56,17 @@ for (const key of domGlobals) {
 
 const { act } = await import('react')
 const { createRoot } = await import('react-dom/client')
+const { zodResolver } = await import('@hookform/resolvers/zod')
 const { createInstance } = await import('i18next')
 const { initReactI18next } = await import('react-i18next')
 const { useForm } = await import('react-hook-form')
 const { Form } = await import('@/components/ui/form')
-const { CHANNEL_FORM_DEFAULT_VALUES } =
-  await import('../../../lib/channel-form')
+const {
+  CHANNEL_FORM_DEFAULT_VALUES,
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID,
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+  channelFormSchema,
+} = await import('../../../lib/channel-form')
 const { OpenCodeAPIKeyChannelSettings } =
   await import('../../drawers/sections/opencode-api-key-channel-settings')
 const { OpenCodeGoChannelSettings } =
@@ -149,10 +154,19 @@ describe('OpenCode Go channel settings', () => {
     const protocolTextarea = host.querySelector<HTMLTextAreaElement>('textarea')
     const protocolSelect =
       host.querySelector<HTMLButtonElement>('[role="combobox"]')
+    const optionalFieldPolicy = getControlByLabel<HTMLButtonElement>(
+      host,
+      'Unsupported optional field policy'
+    )
     assert.ok(protocolTextarea)
     assert.ok(protocolSelect)
     assert.equal(protocolTextarea.disabled, false)
     assert.equal(protocolSelect.disabled, false)
+    assert.equal(optionalFieldPolicy.disabled, false)
+    assert.match(
+      host.textContent || '',
+      /Malformed, unknown, security-sensitive, and core-semantic fields are always rejected\./
+    )
 
     const switches = [
       ...host.querySelectorAll<HTMLButtonElement>('[role="switch"]'),
@@ -249,6 +263,11 @@ describe('OpenCode Go channel settings', () => {
     )
     assert.ok(usageConversionSwitch)
     assert.equal(usageConversionSwitch.getAttribute('aria-checked'), 'false')
+    const optionalFieldPolicy = getControlByLabel<HTMLButtonElement>(
+      host,
+      'Unsupported optional field policy'
+    )
+    assert.equal(optionalFieldPolicy.disabled, false)
     assert.match(
       host.textContent || '',
       /Controls public Usage projection only; it does not change model pricing or internal settlement\./
@@ -256,6 +275,99 @@ describe('OpenCode Go channel settings', () => {
 
     await act(async () => usageConversionSwitch.click())
     assert.equal(usageConversionSwitch.getAttribute('aria-checked'), 'true')
+  })
+
+  test('surfaces an invalid persisted policy without displaying strict', async () => {
+    function Harness() {
+      const form = useForm({
+        defaultValues: {
+          ...CHANNEL_FORM_DEFAULT_VALUES,
+          opencode_go_unsupported_optional_field_policy:
+            OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID,
+        },
+      })
+      return (
+        <Form {...form}>
+          <OpenCodeAPIKeyChannelSettings />
+        </Form>
+      )
+    }
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const root = createRoot(host)
+    renderedSettings = { host, root }
+    await act(async () => root.render(<Harness />))
+
+    const optionalFieldPolicy = getControlByLabel<HTMLButtonElement>(
+      host,
+      'Unsupported optional field policy'
+    )
+    assert.equal(optionalFieldPolicy.getAttribute('aria-invalid'), 'true')
+    assert.match(optionalFieldPolicy.textContent || '', /Invalid stored policy/)
+    assert.doesNotMatch(
+      optionalFieldPolicy.textContent || '',
+      /Strict: reject unrelayable registered hints/
+    )
+    assert.match(
+      host.textContent || '',
+      /The stored policy is invalid\. Select a valid policy before saving\./
+    )
+  })
+
+  test('blocks resolver submission until an invalid policy is explicitly replaced', async () => {
+    let submissionCount = 0
+    let selectValidPolicy: (() => void) | undefined
+
+    function Harness() {
+      const form = useForm({
+        resolver: zodResolver(channelFormSchema),
+        defaultValues: {
+          ...CHANNEL_FORM_DEFAULT_VALUES,
+          name: 'OpenCode API Key',
+          type: 63,
+          models: 'glm-5.2',
+          opencode_go_unsupported_optional_field_policy:
+            OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID,
+        },
+      })
+      selectValidPolicy = () => {
+        form.setValue(
+          'opencode_go_unsupported_optional_field_policy',
+          OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+          { shouldDirty: true, shouldValidate: true }
+        )
+      }
+      return (
+        <Form {...form}>
+          <form
+            onSubmit={form.handleSubmit(() => {
+              submissionCount += 1
+            })}
+          >
+            <OpenCodeAPIKeyChannelSettings />
+            <button type='submit'>Save</button>
+          </form>
+        </Form>
+      )
+    }
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const root = createRoot(host)
+    renderedSettings = { host, root }
+    await act(async () => root.render(<Harness />))
+
+    const saveButton = [
+      ...host.querySelectorAll<HTMLButtonElement>('button'),
+    ].find((button) => button.textContent === 'Save')
+    assert.ok(saveButton)
+    await act(async () => saveButton.click())
+    assert.equal(submissionCount, 0)
+
+    await act(async () => selectValidPolicy?.())
+    await act(async () => saveButton.click())
+    assert.equal(submissionCount, 1)
   })
 
   test('infers the initial policy when identity proxy routing is enabled', async () => {

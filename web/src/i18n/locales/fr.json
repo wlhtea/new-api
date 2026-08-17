@@ -5491,6 +5491,12 @@
     "Zero retention": "Aucune rétention",
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V4",
+    "Unsupported optional field policy": "Politique des champs facultatifs non pris en charge",
+    "Strict: reject unrelayable registered hints": "Stricte : refuser les indications enregistrées non transmissibles",
+    "Drop known optional hints": "Ignorer les indications facultatives connues",
+    "Invalid stored policy": "Politique enregistrée non valide",
+    "The stored policy is invalid. Select a valid policy before saving.": "La politique enregistrée n'est pas valide. Sélectionnez une politique valide avant d'enregistrer.",
+    "Malformed, unknown, security-sensitive, and core-semantic fields are always rejected.": "Les champs mal formés, inconnus, sensibles à la sécurité et essentiels à la sémantique sont toujours rejetés.",
     "Zoom": "Zoom"
   }
 }

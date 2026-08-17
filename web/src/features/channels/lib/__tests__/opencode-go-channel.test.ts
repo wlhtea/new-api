@@ -27,6 +27,9 @@ import {
 import { channelSchema } from '../../types'
 import {
   CHANNEL_FORM_DEFAULT_VALUES,
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID,
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
   channelFormSchema,
   transformChannelToFormDefaults,
   transformFormDataToCreatePayload,
@@ -143,6 +146,8 @@ describe('OpenCode Go channel configuration', () => {
 
     assert.deepEqual(settings.opencode_go, {
       billing_usage_conversion_enabled: true,
+      unsupported_optional_field_policy:
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
       identity_proxy_enabled: false,
       identity_proxy_country: 'US',
       identity_proxy_rotate_minutes: 10,
@@ -173,6 +178,153 @@ describe('OpenCode Go channel configuration', () => {
       }).success,
       true
     )
+  })
+
+  test('defaults only an absent optional-field policy and round-trips valid values', () => {
+    for (const [name, persisted, expected] of [
+      [
+        'missing',
+        undefined,
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
+      ],
+      [
+        'strict',
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
+      ],
+      [
+        'compatibility',
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+      ],
+    ] as const) {
+      const openCodeGo: Record<string, unknown> = {
+        future_protocol_setting: 'keep-me',
+      }
+      if (persisted !== undefined) {
+        openCodeGo.unsupported_optional_field_policy = persisted
+      }
+      const channel = channelSchema.parse({
+        id: 6200,
+        type: CHANNEL_TYPE_OPENCODE_GO,
+        key: '',
+        status: 1,
+        name: `OpenCode Go ${name}`,
+        created_time: 1,
+        test_time: 0,
+        response_time: 0,
+        balance_updated_time: 0,
+        base_url: OPENCODE_GO_BASE_URL,
+        models: 'glm-5.2',
+        settings: JSON.stringify({ opencode_go: openCodeGo }),
+      })
+
+      const defaults = transformChannelToFormDefaults(channel)
+      assert.equal(
+        defaults.opencode_go_unsupported_optional_field_policy,
+        expected,
+        name
+      )
+      const parsed = channelFormSchema.safeParse(defaults)
+      assert.equal(parsed.success, true, name)
+      if (!parsed.success) continue
+
+      const update = transformFormDataToUpdatePayload(parsed.data, channel.id)
+      const settings = JSON.parse(String(update.settings))
+      assert.equal(
+        settings.opencode_go.unsupported_optional_field_policy,
+        expected,
+        name
+      )
+      assert.equal(settings.opencode_go.future_protocol_setting, 'keep-me')
+    }
+  })
+
+  test('keeps every invalid persisted optional-field policy visibly invalid until repaired', () => {
+    const invalidPolicies: unknown[] = [
+      null,
+      '',
+      true,
+      1,
+      {},
+      [],
+      'future_policy',
+    ]
+
+    for (const persisted of invalidPolicies) {
+      const channel = channelSchema.parse({
+        id: 6201,
+        type: CHANNEL_TYPE_OPENCODE_GO,
+        key: '',
+        status: 1,
+        name: 'OpenCode Go invalid policy',
+        created_time: 1,
+        test_time: 0,
+        response_time: 0,
+        balance_updated_time: 0,
+        base_url: OPENCODE_GO_BASE_URL,
+        models: 'glm-5.2',
+        settings: JSON.stringify({
+          retained_setting: 'keep-root',
+          opencode_go: {
+            retained_nested_setting: 'keep-nested',
+            unsupported_optional_field_policy: persisted,
+          },
+        }),
+      })
+
+      const defaults = transformChannelToFormDefaults(channel)
+      assert.equal(
+        defaults.opencode_go_unsupported_optional_field_policy,
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID
+      )
+      const invalidResult = channelFormSchema.safeParse(defaults)
+      assert.equal(invalidResult.success, false, JSON.stringify(persisted))
+      if (!invalidResult.success) {
+        assert.equal(
+          invalidResult.error.issues.some(
+            (issue) =>
+              issue.path[0] === 'opencode_go_unsupported_optional_field_policy'
+          ),
+          true
+        )
+      }
+      assert.throws(
+        () => transformFormDataToUpdatePayload(defaults, channel.id),
+        /Select a valid unsupported optional field policy/
+      )
+
+      const repaired = channelFormSchema.parse({
+        ...defaults,
+        opencode_go_unsupported_optional_field_policy:
+          OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+      })
+      const update = transformFormDataToUpdatePayload(repaired, channel.id)
+      const settings = JSON.parse(String(update.settings))
+      assert.equal(settings.retained_setting, 'keep-root')
+      assert.equal(settings.opencode_go.retained_nested_setting, 'keep-nested')
+      assert.equal(
+        settings.opencode_go.unsupported_optional_field_policy,
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN
+      )
+    }
+  })
+
+  test('does not let stale OpenCode settings block a channel changed to another type', () => {
+    const parsed = channelFormSchema.safeParse({
+      ...CHANNEL_FORM_DEFAULT_VALUES,
+      name: 'Changed channel type',
+      type: 1,
+      models: 'gpt-4o-mini',
+      opencode_go_unsupported_optional_field_policy:
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID,
+    })
+
+    assert.equal(parsed.success, true)
+    if (!parsed.success) return
+    const payload = transformFormDataToCreatePayload(parsed.data)
+    const settings = JSON.parse(String(payload.channel.settings))
+    assert.equal('opencode_go' in settings, false)
   })
 
   test('round-trips an empty-pool channel without exposing a key', () => {

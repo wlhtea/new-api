@@ -444,7 +444,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				return newRelayInvalidRequestError(bodyErr)
 			}
 			c.Request.Body = io.NopCloser(bodyStorage)
-			return relaySelectedChannel(c, relayFormat, relayInfo)
+			return relayOpenCodePhysicalAttempt(c, func() *types.NewAPIError {
+				return relaySelectedChannel(c, relayFormat, relayInfo)
+			})
 		})
 
 		if newAPIError == nil {

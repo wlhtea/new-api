@@ -40,7 +40,12 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 
-import type { ChannelFormInput } from '../../../lib/channel-form'
+import {
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID,
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
+  type ChannelFormInput,
+} from '../../../lib/channel-form'
 
 type OpenCodeProtocolSettingsProps = {
   title: string
@@ -130,6 +135,88 @@ export function OpenCodeProtocolSettings(props: OpenCodeProtocolSettingsProps) {
           )}
         />
       </div>
+
+      <FormField
+        control={form.control}
+        name='opencode_go_unsupported_optional_field_policy'
+        render={({ field }) => {
+          const hasInvalidPersistedPolicy =
+            field.value ===
+            OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID
+
+          return (
+            <FormItem>
+              <FormLabel>{t('Unsupported optional field policy')}</FormLabel>
+              <Select
+                items={[
+                  {
+                    value: OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
+                    label: t('Strict: reject unrelayable registered hints'),
+                  },
+                  {
+                    value:
+                      OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+                    label: t('Drop known optional hints'),
+                  },
+                  {
+                    value:
+                      OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID,
+                    label: t('Invalid stored policy'),
+                  },
+                ]}
+                value={field.value}
+                onValueChange={field.onChange}
+              >
+                <FormControl>
+                  <SelectTrigger aria-invalid={hasInvalidPersistedPolicy}>
+                    <SelectValue />
+                  </SelectTrigger>
+                </FormControl>
+                <SelectContent alignItemWithTrigger={false}>
+                  <SelectGroup>
+                    <SelectItem
+                      value={
+                        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT
+                      }
+                    >
+                      {t('Strict: reject unrelayable registered hints')}
+                    </SelectItem>
+                    <SelectItem
+                      value={
+                        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN
+                      }
+                    >
+                      {t('Drop known optional hints')}
+                    </SelectItem>
+                    <SelectItem
+                      value={
+                        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID
+                      }
+                      disabled
+                    >
+                      {t('Invalid stored policy')}
+                    </SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <FormDescription
+                className={
+                  hasInvalidPersistedPolicy ? 'text-destructive' : undefined
+                }
+              >
+                {hasInvalidPersistedPolicy
+                  ? t(
+                      'The stored policy is invalid. Select a valid policy before saving.'
+                    )
+                  : t(
+                      'Malformed, unknown, security-sensitive, and core-semantic fields are always rejected.'
+                    )}
+              </FormDescription>
+              <FormMessage />
+            </FormItem>
+          )
+        }}
+      />
 
       <FormField
         control={form.control}

@@ -330,16 +330,23 @@ func (a *Adaptor) convertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 		}
 		request = &copy
 	}
-	usesFunctionTools := requestUsesFunctionTools(request)
-	a.statefulResponses = requestUsesStatefulResponses(request)
-	protocol, _ = effectiveRequestProtocol(protocol, info.RelayFormat, request)
 	plan, planned, err := AssertRequestPreflightPlan(c, info, request)
 	if err != nil {
 		return nil, err
 	}
 	if planned {
 		protocol = plan.FinalProtocol
+		cachePlan, planErr := cacheControlDispositionPlanFromPreflight(plan)
+		if planErr != nil {
+			return nil, planErr
+		}
+		request, planErr = applyCacheControlDispositionPlan(request, cachePlan)
+		if planErr != nil {
+			return nil, planErr
+		}
 	}
+	usesFunctionTools := requestUsesFunctionTools(request)
+	a.statefulResponses = requestUsesStatefulResponses(request)
 	a.protocol = protocol
 
 	a.cacheIdentity = cacheIdentityForRequest(c, info, request)

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -195,6 +196,46 @@ func TestOpenCodeAPIKeyChannelValidatesOnlySharedProtocolSettings(t *testing.T) 
 	poolOnlyInvalid.ModelProtocols = map[string]string{"future-[": dto.OpenCodeGoProtocolMessages}
 	channel.SetOtherSettings(dto.ChannelOtherSettings{OpenCodeGo: poolOnlyInvalid})
 	require.ErrorContains(t, channel.ValidateSettings(), "model protocol pattern")
+}
+
+func TestOpenCodeChannelsValidateUnsupportedOptionalFieldPolicyAtSaveTime(t *testing.T) {
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		for _, rawValue := range []string{`""`, `null`, `true`, `1`, `{}`, `[]`, `"ignore_all"`} {
+			t.Run(fmt.Sprintf("type-%d/%s", channelType, rawValue), func(t *testing.T) {
+				channel := &Channel{
+					Type:          channelType,
+					OtherSettings: `{"opencode_go":{"unsupported_optional_field_policy":` + rawValue + `}}`,
+				}
+				err := channel.ValidateSettings()
+				require.Error(t, err)
+			})
+		}
+		for _, policy := range []string{
+			dto.OpenCodeGoUnsupportedOptionalFieldStrict,
+			dto.OpenCodeGoUnsupportedOptionalFieldDropKnown,
+		} {
+			t.Run(fmt.Sprintf("type-%d/%s", channelType, policy), func(t *testing.T) {
+				channel := &Channel{Type: channelType}
+				channel.SetOtherSettings(dto.ChannelOtherSettings{OpenCodeGo: &dto.OpenCodeGoConfig{
+					UnsupportedOptionalFieldPolicy: policy,
+				}})
+				require.NoError(t, channel.ValidateSettings())
+				persisted := channel.GetOtherSettings().OpenCodeGo
+				require.NotNil(t, persisted)
+				assert.Equal(t, policy, persisted.EffectiveUnsupportedOptionalFieldPolicy())
+			})
+		}
+	}
+
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		channel := &Channel{Type: channelType, OtherSettings: `{"opencode_go":{"future":true}}`}
+		require.NoError(t, channel.ValidateSettings())
+		assert.Equal(
+			t,
+			dto.OpenCodeGoUnsupportedOptionalFieldStrict,
+			channel.GetOtherSettings().OpenCodeGo.EffectiveUnsupportedOptionalFieldPolicy(),
+		)
+	}
 }
 
 func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(t *testing.T) {

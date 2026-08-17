@@ -106,7 +106,13 @@ func finalizeOutboundRequest(
 	if err != nil {
 		return nil, err
 	}
-	if err := ValidateRequestPathContracts(envelope, info.RelayFormat, finalProtocol, originalRequest); err != nil {
+	cachePlan, err := cacheControlPlanForFinalizer(c, info, envelope, finalProtocol, originalRequest)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateRequestPathContractsWithCachePlan(
+		envelope, info.RelayFormat, finalProtocol, originalRequest, &cachePlan,
+	); err != nil {
 		return nil, err
 	}
 	clientExtensions, err := collectClientExtensionFields(envelope, info.RelayFormat, finalProtocol)
@@ -118,7 +124,7 @@ func finalizeOutboundRequest(
 		return nil, err
 	}
 
-	jsonData, err = mergeSameProtocolPreservedFields(c, info, envelope, finalProtocol, jsonData)
+	jsonData, err = mergeSameProtocolPreservedFields(c, info, envelope, finalProtocol, &cachePlan, jsonData)
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +173,9 @@ func finalizeOutboundRequest(
 			return nil, err
 		}
 	}
+	if err := assertCacheControlDisposition(jsonData, cachePlan); err != nil {
+		return nil, newCacheControlFinalizerInvariantError(err)
+	}
 	protectedFields, err := captureProtectedOutboundFields(
 		envelope, info.RelayFormat, finalProtocol, projection, wireEffort, jsonData,
 	)
@@ -189,6 +198,9 @@ func finalizeOutboundRequest(
 	}
 	if err := assertProtectedOutboundFields(jsonData, protectedFields); err != nil {
 		return nil, err
+	}
+	if err := assertCacheControlDisposition(jsonData, cachePlan); err != nil {
+		return nil, newCacheControlFinalizerConfigError(err)
 	}
 	finalEffort, err := validateFinalOutboundRequest(
 		jsonData,
@@ -1033,6 +1045,7 @@ func mergeSameProtocolPreservedFields(
 	info *relaycommon.RelayInfo,
 	envelope *helper.ValidatedRequestEnvelope,
 	finalProtocol Protocol,
+	cachePlan *CacheControlDispositionPlan,
 	convertedJSON []byte,
 ) ([]byte, error) {
 	if info.RelayFormat != finalProtocol.RelayFormat() {
@@ -1054,9 +1067,20 @@ func mergeSameProtocolPreservedFields(
 	if err := common.Unmarshal(convertedJSON, &convertedFields); err != nil || convertedFields == nil {
 		return nil, errors.New("converted OpenCode request is not a JSON object")
 	}
+	normalizedMessagesRaw, normalizedSystemMessages, err := normalizedClaudeMessagesRawForSameProtocol(
+		envelope,
+		info.RelayFormat,
+		finalProtocol,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	result := convertedJSON
 	for _, field := range envelope.TopLevelFieldNames() {
+		if cachePlan != nil && cachePlan.dropsSourcePath(cachePath(cacheKey(field))) {
+			continue
+		}
 		contract, found := LookupRequestPathContract(info.RelayFormat, finalProtocol, field)
 		if !found || contract.WireAction != RequestPathWirePreserve {
 			continue
@@ -1064,6 +1088,9 @@ func mergeSameProtocolPreservedFields(
 		raw, present, err := envelope.RawTopLevelField(field)
 		if err != nil {
 			return nil, err
+		}
+		if normalizedSystemMessages && field == "messages" {
+			raw = normalizedMessagesRaw
 		}
 		if !present {
 			return nil, errors.New("validated OpenCode request inventory lost a top-level field")
@@ -1074,6 +1101,15 @@ func mergeSameProtocolPreservedFields(
 		unchanged, err := semanticJSONPresenceEqual(original, originalPresent, converted, convertedPresent)
 		if err != nil {
 			return nil, err
+		}
+		if normalizedSystemMessages && field == "system" {
+			if !unchanged {
+				return nil, newRequestPathContractClientError(RequestContractPreserveConflictRule)
+			}
+			// Message-level system entries were deliberately merged into this
+			// typed field during validation. Restoring only the raw top-level
+			// value would erase those validated additions.
+			continue
 		}
 		if unchanged {
 			if originalPresent {
@@ -1113,6 +1149,53 @@ func mergeSameProtocolPreservedFields(
 		}
 	}
 	return result, nil
+}
+
+func normalizedClaudeMessagesRawForSameProtocol(
+	envelope *helper.ValidatedRequestEnvelope,
+	clientFormat types.RelayFormat,
+	finalProtocol Protocol,
+) ([]byte, bool, error) {
+	if envelope == nil || clientFormat != types.RelayFormatClaude || finalProtocol != ProtocolMessages {
+		return nil, false, nil
+	}
+	raw, present, err := envelope.RawTopLevelField("messages")
+	if err != nil {
+		return nil, false, err
+	}
+	if !present {
+		return nil, false, errors.New("validated Messages request lost messages")
+	}
+	var messages []json.RawMessage
+	if err := common.Unmarshal(raw, &messages); err != nil {
+		return nil, false, errors.New("validated Messages array cannot be decoded")
+	}
+	filtered := make([]json.RawMessage, 0, len(messages))
+	normalized := false
+	for _, message := range messages {
+		var header struct {
+			Role string `json:"role"`
+		}
+		if err := common.Unmarshal(message, &header); err != nil {
+			return nil, false, errors.New("validated Messages entry cannot be decoded")
+		}
+		switch header.Role {
+		case "user", "assistant":
+			filtered = append(filtered, message)
+		case "system":
+			normalized = true
+		default:
+			return nil, false, errors.New("validated Messages role cannot be normalized")
+		}
+	}
+	if !normalized {
+		return nil, false, nil
+	}
+	normalizedRaw, err := common.Marshal(filtered)
+	if err != nil {
+		return nil, false, errors.New("normalized Messages array cannot be encoded")
+	}
+	return normalizedRaw, true, nil
 }
 
 func semanticJSONPresenceEqual(

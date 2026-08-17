@@ -5491,6 +5491,12 @@
     "Zero retention": "零数据保留",
     "Zhipu": "智谱",
     "Zhipu V4": "智谱 V4",
+    "Unsupported optional field policy": "不支持的可选字段策略",
+    "Strict: reject unrelayable registered hints": "严格：拒绝无法转发的已登记提示",
+    "Drop known optional hints": "丢弃已登记的可选提示",
+    "Invalid stored policy": "已存储的策略无效",
+    "The stored policy is invalid. Select a valid policy before saving.": "已存储的策略无效。请先选择有效策略再保存。",
+    "Malformed, unknown, security-sensitive, and core-semantic fields are always rejected.": "畸形、未知、安全敏感和核心语义字段始终会被拒绝。",
     "Zoom": "缩放"
   }
 }

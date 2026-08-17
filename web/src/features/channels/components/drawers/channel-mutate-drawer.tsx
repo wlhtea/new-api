@@ -1000,6 +1000,7 @@ export function ChannelMutateDrawer({
     formErrors.vertex_key_type ||
     formErrors.aws_key_type ||
     formErrors.azure_responses_version ||
+    formErrors.opencode_go_unsupported_optional_field_policy ||
     formErrors.opencode_go_identity_proxy_enabled ||
     formErrors.opencode_go_identity_proxy_country ||
     formErrors.opencode_go_identity_proxy_rotate_minutes

@@ -839,7 +839,7 @@ func TestAdaptorKeepsClaudeChatFamilyFunctionToolsOnChat(t *testing.T) {
 	assert.Equal(t, constant.ChannelBaseURLs[constant.ChannelTypeOpenCodeGo]+"/chat/completions", requestURL)
 }
 
-func TestAdaptorRoutesOpenAIChatFamilyFunctionToolsThroughResponses(t *testing.T) {
+func TestAdaptorKeepsOpenAIChatFamilyFunctionToolsOnConfiguredChat(t *testing.T) {
 	info := newAdaptorTestInfo("glm-5.2", false)
 	request := requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest)
 	request.Tools = []dto.ToolCallRequest{
@@ -855,9 +855,9 @@ func TestAdaptorRoutesOpenAIChatFamilyFunctionToolsThroughResponses(t *testing.T
 
 	converted, err := adaptor.ConvertOpenAIRequest(newAdaptorTestContext(), info, request)
 	require.NoError(t, err)
-	require.IsType(t, &dto.OpenAIResponsesRequest{}, converted)
-	assert.Equal(t, ProtocolResponses, adaptor.protocol)
-	assert.Equal(t, types.RelayFormat(types.RelayFormatOpenAIResponses), info.FinalRequestRelayFormat)
+	require.IsType(t, &dto.GeneralOpenAIRequest{}, converted)
+	assert.Equal(t, ProtocolChat, adaptor.protocol)
+	assert.Equal(t, types.RelayFormat(types.RelayFormatOpenAI), info.FinalRequestRelayFormat)
 }
 
 func TestAdaptorAddsOpenCodeGoResponsesFunctionCallIDFromClaude(t *testing.T) {
@@ -1162,6 +1162,9 @@ func TestReasoningToolResponseRoundTripsIntoChatContinuation(t *testing.T) {
 
 func TestAdaptorAddsOpenCodeGoResponsesFunctionCallID(t *testing.T) {
 	info := newAdaptorTestInfo("glm-5.2", false)
+	info.ChannelOtherSettings.OpenCodeGo = &dto.OpenCodeGoConfig{
+		ModelProtocols: map[string]string{"glm-5.2": dto.OpenCodeGoProtocolResponses},
+	}
 	request := requestForFormat(types.RelayFormatOpenAI).(*dto.GeneralOpenAIRequest)
 	request.Tools = []dto.ToolCallRequest{
 		{Type: "function", Function: dto.FunctionRequest{Name: "Bash"}},

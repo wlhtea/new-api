@@ -157,7 +157,7 @@ func TestGetAndValidateRequestRejectsProtocolFieldErrors(t *testing.T) {
 		{name: "messages content type missing", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"user","content":[{"text":"hello"}]}]}`, wantDetail: "messages[0].content[0].type"},
 		{name: "messages text missing", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"user","content":[{"type":"text"}]}]}`, wantDetail: "messages[0].content[0].text"},
 		{name: "messages tool use missing id", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"assistant","content":[{"type":"tool_use","name":"lookup","input":{}}]}]}`, wantDetail: "messages[0].content[0].id"},
-		{name: "messages tool use input must be object", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":"{}"}]}]}`, wantDetail: "messages[0].content[0].input"},
+		{name: "messages tool use input is required", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"lookup"}]}]}`, wantDetail: "messages[0].content[0].input"},
 		{name: "messages tool result missing id", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"user","content":[{"type":"tool_result","content":"ok"}]}]}`, wantDetail: "messages[0].content[0].tool_use_id"},
 		{name: "messages tool result content wrong type", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":42}]}]}`, wantDetail: "messages[0].content[0].content"},
 		{name: "messages system media is unsupported", path: "/v1/messages", format: types.RelayFormatClaude, body: `{"model":"test-model","messages":[{"role":"system","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]},{"role":"user","content":"hello"}]}`, wantDetail: "messages[0].content[0].type"},
@@ -247,6 +247,28 @@ func TestGetAndValidateRequestRejectsProtocolFieldErrors(t *testing.T) {
 			validationErr, ok := AsClientRequestValidationError(err)
 			require.True(t, ok)
 			require.Equal(t, http.StatusBadRequest, validationErr.StatusCode)
+		})
+	}
+}
+
+func TestGetAndValidateRequestAcceptsClaudeToolUseUnknownInput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		name  string
+		input string
+	}{
+		{name: "object", input: `{"query":"value"}`},
+		{name: "array", input: `["value",true]`},
+		{name: "string", input: `"value"`},
+		{name: "number", input: `42`},
+		{name: "boolean", input: `true`},
+		{name: "null", input: `null`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"model":"test-model","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":` + test.input + `}]}]}`)
+			c := newRelayValidationContext(t, "/v1/messages", body)
+			_, err := GetAndValidateRequest(c, types.RelayFormatClaude)
+			require.NoError(t, err)
 		})
 	}
 }

@@ -30,6 +30,9 @@ import {
 import { channelSchema } from '../../types'
 import {
   CHANNEL_FORM_DEFAULT_VALUES,
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID,
+  OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
   channelFormSchema,
   transformChannelToFormDefaults,
   transformFormDataToCreatePayload,
@@ -226,6 +229,8 @@ describe('OpenCode API Key channel', () => {
     assert.deepEqual(settings.opencode_go, {
       future_protocol_setting: 'keep-me-too',
       billing_usage_conversion_enabled: false,
+      unsupported_optional_field_policy:
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
       model_protocols: { 'glm-*': 'messages' },
       default_protocol: 'responses',
     })
@@ -243,6 +248,8 @@ describe('OpenCode API Key channel', () => {
       proxy: 'https://stale-proxy.invalid:8443',
       batch_add_set_key_prefix_2_name: true,
       opencode_go_default_protocol: 'messages',
+      opencode_go_unsupported_optional_field_policy:
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
       opencode_go_model_protocols: '{"qwen*":"messages"}',
     })
     const setting = JSON.parse(String(result.channel.setting))
@@ -254,6 +261,8 @@ describe('OpenCode API Key channel', () => {
     assert.equal(result.batch_add_set_key_prefix_2_name, undefined)
     assert.deepEqual(settings.opencode_go, {
       billing_usage_conversion_enabled: true,
+      unsupported_optional_field_policy:
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
       model_protocols: { 'qwen*': 'messages' },
       default_protocol: 'messages',
     })
@@ -308,10 +317,97 @@ describe('OpenCode API Key channel', () => {
     assert.equal(settings.retained_setting, 'keep-me')
     assert.deepEqual(settings.opencode_go, {
       billing_usage_conversion_enabled: false,
+      unsupported_optional_field_policy:
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT,
       future_protocol_setting: 'keep-me-too',
       model_protocols: { 'glm-*': 'messages' },
       default_protocol: 'chat',
     })
+  })
+
+  test('shares fail-closed optional-field policy persistence with Type 62', () => {
+    for (const persisted of [null, '', false, 2, {}, [], 'unknown_policy']) {
+      const channel = channelSchema.parse({
+        id: 6302,
+        type: CHANNEL_TYPE_OPENCODE_API_KEY,
+        key: '',
+        status: 1,
+        name: 'Imported invalid policy',
+        created_time: 1,
+        test_time: 0,
+        response_time: 0,
+        balance_updated_time: 0,
+        base_url: OPENCODE_API_KEY_BASE_URL,
+        models: 'glm-5.2',
+        group: 'opencode-key-pool',
+        settings: JSON.stringify({
+          retained_setting: 'keep-root',
+          opencode_go: {
+            future_protocol_setting: 'keep-nested',
+            unsupported_optional_field_policy: persisted,
+          },
+        }),
+      })
+
+      const defaults = transformChannelToFormDefaults(channel)
+      assert.equal(
+        defaults.opencode_go_unsupported_optional_field_policy,
+        OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_INVALID
+      )
+      assert.equal(channelFormSchema.safeParse(defaults).success, false)
+      assert.throws(
+        () => transformFormDataToUpdatePayload(defaults, channel.id),
+        /Select a valid unsupported optional field policy/
+      )
+    }
+
+    const channel = channelSchema.parse({
+      id: 6303,
+      type: CHANNEL_TYPE_OPENCODE_API_KEY,
+      key: '',
+      status: 1,
+      name: 'Imported compatibility policy',
+      created_time: 1,
+      test_time: 0,
+      response_time: 0,
+      balance_updated_time: 0,
+      base_url: OPENCODE_API_KEY_BASE_URL,
+      models: 'glm-5.2',
+      group: 'opencode-key-pool',
+      settings: JSON.stringify({
+        retained_setting: 'keep-root',
+        opencode_go: {
+          future_protocol_setting: 'keep-nested',
+          unsupported_optional_field_policy:
+            OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN,
+        },
+      }),
+    })
+    const defaults = transformChannelToFormDefaults(channel)
+    assert.equal(
+      defaults.opencode_go_unsupported_optional_field_policy,
+      OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN
+    )
+    const parsed = channelFormSchema.parse(defaults)
+    const update = transformFormDataToUpdatePayload(parsed, channel.id)
+    const settings = JSON.parse(String(update.settings))
+    assert.equal(settings.retained_setting, 'keep-root')
+    assert.equal(settings.opencode_go.future_protocol_setting, 'keep-nested')
+    assert.equal(
+      settings.opencode_go.unsupported_optional_field_policy,
+      OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_DROP_KNOWN
+    )
+
+    const legacyChannel = channelSchema.parse({
+      ...channel,
+      id: 6304,
+      settings: JSON.stringify({ opencode_go: {} }),
+    })
+    assert.equal(
+      transformChannelToFormDefaults(legacyChannel)
+        .opencode_go_unsupported_optional_field_policy,
+      OPENCODE_GO_UNSUPPORTED_OPTIONAL_FIELD_POLICY_STRICT
+    )
   })
 
   test('deduplicates pair lines by key while preserving the first proxy value', () => {

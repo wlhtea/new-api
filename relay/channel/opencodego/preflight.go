@@ -19,7 +19,7 @@ import (
 const (
 	requestPreflightContextKey          = "opencodego_request_preflight_v1"
 	requestPreflightRejectionContextKey = "opencodego_request_preflight_rejection_v1"
-	requestPreflightVersion             = "opencodego-request-preflight-v2"
+	requestPreflightVersion             = "opencodego-request-preflight-v3"
 
 	PreflightRoutingStage               = "preflight.routing"
 	PreflightAssertionStage             = "preflight.assertion"
@@ -28,25 +28,28 @@ const (
 	PreflightProtocolConfigInvalidRule  = "gateway.protocol-routing.invalid"
 	PreflightCandidateConfigInvalidRule = "gateway.channel-config.invalid"
 	PreflightPlanMismatchRule           = "gateway.preflight-plan.mismatch"
-
-	DynamicProtocolReasonChatFunctionTools = "chat-function-tools-without-assistant-reasoning"
 )
 
 type RequestPreflightPlan struct {
-	Version            string
-	ChannelType        int
-	ChannelID          int
-	SelectionGroup     string
-	ClientFormat       types.RelayFormat
-	OriginModel        string
-	FinalModel         string
-	ModelMapped        bool
-	BaseProtocol       Protocol
-	FinalProtocol      Protocol
-	ProtocolSource     ProtocolResolutionSource
-	DynamicReason      string
-	ConfigFingerprint  string
-	CapabilityRevision string
+	Version                        string
+	ChannelType                    int
+	ChannelID                      int
+	SelectionGroup                 string
+	ClientFormat                   types.RelayFormat
+	OriginModel                    string
+	FinalModel                     string
+	ModelMapped                    bool
+	BaseProtocol                   Protocol
+	FinalProtocol                  Protocol
+	ProtocolSource                 ProtocolResolutionSource
+	ConfigFingerprint              string
+	CapabilityRevision             string
+	UnsupportedOptionalFieldPolicy string
+	CacheControlRegistryVersion    string
+	CacheControlPlanCanonical      string
+	CacheControlPlanFingerprint    string
+	CacheControlPreserveCount      int
+	CacheControlDropCount          int
 }
 
 // RequestPreflightPlanKey identifies one frozen routing candidate. Channel IDs
@@ -163,7 +166,20 @@ func BuildRequestPreflightPlan(c *gin.Context, info *relaycommon.RelayInfo) (Req
 		}
 	}
 
-	finalProtocol, dynamicReason := effectiveRequestProtocol(protocol.Protocol, info.RelayFormat, info.Request)
+	finalProtocol := protocol.Protocol
+	cachePlan, err := BuildCacheControlDispositionPlan(
+		envelope,
+		info.RelayFormat,
+		finalProtocol,
+		info.Request,
+		otherSettings.OpenCodeGo.EffectiveUnsupportedOptionalFieldPolicy(),
+	)
+	if err != nil {
+		if preflightErr, ok := newRequestPreflightClientError(err); ok {
+			return RequestPreflightPlan{}, preflightErr
+		}
+		return RequestPreflightPlan{}, newPreflightInvariantError(err)
+	}
 	if err := ValidateMessagesStopSourceCollision(envelope, info.RelayFormat); err != nil {
 		if preflightErr, ok := newRequestPreflightClientError(err); ok {
 			return RequestPreflightPlan{}, preflightErr
@@ -182,7 +198,9 @@ func BuildRequestPreflightPlan(c *gin.Context, info *relaycommon.RelayInfo) (Req
 		}
 		return RequestPreflightPlan{}, newPreflightInvariantError(err)
 	}
-	if err := ValidateRequestPathContracts(envelope, info.RelayFormat, finalProtocol, info.Request); err != nil {
+	if err := ValidateRequestPathContractsWithCachePlan(
+		envelope, info.RelayFormat, finalProtocol, info.Request, &cachePlan,
+	); err != nil {
 		if preflightErr, ok := newRequestPreflightClientError(err); ok {
 			return RequestPreflightPlan{}, preflightErr
 		}
@@ -194,19 +212,24 @@ func BuildRequestPreflightPlan(c *gin.Context, info *relaycommon.RelayInfo) (Req
 		return RequestPreflightPlan{}, newPreflightInvariantError(err)
 	}
 	return RequestPreflightPlan{
-		Version:           requestPreflightVersion,
-		ChannelType:       channelType,
-		ChannelID:         common.GetContextKeyInt(c, constant.ContextKeyChannelId),
-		SelectionGroup:    relaycommon.ResolveSelectionGroup(c, info),
-		ClientFormat:      info.RelayFormat,
-		OriginModel:       mapping.OriginModel,
-		FinalModel:        mapping.FinalModel,
-		ModelMapped:       mapping.Mapped,
-		BaseProtocol:      protocol.Protocol,
-		FinalProtocol:     finalProtocol,
-		ProtocolSource:    protocol.Source,
-		DynamicReason:     dynamicReason,
-		ConfigFingerprint: fingerprint,
+		Version:                        requestPreflightVersion,
+		ChannelType:                    channelType,
+		ChannelID:                      common.GetContextKeyInt(c, constant.ContextKeyChannelId),
+		SelectionGroup:                 relaycommon.ResolveSelectionGroup(c, info),
+		ClientFormat:                   info.RelayFormat,
+		OriginModel:                    mapping.OriginModel,
+		FinalModel:                     mapping.FinalModel,
+		ModelMapped:                    mapping.Mapped,
+		BaseProtocol:                   protocol.Protocol,
+		FinalProtocol:                  finalProtocol,
+		ProtocolSource:                 protocol.Source,
+		ConfigFingerprint:              fingerprint,
+		UnsupportedOptionalFieldPolicy: cachePlan.Policy,
+		CacheControlRegistryVersion:    cachePlan.RegistryVersion,
+		CacheControlPlanCanonical:      cachePlan.Canonical,
+		CacheControlPlanFingerprint:    cachePlan.Fingerprint,
+		CacheControlPreserveCount:      cachePlan.PreserveCount,
+		CacheControlDropCount:          cachePlan.DropCount,
 	}, nil
 }
 
@@ -241,7 +264,9 @@ func StoreRequestPreflightPlans(c *gin.Context, plans []RequestPreflightPlan) er
 		Plans:   make(map[RequestPreflightPlanKey]RequestPreflightPlan, len(plans)),
 	}
 	for _, plan := range plans {
-		if plan.Version != requestPreflightVersion || plan.ChannelID <= 0 || plan.ConfigFingerprint == "" {
+		if plan.Version != requestPreflightVersion || plan.ChannelID <= 0 || plan.ConfigFingerprint == "" ||
+			plan.UnsupportedOptionalFieldPolicy == "" || plan.CacheControlRegistryVersion == "" ||
+			plan.CacheControlPlanCanonical == "" || plan.CacheControlPlanFingerprint == "" {
 			return errors.New("OpenCode request preflight plan is invalid")
 		}
 		key := plan.Key()
@@ -280,6 +305,32 @@ func NewRequestPreflightFinalizationError(cause error) error {
 			RuleID:     validationErr.RuleID,
 			StageID:    validationErr.StageID,
 			Message:    validationErr.Message,
+			cause:      cause,
+		}
+	}
+	if cacheErr, ok := AsCacheControlFinalizerError(cause); ok {
+		statusCode := http.StatusInternalServerError
+		origin := types.ErrorOriginGatewayInvariant
+		message := "OpenCode cache-control finalization invariant failed"
+		if cacheErr.Configuration {
+			statusCode = http.StatusServiceUnavailable
+			origin = types.ErrorOriginGatewayConfig
+			message = "OpenCode cache-control finalization configuration is invalid"
+		}
+		ruleID := strings.TrimSpace(cacheErr.RuleID)
+		if ruleID == "" {
+			ruleID = CacheControlPlanMismatchRule
+		}
+		stageID := strings.TrimSpace(cacheErr.StageID)
+		if stageID == "" {
+			stageID = CacheControlFinalizerStage
+		}
+		return &RequestPreflightError{
+			StatusCode: statusCode,
+			Origin:     origin,
+			RuleID:     ruleID,
+			StageID:    stageID,
+			Message:    message,
 			cause:      cause,
 		}
 	}
@@ -332,7 +383,8 @@ func getRequestPreflightPlanForSelection(
 		return RequestPreflightPlan{}, false, true, nil
 	}
 	if plan.Version != requestPreflightVersion || plan.ChannelID != channelID ||
-		plan.SelectionGroup != strings.TrimSpace(selectionGroup) || plan.ConfigFingerprint == "" {
+		plan.SelectionGroup != strings.TrimSpace(selectionGroup) || plan.ConfigFingerprint == "" ||
+		plan.CacheControlPlanCanonical == "" || plan.CacheControlPlanFingerprint == "" {
 		return RequestPreflightPlan{}, false, true, errors.New("OpenCode request preflight plan is corrupt")
 	}
 	return plan, true, true, nil
@@ -399,7 +451,17 @@ func AssertRequestPreflightPlan(
 	if err != nil {
 		return RequestPreflightPlan{}, true, newPreflightPlanMismatchError(err)
 	}
-	finalProtocol, dynamicReason := effectiveRequestProtocol(protocol.Protocol, info.RelayFormat, request)
+	finalProtocol := protocol.Protocol
+	cachePlan, err := BuildCacheControlDispositionPlan(
+		envelope,
+		info.RelayFormat,
+		finalProtocol,
+		request,
+		info.ChannelOtherSettings.OpenCodeGo.EffectiveUnsupportedOptionalFieldPolicy(),
+	)
+	if err != nil {
+		return RequestPreflightPlan{}, true, newPreflightPlanMismatchError(err)
+	}
 	fingerprint, err := requestPreflightConfigFingerprint(c.GetString("model_mapping"), info.ChannelOtherSettings.OpenCodeGo)
 	if err != nil {
 		return RequestPreflightPlan{}, true, newPreflightPlanMismatchError(err)
@@ -416,22 +478,19 @@ func AssertRequestPreflightPlan(
 		plan.BaseProtocol != protocol.Protocol ||
 		plan.FinalProtocol != finalProtocol ||
 		plan.ProtocolSource != protocol.Source ||
-		plan.DynamicReason != dynamicReason ||
 		plan.ConfigFingerprint != fingerprint ||
+		plan.UnsupportedOptionalFieldPolicy != cachePlan.Policy ||
+		plan.CacheControlRegistryVersion != cachePlan.RegistryVersion ||
+		plan.CacheControlPlanCanonical != cachePlan.Canonical ||
+		plan.CacheControlPlanFingerprint != cachePlan.Fingerprint ||
+		plan.CacheControlPreserveCount != cachePlan.PreserveCount ||
+		plan.CacheControlDropCount != cachePlan.DropCount ||
 		info.OriginModelName != plan.OriginModel ||
 		info.UpstreamModelName != plan.FinalModel ||
 		info.IsModelMapped != plan.ModelMapped {
 		return RequestPreflightPlan{}, true, newPreflightPlanMismatchError(errors.New("OpenCode request preflight plan no longer matches the selected attempt"))
 	}
 	return plan, true, nil
-}
-
-func effectiveRequestProtocol(base Protocol, clientFormat types.RelayFormat, request any) (Protocol, string) {
-	if base == ProtocolChat && clientFormat != types.RelayFormatClaude &&
-		requestUsesFunctionTools(request) && !requestContainsAssistantReasoning(request) {
-		return ProtocolResponses, DynamicProtocolReasonChatFunctionTools
-	}
-	return base, ""
 }
 
 func requestPreflightConfigFingerprint(rawMapping string, config *dto.OpenCodeGoConfig) (string, error) {

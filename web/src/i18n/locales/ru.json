@@ -5491,6 +5491,12 @@
     "Zero retention": "Без хранения данных",
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V4",
+    "Unsupported optional field policy": "Политика неподдерживаемых необязательных полей",
+    "Strict: reject unrelayable registered hints": "Строго: отклонять зарегистрированные подсказки, которые нельзя передать",
+    "Drop known optional hints": "Удалять известные необязательные подсказки",
+    "Invalid stored policy": "Недопустимая сохраненная политика",
+    "The stored policy is invalid. Select a valid policy before saving.": "Сохраненная политика недопустима. Перед сохранением выберите допустимую политику.",
+    "Malformed, unknown, security-sensitive, and core-semantic fields are always rejected.": "Некорректные, неизвестные, чувствительные к безопасности и семантически значимые поля всегда отклоняются.",
     "Zoom": "Zoom"
   }
 }

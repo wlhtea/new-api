@@ -301,6 +301,32 @@ func ValidateRequestPathContracts(
 	finalProtocol Protocol,
 	typedRequest any,
 ) error {
+	return validateRequestPathContracts(envelope, clientFormat, finalProtocol, typedRequest, nil)
+}
+
+func ValidateRequestPathContractsWithCachePlan(
+	envelope *helper.ValidatedRequestEnvelope,
+	clientFormat types.RelayFormat,
+	finalProtocol Protocol,
+	typedRequest any,
+	cachePlan *CacheControlDispositionPlan,
+) error {
+	if cachePlan == nil || cachePlan.ClientFormat != clientFormat || cachePlan.FinalProtocol != finalProtocol {
+		return errors.New("cache-control request contract plan is invalid")
+	}
+	if err := validateCacheControlPlanShape(*cachePlan); err != nil {
+		return err
+	}
+	return validateRequestPathContracts(envelope, clientFormat, finalProtocol, typedRequest, cachePlan)
+}
+
+func validateRequestPathContracts(
+	envelope *helper.ValidatedRequestEnvelope,
+	clientFormat types.RelayFormat,
+	finalProtocol Protocol,
+	typedRequest any,
+	cachePlan *CacheControlDispositionPlan,
+) error {
 	if envelope == nil {
 		return errors.New("validated request envelope is unavailable for request contract")
 	}
@@ -325,11 +351,17 @@ func ValidateRequestPathContracts(
 			}
 			continue
 		}
-		if contract.WireAction == RequestPathWireReject {
+		if contract.WireAction == RequestPathWireReject &&
+			(cachePlan == nil || !cachePlan.dropsSourcePath(cachePath(cacheKey(field)))) {
 			return newRequestPathContractClientError(RequestContractUnmappedPathRule)
 		}
 	}
 	if finalProtocol.RelayFormat() == clientFormat {
+		if clientFormat == types.RelayFormatClaude && cachePlan != nil && len(cachePlan.Entries) > 0 {
+			if err := validateSameProtocolClaudeCacheParents(envelope, finalProtocol, cachePlan); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	if typedRequest == nil {
@@ -362,7 +394,37 @@ func ValidateRequestPathContracts(
 			return errors.New("typed request field is unavailable for cross-protocol contract validation")
 		}
 		if !jsonValueFitsDeclaredType(value, fieldType) ||
-			!validateConverterOwnedNestedValue(clientFormat, finalProtocol, field, value) {
+			!validateConverterOwnedNestedValue(clientFormat, finalProtocol, field, value, cachePlan) {
+			return newRequestPathContractClientError(RequestContractUnmappedNestedRule)
+		}
+	}
+	return nil
+}
+
+func validateSameProtocolClaudeCacheParents(
+	envelope *helper.ValidatedRequestEnvelope,
+	finalProtocol Protocol,
+	cachePlan *CacheControlDispositionPlan,
+) error {
+	for _, field := range []string{"system", "messages", "tools"} {
+		raw, present, err := envelope.RawTopLevelField(field)
+		if err != nil {
+			return err
+		}
+		if !present {
+			continue
+		}
+		var value any
+		if err := common.Unmarshal(raw, &value); err != nil {
+			return errors.New("validated Messages cache parent cannot be decoded")
+		}
+		if !validateConverterOwnedNestedValue(
+			types.RelayFormatClaude,
+			finalProtocol,
+			field,
+			value,
+			cachePlan,
+		) {
 			return newRequestPathContractClientError(RequestContractUnmappedNestedRule)
 		}
 	}
@@ -516,6 +578,7 @@ func validateConverterOwnedNestedValue(
 	finalProtocol Protocol,
 	field string,
 	value any,
+	cachePlan *CacheControlDispositionPlan,
 ) bool {
 	switch clientFormat {
 	case types.RelayFormatOpenAI:
@@ -534,11 +597,11 @@ func validateConverterOwnedNestedValue(
 	case types.RelayFormatClaude:
 		switch field {
 		case "system":
-			return validateClaudeSystem(value)
+			return validateClaudeSystem(value, cachePlan)
 		case "messages":
-			return validateClaudeMessages(value, finalProtocol)
+			return validateClaudeMessages(value, finalProtocol, cachePlan)
 		case "tools":
-			return validateClaudeTools(value)
+			return validateClaudeTools(value, cachePlan)
 		}
 	case types.RelayFormatOpenAIResponses:
 		switch field {
@@ -816,7 +879,7 @@ func validateChatWebSearchOptions(value any) bool {
 	return true
 }
 
-func validateClaudeSystem(value any) bool {
+func validateClaudeSystem(value any, cachePlan *CacheControlDispositionPlan) bool {
 	if value == nil {
 		return true
 	}
@@ -827,17 +890,30 @@ func validateClaudeSystem(value any) bool {
 	if !ok {
 		return false
 	}
-	for _, part := range parts {
+	for index, part := range parts {
 		object, ok := part.(map[string]any)
-		if !ok || (object["type"] != "text" && object["type"] != "input_text") ||
-			!requestContractMapHasOnlyKeys(object, requestContractKeySet("type", "text")) {
+		if !ok || (object["type"] != "text" && object["type"] != "input_text") {
+			return false
+		}
+		if _, ok := object["text"].(string); !ok {
+			return false
+		}
+		allowed := requestContractKeySet("type", "text")
+		if _, present := object["cache_control"]; present {
+			path := cachePath(cacheKey("system"), cacheIndex(index), cacheKey("cache_control"))
+			if cachePlan == nil || !cachePlan.hasSourcePath(path) {
+				return false
+			}
+			allowed["cache_control"] = struct{}{}
+		}
+		if !requestContractMapHasOnlyKeys(object, allowed) {
 			return false
 		}
 	}
 	return true
 }
 
-func validateClaudeMessages(value any, finalProtocol Protocol) bool {
+func validateClaudeMessages(value any, finalProtocol Protocol, cachePlan *CacheControlDispositionPlan) bool {
 	if value == nil {
 		return true
 	}
@@ -845,17 +921,42 @@ func validateClaudeMessages(value any, finalProtocol Protocol) bool {
 	if !ok {
 		return false
 	}
-	for _, rawMessage := range messages {
+	for messageIndex, rawMessage := range messages {
 		message, ok := rawMessage.(map[string]any)
-		if !ok || !requestContractMapHasOnlyKeys(message, claudeMessageKeys) ||
-			!validateClaudeContent(message["content"], finalProtocol) {
+		if !ok || !requestContractMapHasOnlyKeys(message, claudeMessageKeys) {
+			return false
+		}
+		role, ok := message["role"].(string)
+		if !ok {
+			return false
+		}
+		switch role {
+		case "user", "assistant":
+			if !validateClaudeContent(
+				message["content"], finalProtocol, cachePlan, messageIndex, role,
+			) {
+				return false
+			}
+		case "system":
+			// The validated request normalizer moves these text-only entries to
+			// top-level system. They remain source-indexed here for raw-contract checks.
+			if message["content"] == nil || !validateClaudeSystem(message["content"], nil) {
+				return false
+			}
+		default:
 			return false
 		}
 	}
 	return true
 }
 
-func validateClaudeContent(value any, finalProtocol Protocol) bool {
+func validateClaudeContent(
+	value any,
+	finalProtocol Protocol,
+	cachePlan *CacheControlDispositionPlan,
+	messageIndex int,
+	role string,
+) bool {
 	if value == nil {
 		return true
 	}
@@ -868,7 +969,7 @@ func validateClaudeContent(value any, finalProtocol Protocol) bool {
 	}
 	hasToolUse := false
 	hasRegularContent := false
-	for _, rawPart := range parts {
+	for partIndex, rawPart := range parts {
 		part, ok := rawPart.(map[string]any)
 		if !ok {
 			return false
@@ -876,44 +977,111 @@ func validateClaudeContent(value any, finalProtocol Protocol) bool {
 		var allowed map[string]struct{}
 		switch part["type"] {
 		case "text", "input_text":
-			hasRegularContent = true
-			allowed = requestContractKeySet("type", "text")
-			if finalProtocol == ProtocolChat {
-				allowed["cache_control"] = struct{}{}
-			}
-		case "image":
-			hasRegularContent = true
-			allowed = requestContractKeySet("type", "source")
-			if source, present := part["source"]; !present ||
-				!requestContractObjectHasOnlyKeys(source, claudeSourceKeys) {
+			if _, ok := part["text"].(string); !ok {
 				return false
 			}
+			hasRegularContent = true
+			allowed = requestContractKeySet("type", "text")
+		case "image":
+			if role != "user" || !validateClaudeImageSource(part["source"]) {
+				return false
+			}
+			hasRegularContent = true
+			allowed = requestContractKeySet("type", "source")
 		case "tool_use":
+			id, idOK := part["id"].(string)
+			name, nameOK := part["name"].(string)
+			_, inputPresent := part["input"]
+			if role != "assistant" || !idOK || strings.TrimSpace(id) == "" ||
+				!nameOK || strings.TrimSpace(name) == "" || !inputPresent {
+				return false
+			}
 			hasToolUse = true
 			allowed = requestContractKeySet("type", "id", "name", "input")
 		case "tool_result":
+			toolUseID, ok := part["tool_use_id"].(string)
+			if role != "user" || !ok || strings.TrimSpace(toolUseID) == "" {
+				return false
+			}
 			allowed = requestContractKeySet("type", "tool_use_id", "content")
 			if finalProtocol == ProtocolChat {
 				allowed["name"] = struct{}{}
 			}
+			if rawIsError, present := part["is_error"]; present {
+				if finalProtocol != ProtocolMessages {
+					return false
+				}
+				if _, ok := rawIsError.(bool); !ok {
+					return false
+				}
+				allowed["is_error"] = struct{}{}
+			}
 			if content, present := part["content"]; present && content != nil {
-				if _, ok := content.(string); !ok {
+				if !validateClaudeToolResultContent(content) {
 					return false
 				}
 			}
 		case "thinking":
-			allowed = requestContractKeySet("type", "thinking")
+			_, thinkingOK := part["thinking"].(string)
+			signature, signatureOK := part["signature"].(string)
+			if role != "assistant" || !thinkingOK || !signatureOK || strings.TrimSpace(signature) == "" {
+				return false
+			}
+			allowed = requestContractKeySet("type", "thinking", "signature")
 		default:
 			return false
+		}
+		if _, present := part["cache_control"]; present {
+			path := cachePath(
+				cacheKey("messages"), cacheIndex(messageIndex), cacheKey("content"),
+				cacheIndex(partIndex), cacheKey("cache_control"),
+			)
+			if cachePlan == nil || !cachePlan.hasSourcePath(path) {
+				return false
+			}
+			allowed["cache_control"] = struct{}{}
 		}
 		if !requestContractMapHasOnlyKeys(part, allowed) {
 			return false
 		}
 	}
-	return !hasToolUse || !hasRegularContent
+	return finalProtocol == ProtocolMessages || !hasToolUse || !hasRegularContent
 }
 
-func validateClaudeTools(value any) bool {
+func validateClaudeToolResultContent(value any) bool {
+	if _, ok := value.(string); ok {
+		return true
+	}
+	parts, ok := value.([]any)
+	if !ok || len(parts) == 0 {
+		return false
+	}
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			return false
+		}
+		switch part["type"] {
+		case "text":
+			if !requestContractMapHasOnlyKeys(part, requestContractKeySet("type", "text")) {
+				return false
+			}
+			if _, ok := part["text"].(string); !ok {
+				return false
+			}
+		case "image":
+			if !requestContractMapHasOnlyKeys(part, requestContractKeySet("type", "source")) ||
+				!validateClaudeImageSource(part["source"]) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validateClaudeTools(value any, cachePlan *CacheControlDispositionPlan) bool {
 	if value == nil {
 		return true
 	}
@@ -921,13 +1089,56 @@ func validateClaudeTools(value any) bool {
 	if !ok {
 		return false
 	}
-	for _, rawTool := range tools {
+	for index, rawTool := range tools {
 		tool, ok := rawTool.(map[string]any)
-		if !ok || !requestContractMapHasOnlyKeys(tool, claudeToolKeys) {
+		if !ok {
+			return false
+		}
+		allowed := claudeToolKeys
+		if _, present := tool["cache_control"]; present {
+			path := cachePath(cacheKey("tools"), cacheIndex(index), cacheKey("cache_control"))
+			if cachePlan == nil || !cachePlan.hasSourcePath(path) {
+				return false
+			}
+			allowed = requestContractKeySet("name", "description", "input_schema", "cache_control")
+		}
+		if !requestContractMapHasOnlyKeys(tool, allowed) || !validateClaudeToolDefinition(tool) {
 			return false
 		}
 	}
 	return true
+}
+
+func validateClaudeImageSource(value any) bool {
+	source, ok := value.(map[string]any)
+	if !ok || !requestContractMapHasOnlyKeys(source, claudeSourceKeys) || source["type"] != "base64" {
+		return false
+	}
+	data, dataOK := source["data"].(string)
+	mediaType, mediaTypeOK := source["media_type"].(string)
+	if !dataOK || strings.TrimSpace(data) == "" || !mediaTypeOK {
+		return false
+	}
+	switch mediaType {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateClaudeToolDefinition(tool map[string]any) bool {
+	name, ok := tool["name"].(string)
+	if !ok || strings.TrimSpace(name) == "" {
+		return false
+	}
+	if description, present := tool["description"]; present {
+		if _, ok := description.(string); !ok {
+			return false
+		}
+	}
+	inputSchema, ok := tool["input_schema"].(map[string]any)
+	return ok && inputSchema["type"] == "object"
 }
 
 func validateResponsesInput(value any, finalProtocol Protocol) bool {
