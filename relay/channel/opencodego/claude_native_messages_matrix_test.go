@@ -95,6 +95,13 @@ func TestClaudeNativeMessagesMatrixPreservesValidatedDocumentAndToolResultWire(t
 			},
 			wantErrorFlag: true,
 		},
+		{
+			name: "tool result explicit success flag",
+			content: map[string]any{
+				"type": "tool_result", "tool_use_id": "native-call-1", "content": "native success", "is_error": false,
+			},
+			wantNested: true,
+		},
 	}
 
 	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {

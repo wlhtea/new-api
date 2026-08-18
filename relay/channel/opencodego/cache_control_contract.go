@@ -224,7 +224,7 @@ func BuildCacheControlDispositionPlan(
 	if len(occurrences) == 0 {
 		return finalizeCacheControlPlan(envelope, plan)
 	}
-	if err := validateCacheControlSourceParents(envelope, occurrences); err != nil {
+	if err := validateCacheControlSourceParents(envelope, occurrences, finalProtocol); err != nil {
 		return CacheControlDispositionPlan{}, err
 	}
 
@@ -333,6 +333,7 @@ func BuildCacheControlDispositionPlan(
 func validateCacheControlSourceParents(
 	envelope *helper.ValidatedRequestEnvelope,
 	occurrences []cacheControlOccurrence,
+	finalProtocol Protocol,
 ) error {
 	classified := CacheControlDispositionPlan{
 		Entries: make([]CacheControlDisposition, 0, len(occurrences)),
@@ -342,7 +343,9 @@ func validateCacheControlSourceParents(
 			SourcePath: publicCacheControlPath(occurrence.sourcePath),
 		})
 	}
-	return validateSameProtocolClaudeCacheParents(envelope, ProtocolMessages, &classified)
+	return validateClaudeCacheParents(
+		envelope, ProtocolMessages, finalProtocol, &classified,
+	)
 }
 
 func validCacheControlPolicy(policy string) bool {

@@ -35,6 +35,18 @@ var claudeReplayStreamCases = []claudeReplayStreamCase{
 	{name: "true", value: common.GetPointer(true), present: true},
 }
 
+type claudeReplayThinkingSignatureCase struct {
+	name    string
+	present bool
+	value   string
+}
+
+var (
+	claudeReplaySignedThinkingSignature  = claudeReplayThinkingSignatureCase{name: "signed", present: true, value: "signed-replay"}
+	claudeReplayMissingThinkingSignature = claudeReplayThinkingSignatureCase{name: "missing"}
+	claudeReplayEmptyThinkingSignature   = claudeReplayThinkingSignatureCase{name: "empty", present: true}
+)
+
 var claudeReplayPolicies = []string{
 	dto.OpenCodeGoUnsupportedOptionalFieldStrict,
 	dto.OpenCodeGoUnsupportedOptionalFieldDropKnown,
@@ -46,6 +58,209 @@ func TestClaudeMessagesReplayMatrixPreservesTextThinkingAndBashHistory(t *testin
 		constant.ChannelTypeOpenCodeAPIKey,
 	} {
 		for _, finalProtocol := range []Protocol{ProtocolChat, ProtocolResponses} {
+			signatureCases := []claudeReplayThinkingSignatureCase{
+				claudeReplaySignedThinkingSignature,
+				claudeReplayEmptyThinkingSignature,
+			}
+			for _, streamCase := range claudeReplayStreamCases {
+				for _, policy := range claudeReplayPolicies {
+					for _, signatureCase := range signatureCases {
+						name := fmt.Sprintf(
+							"type-%d/%s/stream-%s/%s/signature-%s",
+							channelType,
+							finalProtocol,
+							streamCase.name,
+							policy,
+							signatureCase.name,
+						)
+						t.Run(name, func(t *testing.T) {
+							extra := claudeReplayPositiveFields(signatureCase)
+							if streamCase.value != nil {
+								extra["stream"] = *streamCase.value
+							}
+							c, info := newRequestContractFixture(
+								t,
+								channelType,
+								requestPreflightEndpoints[0],
+								finalProtocol,
+								extra,
+							)
+							setClaudeReplayPolicy(c, finalProtocol, policy)
+
+							wire := convertAndFinalizeRequestForPresenceTest(t, c, info)
+							var root map[string]any
+							require.NoError(t, common.Unmarshal(wire, &root))
+							assertClaudeReplayStream(t, root, streamCase)
+
+							switch finalProtocol {
+							case ProtocolChat:
+								assertClaudeReplayChatWire(t, root)
+							case ProtocolResponses:
+								assertClaudeReplayResponsesWire(t, root)
+							default:
+								t.Fatalf("unexpected protocol %q", finalProtocol)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestClaudeThinkingSignatureMatrixRejectsMissingOrNativeEmpty(t *testing.T) {
+	for _, channelType := range []int{
+		constant.ChannelTypeOpenCodeGo,
+		constant.ChannelTypeOpenCodeAPIKey,
+	} {
+		for _, finalProtocol := range []Protocol{ProtocolChat, ProtocolResponses, ProtocolMessages} {
+			for _, streamCase := range claudeReplayStreamCases {
+				for _, policy := range claudeReplayPolicies {
+					for _, signatureCase := range []claudeReplayThinkingSignatureCase{
+						claudeReplayMissingThinkingSignature,
+						claudeReplayEmptyThinkingSignature,
+					} {
+						if signatureCase.present && finalProtocol != ProtocolMessages {
+							// Exact empty is the only cross-protocol exception.
+							continue
+						}
+						name := fmt.Sprintf(
+							"type-%d/%s/stream-%s/%s/signature-%s",
+							channelType,
+							finalProtocol,
+							streamCase.name,
+							policy,
+							signatureCase.name,
+						)
+						t.Run(name, func(t *testing.T) {
+							extra := claudeReplayPositiveFields(signatureCase)
+							if streamCase.value != nil {
+								extra["stream"] = *streamCase.value
+							}
+							c, info := newRequestContractFixture(
+								t,
+								channelType,
+								requestPreflightEndpoints[0],
+								finalProtocol,
+								extra,
+							)
+							setClaudeReplayPolicy(c, finalProtocol, policy)
+
+							_, err := BuildRequestPreflightPlan(c, info)
+							require.Error(t, err)
+							preflightErr, ok := AsRequestPreflightError(err)
+							require.True(t, ok)
+							assert.Equal(t, http.StatusBadRequest, preflightErr.StatusCode)
+							assert.Equal(t, types.ErrorOriginLocalValidation, preflightErr.Origin)
+							assert.Equal(t, RequestContractUnmappedNestedRule, preflightErr.RuleID)
+							assert.Equal(t, RequestContractPreflightStage, preflightErr.StageID)
+							assert.Equal(t, RequestContractPublicMessage, preflightErr.Message)
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestClaudeThinkingSignatureCacheParentMatrix(t *testing.T) {
+	for _, channelType := range []int{
+		constant.ChannelTypeOpenCodeGo,
+		constant.ChannelTypeOpenCodeAPIKey,
+	} {
+		for _, finalProtocol := range []Protocol{ProtocolChat, ProtocolResponses, ProtocolMessages} {
+			for _, signatureCase := range []claudeReplayThinkingSignatureCase{
+				claudeReplayMissingThinkingSignature,
+				claudeReplayEmptyThinkingSignature,
+			} {
+				for _, streamCase := range claudeReplayStreamCases {
+					name := fmt.Sprintf(
+						"type-%d/%s/stream-%s/signature-%s",
+						channelType, finalProtocol, streamCase.name, signatureCase.name,
+					)
+					t.Run(name, func(t *testing.T) {
+						extra := claudeReplayPositiveFields(signatureCase)
+						userText := extra["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+						userText["cache_control"] = map[string]any{"type": "ephemeral"}
+						if streamCase.value != nil {
+							extra["stream"] = *streamCase.value
+						}
+						c, info := newRequestContractFixture(
+							t, channelType, requestPreflightEndpoints[0], finalProtocol, extra,
+						)
+						setClaudeReplayPolicy(c, finalProtocol, dto.OpenCodeGoUnsupportedOptionalFieldDropKnown)
+
+						plan, err := BuildRequestPreflightPlan(c, info)
+						bridgeEmpty := signatureCase.present && finalProtocol != ProtocolMessages
+						if bridgeEmpty {
+							require.NoError(t, err)
+							assert.Equal(t, 1, plan.CacheControlDropCount)
+							assert.Zero(t, plan.CacheControlPreserveCount)
+							wire := convertAndFinalizeRequestForPresenceTest(t, c, info)
+							assert.NotContains(t, string(wire), "cache_control")
+							assert.NotContains(t, string(wire), "signature")
+							return
+						}
+
+						require.Error(t, err)
+						preflightErr, ok := AsRequestPreflightError(err)
+						require.True(t, ok)
+						assert.Equal(t, RequestContractUnmappedNestedRule, preflightErr.RuleID)
+						assert.Equal(t, RequestContractPreflightStage, preflightErr.StageID)
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestClaudeThinkingSignatureWhitespaceIsRejectedAtPreflight(t *testing.T) {
+	for _, channelType := range []int{
+		constant.ChannelTypeOpenCodeGo,
+		constant.ChannelTypeOpenCodeAPIKey,
+	} {
+		for _, finalProtocol := range []Protocol{ProtocolChat, ProtocolResponses, ProtocolMessages} {
+			for _, streamCase := range claudeReplayStreamCases {
+				for _, policy := range claudeReplayPolicies {
+					signatureCase := claudeReplayThinkingSignatureCase{
+						name: "whitespace", present: true, value: " ",
+					}
+					name := fmt.Sprintf(
+						"type-%d/%s/stream-%s/%s/signature-%s",
+						channelType, finalProtocol, streamCase.name, policy, signatureCase.name,
+					)
+					t.Run(name, func(t *testing.T) {
+						extra := claudeReplayPositiveFields(signatureCase)
+						if streamCase.value != nil {
+							extra["stream"] = *streamCase.value
+						}
+						c, info := newRequestContractFixture(
+							t, channelType, requestPreflightEndpoints[0], finalProtocol, extra,
+						)
+						setClaudeReplayPolicy(c, finalProtocol, policy)
+
+						_, err := BuildRequestPreflightPlan(c, info)
+						require.Error(t, err)
+						preflightErr, ok := AsRequestPreflightError(err)
+						require.True(t, ok)
+						assert.Equal(t, http.StatusBadRequest, preflightErr.StatusCode)
+						assert.Equal(t, types.ErrorOriginLocalValidation, preflightErr.Origin)
+						assert.Equal(t, RequestContractUnmappedNestedRule, preflightErr.RuleID)
+						assert.Equal(t, RequestContractPreflightStage, preflightErr.StageID)
+						assert.Equal(t, RequestContractPublicMessage, preflightErr.Message)
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestClaudeThinkingSignatureWrongTypeIsRejectedAtPreflight(t *testing.T) {
+	for _, channelType := range []int{
+		constant.ChannelTypeOpenCodeGo,
+		constant.ChannelTypeOpenCodeAPIKey,
+	} {
+		for _, finalProtocol := range []Protocol{ProtocolChat, ProtocolResponses, ProtocolMessages} {
 			for _, streamCase := range claudeReplayStreamCases {
 				for _, policy := range claudeReplayPolicies {
 					name := fmt.Sprintf(
@@ -56,7 +271,11 @@ func TestClaudeMessagesReplayMatrixPreservesTextThinkingAndBashHistory(t *testin
 						policy,
 					)
 					t.Run(name, func(t *testing.T) {
-						extra := claudeReplayPositiveFields()
+						extra := claudeReplayPositiveFields(claudeReplayThinkingSignatureCase{
+							name: "wrong-type", present: true,
+						})
+						thinking := extra["messages"].([]any)[1].(map[string]any)["content"].([]any)[0].(map[string]any)
+						thinking["signature"] = 17
 						if streamCase.value != nil {
 							extra["stream"] = *streamCase.value
 						}
@@ -69,19 +288,16 @@ func TestClaudeMessagesReplayMatrixPreservesTextThinkingAndBashHistory(t *testin
 						)
 						setClaudeReplayPolicy(c, finalProtocol, policy)
 
-						wire := convertAndFinalizeRequestForPresenceTest(t, c, info)
-						var root map[string]any
-						require.NoError(t, common.Unmarshal(wire, &root))
-						assertClaudeReplayStream(t, root, streamCase)
-
-						switch finalProtocol {
-						case ProtocolChat:
-							assertClaudeReplayChatWire(t, root)
-						case ProtocolResponses:
-							assertClaudeReplayResponsesWire(t, root)
-						default:
-							t.Fatalf("unexpected protocol %q", finalProtocol)
-						}
+						_, err := BuildRequestPreflightPlan(c, info)
+						require.Error(t, err)
+						preflightErr, ok := AsRequestPreflightError(err)
+						require.True(t, ok)
+						assert.Equal(t, http.StatusBadRequest, preflightErr.StatusCode)
+						assert.Equal(t, types.ErrorOriginLocalValidation, preflightErr.Origin)
+						assert.Equal(t, RequestContractUnmappedNestedRule, preflightErr.RuleID)
+						assert.Equal(t, RequestContractPreflightStage, preflightErr.StageID)
+						assert.Equal(t, RequestContractPublicMessage, preflightErr.Message)
+						assert.NotContains(t, err.Error(), "17")
 					})
 				}
 			}
@@ -135,6 +351,20 @@ func TestClaudeMessagesReplayMatrixRejectsUnrepresentableContentAtPreflight(t *t
 			messages: claudeReplayToolResultMessages(map[string]any{
 				"type": "tool_result", "tool_use_id": claudeReplayCallID,
 				"content": claudeReplayPrivateValue, "is_error": true,
+			}),
+		},
+		{
+			name: "tool result is error wrong type",
+			messages: claudeReplayToolResultMessages(map[string]any{
+				"type": "tool_result", "tool_use_id": claudeReplayCallID,
+				"content": claudeReplayPrivateValue, "is_error": "false",
+			}),
+		},
+		{
+			name: "tool result is error null",
+			messages: claudeReplayToolResultMessages(map[string]any{
+				"type": "tool_result", "tool_use_id": claudeReplayCallID,
+				"content": claudeReplayPrivateValue, "is_error": nil,
 			}),
 		},
 		{
@@ -268,7 +498,13 @@ func TestClaudeMessagesReplayMatrixRejectsUnknownToolResultAtIngress(t *testing.
 	}
 }
 
-func claudeReplayPositiveFields() map[string]any {
+func claudeReplayPositiveFields(signatureCase claudeReplayThinkingSignatureCase) map[string]any {
+	thinking := map[string]any{
+		"type": "thinking", "thinking": "inspect the local reference",
+	}
+	if signatureCase.present {
+		thinking["signature"] = signatureCase.value
+	}
 	return map[string]any{
 		"messages": []any{
 			map[string]any{
@@ -280,9 +516,7 @@ func claudeReplayPositiveFields() map[string]any {
 			map[string]any{
 				"role": "assistant",
 				"content": []any{
-					map[string]any{
-						"type": "thinking", "thinking": "inspect the local reference", "signature": "signed-replay",
-					},
+					thinking,
 					map[string]any{"type": "text", "text": "I will inspect it."},
 					map[string]any{
 						"type": "tool_use", "id": claudeReplayCallID, "name": "Bash",
@@ -294,6 +528,7 @@ func claudeReplayPositiveFields() map[string]any {
 				"role": "user",
 				"content": []any{map[string]any{
 					"type": "tool_result", "tool_use_id": claudeReplayCallID,
+					"is_error": false,
 					"content": []any{
 						map[string]any{"type": "text", "text": "first"},
 						map[string]any{"type": "text", "text": " second"},
@@ -388,6 +623,7 @@ func assertClaudeReplayChatWire(t *testing.T, root map[string]any) {
 	assert.Equal(t, "tool", toolResult["role"])
 	assert.Equal(t, claudeReplayCallID, toolResult["tool_call_id"])
 	assert.Equal(t, "first second", toolResult["content"])
+	assert.NotContains(t, toolResult, "is_error")
 }
 
 func assertClaudeReplayResponsesWire(t *testing.T, root map[string]any) {
@@ -430,6 +666,7 @@ func assertClaudeReplayResponsesWire(t *testing.T, root map[string]any) {
 	assert.Equal(t, "function_call_output", toolResult["type"])
 	assert.Equal(t, claudeReplayCallID, toolResult["call_id"])
 	assert.Equal(t, "first second", toolResult["output"])
+	assert.NotContains(t, toolResult, "is_error")
 
 	for _, rawItem := range input {
 		item := claudeReplayObject(t, rawItem)

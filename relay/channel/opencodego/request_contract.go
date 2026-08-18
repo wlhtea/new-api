@@ -358,7 +358,9 @@ func validateRequestPathContracts(
 	}
 	if finalProtocol.RelayFormat() == clientFormat {
 		if clientFormat == types.RelayFormatClaude {
-			if err := validateSameProtocolClaudeCacheParents(envelope, finalProtocol, cachePlan); err != nil {
+			if err := validateClaudeCacheParents(
+				envelope, finalProtocol, finalProtocol, cachePlan,
+			); err != nil {
 				return err
 			}
 		}
@@ -401,9 +403,10 @@ func validateRequestPathContracts(
 	return nil
 }
 
-func validateSameProtocolClaudeCacheParents(
+func validateClaudeCacheParents(
 	envelope *helper.ValidatedRequestEnvelope,
-	finalProtocol Protocol,
+	contentProtocol Protocol,
+	thinkingSignatureProtocol Protocol,
 	cachePlan *CacheControlDispositionPlan,
 ) error {
 	for _, field := range []string{"system", "messages", "tools"} {
@@ -418,13 +421,15 @@ func validateSameProtocolClaudeCacheParents(
 		if err := common.Unmarshal(raw, &value); err != nil {
 			return errors.New("validated Messages cache parent cannot be decoded")
 		}
-		if !validateConverterOwnedNestedValue(
-			types.RelayFormatClaude,
-			finalProtocol,
-			field,
-			value,
-			cachePlan,
-		) {
+		valid := validateConverterOwnedNestedValue(
+			types.RelayFormatClaude, contentProtocol, field, value, cachePlan,
+		)
+		if field == "messages" {
+			valid = validateClaudeMessagesWithThinkingSignatureProtocol(
+				value, contentProtocol, thinkingSignatureProtocol, cachePlan,
+			)
+		}
+		if !valid {
 			return newRequestPathContractClientError(RequestContractUnmappedNestedRule)
 		}
 	}
@@ -937,6 +942,17 @@ func validateClaudeSystemParts(
 }
 
 func validateClaudeMessages(value any, finalProtocol Protocol, cachePlan *CacheControlDispositionPlan) bool {
+	return validateClaudeMessagesWithThinkingSignatureProtocol(
+		value, finalProtocol, finalProtocol, cachePlan,
+	)
+}
+
+func validateClaudeMessagesWithThinkingSignatureProtocol(
+	value any,
+	finalProtocol Protocol,
+	thinkingSignatureProtocol Protocol,
+	cachePlan *CacheControlDispositionPlan,
+) bool {
 	if value == nil {
 		return true
 	}
@@ -963,7 +979,8 @@ func validateClaudeMessages(value any, finalProtocol Protocol, cachePlan *CacheC
 		switch role {
 		case "user", "assistant":
 			if !validateClaudeContent(
-				message["content"], finalProtocol, cachePlan, messageIndex, role,
+				message["content"], finalProtocol, thinkingSignatureProtocol,
+				cachePlan, messageIndex, role,
 			) {
 				return false
 			}
@@ -983,6 +1000,7 @@ func validateClaudeMessages(value any, finalProtocol Protocol, cachePlan *CacheC
 func validateClaudeContent(
 	value any,
 	finalProtocol Protocol,
+	thinkingSignatureProtocol Protocol,
 	cachePlan *CacheControlDispositionPlan,
 	messageIndex int,
 	role string,
@@ -1048,10 +1066,14 @@ func validateClaudeContent(
 				allowed["name"] = struct{}{}
 			}
 			if rawIsError, present := part["is_error"]; present {
-				if finalProtocol != ProtocolMessages {
+				isError, ok := rawIsError.(bool)
+				if !ok {
 					return false
 				}
-				if _, ok := rawIsError.(bool); !ok {
+				// A false flag is exactly the ordinary successful tool-result state
+				// already represented by Chat and Responses. Their converters consume
+				// it locally; true remains unrelayable because it carries error state.
+				if finalProtocol != ProtocolMessages && isError {
 					return false
 				}
 				allowed["is_error"] = struct{}{}
@@ -1067,8 +1089,28 @@ func validateClaudeContent(
 			}
 		case "thinking":
 			_, thinkingOK := part["thinking"].(string)
-			signature, signatureOK := part["signature"].(string)
-			if role != "assistant" || !thinkingOK || !signatureOK || strings.TrimSpace(signature) == "" {
+			if role != "assistant" || !thinkingOK {
+				return false
+			}
+			signature, present := part["signature"]
+			if !present {
+				// The captured Claude Code request includes an explicit empty
+				// signature. An omitted member is not part of that closed
+				// compatibility exception and remains invalid on every target.
+				return false
+			}
+			signatureText, signatureOK := signature.(string)
+			if !signatureOK {
+				return false
+			}
+			if signatureText == "" {
+				// Chat and Responses lowerers carry the validated thinking text
+				// without a signature. Native Messages replay still requires a
+				// non-empty Anthropic signature.
+				if thinkingSignatureProtocol != ProtocolChat && thinkingSignatureProtocol != ProtocolResponses {
+					return false
+				}
+			} else if strings.TrimSpace(signatureText) == "" {
 				return false
 			}
 			allowed = requestContractKeySet("type", "thinking", "signature")

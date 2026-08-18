@@ -109,7 +109,20 @@ func TestClaudeChatProjectionRejectsUnprovedSemantics(t *testing.T) {
 		{name: "effort unknown", extra: map[string]any{"output_config": map[string]any{"effort": "ultra"}}, wantRule: ClaudeOutputConfigShapeRule},
 		{name: "output unknown member", extra: map[string]any{"output_config": map[string]any{"future": true}}, wantRule: ClaudeOutputConfigShapeRule},
 		{name: "format unsupported", extra: map[string]any{"output_config": map[string]any{"format": nil}}, wantRule: ClaudeOutputConfigUnsupportedRule},
+		{name: "structured format shape remains unsupported", extra: map[string]any{"output_config": map[string]any{
+			"effort": "high",
+			"format": map[string]any{
+				"type":   "json_schema",
+				"schema": map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+		}}, wantRule: ClaudeOutputConfigUnsupportedRule},
 		{name: "task budget unsupported", extra: map[string]any{"output_config": map[string]any{"task_budget": nil}}, wantRule: ClaudeOutputConfigUnsupportedRule},
+		{name: "captured task budget shape remains unsupported", extra: map[string]any{"output_config": map[string]any{
+			"effort": "high",
+			"task_budget": map[string]any{
+				"type": "synthetic", "total": 1024,
+			},
+		}}, wantRule: ClaudeOutputConfigUnsupportedRule},
 		{name: "context wrong type", extra: map[string]any{"context_management": []any{}}, wantRule: ClaudeContextManagementShapeRule},
 		{name: "context unknown member", extra: map[string]any{"context_management": map[string]any{"future": true}}, wantRule: ClaudeContextManagementShapeRule},
 		{name: "context missing keep", extra: map[string]any{"context_management": map[string]any{"edits": []any{map[string]any{"type": "clear_thinking_20251015"}}}}, wantRule: ClaudeContextManagementActiveRule},
