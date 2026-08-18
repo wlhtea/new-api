@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	CacheControlRegistryVersion = "claude-cache-control-v1"
+	CacheControlRegistryVersion = "claude-cache-control-v2"
 	CacheControlPlanVersion     = "opencodego-cache-control-plan-v1"
 	CacheControlMarkerMaxBytes  = int64(4 << 10)
 
@@ -742,8 +742,9 @@ func normalizedCacheControlSourcePath(
 	}
 	normalizedIndex := 0
 	found := false
+	role := ""
 	for _, sourceIndex := range inventoryObjectArrayIndexes(view, cachePath(cacheKey("messages"))) {
-		role, ok := inventoryString(
+		messageRole, ok := inventoryString(
 			envelope,
 			view,
 			cachePath(cacheKey("messages"), cacheIndex(sourceIndex), cacheKey("role")),
@@ -753,21 +754,93 @@ func normalizedCacheControlSourcePath(
 			return nil, errors.New("validated Messages role is unavailable during cache-control normalization")
 		}
 		if sourceIndex == path[1].Index {
-			if role != "user" && role != "assistant" {
-				return nil, errors.New("registered cache-control message role cannot be normalized")
-			}
+			role = messageRole
 			found = true
 			break
 		}
-		if role == "user" || role == "assistant" {
+		if messageRole == "user" || messageRole == "assistant" {
 			normalizedIndex++
 		}
 	}
 	if !found {
 		return nil, errors.New("registered cache-control message index cannot be normalized")
 	}
+	if role == "system" {
+		systemIndex, err := normalizedClaudeSystemPartIndex(envelope, view, path[1].Index, path[3].Index)
+		if err != nil {
+			return nil, err
+		}
+		return cachePath(cacheKey("system"), cacheIndex(systemIndex), cacheKey("cache_control")), nil
+	}
+	if role != "user" && role != "assistant" {
+		return nil, errors.New("registered cache-control message role cannot be normalized")
+	}
 	normalized[1].Index = normalizedIndex
 	return normalized, nil
+}
+
+// normalizedClaudeSystemPartIndex mirrors normalizeClaudeSystemMessages: the
+// existing top-level system value is flattened first, followed by each
+// message-level system entry in source order. The raw message locator remains
+// in the disposition for diagnostics, while this index addresses the typed
+// request and final wire after normalization.
+func normalizedClaudeSystemPartIndex(
+	envelope *helper.ValidatedRequestEnvelope,
+	view cacheControlInventoryView,
+	messageIndex int,
+	partIndex int,
+) (int, error) {
+	systemPath := cachePath(cacheKey("system"))
+	index := 0
+	switch inventoryKind(view, systemPath) {
+	case helper.JSONValueString:
+		index = 1
+	case helper.JSONValueArray:
+		index = len(inventoryObjectArrayIndexes(view, systemPath))
+	}
+
+	for _, sourceIndex := range inventoryObjectArrayIndexes(view, cachePath(cacheKey("messages"))) {
+		if sourceIndex == messageIndex {
+			contentPath := cachePath(
+				cacheKey("messages"), cacheIndex(sourceIndex), cacheKey("content"),
+			)
+			if inventoryKind(view, contentPath) != helper.JSONValueArray {
+				return 0, errors.New("registered system cache-control message content cannot be normalized")
+			}
+			partIndexes := inventoryObjectArrayIndexes(view, contentPath)
+			for ordinal, candidate := range partIndexes {
+				if candidate == partIndex {
+					return index + ordinal, nil
+				}
+			}
+			return 0, errors.New("registered system cache-control content index cannot be normalized")
+		}
+
+		role, ok := inventoryString(
+			envelope,
+			view,
+			cachePath(cacheKey("messages"), cacheIndex(sourceIndex), cacheKey("role")),
+			64,
+		)
+		if !ok {
+			return 0, errors.New("validated Messages role is unavailable during system normalization")
+		}
+		if role != "system" {
+			continue
+		}
+		contentPath := cachePath(
+			cacheKey("messages"), cacheIndex(sourceIndex), cacheKey("content"),
+		)
+		switch inventoryKind(view, contentPath) {
+		case helper.JSONValueString:
+			index++
+		case helper.JSONValueArray:
+			index += len(inventoryObjectArrayIndexes(view, contentPath))
+		default:
+			return 0, errors.New("validated system message content cannot be normalized")
+		}
+	}
+	return 0, errors.New("registered system cache-control message index cannot be normalized")
 }
 
 func cacheControlDirectRegisteredPattern(path []helper.JSONPathSegment) bool {
@@ -1067,7 +1140,7 @@ func validCacheMessageParent(
 		return "", "", false
 	}
 	role, ok := inventoryString(envelope, view, appendCachePath(messagePath, cacheKey("role")), 64)
-	if !ok || (role != "user" && role != "assistant") {
+	if !ok || (role != "user" && role != "assistant" && role != "system") {
 		return "", "", false
 	}
 	partPath := cachePath(
@@ -1085,6 +1158,9 @@ func validCacheMessageParent(
 		if !inventoryObjectHasOnlyKeys(view, partPath, "type", "text", "cache_control") ||
 			!inventoryNonEmptyString(view, appendCachePath(partPath, cacheKey("text"))) {
 			return "", "", false
+		}
+		if role == "system" {
+			return "system", cacheControlRuleSystem, false
 		}
 		return "text", cacheControlRuleText, false
 	case "image":
@@ -1398,6 +1474,29 @@ func buildCacheControlUnits(envelope *helper.ValidatedRequestEnvelope) []cacheCo
 		}
 	}
 	messageIndexes := inventoryObjectArrayIndexes(view, cachePath(cacheKey("messages")))
+	// Message-level system entries are normalized into the top-level system
+	// value before conversion. Keep their cache units in the system phase even
+	// when the source message was interleaved with conversation messages.
+	for _, messageIndex := range messageIndexes {
+		messagePath := cachePath(cacheKey("messages"), cacheIndex(messageIndex))
+		role, ok := inventoryString(envelope, view, appendCachePath(messagePath, cacheKey("role")), 64)
+		if !ok || role != "system" || !inventoryObjectHasOnlyKeys(view, messagePath, "role", "content") {
+			continue
+		}
+		contentPath := appendCachePath(messagePath, cacheKey("content"))
+		for _, partIndex := range inventoryObjectArrayIndexes(view, contentPath) {
+			kind, _, _ := validCacheMessageParent(envelope, view, messageIndex, partIndex)
+			if kind == "" {
+				continue
+			}
+			partPath := appendCachePath(contentPath, cacheIndex(partIndex))
+			units = append(units, cacheControlUnit{
+				markerPath: appendCachePath(partPath, cacheKey("cache_control")),
+				position:   position,
+			})
+			position++
+		}
+	}
 	for _, messageIndex := range messageIndexes {
 		messagePath := cachePath(cacheKey("messages"), cacheIndex(messageIndex))
 		if !inventoryObjectHasOnlyKeys(view, messagePath, "role", "content") {

@@ -880,6 +880,29 @@ func validateChatWebSearchOptions(value any) bool {
 }
 
 func validateClaudeSystem(value any, cachePlan *CacheControlDispositionPlan) bool {
+	return validateClaudeSystemParts(value, cachePlan, func(index int) []helper.JSONPathSegment {
+		return cachePath(cacheKey("system"), cacheIndex(index), cacheKey("cache_control"))
+	})
+}
+
+func validateClaudeSystemMessage(
+	value any,
+	cachePlan *CacheControlDispositionPlan,
+	messageIndex int,
+) bool {
+	return validateClaudeSystemParts(value, cachePlan, func(index int) []helper.JSONPathSegment {
+		return cachePath(
+			cacheKey("messages"), cacheIndex(messageIndex), cacheKey("content"),
+			cacheIndex(index), cacheKey("cache_control"),
+		)
+	})
+}
+
+func validateClaudeSystemParts(
+	value any,
+	cachePlan *CacheControlDispositionPlan,
+	cacheMarkerPath func(index int) []helper.JSONPathSegment,
+) bool {
 	if value == nil {
 		return true
 	}
@@ -900,7 +923,7 @@ func validateClaudeSystem(value any, cachePlan *CacheControlDispositionPlan) boo
 		}
 		allowed := requestContractKeySet("type", "text")
 		if _, present := object["cache_control"]; present {
-			path := cachePath(cacheKey("system"), cacheIndex(index), cacheKey("cache_control"))
+			path := cacheMarkerPath(index)
 			if cachePlan == nil || !cachePlan.hasSourcePath(path) {
 				return false
 			}
@@ -947,7 +970,7 @@ func validateClaudeMessages(value any, finalProtocol Protocol, cachePlan *CacheC
 		case "system":
 			// The validated request normalizer moves these text-only entries to
 			// top-level system. They remain source-indexed here for raw-contract checks.
-			if message["content"] == nil || !validateClaudeSystem(message["content"], nil) {
+			if message["content"] == nil || !validateClaudeSystemMessage(message["content"], cachePlan, messageIndex) {
 				return false
 			}
 		default:

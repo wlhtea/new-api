@@ -29,6 +29,13 @@ func TestCacheControlContractRegisteredExplicitLocations(t *testing.T) {
 			body: map[string]any{"system": []any{cacheSystemText("system")}},
 		},
 		{
+			name: "message-level system text",
+			body: map[string]any{"messages": []any{
+				cacheMessage("system", cacheText("system")),
+				cacheMessage("user", map[string]any{"type": "text", "text": "hello"}),
+			}},
+		},
+		{
 			name: "user text",
 			body: map[string]any{"messages": []any{cacheMessage("user", cacheText("user"))}},
 		},
@@ -87,6 +94,73 @@ func TestCacheControlContractRegisteredExplicitLocations(t *testing.T) {
 	}
 }
 
+func TestCacheControlContractNormalizesCapturedSystemRoleTextMarker(t *testing.T) {
+	for _, channelType := range []int{constant.ChannelTypeOpenCodeGo, constant.ChannelTypeOpenCodeAPIKey} {
+		for _, finalProtocol := range []Protocol{ProtocolMessages, ProtocolChat, ProtocolResponses} {
+			for _, policy := range []string{
+				dto.OpenCodeGoUnsupportedOptionalFieldStrict,
+				dto.OpenCodeGoUnsupportedOptionalFieldDropKnown,
+			} {
+				name := "type-" + strconv.Itoa(channelType) + "/" + string(finalProtocol) + "/" + policy
+				t.Run(name, func(t *testing.T) {
+					c, info := newCacheControlPreflightFixture(
+						t,
+						capturedSystemRoleCacheBody(),
+						channelType,
+						finalProtocol,
+						policy,
+					)
+					plan, err := BuildRequestPreflightPlan(c, info)
+					if finalProtocol != ProtocolMessages && policy == dto.OpenCodeGoUnsupportedOptionalFieldStrict {
+						requireCacheControlPreflightError(
+							t, err, CacheControlUnsupportedRule, CacheControlPreflightStage,
+						)
+						return
+					}
+					require.NoError(t, err)
+					cachePlan, err := cacheControlDispositionPlanFromPreflight(plan)
+					require.NoError(t, err)
+					require.Len(t, cachePlan.Entries, 3)
+
+					var systemMessageEntry *CacheControlDisposition
+					for index := range cachePlan.Entries {
+						entry := &cachePlan.Entries[index]
+						if len(entry.SourcePath) == 5 && entry.SourcePath[0].Key == "messages" &&
+							entry.SourcePath[1].Index == 1 {
+							systemMessageEntry = entry
+						}
+					}
+					require.NotNil(t, systemMessageEntry)
+					require.Len(t, systemMessageEntry.NormalizedSourcePath, 3)
+					assert.Equal(t, "system", systemMessageEntry.NormalizedSourcePath[0].Key)
+					assert.Equal(t, 3, systemMessageEntry.NormalizedSourcePath[1].Index)
+					assert.Equal(t, cacheControlRuleSystem, systemMessageEntry.RuleID)
+
+					wire := convertAndFinalizeRequestForPresenceTest(t, c, info)
+					root, err := decodeCacheControlFinalBody(wire)
+					require.NoError(t, err)
+					if finalProtocol == ProtocolMessages {
+						system, ok := root.(map[string]any)["system"].([]any)
+						require.True(t, ok)
+						require.Len(t, system, 4)
+						for _, index := range []int{1, 2, 3} {
+							marker, present := system[index].(map[string]any)["cache_control"]
+							assert.True(t, present)
+							assert.Equal(t, "ephemeral", marker.(map[string]any)["type"])
+						}
+						messages := root.(map[string]any)["messages"].([]any)
+						assert.Len(t, messages, 1)
+						assert.Equal(t, "user", messages[0].(map[string]any)["role"])
+					} else {
+						assert.Empty(t, targetOwnedCacheControlPaths(root, finalProtocol))
+						assert.Contains(t, string(wire), "message-system")
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestCacheControlContractToolUseInputPreservesUnknownJSONValues(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -132,6 +206,13 @@ func TestCacheControlContractRegisteredLocationsFinalWireMatrix(t *testing.T) {
 		{
 			name: "system text",
 			body: map[string]any{"system": []any{cacheSystemText("system")}},
+		},
+		{
+			name: "message-level system text",
+			body: map[string]any{"messages": []any{
+				cacheMessage("system", cacheText("system")),
+				cacheMessage("user", map[string]any{"type": "text", "text": "hello"}),
+			}},
 		},
 		{
 			name: "user text",
@@ -697,8 +778,28 @@ func TestCacheControlContractRejectsMalformedAndUnregisteredMarkers(t *testing.T
 		{name: "unknown member", body: cacheBodyWithTextMarker(map[string]any{"type": "ephemeral", "future": true}), rule: CacheControlShapeRule},
 		{name: "empty marked text", body: map[string]any{"messages": []any{cacheMessage("user", map[string]any{"type": "text", "text": "", "cache_control": cacheMarker("5m")})}}, rule: CacheControlParentRule},
 		{name: "thinking marker", body: map[string]any{"messages": []any{cacheMessage("assistant", map[string]any{"type": "thinking", "thinking": "x", "signature": "signed", "cache_control": cacheMarker("5m")})}}, rule: CacheControlParentRule},
-		{name: "system role marker", body: map[string]any{"messages": []any{
-			cacheMessage("system", cacheText("x")),
+		{name: "system role marker with unknown parent member", body: map[string]any{"messages": []any{
+			map[string]any{
+				"role": "system", "content": []any{cacheText("x")}, "name": "unexpected",
+			},
+			cacheMessage("user", map[string]any{"type": "text", "text": "control"}),
+		}}, rule: CacheControlParentRule},
+		{name: "system role marker with unknown block member", body: map[string]any{"messages": []any{
+			cacheMessage("system", map[string]any{
+				"type": "text", "text": "x", "cache_control": cacheMarker("5m"), "name": "unexpected",
+			}),
+			cacheMessage("user", map[string]any{"type": "text", "text": "control"}),
+		}}, rule: CacheControlParentRule},
+		{name: "system role marker with empty text", body: map[string]any{"messages": []any{
+			cacheMessage("system", map[string]any{
+				"type": "text", "text": "", "cache_control": cacheMarker("5m"),
+			}),
+			cacheMessage("user", map[string]any{"type": "text", "text": "control"}),
+		}}, rule: CacheControlParentRule},
+		{name: "system role marker with input text block", body: map[string]any{"messages": []any{
+			cacheMessage("system", map[string]any{
+				"type": "input_text", "text": "x", "cache_control": cacheMarker("5m"),
+			}),
 			cacheMessage("user", map[string]any{"type": "text", "text": "control"}),
 		}}, rule: CacheControlParentRule},
 		{name: "nested tool result marker", body: map[string]any{"messages": []any{cacheMessage("user", map[string]any{
@@ -1437,6 +1538,102 @@ func TestApplyCacheControlDispositionPlanUsesNormalizedMessageIndex(t *testing.T
 	assert.True(t, originalMarker)
 }
 
+func TestApplyCacheControlDispositionPlanUsesNormalizedSystemMessageIndex(t *testing.T) {
+	envelope, request := newCacheControlContractFixture(t, map[string]any{
+		"system": []any{map[string]any{"type": "text", "text": "existing system"}},
+		"messages": []any{
+			cacheMessage("user", map[string]any{"type": "text", "text": "hello"}),
+			cacheMessage("system", cacheText("message system")),
+		},
+	})
+	plan, err := BuildCacheControlDispositionPlan(
+		envelope,
+		types.RelayFormatClaude,
+		ProtocolChat,
+		request,
+		dto.OpenCodeGoUnsupportedOptionalFieldDropKnown,
+	)
+	require.NoError(t, err)
+	require.Len(t, plan.Entries, 1)
+	assert.Equal(t, 1, plan.Entries[0].SourcePath[1].Index)
+	assert.Equal(t, 1, plan.Entries[0].NormalizedSourcePath[1].Index)
+
+	plannedRequest, err := applyCacheControlDispositionPlan(request, plan)
+	require.NoError(t, err)
+	clone, ok := plannedRequest.(*dto.ClaudeRequest)
+	require.True(t, ok)
+	system, ok := clone.System.([]any)
+	require.True(t, ok)
+	require.Len(t, system, 2)
+	_, markerPresent := system[1].(map[string]any)["cache_control"]
+	assert.False(t, markerPresent)
+
+	originalSystem, ok := request.System.([]any)
+	require.True(t, ok)
+	_, originalMarkerPresent := originalSystem[1].(map[string]any)["cache_control"]
+	assert.True(t, originalMarkerPresent)
+}
+
+func TestCacheControlContractNormalizesMultipleSystemMessagesInSourceOrder(t *testing.T) {
+	body := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "system", "content": []any{
+				cacheText("first system"), cacheText("first system continuation"),
+			}},
+			cacheMessage("user", map[string]any{"type": "text", "text": "hello"}),
+			map[string]any{"role": "system", "content": []any{cacheText("second system")}},
+		},
+	}
+	c, info := newCacheControlPreflightFixture(
+		t, body, constant.ChannelTypeOpenCodeAPIKey, ProtocolMessages,
+		dto.OpenCodeGoUnsupportedOptionalFieldStrict,
+	)
+	preflight, err := BuildRequestPreflightPlan(c, info)
+	require.NoError(t, err)
+	plan, err := cacheControlDispositionPlanFromPreflight(preflight)
+	require.NoError(t, err)
+	require.Len(t, plan.Entries, 3)
+	wantSourceIndexes := []int{0, 0, 2}
+	wantPartIndexes := []int{0, 1, 0}
+	for index, entry := range plan.Entries {
+		assert.Equal(t, wantSourceIndexes[index], entry.SourcePath[1].Index)
+		assert.Equal(t, wantPartIndexes[index], entry.SourcePath[3].Index)
+		assert.Equal(t, index, entry.NormalizedSourcePath[1].Index)
+	}
+
+	wire := convertAndFinalizeRequestForPresenceTest(t, c, info)
+	root, err := decodeCacheControlFinalBody(wire)
+	require.NoError(t, err)
+	system, ok := root.(map[string]any)["system"].([]any)
+	require.True(t, ok)
+	require.Len(t, system, 3)
+	assert.Equal(t, "first system", system[0].(map[string]any)["text"])
+	assert.Equal(t, "first system continuation", system[1].(map[string]any)["text"])
+	assert.Equal(t, "second system", system[2].(map[string]any)["text"])
+
+	t.Run("top-level string precedes message systems", func(t *testing.T) {
+		c, info := newCacheControlPreflightFixture(
+			t,
+			map[string]any{
+				"system": "existing system",
+				"messages": []any{
+					map[string]any{"role": "system", "content": []any{cacheText("message system")}},
+					cacheMessage("user", map[string]any{"type": "text", "text": "hello"}),
+				},
+			},
+			constant.ChannelTypeOpenCodeAPIKey,
+			ProtocolMessages,
+			dto.OpenCodeGoUnsupportedOptionalFieldStrict,
+		)
+		preflight, err := BuildRequestPreflightPlan(c, info)
+		require.NoError(t, err)
+		plan, err := cacheControlDispositionPlanFromPreflight(preflight)
+		require.NoError(t, err)
+		require.Len(t, plan.Entries, 1)
+		assert.Equal(t, 1, plan.Entries[0].NormalizedSourcePath[1].Index)
+	})
+}
+
 func TestBuildRequestPreflightPlanFreezesCacheControlPolicyForBothChannelTypes(t *testing.T) {
 	body := map[string]any{
 		"system": []any{cacheSystemText("system")},
@@ -2013,6 +2210,20 @@ func cacheTextTTL(text string, ttl string) map[string]any {
 
 func cacheMessage(role string, content ...any) map[string]any {
 	return map[string]any{"role": role, "content": content}
+}
+
+func capturedSystemRoleCacheBody() map[string]any {
+	return map[string]any{
+		"system": []any{
+			map[string]any{"type": "text", "text": "unmarked system"},
+			cacheSystemText("top-level one"),
+			cacheSystemText("top-level two"),
+		},
+		"messages": []any{
+			cacheMessage("user", map[string]any{"type": "text", "text": "hello"}),
+			cacheMessage("system", cacheText("message-system")),
+		},
+	}
 }
 
 func chatToolOpaqueCacheControlBody() map[string]any {
