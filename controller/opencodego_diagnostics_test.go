@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -42,6 +43,7 @@ func captureOpenCodeDiagnosticLogs(t *testing.T) (*bytes.Buffer, *bytes.Buffer) 
 }
 
 func TestOpenCodePreflightRejectionDiagnosticIsBoundedAndPrivate(t *testing.T) {
+	t.Setenv(openCodeFullRequestDebugEnv, "false")
 	_, errorLogs := captureOpenCodeDiagnosticLogs(t)
 	body := []byte(`{
 		"model":"diagnostic-model-private-glm-5.2",
@@ -103,7 +105,54 @@ func TestOpenCodePreflightRejectionDiagnosticIsBoundedAndPrivate(t *testing.T) {
 	)
 }
 
+func TestOpenCodePreflightRejectionFullRequestDebugLogsCompleteType62RequestOnce(t *testing.T) {
+	t.Setenv(openCodeFullRequestDebugEnv, "true")
+	_, errorLogs := captureOpenCodeDiagnosticLogs(t)
+	longText := "full-request-body-" + strings.Repeat("x", common.LocalLogContentLimit+512)
+	body := []byte(`{"model":"glm-5.2","max_tokens":16,"messages":[{"role":"user","name":"full-request-parent","content":[{"type":"text","text":"` + longText + `","cache_control":{"type":"ephemeral"}}]}]}`)
+	c, info, _ := newOpenCodeControllerPreflightFixture(
+		t,
+		constant.ChannelTypeOpenCodeGo,
+		"/v1/messages",
+		types.RelayFormatClaude,
+		"glm-5.2",
+		"",
+		body,
+	)
+	c.Set(common.RequestIdKey, "full-request-debug-id")
+	c.Request.URL.RawQuery = "beta=true&debug=complete"
+	c.Request.Host = "debug.example.test"
+	c.Request.Header.Set("Authorization", "Bearer full-request-debug-secret")
+	c.Request.Header.Set("Anthropic-Version", "2023-06-01")
+
+	relayErr := preflightOpenCodeRequest(c, info)
+
+	require.NotNil(t, relayErr)
+	assert.Equal(t, http.StatusBadRequest, relayErr.StatusCode)
+	assert.Equal(t, opencodego.CacheControlParentRule, relayErr.Provenance().Subtype)
+	logText := errorLogs.String()
+	assert.Equal(t, 1, strings.Count(logText, openCodeFullRequestDebugMarker))
+	assert.Contains(t, logText, "| full-request-debug-id | "+openCodeFullRequestDebugMarker)
+	assert.Contains(t, logText, "POST /v1/messages?beta=true&debug=complete HTTP/1.1")
+	assert.Contains(t, logText, "Host: debug.example.test")
+	assert.Contains(t, logText, "Authorization: Bearer full-request-debug-secret")
+	assert.Contains(t, logText, "Anthropic-Version: 2023-06-01")
+	assert.Contains(t, logText, longText)
+	assert.NotContains(t, logText, "[truncated")
+	assert.Equal(t, 1, strings.Count(logText, "OpenCode request preflight rejected:"))
+
+	storage, err := common.GetBodyStorage(c)
+	require.NoError(t, err)
+	replay, err := storage.NewReader()
+	require.NoError(t, err)
+	replayedBody, err := io.ReadAll(replay)
+	require.NoError(t, err)
+	require.NoError(t, replay.Close())
+	assert.Equal(t, body, replayedBody)
+}
+
 func TestOpenCodeAllRejectedAPIKeyCandidatesLogMixedPolicyOnly(t *testing.T) {
+	t.Setenv(openCodeFullRequestDebugEnv, "false")
 	_, errorLogs := captureOpenCodeDiagnosticLogs(t)
 	db := setupModelListControllerTestDB(t)
 	const modelName = "diagnostic-candidate-model-private"
@@ -159,6 +208,83 @@ func TestOpenCodeAllRejectedAPIKeyCandidatesLogMixedPolicyOnly(t *testing.T) {
 		"diagnostic-candidate-request-id-private",
 		"diagnostic-candidate-url-private",
 	)
+}
+
+func TestOpenCodeAllRejectedAPIKeyCandidatesFullRequestDebugLogsRootOnce(t *testing.T) {
+	t.Setenv(openCodeFullRequestDebugEnv, "true")
+	_, errorLogs := captureOpenCodeDiagnosticLogs(t)
+	db := setupModelListControllerTestDB(t)
+	const modelName = "diagnostic-candidate-full-request-model"
+
+	strict := newOpenCodeAPIKeySnapshotTestChannel(
+		"diagnostic-candidate-full-request-strict",
+		modelName,
+		20,
+		dto.OpenCodeGoProtocolChat,
+	)
+	strict.Key = "diagnostic-candidate-full-request-strict-key"
+	setCandidateCachePolicy(&strict, dto.OpenCodeGoUnsupportedOptionalFieldStrict)
+	persistOpenCodeAPIKeySnapshotTestChannel(t, db, &strict)
+	compatible := newOpenCodeAPIKeySnapshotTestChannel(
+		"diagnostic-candidate-full-request-compatible",
+		modelName,
+		10,
+		dto.OpenCodeGoProtocolChat,
+	)
+	compatible.Key = "diagnostic-candidate-full-request-compatible-key"
+	setCandidateCachePolicy(&compatible, dto.OpenCodeGoUnsupportedOptionalFieldDropKnown)
+	persistOpenCodeAPIKeySnapshotTestChannel(t, db, &compatible)
+	c, info := newMalformedOpenCodeCacheCandidateFixture(t, &strict, modelName)
+	c.Request.Header.Set("Authorization", "Bearer candidate-root-full-request-secret")
+
+	plans, relayErr := prepareAndFreezeOpenCodeCandidatePlans(c, info)
+
+	assert.Nil(t, plans)
+	require.NotNil(t, relayErr)
+	assert.Equal(t, http.StatusBadRequest, relayErr.StatusCode)
+	logText := errorLogs.String()
+	assert.Equal(t, 1, strings.Count(logText, openCodeFullRequestDebugMarker))
+	assert.Equal(t, 1, strings.Count(logText, "Authorization: Bearer candidate-root-full-request-secret"))
+	assert.Equal(t, 1, strings.Count(logText, "diagnostic-candidate-body-private"))
+	assert.Equal(t, 1, strings.Count(logText, "OpenCode request preflight rejected:"))
+}
+
+func TestOpenCodeFullRequestDebugFailureDoesNotReplacePreflightError(t *testing.T) {
+	t.Setenv(openCodeFullRequestDebugEnv, "true")
+	_, errorLogs := captureOpenCodeDiagnosticLogs(t)
+	body := []byte(`{"model":"glm-5.2","max_tokens":16,"messages":[{"role":"user","name":"closed-storage-parent","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}]}`)
+	c, info, _ := newOpenCodeControllerPreflightFixture(
+		t,
+		constant.ChannelTypeOpenCodeGo,
+		"/v1/messages",
+		types.RelayFormatClaude,
+		"glm-5.2",
+		"",
+		body,
+	)
+	storage, err := common.GetBodyStorage(c)
+	require.NoError(t, err)
+	_, preflightErr := opencodego.BuildRequestPreflightPlan(c, info)
+	require.Error(t, preflightErr)
+	c.Set(common.KeyBodyStorage, openCodeFullRequestDebugFailingStorage{BodyStorage: storage})
+
+	relayErr := newOpenCodeRequestPreflightAPIError(c, preflightErr)
+
+	require.NotNil(t, relayErr)
+	assert.Equal(t, http.StatusBadRequest, relayErr.StatusCode)
+	assert.Equal(t, opencodego.CacheControlParentRule, relayErr.Provenance().Subtype)
+	logText := errorLogs.String()
+	assert.Equal(t, 1, strings.Count(logText, openCodeFullRequestDebugFailureMarker))
+	assert.Equal(t, 0, strings.Count(logText, openCodeFullRequestDebugMarker+" rule_id="))
+	assert.Equal(t, 1, strings.Count(logText, "OpenCode request preflight rejected:"))
+}
+
+type openCodeFullRequestDebugFailingStorage struct {
+	common.BodyStorage
+}
+
+func (openCodeFullRequestDebugFailingStorage) NewReader() (io.ReadCloser, error) {
+	return nil, fmt.Errorf("synthetic full request debug reader failure")
 }
 
 func TestOpenCodeCompatibilitySummaryPrecedesAttemptAndDeduplicatesByPlan(t *testing.T) {

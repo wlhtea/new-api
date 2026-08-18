@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
 	"strings"
 	"sync"
 
@@ -20,6 +21,9 @@ import (
 
 const (
 	openCodeCacheControlDiagnosticContextKey = "opencode_cache_control_diagnostics_v1"
+	openCodeFullRequestDebugEnv              = "OPENCODE_DEBUG_FULL_REQUEST"
+	openCodeFullRequestDebugMarker           = "OpenCode full inbound request debug:"
+	openCodeFullRequestDebugFailureMarker    = "OpenCode full inbound request debug failed:"
 
 	openCodeCacheControlCompatibilityRule    = "request.cache-control.compatibility-summary"
 	openCodeCacheControlPhysicalAttemptStage = "relay.physical-attempt"
@@ -223,6 +227,7 @@ func logOpenCodeRequestPreflightRejection(
 	statusCode = boundedOpenCodeDiagnosticHTTPStatus(statusCode)
 	ruleID = boundedOpenCodeDiagnosticRule(ruleID)
 	stageID = boundedOpenCodeDiagnosticStage(stageID)
+	logOpenCodeFullRequestDebug(c, ruleID, stageID)
 	logger.LogWarn(context.Background(), fmt.Sprintf(
 		"OpenCode request preflight rejected: rule_id=%s stage=%s status=%d client_protocol=%s final_protocol=%s channel_type=%d policy=%s candidate_count=%d preserve_count=%d drop_count=%d",
 		ruleID,
@@ -236,6 +241,72 @@ func logOpenCodeRequestPreflightRejection(
 		snapshot.preserveCount,
 		snapshot.dropCount,
 	))
+}
+
+func logOpenCodeFullRequestDebug(c *gin.Context, ruleID string, stageID string) {
+	if c == nil || !common.GetEnvOrDefaultBool(openCodeFullRequestDebugEnv, false) {
+		return
+	}
+	logContext := openCodeFullRequestLogContext(c)
+	dump, err := dumpOpenCodeFullRequest(c)
+	if err != nil {
+		logger.LogWarn(logContext, fmt.Sprintf(
+			"%s rule_id=%s stage=%s error=%s",
+			openCodeFullRequestDebugFailureMarker,
+			ruleID,
+			stageID,
+			common.LocalLogPreview(common.MaskSensitiveInfo(err.Error())),
+		))
+		return
+	}
+	logger.LogWarn(logContext, fmt.Sprintf(
+		"%s rule_id=%s stage=%s\n%s",
+		openCodeFullRequestDebugMarker,
+		ruleID,
+		stageID,
+		dump,
+	))
+}
+
+func dumpOpenCodeFullRequest(c *gin.Context) ([]byte, error) {
+	if c == nil || c.Request == nil {
+		return nil, fmt.Errorf("request is unavailable")
+	}
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil, fmt.Errorf("get request body storage: %w", err)
+	}
+	body, err := storage.NewReader()
+	if err != nil {
+		return nil, fmt.Errorf("open request body reader: %w", err)
+	}
+	defer body.Close()
+
+	request := c.Request.Clone(c.Request.Context())
+	request.Body = body
+	request.GetBody = nil
+	request.RequestURI = request.URL.RequestURI()
+	dump, err := httputil.DumpRequest(request, true)
+	if err != nil {
+		return nil, fmt.Errorf("dump request: %w", err)
+	}
+	return dump, nil
+}
+
+func openCodeFullRequestLogContext(c *gin.Context) context.Context {
+	if c == nil {
+		return context.Background()
+	}
+	if c.Request != nil {
+		requestContext := c.Request.Context()
+		if requestContext.Value(common.RequestIdKey) != nil {
+			return requestContext
+		}
+	}
+	if requestID := strings.TrimSpace(c.GetString(common.RequestIdKey)); requestID != "" {
+		return context.WithValue(context.Background(), common.RequestIdKey, requestID)
+	}
+	return context.Background()
 }
 
 func logOpenCodeCacheControlCompatibilityAttempt(c *gin.Context) {
