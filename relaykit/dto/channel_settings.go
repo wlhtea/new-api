@@ -85,6 +85,11 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastRemovedModels  []string              `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string              `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
 	AdvancedCustom                        *AdvancedCustomConfig `json:"advanced_custom,omitempty"`
+	// VolcAssets (channel type 62) permission switches. Both default to false
+	// (deny) so a leaked customer token cannot delete or rename assets, which
+	// would break upload traceability.
+	AllowAssetDelete bool `json:"allow_asset_delete,omitempty"` // allow DeleteAsset / DeleteAssetGroup
+	AllowAssetUpdate bool `json:"allow_asset_update,omitempty"` // allow UpdateAsset / UpdateAssetGroup
 }
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {

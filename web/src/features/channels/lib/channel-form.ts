@@ -275,6 +275,8 @@ export const channelFormSchema = z
     allow_speed: z.boolean().optional(), // Anthropic: speed mode control
     claude_beta_query: z.boolean().optional(), // Anthropic: beta query passthrough
     disable_task_polling_sleep: z.boolean().optional(),
+    asset_allow_delete: z.boolean().optional(), // VolcAssets (type 62)
+    asset_allow_update: z.boolean().optional(), // VolcAssets (type 62)
     // Upstream model update settings (stored in settings JSON)
     upstream_model_update_check_enabled: z.boolean().optional(),
     upstream_model_update_auto_sync_enabled: z.boolean().optional(),
@@ -447,6 +449,8 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   allow_speed: false,
   claude_beta_query: false,
   disable_task_polling_sleep: false,
+  asset_allow_delete: false,
+  asset_allow_update: false,
   upstream_model_update_check_enabled: false,
   upstream_model_update_auto_sync_enabled: false,
   upstream_model_update_ignored_models: '',
@@ -511,6 +515,8 @@ export function transformChannelToFormDefaults(
   let allowSpeed = false
   let claudeBetaQuery = false
   let disableTaskPollingSleep = false
+  let assetAllowDelete = false
+  let assetAllowUpdate = false
   let upstreamModelUpdateCheckEnabled = false
   let upstreamModelUpdateAutoSyncEnabled = false
   let upstreamModelUpdateIgnoredModels = ''
@@ -529,6 +535,8 @@ export function transformChannelToFormDefaults(
       allowIncludeObfuscation = parsed.allow_include_obfuscation === true
       allowInferenceGeo = parsed.allow_inference_geo === true
       allowSpeed = parsed.allow_speed === true
+      assetAllowDelete = parsed.allow_asset_delete === true
+      assetAllowUpdate = parsed.allow_asset_update === true
       claudeBetaQuery = parsed.claude_beta_query === true
       disableTaskPollingSleep = parsed.disable_task_polling_sleep === true
       upstreamModelUpdateCheckEnabled =
@@ -589,6 +597,8 @@ export function transformChannelToFormDefaults(
     allow_speed: allowSpeed,
     claude_beta_query: claudeBetaQuery,
     disable_task_polling_sleep: disableTaskPollingSleep,
+    asset_allow_delete: assetAllowDelete,
+    asset_allow_update: assetAllowUpdate,
     allow_safety_identifier: allowSafetyIdentifier,
     upstream_model_update_check_enabled: upstreamModelUpdateCheckEnabled,
     upstream_model_update_auto_sync_enabled: upstreamModelUpdateAutoSyncEnabled,
@@ -647,6 +657,17 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     settingsObj.vertex_key_type = formData.vertex_key_type || 'json'
   } else if ('vertex_key_type' in settingsObj) {
     delete settingsObj.vertex_key_type
+  }
+
+  // Asset permission switches for VolcAssets channels (type 62)
+  if (formData.type === 62) {
+    if (formData.asset_allow_delete) settingsObj.allow_asset_delete = true
+    else delete settingsObj.allow_asset_delete
+    if (formData.asset_allow_update) settingsObj.allow_asset_update = true
+    else delete settingsObj.allow_asset_update
+  } else {
+    delete settingsObj.allow_asset_delete
+    delete settingsObj.allow_asset_update
   }
 
   // Add azure_responses_version for Azure channels (type 3)

@@ -280,6 +280,8 @@ const SENSITIVE_FORM_FIELDS = [
   'advanced_custom',
   'is_enterprise_account',
   'vertex_key_type',
+  'asset_allow_delete',
+  'asset_allow_update',
   'aws_key_type',
   'azure_responses_version',
   'force_format',
@@ -2656,6 +2658,60 @@ export function ChannelMutateDrawer({
                                         {'}'}
                                       </FormDescription>
                                       <FormMessage />
+                                    </FormItem>
+                                  )}
+                                />
+                              </>
+                            )}
+
+                            {/* VolcAssets (type 62) - asset permission switches */}
+                            {currentType === 62 && (
+                              <>
+                                <FormField
+                                  control={form.control}
+                                  name='asset_allow_delete'
+                                  render={({ field }) => (
+                                    <FormItem className='flex items-center justify-between px-4 py-3'>
+                                      <div className='space-y-0.5'>
+                                        <FormLabel>
+                                          {t('Allow asset deletion')}
+                                        </FormLabel>
+                                        <FormDescription>
+                                          {t(
+                                            'Allow callers to delete assets and asset groups through this channel. Keep OFF to prevent malicious deletion.'
+                                          )}
+                                        </FormDescription>
+                                      </div>
+                                      <FormControl>
+                                        <Switch
+                                          checked={!!field.value}
+                                          onCheckedChange={field.onChange}
+                                        />
+                                      </FormControl>
+                                    </FormItem>
+                                  )}
+                                />
+                                <FormField
+                                  control={form.control}
+                                  name='asset_allow_update'
+                                  render={({ field }) => (
+                                    <FormItem className='flex items-center justify-between px-4 py-3'>
+                                      <div className='space-y-0.5'>
+                                        <FormLabel>
+                                          {t('Allow asset rename/update')}
+                                        </FormLabel>
+                                        <FormDescription>
+                                          {t(
+                                            'Allow callers to rename assets and asset groups through this channel. Keep OFF to preserve traceable names.'
+                                          )}
+                                        </FormDescription>
+                                      </div>
+                                      <FormControl>
+                                        <Switch
+                                          checked={!!field.value}
+                                          onCheckedChange={field.onChange}
+                                        />
+                                      </FormControl>
                                     </FormItem>
                                   )}
                                 />

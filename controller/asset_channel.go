@@ -84,6 +84,24 @@ func RelayVolcAsset(c *gin.Context) {
 		return
 	}
 
+	// Per-channel permission switches for destructive / rename operations.
+	// Default is DENY: a leaked customer token must not be able to delete or
+	// rename assets (that would break traceability of uploads).
+	if strings.HasPrefix(action, "Delete") && !channel.GetOtherSettings().AllowAssetDelete {
+		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{
+			"message": "delete operations are disabled on this channel",
+			"type":    "permission_denied",
+		}})
+		return
+	}
+	if strings.HasPrefix(action, "Update") && !channel.GetOtherSettings().AllowAssetUpdate {
+		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{
+			"message": "rename/update operations are disabled on this channel",
+			"type":    "permission_denied",
+		}})
+		return
+	}
+
 	key, _, keyErr := channel.GetNextEnabledKey()
 	if keyErr != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "no enabled key on channel: " + keyErr.Error(), "type": "server_error"}})
