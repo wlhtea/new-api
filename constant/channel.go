@@ -59,7 +59,8 @@ const (
 	ChannelTypeSeedDance      = 59
 	ChannelTypeSub2API        = 60
 	ChannelTypeNewAPI         = 61
-	ChannelTypeDummy          = 62 // this one is only for count, do not add any channel after this
+	ChannelTypeVolcAssets     = 62
+	ChannelTypeDummy          = 63 // this one is only for count, do not add any channel after this
 
 )
 
@@ -126,6 +127,7 @@ var ChannelBaseURLs = []string{
 	"http://alb-o13xqj8f2cpjsa67ym.ap-northeast-1.alb.aliyuncsslbintl.com/v1/public_api/m-predict/polar4ai-i2v", // 59
 	"", //60
 	"", //61
+	"https://open.volcengineapi.com", //62
 }
 
 var ChannelTypeNames = map[int]string{
@@ -187,6 +189,7 @@ var ChannelTypeNames = map[int]string{
 	ChannelTypeSub2API:        "Sub2API",
 	ChannelTypeSeedDance:      "SeedDance",
 	ChannelTypeNewAPI:         "New API",
+	ChannelTypeVolcAssets:     "VolcAssets",
 }
 
 func GetChannelTypeName(channelType int) string {

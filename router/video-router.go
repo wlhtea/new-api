@@ -31,6 +31,16 @@ func SetVideoRouter(router *gin.Engine) {
 		videoV1Router.GET("/videos/:task_id", controller.RelayTaskFetch)
 	}
 
+	// Volcengine Ark Assets (素材库) management, channel-level relay.
+	// Downstream: POST /v1/assets/{Action} with pseudo "model" in JSON body
+	// (e.g. "seedance-assets") for channel selection.
+	assetV1Router := router.Group("/v1/assets")
+	assetV1Router.Use(middleware.RouteTag("relay"))
+	assetV1Router.Use(middleware.TokenAuth(), middleware.Distribute())
+	{
+		assetV1Router.POST("/:action", controller.RelayVolcAsset)
+	}
+
 	klingV1Router := router.Group("/kling/v1")
 	klingV1Router.Use(middleware.RouteTag("relay"))
 	klingV1Router.Use(middleware.KlingRequestConvert(), middleware.TokenAuth(), middleware.Distribute())
