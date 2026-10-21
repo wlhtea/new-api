@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -139,6 +140,10 @@ func RelayVolcAsset(c *gin.Context) {
 			bodyMap["ProjectName"] = defaultProject
 		}
 	}
+	// Traceable naming for uploads: {username}_{keyTail6}_{timestamp}[_{customName}]
+	if action == "CreateAsset" {
+		bodyMap["Name"] = buildTraceableAssetName(c, bodyMap["Name"])
+	}
 	forwardBody, err := json.Marshal(bodyMap)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "marshal body failed", "type": "invalid_request_error"}})
@@ -167,6 +172,72 @@ func RelayVolcAsset(c *gin.Context) {
 		return
 	}
 	c.Data(resp.StatusCode, "application/json; charset=utf-8", respBody)
+}
+
+// buildTraceableAssetName composes the upstream asset Name as
+// "{username}_{keyTail6}_{yyyyMMdd-HHmmss}" plus an optional sanitized custom
+// suffix, so every upload can be traced back to the user, the API key and the
+// submission time.
+func buildTraceableAssetName(c *gin.Context, customName interface{}) string {
+	username := ""
+	if uid := c.GetInt(string(constant.ContextKeyUserId)); uid > 0 {
+		if un, err := model.GetUsernameById(uid, false); err == nil {
+			username = un
+		}
+	}
+	if username == "" {
+		username = "user"
+	}
+	tokenKey := strings.TrimPrefix(common.GetContextKeyString(c, constant.ContextKeyTokenKey), "sk-")
+	tail := tokenKey
+	if len(tail) > 6 {
+		tail = tail[len(tail)-6:]
+	}
+	if tail == "" {
+		tail = "nokey"
+	}
+	ts := time.Now().Format("20060102-150405")
+
+	var b strings.Builder
+	b.WriteString(sanitizeAssetNamePart(username))
+	b.WriteString("_")
+	b.WriteString(tail)
+	b.WriteString("_")
+	b.WriteString(ts)
+	if s, ok := customName.(string); ok && strings.TrimSpace(s) != "" {
+		b.WriteString("_")
+		b.WriteString(sanitizeAssetNamePart(strings.TrimSpace(s)))
+	}
+	return b.String()
+}
+
+// sanitizeAssetNamePart keeps letters (incl. CJK), digits and "-_.", maps
+// everything else to "-", collapses repeats and caps the length at 40 runes.
+func sanitizeAssetNamePart(s string) string {
+	var b strings.Builder
+	lastDash := false
+	for _, r := range s {
+		ok := unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || r == '.'
+		if !ok {
+			if lastDash {
+				continue
+			}
+			b.WriteByte('-')
+			lastDash = true
+			continue
+		}
+		b.WriteRune(r)
+		lastDash = false
+	}
+	out := strings.Trim(b.String(), "-_.")
+	runes := []rune(out)
+	if len(runes) > 40 {
+		out = string(runes[:40])
+	}
+	if out == "" {
+		out = "x"
+	}
+	return out
 }
 
 // testVolcAssetsChannel probes a VolcAssets channel by calling
