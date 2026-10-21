@@ -102,6 +102,19 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		}
 		return testResult{context: c}
 	}
+	if channel.Type == constant.ChannelTypeVolcAssets {
+		if err := testVolcAssetsChannel(ctx, channel); err != nil {
+			return testResult{
+				localErr: err,
+				newAPIError: types.NewErrorWithStatusCode(
+					err,
+					types.ErrorCodeBadResponseStatusCode,
+					http.StatusBadGateway,
+				),
+			}
+		}
+		return testResult{}
+	}
 	tik := time.Now()
 	var unsupportedTestChannelTypes = []int{
 		constant.ChannelTypeMidjourney,

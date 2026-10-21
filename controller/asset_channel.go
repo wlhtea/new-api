@@ -16,6 +16,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -112,12 +113,12 @@ func RelayVolcAsset(c *gin.Context) {
 	}
 
 	// Read body via reusable storage (distributor may have consumed Request.Body).
-	bodySeeker, err := common.GetRequestBody(c)
+	bodyStorage, err := common.GetBodyStorage(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "read body failed: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
-	bodyBytes, err := io.ReadAll(bodySeeker)
+	bodyBytes, err := bodyStorage.Bytes()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "read body failed", "type": "invalid_request_error"}})
 		return
@@ -166,6 +167,61 @@ func RelayVolcAsset(c *gin.Context) {
 		return
 	}
 	c.Data(resp.StatusCode, "application/json; charset=utf-8", respBody)
+}
+
+// testVolcAssetsChannel probes a VolcAssets channel by calling
+// ListAssetGroups (PageSize=1) with the channel's AK/SK.
+func testVolcAssetsChannel(ctx context.Context, channel *model.Channel) error {
+	key, _, keyErr := channel.GetNextEnabledKey()
+	if keyErr != nil {
+		return fmt.Errorf("no enabled key: %v", keyErr)
+	}
+	parts := strings.SplitN(strings.TrimSpace(key), "|", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("channel key must be in \"AccessKey|SecretKey\" format")
+	}
+	baseURL := strings.TrimSuffix(strings.TrimSpace(channel.GetBaseURL()), "/")
+	if baseURL == "" {
+		baseURL = volcAssetDefaultURL
+	}
+	region := volcAssetDefaultRegion
+	if r, ok := channel.GetOtherInfo()["region"].(string); ok && r != "" {
+		region = r
+	}
+	bodyMap := map[string]interface{}{"PageSize": 1}
+	if p, ok := channel.GetOtherInfo()["project_name"].(string); ok && strings.TrimSpace(p) != "" {
+		bodyMap["ProjectName"] = strings.TrimSpace(p)
+	}
+	bodyBytes, _ := json.Marshal(bodyMap)
+	upstreamURL := fmt.Sprintf("%s?Action=ListAssetGroups&Version=%s", baseURL, volcAssetAPIVersion)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	signVolcAssetRequest(req, bodyBytes, parts[0], parts[1], region)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(respBody))
+	}
+	var parsed struct {
+		ResponseMetadata struct {
+			Error *struct {
+				Code    string `json:"Code"`
+				Message string `json:"Message"`
+			} `json:"Error"`
+		} `json:"ResponseMetadata"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err == nil && parsed.ResponseMetadata.Error != nil {
+		return fmt.Errorf("upstream error %s: %s", parsed.ResponseMetadata.Error.Code, parsed.ResponseMetadata.Error.Message)
+	}
+	return nil
 }
 
 // signVolcAssetRequest signs req with Volcengine HMAC-SHA256 (ark service).
