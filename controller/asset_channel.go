@@ -30,7 +30,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/gin-gonic/gin"
 )
@@ -152,6 +154,10 @@ func RelayVolcAsset(c *gin.Context) {
 	} else {
 		bodyMap = map[string]interface{}{}
 	}
+	modelName, _ := bodyMap["model"].(string)
+	if modelName == "" {
+		modelName = "seedance-assets"
+	}
 	delete(bodyMap, "model")
 	if defaultProject != "" {
 		if pn, exists := bodyMap["ProjectName"]; !exists || pn == "" {
@@ -190,6 +196,76 @@ func RelayVolcAsset(c *gin.Context) {
 		return
 	}
 	c.Data(resp.StatusCode, "application/json; charset=utf-8", respBody)
+
+	recordVolcAssetUsage(c, channel, modelName, action, upstreamRequestID(respBody), resp.StatusCode)
+}
+
+// upstreamRequestID 从火山资产响应里提取 ResponseMetadata.RequestId（失败则空字符串）。
+func upstreamRequestID(respBody []byte) string {
+	var m map[string]interface{}
+	if err := json.Unmarshal(respBody, &m); err != nil {
+		return ""
+	}
+	if rm, ok := m["ResponseMetadata"].(map[string]interface{}); ok {
+		if rid, ok := rm["RequestId"].(string); ok {
+			return rid
+		}
+	}
+	return ""
+}
+
+// recordVolcAssetUsage 为素材库请求写入使用日志并按 ModelPrice 计次扣费。
+// 此前该 handler 完全跳过日志与计费，导致客户使用素材库在使用日志页不可见、
+// 配置的 seedance-assets ModelPrice 从未生效。仅在上游返回 2xx 时计为成功消费。
+func recordVolcAssetUsage(c *gin.Context, channel *model.Channel, modelName, action, upstreamRid string, statusCode int) {
+	userId := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+	tokenId := common.GetContextKeyInt(c, constant.ContextKeyTokenId)
+	tokenName := c.GetString("token_name")
+	usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	if usingGroup == "" {
+		usingGroup = common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+	}
+
+	quota := 0
+	var content string
+	if statusCode >= 200 && statusCode < 300 {
+		if modelPrice, hasPrice := ratio_setting.GetModelPrice(modelName, false); hasPrice && modelPrice > 0 {
+			groupRatio := ratio_setting.GetGroupRatio(usingGroup)
+			if userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup); userGroup != "" {
+				if rr, ok := ratio_setting.GetGroupGroupRatio(userGroup, usingGroup); ok {
+					groupRatio = rr
+				}
+			}
+			quota = common.QuotaFromFloat(modelPrice * groupRatio)
+			if quota > 0 {
+				if err := model.DecreaseUserQuota(userId, quota, false); err != nil {
+					logger.LogError(c, fmt.Sprintf("asset billing: decrease user %d quota %d failed: %v", userId, quota, err))
+				}
+				if tokenId > 0 {
+					if err := model.DecreaseTokenQuota(tokenId, "", quota); err != nil {
+						logger.LogError(c, fmt.Sprintf("asset billing: decrease token %d quota %d failed: %v", tokenId, quota, err))
+					}
+				}
+			}
+			content = fmt.Sprintf("资产操作 %s 按次计费: price=$%.4f/次, groupRatio=%.2f", action, modelPrice, groupRatio)
+		} else {
+			content = fmt.Sprintf("资产操作 %s (未配置 ModelPrice, 免费)", action)
+		}
+	} else {
+		content = fmt.Sprintf("资产操作 %s 上游返回 %d, 不计费", action, statusCode)
+	}
+
+	model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
+		ChannelId:    channel.Id,
+		ModelName:    modelName,
+		TokenName:    tokenName,
+		TokenId:      tokenId,
+		Quota:        quota,
+		Content:      content,
+		IsStream:     false,
+		Group:        usingGroup,
+		Other:        map[string]interface{}{"action": action, "upstream_request_id": upstreamRid},
+	})
 }
 
 // buildTraceableAssetName composes the upstream asset Name as
