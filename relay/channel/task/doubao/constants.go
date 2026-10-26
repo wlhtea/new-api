@@ -36,6 +36,19 @@ var videoPriceTable = map[string]map[videoPriceKey]float64{
 		{hasVideo: false}: 37.0,
 		{hasVideo: true}:  22.0,
 	},
+	// 官方刊例（元/百万 tokens，2026-10）：
+	// mini 480p/720p 无视频 23 / 含视频 14（最高 720p）
+	// 2-5  480p/720p 无视频 70 / 含视频 42；1080p 无视频 77 / 含视频 46
+	"doubao-seedance-2-0-mini-260615": {
+		{hasVideo: false}: 23.0,
+		{hasVideo: true}:  14.0,
+	},
+	"doubao-seedance-2-5-260628": {
+		{hasVideo: false}:                70.0,
+		{hasVideo: true}:                 42.0,
+		{is1080p: true, hasVideo: false}: 77.0,
+		{is1080p: true, hasVideo: true}:  46.0,
+	},
 }
 
 // GetVideoInputRatio 返回指定模型在给定输出分辨率/是否含视频输入下，相对基准价的计费倍率。

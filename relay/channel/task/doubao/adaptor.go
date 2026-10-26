@@ -144,6 +144,14 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 	}
 	hasVideo := hasVideoInMetadata(req.Metadata)
 	resolution, _ := req.Metadata["resolution"].(string)
+	if resolution == "" && req.Size != "" {
+		// OpenAI 路径顶层 size（如 "1920x1080"）：估算阶段 metadata 尚未回填
+		// resolution（convertToRequestPayload 在提交流程后段才执行），此处直接
+		// 归档为火山档位，保证 OtherRatio 与最终执行分辨率一致。
+		if res, okRes := sizeToResolution(req.Size); okRes {
+			resolution = res
+		}
+	}
 	ratio, ok := GetVideoInputRatio(info.OriginModelName, resolution, hasVideo)
 	if !ok || ratio == 1.0 {
 		return nil
