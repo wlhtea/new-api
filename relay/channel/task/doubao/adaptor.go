@@ -1,6 +1,7 @@
 package doubao
 
 import (
+	"strings"
 	"bytes"
 	"fmt"
 	"io"
@@ -271,6 +272,32 @@ func (a *TaskAdaptor) GetChannelName() string {
 	return ChannelName
 }
 
+// sizeToResolution 将 OpenAI 风格的 "宽x高"（如 "854x480"）映射为火山 resolution 档位。
+// 火山支持 480p/720p/1080p/2k/4k；按高度就近归档，无法解析时返回 false 交由上游默认值。
+func sizeToResolution(size string) (string, bool) {
+	parts := strings.SplitN(strings.ToLower(strings.TrimSpace(size)), "x", 2)
+	if len(parts) != 2 {
+		return "", false
+	}
+	w, errW := strconv.Atoi(strings.TrimSpace(parts[0]))
+	h, errH := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errW != nil || errH != nil || w <= 0 || h <= 0 {
+		return "", false
+	}
+	switch {
+	case h <= 480:
+		return "480p", true
+	case h <= 720:
+		return "720p", true
+	case h <= 1080:
+		return "1080p", true
+	case h <= 1440:
+		return "2k", true
+	default:
+		return "4k", true
+	}
+}
+
 func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq) (*requestPayload, error) {
 	r := requestPayload{
 		Model:   req.Model,
@@ -296,6 +323,25 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq) (*
 
 	if sec, _ := strconv.Atoi(req.Seconds); sec > 0 {
 		r.Duration = lo.ToPtr(dto.IntValue(sec))
+	} else if req.Duration > 0 {
+		// OpenAI 路径顶层 duration 字段（此前被丢弃，导致上游按默认时长执行/计费）
+		r.Duration = lo.ToPtr(dto.IntValue(req.Duration))
+	}
+
+	// OpenAI 路径顶层 size（如 "854x480"）映射为火山 resolution 档位；
+	// metadata.resolution 优先，避免覆盖调用方显式指定的分辨率。
+	if r.Resolution == "" && req.Size != "" {
+		if res, ok := sizeToResolution(req.Size); ok {
+			r.Resolution = res
+			if metadata == nil {
+				metadata = map[string]interface{}{}
+				req.Metadata = metadata
+			}
+			if _, exists := metadata["resolution"]; !exists {
+				// 供 EstimateBilling 读取同一档位，保持预扣与最终计费一致
+				metadata["resolution"] = res
+			}
+		}
 	}
 
 	r.Content = lo.Reject(r.Content, func(c ContentItem, _ int) bool { return c.Type == "text" })
