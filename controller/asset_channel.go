@@ -236,7 +236,7 @@ func recordVolcAssetUsage(c *gin.Context, channel *model.Channel, modelName, act
 					groupRatio = rr
 				}
 			}
-			quota = common.QuotaFromFloat(modelPrice * groupRatio)
+			quota = common.QuotaFromFloat(modelPrice * groupRatio * common.QuotaPerUnit)
 			if quota > 0 {
 				if err := model.DecreaseUserQuota(userId, quota, false); err != nil {
 					logger.LogError(c, fmt.Sprintf("asset billing: decrease user %d quota %d failed: %v", userId, quota, err))
