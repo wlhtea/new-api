@@ -412,14 +412,20 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		return
 	}
 
-	groupRatio := ratio_setting.GetGroupRatio(group)
-	userGroupRatio, hasUserGroupRatio := ratio_setting.GetGroupGroupRatio(group, group)
-
+	// 优先使用提交时快照的 GroupRatio（billing_context），它已正确包含
+	// GroupGroupRatio（用户组 x 使用组）折扣；重新解析会在跨组任务
+	// （task.Group=使用组，非用户组）时查不到组合折扣，导致结算漏乘。
 	var finalGroupRatio float64
-	if hasUserGroupRatio {
-		finalGroupRatio = userGroupRatio
+	if task.PrivateData.BillingContext != nil && task.PrivateData.BillingContext.GroupRatio > 0 {
+		finalGroupRatio = task.PrivateData.BillingContext.GroupRatio
 	} else {
+		groupRatio := ratio_setting.GetGroupRatio(group)
+		userGroupRatio, hasUserGroupRatio := ratio_setting.GetGroupGroupRatio(group, group)
+
 		finalGroupRatio = groupRatio
+		if hasUserGroupRatio {
+			finalGroupRatio = userGroupRatio
+		}
 	}
 
 	// 计算 OtherRatios 乘积（视频折扣、时长等）
