@@ -13,6 +13,8 @@ import (
 
 type ChannelSettings struct {
 	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
+	AllowOfficialTaskList     bool   `json:"allow_official_task_list,omitempty"`
+	AllowOfficialTaskDelete   bool   `json:"allow_official_task_delete,omitempty"`
 	ForceFormat               bool   `json:"force_format,omitempty"`
 	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`
 	Proxy                     string `json:"proxy"`

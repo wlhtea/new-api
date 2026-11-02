@@ -15,7 +15,7 @@ func setupDoubaoOfficialDeleteStateTask(t *testing.T, providerID string, hostSta
 	t.Helper()
 	fixture := setupDoubaoNativeFixture(t, providerID)
 	require.NoError(t, fixture.database.AutoMigrate(&model.AuditLog{}))
-	pluginSetting := `{"task_plugin_key":"doubao_ark_official"}`
+	pluginSetting := `{"task_plugin_key":"doubao_ark_official","allow_official_task_list":true,"allow_official_task_delete":true}`
 	fixture.channel.Type = constant.ChannelTypeTaskPlugin
 	fixture.channel.Setting = &pluginSetting
 	require.NoError(t, fixture.database.Save(fixture.channel).Error)

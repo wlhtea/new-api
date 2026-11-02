@@ -1992,9 +1992,14 @@ func setupTaskPluginRouteDB(t *testing.T) {
 	previousType := common.MainDatabaseType()
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.Channel{}))
 	model.DB = database
 	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	defaultOfficialListSetting := `{"task_plugin_key":"doubao_ark_official","allow_official_task_list":true}`
+	require.NoError(t, model.DB.Create(&model.Channel{
+		Id: 1, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled,
+		Name: "default-official-list-test", Key: "test-only", Setting: &defaultOfficialListSetting,
+	}).Error)
 	t.Cleanup(func() {
 		model.DB = previousDB
 		common.SetMainDatabaseType(previousType)
@@ -2003,6 +2008,9 @@ func setupTaskPluginRouteDB(t *testing.T) {
 
 func insertTaskPluginRouteTask(t *testing.T, task *model.Task) {
 	t.Helper()
+	if task.Platform == constant.TaskPlatform("doubao_ark_official") && task.ChannelId == 0 {
+		task.ChannelId = 1
+	}
 	require.NoError(t, model.DB.Create(task).Error)
 }
 

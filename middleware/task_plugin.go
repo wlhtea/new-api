@@ -128,6 +128,12 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		if pinned.Plugin.Meta.Key == "doubao_ark_official" && pinned.Route.Method == http.MethodDelete {
 			taskErr := service.DeleteDoubaoArkOfficialTask(c, pinned.Plugin.Meta.Key, requestContext.Params[pinned.Route.TaskIDParam])
 			if taskErr != nil {
+				if taskErr.Code == "official_task_delete_disabled" {
+					c.Abort()
+					if RespondTaskPluginError(c, taskErr) {
+						return
+					}
+				}
 				abortTaskPluginRouteErrorDetail(c, taskErr.StatusCode, taskErr.Message)
 				return
 			}
@@ -1246,6 +1252,27 @@ func officialListPagination(query map[string][]string, name string) (int, error)
 }
 
 func renderDoubaoArkOfficialList(c *gin.Context, pinned pluginruntime.PinnedRoute, requestContext pluginruntime.RouteRequestContext) {
+	channels, err := model.GetEnabledTaskPluginChannels(pinned.Plugin.Meta.Key)
+	if err != nil {
+		abortTaskPluginRouteError(c, http.StatusInternalServerError)
+		return
+	}
+	allowedChannelIDs := make([]int, 0, len(channels))
+	for _, channel := range channels {
+		if channel.GetSetting().AllowOfficialTaskList {
+			allowedChannelIDs = append(allowedChannelIDs, channel.Id)
+		}
+	}
+	if len(allowedChannelIDs) == 0 {
+		c.Abort()
+		if RespondTaskPluginError(c, &dto.TaskError{
+			Code: "official_task_list_disabled", Message: "Official task listing is disabled", StatusCode: http.StatusForbidden,
+		}) {
+			return
+		}
+		abortTaskPluginRouteError(c, http.StatusForbidden)
+		return
+	}
 	taskIDs := requestContext.Query["filter.task_ids"]
 	if len(taskIDs) > model.OfficialTaskListMaxTaskIDs {
 		abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, fmt.Sprintf("filter.task_ids accepts at most %d IDs", model.OfficialTaskListMaxTaskIDs))
@@ -1263,8 +1290,8 @@ func renderDoubaoArkOfficialList(c *gin.Context, pinned pluginruntime.PinnedRout
 	}
 	options := model.OfficialTaskListOptions{
 		PageNum: pageNum, PageSize: pageSize,
-		TaskIDs: taskIDs,
-		Since:   time.Now().Add(-7 * 24 * time.Hour).Unix(),
+		TaskIDs: taskIDs, ChannelIDs: allowedChannelIDs,
+		Since: time.Now().Add(-7 * 24 * time.Hour).Unix(),
 	}
 	for _, filter := range []struct {
 		name    string
@@ -1460,6 +1487,9 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 		return false
 	}
 	sanitized := sanitizedTaskPluginError(taskErr.StatusCode, taskErr.Message)
+	if (taskErr.Code == "official_task_delete_disabled" || taskErr.Code == "official_task_list_disabled") && sanitized.HTTPStatus == http.StatusForbidden {
+		sanitized.Code = taskErr.Code
+	}
 	requestID := c.GetString(common.RequestIdKey)
 	hasRenderer, err := pinned.Plugin.Engine.HasCallablePath(c.Request.Context(), "native", "error")
 	requestValue, exists := c.Get(pluginruntime.ContextKeyRouteRequest)

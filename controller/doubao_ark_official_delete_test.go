@@ -59,7 +59,7 @@ func useRealDoubaoTaskAdaptors(t *testing.T) {
 func TestDoubaoArkOfficialQueuedDeleteCancelsUpstreamAndRefundsOnce(t *testing.T) {
 	fixture := setupDoubaoNativeFixture(t, "cgt-delete-queued")
 	require.NoError(t, fixture.database.AutoMigrate(&model.AuditLog{}))
-	pluginSetting := `{"task_plugin_key":"doubao_ark_official"}`
+	pluginSetting := `{"task_plugin_key":"doubao_ark_official","allow_official_task_delete":true}`
 	fixture.channel.Type = constant.ChannelTypeTaskPlugin
 	fixture.channel.Setting = &pluginSetting
 	require.NoError(t, fixture.database.Save(fixture.channel).Error)

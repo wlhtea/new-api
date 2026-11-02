@@ -21,6 +21,22 @@ type TaskPluginChannelRef struct {
 	Type int    `json:"type"`
 }
 
+// GetEnabledTaskPluginChannels returns enabled type-61 channels explicitly
+// bound to one plugin. Extension bindings and legacy channel types are excluded.
+func GetEnabledTaskPluginChannels(key string) ([]*Channel, error) {
+	var channels []*Channel
+	if err := DB.Where("type = ? AND status = ?", constant.ChannelTypeTaskPlugin, common.ChannelStatusEnabled).Find(&channels).Error; err != nil {
+		return nil, err
+	}
+	bound := make([]*Channel, 0, len(channels))
+	for _, channel := range channels {
+		if channel.GetSetting().TaskPluginKey == key {
+			bound = append(bound, channel)
+		}
+	}
+	return bound, nil
+}
+
 func GetTaskPluginUsage(key string) ([]TaskPluginChannelRef, int64, error) {
 	var channels []Channel
 	boundTypes := []int{constant.ChannelTypeTaskPlugin, constant.ChannelTypeNewAPI}

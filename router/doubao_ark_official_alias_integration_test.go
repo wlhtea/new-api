@@ -114,7 +114,7 @@ func setupDoubaoArkAliasIntegration(t *testing.T) *doubaoArkAliasIntegrationFixt
 		Id: 1, UserId: 7, Key: "aliasintegration", Name: "alias integration",
 		Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true,
 	}).Error)
-	pluginSetting := `{"task_plugin_key":"doubao_ark_official"}`
+	pluginSetting := `{"task_plugin_key":"doubao_ark_official","allow_official_task_list":true,"allow_official_task_delete":true}`
 	channel := &model.Channel{
 		Type: constant.ChannelTypeTaskPlugin, Name: "ark-alias-integration", Key: "sk-upstream-alias",
 		BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled,

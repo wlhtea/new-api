@@ -695,6 +695,7 @@ type OfficialTaskListOptions struct {
 	Model       string
 	ServiceTier string
 	TaskIDs     []string
+	ChannelIDs  []int
 	Since       int64
 }
 
@@ -707,6 +708,9 @@ func ListTasksForOfficialPlugin(userID int, platform constant.TaskPlatform, opti
 		Where("provider_deleted = ?", false).
 		Where("provider_task_id <> ''").
 		Where("created_at >= ?", options.Since)
+	if len(options.ChannelIDs) > 0 {
+		query = query.Where("channel_id IN ?", options.ChannelIDs)
+	}
 	if len(options.TaskIDs) > 0 {
 		query = query.Where("provider_task_id IN ?", options.TaskIDs)
 	}

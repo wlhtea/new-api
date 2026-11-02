@@ -60,6 +60,13 @@ func DeleteDoubaoArkOfficialTask(c *gin.Context, pluginKey, providerTaskID strin
 		return &dto.TaskError{Code: "task_not_found", Message: "Task not found", StatusCode: http.StatusNotFound}
 	}
 	task := tasks[0]
+	channel, channelErr := model.CacheGetChannel(task.ChannelId)
+	if channelErr != nil || channel == nil || channel.Status != common.ChannelStatusEnabled || channel.Type != constant.ChannelTypeTaskPlugin {
+		return &dto.TaskError{Code: "official_task_delete_disabled", Message: "Official task deletion is disabled for this channel", StatusCode: http.StatusForbidden}
+	}
+	if setting := channel.GetSetting(); setting.TaskPluginKey != pluginKey || !setting.AllowOfficialTaskDelete {
+		return &dto.TaskError{Code: "official_task_delete_disabled", Message: "Official task deletion is disabled for this channel", StatusCode: http.StatusForbidden}
+	}
 	terminal := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if !terminal {
 		action = "task_provider_cancel"
@@ -72,10 +79,6 @@ func DeleteDoubaoArkOfficialTask(c *gin.Context, pluginKey, providerTaskID strin
 	deletion, ok := adaptor.(TaskDeletionAdaptor)
 	if !ok || deletion == nil {
 		return &dto.TaskError{Code: "server_error", Message: "Task deletion is unavailable", StatusCode: http.StatusInternalServerError}
-	}
-	channel, err := model.CacheGetChannel(task.ChannelId)
-	if err != nil {
-		return &dto.TaskError{Code: "server_error", Message: "Task channel is unavailable", StatusCode: http.StatusInternalServerError}
 	}
 	baseURL := constant.GetChannelBaseURL(channel.Type)
 	if channel.GetBaseURL() != "" {
