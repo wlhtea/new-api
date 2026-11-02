@@ -4277,7 +4277,7 @@ export function ChannelMutateDrawer({
             )}
 
             {currentType === CHANNEL_TYPE_TASK_PLUGIN &&
-              currentTaskPluginKey === 'doubao_ark_official' && (
+              boundTaskPlugin?.key === 'doubao_ark_official' && (
                 <>
                   <FormField
                     control={form.control}

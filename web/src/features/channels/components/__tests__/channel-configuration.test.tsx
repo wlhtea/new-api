@@ -90,6 +90,14 @@ const soraPlugin: TaskPluginOption = {
   models: ['sora-2'],
 }
 
+const doubaoArkOfficialPlugin: TaskPluginOption = {
+  key: 'doubao_ark_official',
+  name: 'Doubao Ark Official',
+  icon: 'text:DA',
+  baseUrl: 'https://ark.cn-beijing.volces.com',
+  models: ['doubao-seedance-1-0-pro'],
+}
+
 function deferredResponse<T>() {
   let resolve!: (value: T) => void
   const promise = new Promise<T>((finish) => {
@@ -3031,6 +3039,7 @@ test('AWS interface selection is disabled without sensitive channel write permis
 })
 
 test('Doubao Ark official permission switches restore, click, and submit explicit values', async () => {
+  pluginOptions = [...plugins, doubaoArkOfficialPlugin]
   editingChannel = {
     ...editingChannel,
     type: 61,
@@ -3120,7 +3129,49 @@ test.each([
   }
 )
 
+test('an unavailable official plugin binding hides permission switches without mutating saved settings', async () => {
+  const savedSetting = {
+    task_plugin_key: 'doubao_ark_official',
+    allow_official_task_list: true,
+    allow_official_task_delete: false,
+  }
+  editingChannel = {
+    ...editingChannel,
+    type: 61,
+    base_url: 'https://ark.cn-beijing.volces.com',
+    models: 'doubao-seedance-1-0-pro',
+    setting: JSON.stringify(savedSetting),
+  }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+
+  await user.click(screen.getByRole('button', { name: 'Change provider' }))
+  expect(await screen.findByRole('option', { name: /Video A/ })).toBeVisible()
+  expect(
+    screen.queryByRole('option', { name: /Doubao Ark Official/ })
+  ).not.toBeInTheDocument()
+  await user.click(
+    screen.getByRole('button', { name: 'Back to configuration' })
+  )
+  expect(
+    screen.queryByRole('switch', { name: 'Allow official task list' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('switch', { name: 'Allow official task deletion' })
+  ).not.toBeInTheDocument()
+
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  const payload = put.mock.calls[0]?.[1] as { setting: string }
+  expect(JSON.parse(payload.setting)).toMatchObject(savedSetting)
+})
+
 test('official task permission switches respect sensitiveLocked', async () => {
+  pluginOptions = [...plugins, doubaoArkOfficialPlugin]
   editingChannel = {
     ...editingChannel,
     type: 61,
@@ -3140,7 +3191,10 @@ test('official task permission switches respect sensitiveLocked', async () => {
         username: 'operator',
         role: ROLE.ADMIN,
         permissions: {
-          admin_permissions: { channel: { read: true, write: true } },
+          admin_permissions: {
+            channel: { read: true, write: true },
+            task_plugin: { bind: true },
+          },
         },
       },
     },
