@@ -163,8 +163,12 @@ func ApplyChannelPin(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError
 			if task == nil {
 				continue
 			}
+			publicTaskID := task.TaskID
+			if task.Platform == constant.TaskPlatform("doubao_ark_official") && task.ProviderTaskID != "" {
+				publicTaskID = task.ProviderTaskID
+			}
 			refs = append(refs, relaycommon.OriginTaskRef{
-				TaskID:         task.TaskID,
+				TaskID:         publicTaskID,
 				UpstreamTaskID: task.GetUpstreamTaskID(),
 				Action:         task.Action,
 				Status:         string(task.Status),

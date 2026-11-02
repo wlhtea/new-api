@@ -1139,7 +1139,12 @@ func applyOriginTaskIntent(c *gin.Context, intent map[string]any, meta pluginrun
 	}
 
 	userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+	lookupByProviderID := meta.Key == "doubao_ark_official"
 	platforms := taskPluginLegacyPlatforms(meta)
+	if lookupByProviderID {
+		// Native cgt IDs are public only inside this explicitly bound plugin.
+		platforms = []constant.TaskPlatform{constant.TaskPlatform(meta.Key)}
+	}
 	allowedPlatform := make(map[constant.TaskPlatform]struct{}, len(platforms))
 	for _, platform := range platforms {
 		allowedPlatform[platform] = struct{}{}
@@ -1148,7 +1153,19 @@ func applyOriginTaskIntent(c *gin.Context, intent map[string]any, meta pluginrun
 	tasks := make([]*model.Task, 0, len(ids))
 	channelID := 0
 	for _, id := range ids {
-		task, exist, err := model.GetByTaskId(userID, id)
+		var task *model.Task
+		var exist bool
+		var err error
+		if lookupByProviderID {
+			var matches []*model.Task
+			matches, err = model.GetByProviderTaskIdsForPlatforms(userID, platforms, []string{id})
+			exist = len(matches) == 1
+			if exist {
+				task = matches[0]
+			}
+		} else {
+			task, exist, err = model.GetByTaskId(userID, id)
+		}
 		if err != nil {
 			return &originTaskIntentError{Code: "origin_task_not_found", Message: "origin task not found or not owned by you", StatusCode: http.StatusInternalServerError}
 		}
@@ -1256,6 +1273,12 @@ func renderTaskPluginQuery(
 		lookupID := task.TaskID
 		if lookupByProviderID {
 			lookupID = task.ProviderTaskID
+			if _, duplicate := tasksByID[lookupID]; duplicate {
+				// Provider IDs are not unique across channels. Never let database
+				// return order choose which same-user/plugin task is exposed.
+				abortTaskPluginRouteError(c, http.StatusNotFound)
+				return
+			}
 		}
 		tasksByID[lookupID] = task
 	}

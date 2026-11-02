@@ -82,3 +82,116 @@ func TestDoubaoArkOfficialNativeQueryScopesProviderID(t *testing.T) {
 		assert.NotContains(t, recorder.Body.String(), providerTaskID)
 	}
 }
+
+func TestDoubaoArkOfficialNativeQueryMergesHostStatusIntoCreateSnapshot(t *testing.T) {
+	setupTaskPluginRouteDB(t)
+	plugin, found := jsplugin.DefaultRegistry.Get("doubao_ark_official")
+	require.True(t, found)
+	router := gin.New()
+	router.GET("/doubao_ark_official/api/v3/contents/generations/tasks/:task_id",
+		pinTaskPluginRoute(plugin, 1),
+		func(c *gin.Context) {
+			c.Set("id", 7)
+			c.Next()
+		},
+		PrepareTaskPluginRoute(),
+	)
+
+	for _, testCase := range []struct {
+		name         string
+		providerID   string
+		hostStatus   model.TaskStatus
+		failReason   string
+		data         string
+		wantStatus   string
+		wantErrorMsg string
+	}{
+		{name: "not start is queued", providerID: "cgt-create-not-start", hostStatus: model.TaskStatusNotStart, wantStatus: "queued"},
+		{name: "submitted is queued", providerID: "cgt-create-submitted", hostStatus: model.TaskStatusSubmitted, wantStatus: "queued"},
+		{name: "queued is queued", providerID: "cgt-create-queued", hostStatus: model.TaskStatusQueued, wantStatus: "queued"},
+		{name: "in progress is running", providerID: "cgt-create-running", hostStatus: model.TaskStatusInProgress, wantStatus: "running"},
+		{name: "success is succeeded", providerID: "cgt-create-succeeded", hostStatus: model.TaskStatusSuccess, wantStatus: "succeeded"},
+		{name: "failure includes host reason", providerID: "cgt-create-failed", hostStatus: model.TaskStatusFailure, failReason: "host failure", wantStatus: "failed", wantErrorMsg: "host failure"},
+		{name: "official status is preserved", providerID: "cgt-create-official", hostStatus: model.TaskStatusSuccess, data: `{"id":"cgt-create-official","status":"running"}`, wantStatus: "running"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			data := testCase.data
+			if data == "" {
+				// Submit persists Ark's create response before the first poll: no
+				// status or error has been added to Data yet.
+				data = `{"id":"` + testCase.providerID + `"}`
+			}
+			insertTaskPluginRouteTask(t, &model.Task{
+				TaskID: "task_internal_" + testCase.providerID, ProviderTaskID: testCase.providerID,
+				UserId: 7, Platform: constant.TaskPlatform("doubao_ark_official"),
+				Status: testCase.hostStatus, FailReason: testCase.failReason, Data: []byte(data),
+				PrivateData: model.TaskPrivateData{UpstreamTaskID: testCase.providerID},
+			})
+
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet,
+				"/doubao_ark_official/api/v3/contents/generations/tasks/"+testCase.providerID, nil))
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			expected := `{"id":"` + testCase.providerID + `","status":"` + testCase.wantStatus + `"`
+			if testCase.wantErrorMsg != "" {
+				expected += `,"error":{"message":"` + testCase.wantErrorMsg + `"}`
+			}
+			expected += "}"
+			assert.JSONEq(t, expected, recorder.Body.String())
+		})
+	}
+}
+
+func TestDoubaoArkOfficialNativeQueryRejectsDuplicateProviderIDs(t *testing.T) {
+	setupTaskPluginRouteDB(t)
+	plugin, found := jsplugin.DefaultRegistry.Get("doubao_ark_official")
+	require.True(t, found)
+
+	const (
+		duplicateProviderID = "cgt-duplicate-same-user-plugin"
+		uniqueProviderID    = "cgt-unique-same-user-plugin"
+	)
+	for _, task := range []*model.Task{
+		{
+			TaskID: "task_duplicate_first", ProviderTaskID: duplicateProviderID,
+			UserId: 7, ChannelId: 11, Platform: constant.TaskPlatform("doubao_ark_official"),
+			Status: model.TaskStatusQueued, Data: []byte(`{"id":"cgt-duplicate-same-user-plugin"}`),
+		},
+		{
+			TaskID: "task_duplicate_second", ProviderTaskID: duplicateProviderID,
+			UserId: 7, ChannelId: 22, Platform: constant.TaskPlatform("doubao_ark_official"),
+			Status: model.TaskStatusSuccess, Data: []byte(`{"id":"cgt-duplicate-same-user-plugin"}`),
+		},
+		{
+			TaskID: "task_unique_control", ProviderTaskID: uniqueProviderID,
+			UserId: 7, ChannelId: 11, Platform: constant.TaskPlatform("doubao_ark_official"),
+			Status: model.TaskStatusQueued, Data: []byte(`{"id":"cgt-unique-same-user-plugin"}`),
+		},
+	} {
+		insertTaskPluginRouteTask(t, task)
+	}
+
+	router := gin.New()
+	router.GET("/doubao_ark_official/api/v3/contents/generations/tasks/:task_id",
+		pinTaskPluginRoute(plugin, 1),
+		func(c *gin.Context) {
+			c.Set("id", 7)
+			c.Next()
+		},
+		PrepareTaskPluginRoute(),
+	)
+
+	duplicate := httptest.NewRecorder()
+	router.ServeHTTP(duplicate, httptest.NewRequest(http.MethodGet,
+		"/doubao_ark_official/api/v3/contents/generations/tasks/"+duplicateProviderID, nil))
+	assert.Equal(t, http.StatusNotFound, duplicate.Code, duplicate.Body.String())
+	assert.Contains(t, duplicate.Body.String(), `"code":"task_not_found"`)
+	assert.NotContains(t, duplicate.Body.String(), "task_duplicate_first")
+	assert.NotContains(t, duplicate.Body.String(), "task_duplicate_second")
+
+	unique := httptest.NewRecorder()
+	router.ServeHTTP(unique, httptest.NewRequest(http.MethodGet,
+		"/doubao_ark_official/api/v3/contents/generations/tasks/"+uniqueProviderID, nil))
+	require.Equal(t, http.StatusOK, unique.Code, unique.Body.String())
+	assert.JSONEq(t, `{"id":"cgt-unique-same-user-plugin","status":"queued"}`, unique.Body.String())
+}
