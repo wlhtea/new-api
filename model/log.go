@@ -334,6 +334,7 @@ type RecordConsumeLogParams struct {
 	IsStream         bool              `json:"is_stream"`
 	Group            string            `json:"group"`
 	Other            *LogOther         `json:"other"`
+	SkipDataExport   bool              `json:"skip_data_export"`
 }
 
 func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams) {
@@ -385,7 +386,7 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 	if err != nil {
 		logger.LogError(c, common.LogText("failed to record log: %s", err.Error()))
 	}
-	if common.DataExportEnabled {
+	if common.DataExportEnabled && !params.SkipDataExport {
 		var cacheReadTokens, cacheCreationTokens int
 		if other != nil {
 			cacheReadTokens, _ = other.public["cache_tokens"].(int)

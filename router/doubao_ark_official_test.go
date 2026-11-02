@@ -1,6 +1,7 @@
 package router
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,13 +19,40 @@ import (
 	"gorm.io/gorm"
 )
 
+func assertDoubaoOfficialNativeOperationLog(t *testing.T, expectedTotal int, providerTaskID, requestPath string) {
+	t.Helper()
+	logs, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
+	require.NoError(t, err)
+	assert.EqualValues(t, expectedTotal, total, "each native single-task request must write exactly one operation log")
+	require.Len(t, logs, expectedTotal)
+	entry := logs[0]
+	assert.Zero(t, entry.Quota)
+	assert.Equal(t, 7, entry.UserId)
+	var metadata map[string]any
+	require.NoError(t, json.Unmarshal([]byte(entry.Other), &metadata))
+	assert.Equal(t, providerTaskID, metadata["provider_task_id"])
+	assert.Equal(t, requestPath, metadata["request_path"])
+}
+
 func TestDoubaoArkOfficialNativeAliasDispatchesCreateAndQuery(t *testing.T) {
 	previousDB := model.DB
+	previousLogDB := model.LOG_DB
+	previousLogConsume := common.LogConsumeEnabled
+	previousRedis := common.RedisEnabled
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Task{}, &model.Log{}))
 	model.DB = database
-	t.Cleanup(func() { model.DB = previousDB })
+	model.LOG_DB = database
+	common.LogConsumeEnabled = true
+	common.RedisEnabled = false
+	t.Cleanup(func() {
+		model.DB = previousDB
+		model.LOG_DB = previousLogDB
+		common.LogConsumeEnabled = previousLogConsume
+		common.RedisEnabled = previousRedis
+	})
+	require.NoError(t, database.Create(&model.User{Id: 7, Username: "alias-user", Group: "default"}).Error)
 	const providerTaskID = "cgt-alias-query"
 	require.NoError(t, database.Create(&model.Task{
 		TaskID: "task_alias_internal", ProviderTaskID: providerTaskID,
@@ -44,7 +72,9 @@ func TestDoubaoArkOfficialNativeAliasDispatchesCreateAndQuery(t *testing.T) {
 			func(c *gin.Context) {
 				common.SetContextKey(c, constant.ContextKeyUserId, 7)
 				common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+				common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
 				common.SetContextKey(c, constant.ContextKeyTokenGroup, "default")
+				c.Set("username", "alias-user")
 				c.Next()
 			},
 			production[4],
@@ -78,6 +108,16 @@ func TestDoubaoArkOfficialNativeAliasDispatchesCreateAndQuery(t *testing.T) {
 	assert.JSONEq(t, `{"id":"cgt-alias-query","status":"queued"}`, query.Body.String())
 	assert.NotContains(t, query.Body.String(), "task_alias_internal")
 	assert.Equal(t, int32(1), submitCalls.Load(), "query must not enter task submission")
+	aliasPath := "/api/v3/contents/generations/tasks/" + providerTaskID
+	assertDoubaoOfficialNativeOperationLog(t, 1, providerTaskID, aliasPath)
+
+	direct := httptest.NewRecorder()
+	directPath := "/doubao_ark_official" + aliasPath
+	outer.ServeHTTP(direct, httptest.NewRequest(http.MethodGet, directPath, nil))
+	require.Equal(t, http.StatusOK, direct.Code, direct.Body.String())
+	assert.JSONEq(t, query.Body.String(), direct.Body.String())
+	assert.Equal(t, int32(1), submitCalls.Load(), "direct query must not enter task submission")
+	assertDoubaoOfficialNativeOperationLog(t, 2, providerTaskID, directPath)
 }
 
 const doubaoArkAliasTestModel = "doubao-seedance-2-0-260128"

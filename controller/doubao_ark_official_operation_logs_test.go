@@ -1,12 +1,14 @@
 package controller
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -16,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func invokeDoubaoOfficialOperationRoute(t *testing.T, fixture *doubaoNativeFixture, method, providerID string) *httptest.ResponseRecorder {
@@ -47,6 +50,33 @@ func invokeDoubaoOfficialOperationRouteWithBody(t *testing.T, fixture *doubaoNat
 	ctx.Set("token_name", "operation-token")
 	ctx.Set(common.RequestIdKey, "req-operation-"+strings.ToLower(method)+"-"+providerID)
 	middleware.PrepareTaskPluginRoute()(ctx)
+	return recorder
+}
+
+func invokeDoubaoOfficialOperationRouteThroughGin(t *testing.T, fixture *doubaoNativeFixture, method, encodedProviderID string) *httptest.ResponseRecorder {
+	t.Helper()
+	binding, found := fixture.generation.LookupDeclaredRoute(method, doubaoOfficialDeleteDeclaredPath)
+	require.True(t, found, "official native task route is not registered")
+	engine := gin.New()
+	engine.Handle(method, doubaoOfficialDeleteDeclaredPath,
+		func(ctx *gin.Context) {
+			ctx.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{
+				Generation: fixture.generation, Plugin: binding.Plugin, Route: binding.Route,
+			})
+			common.SetContextKey(ctx, constant.ContextKeyUserId, 7)
+			common.SetContextKey(ctx, constant.ContextKeyTokenId, 41)
+			common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "operation-group")
+			ctx.Set("id", 7)
+			ctx.Set("username", "doubao-native-user")
+			ctx.Set("role", common.RoleCommonUser)
+			ctx.Set("token_name", "operation-token")
+			ctx.Set(common.RequestIdKey, "req-operation-invalid-provider-id")
+		},
+		middleware.PrepareTaskPluginRoute(),
+	)
+	recorder := httptest.NewRecorder()
+	requestPath := strings.Replace(doubaoOfficialDeleteDeclaredPath, ":task_id", encodedProviderID, 1)
+	engine.ServeHTTP(recorder, httptest.NewRequest(method, requestPath, nil))
 	return recorder
 }
 
@@ -191,6 +221,153 @@ func TestDoubaoArkOfficialNativeQueryWritesZeroQuotaOperationLogs(t *testing.T) 
 	responseAfterLogFailure := invokeDoubaoOfficialOperationRoute(t, fixture, http.MethodGet, owned.ProviderTaskID)
 	require.Equal(t, http.StatusOK, responseAfterLogFailure.Code, responseAfterLogFailure.Body.String())
 	assert.JSONEq(t, ownedResponse.Body.String(), responseAfterLogFailure.Body.String())
+}
+
+func TestDoubaoArkOfficialNativeSingleTaskValidatesProviderTaskID(t *testing.T) {
+	testCases := []struct {
+		name              string
+		encodedProviderID string
+		decodedBytes      int
+		wantStatus        int
+		expectLookup      bool
+	}{
+		{name: "191 ASCII bytes accepted", encodedProviderID: strings.Repeat("a", 191), decodedBytes: 191, wantStatus: http.StatusNotFound, expectLookup: true},
+		{name: "192 ASCII bytes rejected", encodedProviderID: strings.Repeat("a", 192), decodedBytes: 192, wantStatus: http.StatusBadRequest},
+		{name: "191 UTF-8 bytes accepted", encodedProviderID: strings.Repeat("é", 95) + "a", decodedBytes: 191, wantStatus: http.StatusNotFound, expectLookup: true},
+		{name: "192 UTF-8 bytes rejected", encodedProviderID: strings.Repeat("é", 96), decodedBytes: 192, wantStatus: http.StatusBadRequest},
+		{name: "percent-encoded newline rejected", encodedProviderID: "cgt%0Aforged", wantStatus: http.StatusBadRequest},
+		{name: "percent-encoded unicode control rejected", encodedProviderID: "cgt%C2%85forged", wantStatus: http.StatusBadRequest},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := setupDoubaoNativeFixture(t, "cgt-operation-validation")
+			common.LogConsumeEnabled = true
+			setupDoubaoOfficialOperationIdentity(t, fixture)
+			if testCase.decodedBytes > 0 {
+				require.Len(t, testCase.encodedProviderID, testCase.decodedBytes, "test input must exercise the byte boundary")
+			}
+
+			providerLookupQueries := 0
+			const callbackName = "test:count_official_provider_lookups"
+			require.NoError(t, fixture.database.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement != nil && tx.Statement.Table == "tasks" && strings.Contains(tx.Statement.SQL.String(), "provider_task_id") {
+					providerLookupQueries++
+				}
+			}))
+
+			response := invokeDoubaoOfficialOperationRouteThroughGin(t, fixture, http.MethodGet, testCase.encodedProviderID)
+			assert.Equal(t, testCase.wantStatus, response.Code, response.Body.String())
+			if testCase.expectLookup {
+				assert.Positive(t, providerLookupQueries)
+			} else {
+				assert.Zero(t, providerLookupQueries, "invalid provider IDs must be rejected before task lookup")
+			}
+		})
+	}
+}
+
+func TestDoubaoArkOfficialOperationLogsBoundSanitizedRejectedRequestValues(t *testing.T) {
+	testCases := []struct {
+		name                 string
+		encodedProviderID    string
+		decodedProviderID    string
+		applicationForbidden string
+	}{
+		{
+			name:                 "oversized provider ID",
+			encodedProviderID:    strings.Repeat("a", 4096),
+			decodedProviderID:    strings.Repeat("a", 4096),
+			applicationForbidden: strings.Repeat("a", 4096),
+		},
+		{
+			name:                 "percent-encoded newline",
+			encodedProviderID:    "cgt%0Aforged",
+			decodedProviderID:    "cgt\nforged",
+			applicationForbidden: `cgt\nforged`,
+		},
+		{
+			name:                 "percent-encoded unicode control",
+			encodedProviderID:    "cgt%C2%85forged",
+			decodedProviderID:    "cgt\u0085forged",
+			applicationForbidden: "cgt\u0085forged",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := setupDoubaoNativeFixture(t, "cgt-operation-log-sanitization")
+			common.LogConsumeEnabled = true
+			setupDoubaoOfficialOperationIdentity(t, fixture)
+			var applicationLogs bytes.Buffer
+			common.LogWriterMu.Lock()
+			previousWriter, previousErrorWriter := gin.DefaultWriter, gin.DefaultErrorWriter
+			gin.DefaultWriter, gin.DefaultErrorWriter = &applicationLogs, &applicationLogs
+			common.LogWriterMu.Unlock()
+			t.Cleanup(func() {
+				common.LogWriterMu.Lock()
+				gin.DefaultWriter, gin.DefaultErrorWriter = previousWriter, previousErrorWriter
+				common.LogWriterMu.Unlock()
+			})
+
+			response := invokeDoubaoOfficialOperationRouteThroughGin(t, fixture, http.MethodGet, testCase.encodedProviderID)
+			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			logs, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1, total)
+			require.Len(t, logs, 1)
+			entry := logs[0]
+			assert.Zero(t, entry.Quota)
+			var metadata map[string]any
+			require.NoError(t, json.Unmarshal([]byte(entry.Other), &metadata))
+			providerID, ok := metadata["provider_task_id"].(string)
+			require.True(t, ok)
+			requestPath, ok := metadata["request_path"].(string)
+			require.True(t, ok)
+			assert.LessOrEqual(t, len(providerID), 191)
+			assert.LessOrEqual(t, len(requestPath), 256)
+			assert.NotEqual(t, testCase.decodedProviderID, providerID)
+			assert.NotContains(t, entry.Content, testCase.decodedProviderID)
+			assert.NotContains(t, applicationLogs.String(), testCase.applicationForbidden)
+			assert.LessOrEqual(t, applicationLogs.Len(), 8192)
+			for _, value := range []string{providerID, requestPath, entry.Content, entry.Other} {
+				for _, r := range value {
+					assert.False(t, unicode.IsControl(r), "log value contains an unsanitized control rune: %q", value)
+				}
+			}
+		})
+	}
+}
+
+func TestDoubaoArkOfficialNativeOperationLogsDoNotChangeQuotaData(t *testing.T) {
+	fixture := setupDoubaoNativeFixture(t, "cgt-operation-quota-data")
+	common.LogConsumeEnabled = true
+	previousDataExport := common.DataExportEnabled
+	common.DataExportEnabled = true
+	model.CacheQuotaDataLock.Lock()
+	previousQuotaData := model.CacheQuotaData
+	model.CacheQuotaData = make(map[string]*model.QuotaData)
+	model.CacheQuotaDataLock.Unlock()
+	t.Cleanup(func() {
+		common.DataExportEnabled = previousDataExport
+		model.CacheQuotaDataLock.Lock()
+		model.CacheQuotaData = previousQuotaData
+		model.CacheQuotaDataLock.Unlock()
+	})
+	setupDoubaoOfficialOperationIdentity(t, fixture)
+
+	response := invokeDoubaoOfficialOperationRoute(t, fixture, http.MethodGet, "cgt-operation-quota-data-missing")
+	require.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+
+	logs, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, total)
+	require.Len(t, logs, 1)
+	assert.Zero(t, logs[0].Quota)
+	assert.Contains(t, logs[0].Content, "cgt-operation-quota-data-missing")
+	assert.Contains(t, logs[0].Other, `"provider_task_id"`)
+
+	model.CacheQuotaDataLock.Lock()
+	assert.Empty(t, model.CacheQuotaData, "zero-quota operation logs must not increment dashboard request counts")
+	model.CacheQuotaDataLock.Unlock()
 }
 
 func TestDoubaoArkOfficialNativeDeleteWritesZeroQuotaOperationLogs(t *testing.T) {

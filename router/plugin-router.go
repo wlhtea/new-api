@@ -19,17 +19,19 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
 type pluginDispatchStateKey struct{}
 
 type pluginDispatchState struct {
-	generation *jsplugin.RoutingGeneration
-	hit        atomic.Bool
-	writer     *gatedResponseWriter
-	requestID  string
-	language   string
+	generation   *jsplugin.RoutingGeneration
+	hit          atomic.Bool
+	writer       *gatedResponseWriter
+	requestID    string
+	language     string
+	originalPath string
 }
 
 func (s *pluginDispatchState) markHit() {
@@ -312,6 +314,9 @@ func importPluginDispatchState() gin.HandlerFunc {
 			if state.language != "" {
 				c.Set(string(constant.ContextKeyLanguage), state.language)
 			}
+			if state.originalPath != "" {
+				c.Set(service.ContextKeyTaskPluginOriginalRequestPath, state.originalPath)
+			}
 		}
 		c.Set(middleware.RouteTagKey, "relay")
 		c.Next()
@@ -397,6 +402,7 @@ func (d *pluginRouteDispatcher) dispatch(c *gin.Context) {
 	c.Request = c.Request.WithContext(context.WithValue(originalContext, pluginDispatchStateKey{}, state))
 
 	originalPath := c.Request.URL.Path
+	state.originalPath = originalPath
 	originalRawPath := c.Request.URL.RawPath
 	aliasPath, aliased := doubaoArkOfficialNativeAlias(c.Request.Method, originalPath)
 	if aliased {

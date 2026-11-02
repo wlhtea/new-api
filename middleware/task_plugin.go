@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
@@ -45,6 +46,13 @@ var errTaskPluginUnsupportedMediaType = errors.New("unsupported task plugin medi
 
 const taskPluginInvalidRouteResult = "plugin returned an invalid route result"
 
+const maxDoubaoArkOfficialProviderTaskIDBytes = 191
+
+func validDoubaoArkOfficialProviderTaskID(providerTaskID string) bool {
+	return providerTaskID != "" && len(providerTaskID) <= maxDoubaoArkOfficialProviderTaskIDBytes &&
+		utf8.ValidString(providerTaskID) && !strings.ContainsFunc(providerTaskID, unicode.IsControl)
+}
+
 // doubaoArkOfficialOperationLogger covers every native single-task route
 // attempt, including request decoding failures. The ownership-scoped lookup is
 // only for log metadata and never participates in the API result.
@@ -66,7 +74,7 @@ func doubaoArkOfficialOperationLogger(c *gin.Context, pinned pluginruntime.Pinne
 		return nil
 	}
 	var task *model.Task
-	if common.LogConsumeEnabled && model.DB != nil && model.LOG_DB != nil {
+	if validDoubaoArkOfficialProviderTaskID(providerTaskID) && common.LogConsumeEnabled && model.DB != nil && model.LOG_DB != nil {
 		userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
 		platform := constant.TaskPlatform(pinned.Plugin.Meta.Key)
 		tasks, err := model.GetByProviderTaskIdsForPlatforms(userID, []constant.TaskPlatform{platform}, []string{providerTaskID})
@@ -103,6 +111,11 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		}
 		if logOperation := doubaoArkOfficialOperationLogger(c, pinned); logOperation != nil {
 			defer logOperation()
+		}
+		if pinned.Plugin.Meta.Key == "doubao_ark_official" && pinned.Route.TaskIDParam != "" &&
+			c.Param(pinned.Route.TaskIDParam) != "" && !validDoubaoArkOfficialProviderTaskID(c.Param(pinned.Route.TaskIDParam)) {
+			abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, "provider task ID is invalid")
+			return
 		}
 		c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{
 			Generation: pinned.Generation,
