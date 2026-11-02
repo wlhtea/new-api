@@ -2,6 +2,7 @@ package jsplugin
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -12,12 +13,19 @@ import (
 // request shape; credentials are removed from its context and reapplied by the
 // host from the executing channel before the request is sent.
 func (a *TaskAdaptor) DeleteTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+	officialArkDelete := a.plugin != nil && a.plugin.Meta.Key == "doubao_ark_official"
+	if officialArkDelete && (task == nil || task.ProviderTaskID == "") {
+		return nil, fmt.Errorf("provider task ID is required for official Ark deletion")
+	}
 	if task != nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
 	ctx, err := a.queryContext(task, key, baseURL, proxy)
 	if err != nil {
 		return nil, err
+	}
+	if officialArkDelete {
+		ctx["taskId"] = task.ProviderTaskID
 	}
 	authHeader, _ := ctx["authHeader"].(string)
 	delete(ctx, "apiKey")

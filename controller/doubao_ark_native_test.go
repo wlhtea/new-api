@@ -114,6 +114,11 @@ func setupDoubaoNativeFixture(t *testing.T, upstreamTaskID string) *doubaoNative
 			_, _ = w.Write([]byte(responseBody))
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v3/contents/generations/tasks/"):
 			fixture.deleteCalls.Add(1)
+			if !strings.HasPrefix(upstreamTaskID, "cgt-") || r.URL.Path != "/api/v3/contents/generations/tasks/"+upstreamTaskID {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"unexpected delete task id"}}`))
+				return
+			}
 			if fixture.deleteStarted != nil {
 				close(fixture.deleteStarted)
 			}

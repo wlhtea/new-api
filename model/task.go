@@ -703,7 +703,7 @@ func ListTasksForOfficialPlugin(userID int, platform constant.TaskPlatform, opti
 		query = query.Where("provider_task_id IN ?", options.TaskIDs)
 	}
 	candidates := make([]*Task, 0)
-	if err := query.Order("created_at DESC").Order("provider_task_id DESC").Find(&candidates).Error; err != nil {
+	if err := query.Order("created_at DESC").Order("provider_task_id DESC").Order("id DESC").Find(&candidates).Error; err != nil {
 		return nil, 0, err
 	}
 	filtered := make([]*Task, 0, len(candidates))
