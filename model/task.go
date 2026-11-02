@@ -714,7 +714,15 @@ func ListTasksForOfficialPlugin(userID int, platform constant.TaskPlatform, opti
 		query = query.Where("official_status = ?", options.Status)
 	}
 	if options.Model != "" {
-		query = query.Where("official_model = ?", options.Model)
+		if query.Dialector.Name() == "mysql" {
+			// Cast only the bound value: MySQL then uses byte-exact comparison even
+			// for a case-insensitive column collation, while leaving the column
+			// expression bare so its ordinary indexes remain available.
+			query = query.Where("official_model = BINARY ?", options.Model)
+		} else {
+			// SQLite BINARY and PostgreSQL text equality are case-sensitive.
+			query = query.Where("official_model = ?", options.Model)
+		}
 	}
 	if options.ServiceTier != "" {
 		query = query.Where("official_service_tier = ?", options.ServiceTier)
@@ -804,7 +812,7 @@ func backfillOfficialTaskListProjections() error {
 			status, modelName, serviceTier := task.officialProjection()
 			if err := DB.Model(&Task{}).
 				Where("id = ? AND official_status = ?", task.ID, "").
-				Updates(map[string]any{
+				UpdateColumns(map[string]any{
 					"official_status":       status,
 					"official_model":        modelName,
 					"official_service_tier": serviceTier,

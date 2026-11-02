@@ -20,7 +20,12 @@ type TaskDeletionAdaptor interface {
 	DeleteTask(ctx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error)
 }
 
-const taskProviderDeleteOperationTimeout = 30 * time.Second
+const (
+	taskProviderDeleteOperationTimeout = 30 * time.Second
+	// Match the normal task-plugin JSON response ceiling. Read one extra byte
+	// so oversized preflight snapshots are rejected instead of truncated.
+	taskProviderPreflightMaxBodyBytes = 1 << 20
+)
 
 type taskContextPollingAdaptor interface {
 	FetchTaskContext(ctx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error)
@@ -104,9 +109,9 @@ func DeleteDoubaoArkOfficialTask(c *gin.Context, pluginKey, providerTaskID strin
 		if fetchErr != nil || preflight == nil {
 			return &dto.TaskError{Code: "upstream_error", Message: "Upstream task state check failed", StatusCode: http.StatusBadGateway}
 		}
-		body, readErr := io.ReadAll(preflight.Body)
+		body, readErr := io.ReadAll(io.LimitReader(preflight.Body, taskProviderPreflightMaxBodyBytes+1))
 		closeErr := preflight.Body.Close()
-		if readErr != nil || closeErr != nil || preflight.StatusCode < 200 || preflight.StatusCode >= 300 {
+		if readErr != nil || closeErr != nil || len(body) > taskProviderPreflightMaxBodyBytes || preflight.StatusCode < 200 || preflight.StatusCode >= 300 {
 			return &dto.TaskError{Code: "upstream_error", Message: "Upstream task state check failed", StatusCode: http.StatusBadGateway}
 		}
 		providerState, parseErr := adaptor.ParseTaskResult(&preflightTask, preflight, body)
