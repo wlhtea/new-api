@@ -317,6 +317,8 @@ export const meta = {
   routes: [
     { method: "POST", path: "/doubao_ark_official/api/v3/contents/generations/tasks", type: "submit", decode: "createTask", render: "taskCreated" },
     { method: "GET", path: "/doubao_ark_official/api/v3/contents/generations/tasks/:task_id", type: "query", render: "taskStatus" },
+    { method: "GET", path: "/doubao_ark_official/api/v3/contents/generations/tasks", type: "query", render: "taskList" },
+    { method: "DELETE", path: "/doubao_ark_official/api/v3/contents/generations/tasks/:task_id", type: "query", render: "taskDeleted" },
     // The vendor image API answers synchronously and has no task to re-query;
     // the complete response is delivered once and never persisted.
     { method: "POST", path: "/doubao_ark_official/api/v3/images/generations", type: "submit", decode: "createImage", render: "imageCreated", retainResult: false },
@@ -768,6 +770,10 @@ export const native = {
     if (!Object.prototype.hasOwnProperty.call(output, "error") && task.fail_reason) output.error = { message: task.fail_reason };
     return output;
   },
+  taskDeleted: function () { return {}; },
+  taskList: function (ctx, page) {
+    return { total: page.total, items: page.items.map(function (task) { return native.taskStatus(ctx, task); }) };
+  },
   createImage: function (ctx) {
     if (!ctx.body || ctx.body.kind !== "json") throw new Error("JSON body required");
     const body = ctx.body.value;
@@ -895,6 +901,14 @@ export function buildQueryRequest(ctx) {
     url: apiRoot(ctx) + "/api/v3/contents/generations/tasks/" + ctx.taskId,
     method: "GET",
     headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: "Bearer " + ctx.apiKey },
+  };
+}
+
+export function buildDeleteRequest(ctx) {
+  return {
+    url: apiRoot(ctx) + "/api/v3/contents/generations/tasks/" + ctx.taskId,
+    method: "DELETE",
+    headers: { Accept: "application/json" },
   };
 }
 

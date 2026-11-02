@@ -125,6 +125,20 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 			abortTaskPluginRouteErrorDetail(c, http.StatusUnsupportedMediaType, detail)
 			return
 		}
+		if pinned.Plugin.Meta.Key == "doubao_ark_official" && pinned.Route.Method == http.MethodDelete {
+			taskErr := service.DeleteDoubaoArkOfficialTask(c, pinned.Plugin.Meta.Key, requestContext.Params[pinned.Route.TaskIDParam])
+			if taskErr != nil {
+				abortTaskPluginRouteErrorDetail(c, taskErr.StatusCode, taskErr.Message)
+				return
+			}
+			c.Abort()
+			c.JSON(http.StatusOK, gin.H{})
+			return
+		}
+		if pinned.Plugin.Meta.Key == "doubao_ark_official" && pinned.Route.Render == "taskList" {
+			renderDoubaoArkOfficialList(c, pinned, requestContext)
+			return
+		}
 		if pinned.Route.Type == pluginruntime.RouteTypeQuery {
 			taskID := requestContext.Params[pinned.Route.TaskIDParam]
 			logger.LogDebug(
@@ -1211,6 +1225,94 @@ func resolvedTaskPluginIDs(value any) ([]string, bool) {
 		taskIDs[index] = taskID
 	}
 	return taskIDs, true
+}
+
+func officialListPagination(query map[string][]string, name string) (int, error) {
+	values, present := query[name]
+	if !present {
+		if name == "page_size" {
+			return 20, nil
+		}
+		return 1, nil
+	}
+	if len(values) != 1 {
+		return 0, fmt.Errorf("%s must be a single integer from 1 to 500", name)
+	}
+	value, err := strconv.Atoi(values[0])
+	if err != nil || value < 1 || value > 500 {
+		return 0, fmt.Errorf("%s must be an integer from 1 to 500", name)
+	}
+	return value, nil
+}
+
+func renderDoubaoArkOfficialList(c *gin.Context, pinned pluginruntime.PinnedRoute, requestContext pluginruntime.RouteRequestContext) {
+	pageNum, err := officialListPagination(requestContext.Query, "page_num")
+	if err != nil {
+		abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	pageSize, err := officialListPagination(requestContext.Query, "page_size")
+	if err != nil {
+		abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	options := model.OfficialTaskListOptions{
+		PageNum: pageNum, PageSize: pageSize,
+		TaskIDs: requestContext.Query["filter.task_ids"],
+		Since:   time.Now().Add(-7 * 24 * time.Hour).Unix(),
+	}
+	for _, filter := range []struct {
+		name    string
+		allowed []string
+		dest    *string
+	}{
+		{name: "filter.status", allowed: []string{"queued", "running", "cancelled", "succeeded", "failed", "expired"}, dest: &options.Status},
+		{name: "filter.service_tier", allowed: []string{"default", "flex"}, dest: &options.ServiceTier},
+	} {
+		values, present := requestContext.Query[filter.name]
+		if !present {
+			continue
+		}
+		if len(values) != 1 || !slices.Contains(filter.allowed, values[0]) {
+			abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, filter.name+" has an unsupported value")
+			return
+		}
+		*filter.dest = values[0]
+	}
+	if values, present := requestContext.Query["filter.model"]; present {
+		if len(values) != 1 {
+			abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, "filter.model must be a single exact model")
+			return
+		}
+		options.Model = values[0]
+	}
+	userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+	tasks, total, err := model.ListTasksForOfficialPlugin(userID, constant.TaskPlatform(pinned.Plugin.Meta.Key), options)
+	if err != nil {
+		abortTaskPluginRouteError(c, http.StatusInternalServerError)
+		return
+	}
+	views := make([]dto.TaskView, 0, len(tasks))
+	for _, task := range tasks {
+		view, viewErr := service.BuildTaskPluginNativeView(task, pinned.Plugin.Meta.Key)
+		if viewErr != nil {
+			abortTaskPluginRouteError(c, http.StatusInternalServerError)
+			return
+		}
+		views = append(views, view)
+	}
+	encoded, err := common.Marshal(gin.H{"total": total, "items": views})
+	if err != nil {
+		abortTaskPluginRouteError(c, http.StatusInternalServerError)
+		return
+	}
+	result, err := pinned.Plugin.Engine.CallPath(c.Request.Context(), "native", []string{"taskList"}, requestContext.JSValue(), pluginruntime.RawJSON(encoded))
+	if err != nil {
+		abortTaskPluginRouteError(c, http.StatusInternalServerError)
+		return
+	}
+	c.Abort()
+	c.JSON(http.StatusOK, result)
 }
 
 func renderTaskPluginQuery(

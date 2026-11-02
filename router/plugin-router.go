@@ -359,14 +359,16 @@ func pluginRouteRecovery() gin.HandlerFunc {
 
 const doubaoArkOfficialNativeTasksPath = "/api/v3/contents/generations/tasks"
 
-// doubaoArkOfficialNativeAlias maps only Ark's official create/retrieve
-// operations onto the independently pinned plugin routes. It deliberately
-// leaves collection list and delete operations unimplemented.
+// doubaoArkOfficialNativeAlias maps Ark's official task operations onto the
+// independently pinned plugin routes without changing the built-in doubao plugin.
 func doubaoArkOfficialNativeAlias(method, path string) (string, bool) {
 	if method == http.MethodPost && path == doubaoArkOfficialNativeTasksPath {
 		return "/doubao_ark_official" + path, true
 	}
-	if method == http.MethodGet && strings.HasPrefix(path, doubaoArkOfficialNativeTasksPath+"/") {
+	if method == http.MethodGet && path == doubaoArkOfficialNativeTasksPath {
+		return "/doubao_ark_official" + path, true
+	}
+	if (method == http.MethodGet || method == http.MethodDelete) && strings.HasPrefix(path, doubaoArkOfficialNativeTasksPath+"/") {
 		taskID := strings.TrimPrefix(path, doubaoArkOfficialNativeTasksPath+"/")
 		if taskID != "" && !strings.Contains(taskID, "/") {
 			return "/doubao_ark_official" + path, true

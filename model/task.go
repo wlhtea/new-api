@@ -48,25 +48,26 @@ const (
 const TaskRefundLegacyCutoff int64 = 1771718400 // 2026-02-22 00:00:00 UTC
 
 type Task struct {
-	ID             int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
-	CreatedAt      int64                 `json:"created_at" gorm:"index"`
-	UpdatedAt      int64                 `json:"updated_at"`
-	TaskID         string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
-	ProviderTaskID string                `json:"-" gorm:"type:varchar(191);index"`       // 上游供应商任务 ID，仅用于原生协议寻址
-	Platform       constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
-	UserId         int                   `json:"user_id" gorm:"index"`
-	Group          string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
-	ChannelId      int                   `json:"channel_id" gorm:"index"`
-	Quota          int                   `json:"quota"`
-	Action         string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
-	Status         TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
-	FailReason     string                `json:"fail_reason"`
-	SubmitTime     int64                 `json:"submit_time" gorm:"index"`
-	StartTime      int64                 `json:"start_time" gorm:"index"`
-	FinishTime     int64                 `json:"finish_time" gorm:"index"`
-	Progress       string                `json:"progress" gorm:"type:varchar(20);index"`
-	Properties     Properties            `json:"properties" gorm:"type:json"`
-	Username       string                `json:"username,omitempty" gorm:"-"`
+	ID              int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
+	CreatedAt       int64                 `json:"created_at" gorm:"index"`
+	UpdatedAt       int64                 `json:"updated_at"`
+	TaskID          string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
+	ProviderTaskID  string                `json:"-" gorm:"type:varchar(191);index"`       // 上游供应商任务 ID，仅用于原生协议寻址
+	ProviderDeleted bool                  `json:"-" gorm:"not null;default:false;index"`  // 原生协议公开删除墓碑，保留本地审计与账务行
+	Platform        constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
+	UserId          int                   `json:"user_id" gorm:"index"`
+	Group           string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
+	ChannelId       int                   `json:"channel_id" gorm:"index"`
+	Quota           int                   `json:"quota"`
+	Action          string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
+	Status          TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
+	FailReason      string                `json:"fail_reason"`
+	SubmitTime      int64                 `json:"submit_time" gorm:"index"`
+	StartTime       int64                 `json:"start_time" gorm:"index"`
+	FinishTime      int64                 `json:"finish_time" gorm:"index"`
+	Progress        string                `json:"progress" gorm:"type:varchar(20);index"`
+	Properties      Properties            `json:"properties" gorm:"type:json"`
+	Username        string                `json:"username,omitempty" gorm:"-"`
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
@@ -475,6 +476,7 @@ func GetByProviderTaskIdsForPlatforms(userID int, platforms []constant.TaskPlatf
 	var tasks []*Task
 	err := DB.
 		Where("user_id = ? AND platform IN ? AND provider_task_id IN ?", userID, platforms, providerTaskIDs).
+		Where("provider_deleted = ?", false).
 		Find(&tasks).Error
 	if err != nil {
 		return nil, err
@@ -674,4 +676,89 @@ func (t *Task) ToOpenAIVideo() *dto.OpenAIVideo {
 		}
 	}
 	return openAIVideo
+}
+
+// OfficialTaskListOptions is the host-validated Ark list query. Selection and
+// pagination remain in Go; JavaScript only receives the projected result page.
+type OfficialTaskListOptions struct {
+	PageNum     int
+	PageSize    int
+	Status      string
+	Model       string
+	ServiceTier string
+	TaskIDs     []string
+	Since       int64
+}
+
+// ListTasksForOfficialPlugin returns only public provider-addressable tasks in
+// the authenticated owner and exact plugin scope. Callers apply the official
+// projection before exposing any persisted fields.
+func ListTasksForOfficialPlugin(userID int, platform constant.TaskPlatform, options OfficialTaskListOptions) ([]*Task, int64, error) {
+	query := DB.Model(&Task{}).
+		Where("user_id = ? AND platform = ?", userID, platform).
+		Where("provider_deleted = ?", false).
+		Where("provider_task_id <> ''").
+		Where("created_at >= ?", options.Since)
+	if len(options.TaskIDs) > 0 {
+		query = query.Where("provider_task_id IN ?", options.TaskIDs)
+	}
+	candidates := make([]*Task, 0)
+	if err := query.Order("created_at DESC").Order("provider_task_id DESC").Find(&candidates).Error; err != nil {
+		return nil, 0, err
+	}
+	filtered := make([]*Task, 0, len(candidates))
+	for _, task := range candidates {
+		data := task.officialData()
+		if options.Status != "" && task.officialStatus(data) != options.Status {
+			continue
+		}
+		modelName, _ := data["model"].(string)
+		if modelName == "" {
+			modelName = task.Properties.UpstreamModelName
+		}
+		if options.Model != "" && modelName != options.Model {
+			continue
+		}
+		serviceTier, _ := data["service_tier"].(string)
+		if options.ServiceTier != "" && serviceTier != options.ServiceTier {
+			continue
+		}
+		filtered = append(filtered, task)
+	}
+	total := int64(len(filtered))
+	offset := (options.PageNum - 1) * options.PageSize
+	if offset >= len(filtered) {
+		return []*Task{}, total, nil
+	}
+	end := offset + options.PageSize
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	return filtered[offset:end], total, nil
+}
+
+func (task *Task) officialData() map[string]any {
+	data := make(map[string]any)
+	if len(task.Data) > 0 {
+		_ = common.Unmarshal(task.Data, &data)
+	}
+	return data
+}
+
+func (task *Task) officialStatus(data map[string]any) string {
+	if status, _ := data["status"].(string); status != "" {
+		return status
+	}
+	switch task.Status {
+	case TaskStatusNotStart, TaskStatusSubmitted, TaskStatusQueued:
+		return "queued"
+	case TaskStatusInProgress:
+		return "running"
+	case TaskStatusSuccess:
+		return "succeeded"
+	case TaskStatusFailure:
+		return "failed"
+	default:
+		return "queued"
+	}
 }

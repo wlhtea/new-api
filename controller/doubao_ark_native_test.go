@@ -30,13 +30,21 @@ import (
 const doubaoNativeTestModel = "doubao-seedance-2-0-260128"
 
 type doubaoNativeFixture struct {
-	database     *gorm.DB
-	channel      *model.Channel
-	generation   *pluginruntime.RoutingGeneration
-	upstream     *httptest.Server
-	submitBodies chan []byte
-	submitCalls  atomic.Int32
-	queryCalls   atomic.Int32
+	database      *gorm.DB
+	channel       *model.Channel
+	generation    *pluginruntime.RoutingGeneration
+	upstream      *httptest.Server
+	submitBodies  chan []byte
+	submitCalls   atomic.Int32
+	queryCalls    atomic.Int32
+	deleteCalls   atomic.Int32
+	deleteStatus  atomic.Int32
+	deleteAuth    chan string
+	queryBody     string
+	queryStarted  chan struct{}
+	queryRelease  chan struct{}
+	deleteStarted chan struct{}
+	deleteRelease chan struct{}
 }
 
 func setupDoubaoNativeFixture(t *testing.T, upstreamTaskID string) *doubaoNativeFixture {
@@ -74,7 +82,7 @@ func setupDoubaoNativeFixture(t *testing.T, upstreamTaskID string) *doubaoNative
 		Id: 7, Username: "doubao-native-user", Group: "default", Quota: 10_000_000,
 	}).Error)
 
-	fixture := &doubaoNativeFixture{database: database, submitBodies: make(chan []byte, 8)}
+	fixture := &doubaoNativeFixture{database: database, submitBodies: make(chan []byte, 8), deleteAuth: make(chan string, 16)}
 	fixture.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -93,7 +101,36 @@ func setupDoubaoNativeFixture(t *testing.T, upstreamTaskID string) *doubaoNative
 			_, _ = w.Write([]byte(`{"id":"` + responseTaskID + `"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/contents/generations/tasks/"+upstreamTaskID:
 			fixture.queryCalls.Add(1)
-			_, _ = w.Write([]byte(`{"id":"` + upstreamTaskID + `","status":"succeeded","content":{"video_url":"https://cdn.example/video.mp4","resolution":"1080p"},"usage":{"total_tokens":1}}`))
+			if fixture.queryStarted != nil {
+				close(fixture.queryStarted)
+			}
+			if fixture.queryRelease != nil {
+				<-fixture.queryRelease
+			}
+			responseBody := fixture.queryBody
+			if responseBody == "" {
+				responseBody = `{"id":"` + upstreamTaskID + `","status":"succeeded","content":{"video_url":"https://cdn.example/video.mp4","resolution":"1080p"},"usage":{"total_tokens":1}}`
+			}
+			_, _ = w.Write([]byte(responseBody))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v3/contents/generations/tasks/"):
+			fixture.deleteCalls.Add(1)
+			if fixture.deleteStarted != nil {
+				close(fixture.deleteStarted)
+			}
+			if fixture.deleteRelease != nil {
+				<-fixture.deleteRelease
+			}
+			fixture.deleteAuth <- r.Header.Get("Authorization")
+			status := int(fixture.deleteStatus.Load())
+			if status == 0 {
+				status = http.StatusOK
+			}
+			w.WriteHeader(status)
+			if status >= 200 && status < 300 {
+				_, _ = w.Write([]byte(`{}`))
+			} else {
+				_, _ = w.Write([]byte(`{"error":{"message":"upstream-sensitive-detail"}}`))
+			}
 		default:
 			http.NotFound(w, r)
 		}

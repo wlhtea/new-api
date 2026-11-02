@@ -19,7 +19,25 @@ func BuildTaskPluginNativeView(task *model.Task, pluginKey string) (dto.TaskView
 	if pluginKey == "doubao_ark_official" && task.ProviderTaskID != "" {
 		publicTaskID = task.ProviderTaskID
 	}
-	return buildTaskPluginView(task, publicTaskID)
+	view, err := buildTaskPluginView(task, publicTaskID)
+	if err == nil && pluginKey == "doubao_ark_official" {
+		view.Data = sanitizeDoubaoArkOfficialData(view.Data)
+	}
+	return view, err
+}
+
+func sanitizeDoubaoArkOfficialData(value any) any {
+	data, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	sanitized := make(map[string]any)
+	for _, key := range []string{"status", "model", "content", "usage", "error", "created_at", "updated_at", "service_tier"} {
+		if field, present := data[key]; present {
+			sanitized[key] = field
+		}
+	}
+	return sanitized
 }
 
 func buildTaskPluginView(task *model.Task, publicTaskID string) (dto.TaskView, error) {

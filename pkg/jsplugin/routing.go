@@ -775,7 +775,7 @@ func validateRoute(route *Route) error {
 		if !pathNamePattern.MatchString(route.TaskIDParam) {
 			return fmt.Errorf("query route %s %s has invalid taskIdParam %q", route.Method, route.Path, route.TaskIDParam)
 		}
-		if !pathHasParameter(route.Path, route.TaskIDParam) {
+		if route.Render != "taskList" && !pathHasParameter(route.Path, route.TaskIDParam) {
 			return fmt.Errorf("query route %s %s must contain :%s", route.Method, route.Path, route.TaskIDParam)
 		}
 	case RouteTypeDynamic:
