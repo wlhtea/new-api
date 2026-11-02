@@ -45,6 +45,40 @@ var errTaskPluginUnsupportedMediaType = errors.New("unsupported task plugin medi
 
 const taskPluginInvalidRouteResult = "plugin returned an invalid route result"
 
+// doubaoArkOfficialOperationLogger covers every native single-task route
+// attempt, including request decoding failures. The ownership-scoped lookup is
+// only for log metadata and never participates in the API result.
+func doubaoArkOfficialOperationLogger(c *gin.Context, pinned pluginruntime.PinnedRoute) func() {
+	if pinned.Plugin == nil || pinned.Plugin.Meta.Key != "doubao_ark_official" || pinned.Route.TaskIDParam == "" {
+		return nil
+	}
+	operation := ""
+	switch pinned.Route.Method {
+	case http.MethodGet:
+		operation = "query"
+	case http.MethodDelete:
+		operation = "delete"
+	default:
+		return nil
+	}
+	providerTaskID := c.Param(pinned.Route.TaskIDParam)
+	if providerTaskID == "" {
+		return nil
+	}
+	var task *model.Task
+	if common.LogConsumeEnabled && model.DB != nil && model.LOG_DB != nil {
+		userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+		platform := constant.TaskPlatform(pinned.Plugin.Meta.Key)
+		tasks, err := model.GetByProviderTaskIdsForPlatforms(userID, []constant.TaskPlatform{platform}, []string{providerTaskID})
+		if err == nil && len(tasks) == 1 {
+			task = tasks[0]
+		}
+	}
+	return func() {
+		service.RecordTaskPluginOperationLog(c, operation, providerTaskID, c.Writer.Status(), task)
+	}
+}
+
 // Text fields have no limit of their own: like a JSON body, they are bounded
 // by the request body limit, so a JSON request sent as a multipart field may
 // be as large as the same request sent as the body.
@@ -66,6 +100,9 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		if !exists || !ok || pinned.Plugin == nil {
 			abortTaskPluginRouteErrorDetail(c, http.StatusInternalServerError, "")
 			return
+		}
+		if logOperation := doubaoArkOfficialOperationLogger(c, pinned); logOperation != nil {
+			defer logOperation()
 		}
 		c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{
 			Generation: pinned.Generation,
