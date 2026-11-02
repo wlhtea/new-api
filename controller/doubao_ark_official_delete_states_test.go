@@ -32,6 +32,9 @@ func setupDoubaoOfficialDeleteStateTask(t *testing.T, providerID string, hostSta
 		},
 	}
 	require.NoError(t, fixture.database.Create(task).Error)
+	// State-mutation tests declare the provider snapshot explicitly; tests for
+	// stale local state override it before invoking DELETE.
+	fixture.queryBody = string(task.Data)
 	var user model.User
 	require.NoError(t, fixture.database.Select("quota").First(&user, 7).Error)
 	return fixture, task, user.Quota

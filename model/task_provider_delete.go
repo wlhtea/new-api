@@ -15,6 +15,16 @@ func (task *Task) CancelNonTerminal(data json.RawMessage, now int64) (bool, erro
 		"data":        data,
 		"fail_reason": "",
 	}
+	officialStatus, officialModel, officialServiceTier := "", "", ""
+	if task.Platform == "doubao_ark_official" {
+		projected := *task
+		projected.Status = TaskStatusFailure
+		projected.Data = data
+		officialStatus, officialModel, officialServiceTier = projected.officialProjection()
+		updates["official_status"] = officialStatus
+		updates["official_model"] = officialModel
+		updates["official_service_tier"] = officialServiceTier
+	}
 	result := DB.Model(&Task{}).
 		Where("id = ?", task.ID).
 		Where("status NOT IN ?", []TaskStatus{TaskStatusSuccess, TaskStatusFailure}).
@@ -28,6 +38,11 @@ func (task *Task) CancelNonTerminal(data json.RawMessage, now int64) (bool, erro
 	task.UpdatedAt = now
 	task.Data = data
 	task.FailReason = ""
+	if task.Platform == "doubao_ark_official" {
+		task.OfficialStatus = officialStatus
+		task.OfficialModel = officialModel
+		task.OfficialServiceTier = officialServiceTier
+	}
 	return true, nil
 }
 

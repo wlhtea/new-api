@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -48,26 +49,29 @@ const (
 const TaskRefundLegacyCutoff int64 = 1771718400 // 2026-02-22 00:00:00 UTC
 
 type Task struct {
-	ID              int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
-	CreatedAt       int64                 `json:"created_at" gorm:"index"`
-	UpdatedAt       int64                 `json:"updated_at"`
-	TaskID          string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
-	ProviderTaskID  string                `json:"-" gorm:"type:varchar(191);index"`       // 上游供应商任务 ID，仅用于原生协议寻址
-	ProviderDeleted bool                  `json:"-" gorm:"not null;default:false;index"`  // 原生协议公开删除墓碑，保留本地审计与账务行
-	Platform        constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
-	UserId          int                   `json:"user_id" gorm:"index"`
-	Group           string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
-	ChannelId       int                   `json:"channel_id" gorm:"index"`
-	Quota           int                   `json:"quota"`
-	Action          string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
-	Status          TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
-	FailReason      string                `json:"fail_reason"`
-	SubmitTime      int64                 `json:"submit_time" gorm:"index"`
-	StartTime       int64                 `json:"start_time" gorm:"index"`
-	FinishTime      int64                 `json:"finish_time" gorm:"index"`
-	Progress        string                `json:"progress" gorm:"type:varchar(20);index"`
-	Properties      Properties            `json:"properties" gorm:"type:json"`
-	Username        string                `json:"username,omitempty" gorm:"-"`
+	ID                  int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT;index:idx_tasks_official_list,priority:6,sort:desc"`
+	CreatedAt           int64                 `json:"created_at" gorm:"index;index:idx_tasks_official_list,priority:4,sort:desc"`
+	UpdatedAt           int64                 `json:"updated_at"`
+	TaskID              string                `json:"task_id" gorm:"type:varchar(191);index"`                                              // 第三方id，不一定有/ song id\ Task id
+	ProviderTaskID      string                `json:"-" gorm:"type:varchar(191);index;index:idx_tasks_official_list,priority:5,sort:desc"` // 上游供应商任务 ID，仅用于原生协议寻址
+	ProviderDeleted     bool                  `json:"-" gorm:"not null;default:false;index;index:idx_tasks_official_list,priority:3"`      // 原生协议公开删除墓碑，保留本地审计与账务行
+	OfficialStatus      string                `json:"-" gorm:"not null;default:'';type:varchar(20)"`                                       // 原生列表精确过滤投影
+	OfficialModel       string                `json:"-" gorm:"not null;default:'';type:varchar(191)"`                                      // 原生列表精确过滤投影
+	OfficialServiceTier string                `json:"-" gorm:"not null;default:'';type:varchar(30)"`                                       // 原生列表精确过滤投影
+	Platform            constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index;index:idx_tasks_official_list,priority:2"`     // 平台
+	UserId              int                   `json:"user_id" gorm:"index;index:idx_tasks_official_list,priority:1"`
+	Group               string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
+	ChannelId           int                   `json:"channel_id" gorm:"index"`
+	Quota               int                   `json:"quota"`
+	Action              string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
+	Status              TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
+	FailReason          string                `json:"fail_reason"`
+	SubmitTime          int64                 `json:"submit_time" gorm:"index"`
+	StartTime           int64                 `json:"start_time" gorm:"index"`
+	FinishTime          int64                 `json:"finish_time" gorm:"index"`
+	Progress            string                `json:"progress" gorm:"type:varchar(20);index"`
+	Properties          Properties            `json:"properties" gorm:"type:json"`
+	Username            string                `json:"username,omitempty" gorm:"-"`
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
@@ -678,8 +682,12 @@ func (t *Task) ToOpenAIVideo() *dto.OpenAIVideo {
 	return openAIVideo
 }
 
-// OfficialTaskListOptions is the host-validated Ark list query. Selection and
-// pagination remain in Go; JavaScript only receives the projected result page.
+// OfficialTaskListMaxTaskIDs bounds both request memory and SQL placeholders.
+// It is deliberately below the 500-item page ceiling and SQLite's variable limit.
+const OfficialTaskListMaxTaskIDs = 100
+
+// OfficialTaskListOptions is the host-validated Ark list query. Filtering,
+// counting, and pagination stay in SQL; JavaScript only receives the result page.
 type OfficialTaskListOptions struct {
 	PageNum     int
 	PageSize    int
@@ -702,39 +710,30 @@ func ListTasksForOfficialPlugin(userID int, platform constant.TaskPlatform, opti
 	if len(options.TaskIDs) > 0 {
 		query = query.Where("provider_task_id IN ?", options.TaskIDs)
 	}
-	candidates := make([]*Task, 0)
-	if err := query.Order("created_at DESC").Order("provider_task_id DESC").Order("id DESC").Find(&candidates).Error; err != nil {
+	if options.Status != "" {
+		query = query.Where("official_status = ?", options.Status)
+	}
+	if options.Model != "" {
+		query = query.Where("official_model = ?", options.Model)
+	}
+	if options.ServiceTier != "" {
+		query = query.Where("official_service_tier = ?", options.ServiceTier)
+	}
+
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
-	filtered := make([]*Task, 0, len(candidates))
-	for _, task := range candidates {
-		data := task.officialData()
-		if options.Status != "" && task.officialStatus(data) != options.Status {
-			continue
-		}
-		modelName, _ := data["model"].(string)
-		if modelName == "" {
-			modelName = task.Properties.UpstreamModelName
-		}
-		if options.Model != "" && modelName != options.Model {
-			continue
-		}
-		serviceTier, _ := data["service_tier"].(string)
-		if options.ServiceTier != "" && serviceTier != options.ServiceTier {
-			continue
-		}
-		filtered = append(filtered, task)
-	}
-	total := int64(len(filtered))
 	offset := (options.PageNum - 1) * options.PageSize
-	if offset >= len(filtered) {
+	if offset >= int(total) {
 		return []*Task{}, total, nil
 	}
-	end := offset + options.PageSize
-	if end > len(filtered) {
-		end = len(filtered)
+	tasks := make([]*Task, 0, options.PageSize)
+	if err := query.Order("created_at DESC").Order("provider_task_id DESC").Order("id DESC").
+		Limit(options.PageSize).Offset(offset).Find(&tasks).Error; err != nil {
+		return nil, 0, err
 	}
-	return filtered[offset:end], total, nil
+	return tasks, total, nil
 }
 
 func (task *Task) officialData() map[string]any {
@@ -760,5 +759,62 @@ func (task *Task) officialStatus(data map[string]any) string {
 		return "failed"
 	default:
 		return "queued"
+	}
+}
+
+func (task *Task) officialProjection() (status, modelName, serviceTier string) {
+	data := task.officialData()
+	status = task.officialStatus(data)
+	modelName, _ = data["model"].(string)
+	if modelName == "" {
+		modelName = task.Properties.UpstreamModelName
+	}
+	serviceTier, _ = data["service_tier"].(string)
+	return status, modelName, serviceTier
+}
+
+// BeforeSave keeps the small SQL query projection synchronized for the
+// official Ark plugin only. Legacy plugins retain their existing schema semantics.
+func (task *Task) BeforeSave(_ *gorm.DB) error {
+	if task.Platform != constant.TaskPlatform("doubao_ark_official") {
+		return nil
+	}
+	task.OfficialStatus, task.OfficialModel, task.OfficialServiceTier = task.officialProjection()
+	return nil
+}
+
+const officialTaskProjectionBackfillBatchSize = 500
+
+// backfillOfficialTaskListProjections normalizes historical official rows in
+// bounded keyset batches. It only selects rows whose required status projection
+// is still empty, so rows written by the new code are never rescanned.
+func backfillOfficialTaskListProjections() error {
+	var lastID int64
+	for {
+		tasks := make([]*Task, 0, officialTaskProjectionBackfillBatchSize)
+		if err := DB.Select("id", "status", "data", "properties").
+			Where("platform = ?", constant.TaskPlatform("doubao_ark_official")).
+			Where("official_status = ?", "").
+			Where("id > ?", lastID).
+			Order("id").Limit(officialTaskProjectionBackfillBatchSize).
+			Find(&tasks).Error; err != nil {
+			return err
+		}
+		for _, task := range tasks {
+			status, modelName, serviceTier := task.officialProjection()
+			if err := DB.Model(&Task{}).
+				Where("id = ? AND official_status = ?", task.ID, "").
+				Updates(map[string]any{
+					"official_status":       status,
+					"official_model":        modelName,
+					"official_service_tier": serviceTier,
+				}).Error; err != nil {
+				return err
+			}
+			lastID = task.ID
+		}
+		if len(tasks) < officialTaskProjectionBackfillBatchSize {
+			return nil
+		}
 	}
 }

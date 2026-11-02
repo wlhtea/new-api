@@ -24,7 +24,12 @@ func TestDoubaoArkOfficialPollerDeleteRaceRefundsExactlyOnce(t *testing.T) {
 	sqlDB, err := fixture.database.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	fixture.queryBody = `{"id":"cgt-delete-race","status":"failed","error":{"code":"upstream_failed","message":"generation failed"}}`
+	fixture.queryBodyForCall = func(call int32) string {
+		if call == 1 {
+			return `{"id":"cgt-delete-race","status":"failed","error":{"code":"upstream_failed","message":"generation failed"}}`
+		}
+		return `{"id":"cgt-delete-race","status":"queued"}`
+	}
 	fixture.queryStarted = make(chan struct{})
 	fixture.queryRelease = make(chan struct{})
 	fixture.deleteStarted = make(chan struct{})
@@ -66,12 +71,17 @@ func TestDoubaoArkOfficialPollerDeleteRaceRefundsExactlyOnce(t *testing.T) {
 	}
 
 	assert.Equal(t, int32(1), fixture.deleteCalls.Load())
-	assert.Equal(t, int32(1), fixture.queryCalls.Load())
+	assert.Equal(t, int32(2), fixture.queryCalls.Load(), "poller and DELETE preflight must each reconcile provider state")
 	var persisted model.Task
 	require.NoError(t, fixture.database.Where("task_id = ?", task.TaskID).First(&persisted).Error)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), persisted.Status)
 	assert.Contains(t, []string{"cancelled", "failed"}, officialStatusFromData(t, persisted.Data))
-	assert.False(t, persisted.ProviderDeleted)
+	assert.True(t, persisted.ProviderDeleted, "the upstream record is gone even when the poller wins local settlement")
+	query := invokeDoubaoOfficialTaskRoute(t, fixture, http.MethodGet, providerID, 7)
+	assert.Equal(t, http.StatusNotFound, query.Code, query.Body.String())
+	list := invokeDoubaoOfficialListRoute(t, fixture, 7)
+	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
+	assert.JSONEq(t, `{"total":0,"items":[]}`, list.Body.String())
 	var userAfter model.User
 	require.NoError(t, fixture.database.Select("quota").First(&userAfter, 7).Error)
 	assert.Equal(t, quotaBefore+1000, userAfter.Quota, "poller and DELETE must have exactly one billing winner")

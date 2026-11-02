@@ -30,21 +30,22 @@ import (
 const doubaoNativeTestModel = "doubao-seedance-2-0-260128"
 
 type doubaoNativeFixture struct {
-	database      *gorm.DB
-	channel       *model.Channel
-	generation    *pluginruntime.RoutingGeneration
-	upstream      *httptest.Server
-	submitBodies  chan []byte
-	submitCalls   atomic.Int32
-	queryCalls    atomic.Int32
-	deleteCalls   atomic.Int32
-	deleteStatus  atomic.Int32
-	deleteAuth    chan string
-	queryBody     string
-	queryStarted  chan struct{}
-	queryRelease  chan struct{}
-	deleteStarted chan struct{}
-	deleteRelease chan struct{}
+	database         *gorm.DB
+	channel          *model.Channel
+	generation       *pluginruntime.RoutingGeneration
+	upstream         *httptest.Server
+	submitBodies     chan []byte
+	submitCalls      atomic.Int32
+	queryCalls       atomic.Int32
+	deleteCalls      atomic.Int32
+	deleteStatus     atomic.Int32
+	deleteAuth       chan string
+	queryBody        string
+	queryBodyForCall func(call int32) string
+	queryStarted     chan struct{}
+	queryRelease     chan struct{}
+	deleteStarted    chan struct{}
+	deleteRelease    chan struct{}
 }
 
 func setupDoubaoNativeFixture(t *testing.T, upstreamTaskID string) *doubaoNativeFixture {
@@ -100,14 +101,17 @@ func setupDoubaoNativeFixture(t *testing.T, upstreamTaskID string) *doubaoNative
 			}
 			_, _ = w.Write([]byte(`{"id":"` + responseTaskID + `"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/contents/generations/tasks/"+upstreamTaskID:
-			fixture.queryCalls.Add(1)
-			if fixture.queryStarted != nil {
+			call := fixture.queryCalls.Add(1)
+			if fixture.queryStarted != nil && call == 1 {
 				close(fixture.queryStarted)
 			}
-			if fixture.queryRelease != nil {
+			if fixture.queryRelease != nil && call == 1 {
 				<-fixture.queryRelease
 			}
 			responseBody := fixture.queryBody
+			if fixture.queryBodyForCall != nil {
+				responseBody = fixture.queryBodyForCall(call)
+			}
 			if responseBody == "" {
 				responseBody = `{"id":"` + upstreamTaskID + `","status":"succeeded","content":{"video_url":"https://cdn.example/video.mp4","resolution":"1080p"},"usage":{"total_tokens":1}}`
 			}

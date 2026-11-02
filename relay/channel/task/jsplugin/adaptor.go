@@ -646,6 +646,10 @@ func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, 
 }
 
 func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+	return a.FetchTaskContext(context.Background(), baseURL, key, task, proxy)
+}
+
+func (a *TaskAdaptor) FetchTaskContext(requestCtx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
 	if task != nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
@@ -653,11 +657,11 @@ func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy str
 	if err != nil {
 		return nil, err
 	}
-	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "buildQueryRequest", ctx)
+	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(requestCtx, a.hookFetcher(baseURL, proxy)), "buildQueryRequest", ctx)
 	if err != nil {
 		return nil, err
 	}
-	return a.doFetchDescriptor(baseURL, key, proxy, descriptor)
+	return a.doFetchDescriptorWithContext(requestCtx, baseURL, key, proxy, descriptor)
 }
 
 // hookFetcher sends a driver hook's utils.fetch requests to the hosts its
@@ -707,6 +711,10 @@ func (a *TaskAdaptor) hookFetcher(baseURL, proxy string) pluginruntime.Fetcher {
 }
 
 func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor requestDescriptor) (*http.Response, error) {
+	return a.doFetchDescriptorWithContext(context.Background(), baseURL, key, proxy, descriptor)
+}
+
+func (a *TaskAdaptor) doFetchDescriptorWithContext(requestCtx context.Context, baseURL, key, proxy string, descriptor requestDescriptor) (*http.Response, error) {
 	if err := pluginruntime.ValidateRequestURL(descriptor.URL, baseURL, a.plugin.Meta.AllowedHosts); err != nil {
 		return nil, err
 	}
@@ -728,7 +736,7 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor r
 	if method == "" {
 		method = http.MethodGet
 	}
-	req, err := http.NewRequest(method, descriptor.URL, requestBody)
+	req, err := http.NewRequestWithContext(requestCtx, method, descriptor.URL, requestBody)
 	if err != nil {
 		return nil, err
 	}

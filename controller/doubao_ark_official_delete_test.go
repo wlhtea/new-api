@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,12 +24,17 @@ const doubaoOfficialDeleteDeclaredPath = "/doubao_ark_official/api/v3/contents/g
 
 func invokeDoubaoOfficialTaskRoute(t *testing.T, fixture *doubaoNativeFixture, method, providerID string, userID int) *httptest.ResponseRecorder {
 	t.Helper()
+	return invokeDoubaoOfficialTaskRouteWithContext(t, fixture, method, providerID, userID, context.Background())
+}
+
+func invokeDoubaoOfficialTaskRouteWithContext(t *testing.T, fixture *doubaoNativeFixture, method, providerID string, userID int, requestContext context.Context) *httptest.ResponseRecorder {
+	t.Helper()
 	binding, found := fixture.generation.LookupDeclaredRoute(method, doubaoOfficialDeleteDeclaredPath)
 	require.True(t, found, "official native task route is not registered")
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	actualPath := strings.Replace(doubaoOfficialDeleteDeclaredPath, ":task_id", providerID, 1)
-	ctx.Request = httptest.NewRequest(method, actualPath, nil)
+	ctx.Request = httptest.NewRequest(method, actualPath, nil).WithContext(requestContext)
 	ctx.Params = gin.Params{{Key: "task_id", Value: providerID}}
 	ctx.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{
 		Generation: fixture.generation, Plugin: binding.Plugin, Route: binding.Route,
@@ -68,6 +74,7 @@ func TestDoubaoArkOfficialQueuedDeleteCancelsUpstreamAndRefundsOnce(t *testing.T
 		Data: []byte(`{"id":"cgt-delete-queued","status":"queued"}`),
 	}
 	require.NoError(t, fixture.database.Create(task).Error)
+	fixture.queryBody = string(task.Data)
 	var userBefore model.User
 	require.NoError(t, fixture.database.Select("quota").First(&userBefore, 7).Error)
 

@@ -380,6 +380,9 @@ func migrateDB() error {
 	if err != nil {
 		return err
 	}
+	if err := backfillOfficialTaskListProjections(); err != nil {
+		return fmt.Errorf("backfill official task list projections: %w", err)
+	}
 	if err := InitializeUserAuthVersions(); err != nil {
 		return err
 	}

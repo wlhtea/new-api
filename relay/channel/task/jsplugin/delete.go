@@ -12,7 +12,7 @@ import (
 // DeleteTask is an optional host capability. The plugin supplies only the
 // request shape; credentials are removed from its context and reapplied by the
 // host from the executing channel before the request is sent.
-func (a *TaskAdaptor) DeleteTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+func (a *TaskAdaptor) DeleteTask(requestCtx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
 	officialArkDelete := a.plugin != nil && a.plugin.Meta.Key == "doubao_ark_official"
 	if officialArkDelete && (task == nil || task.ProviderTaskID == "") {
 		return nil, fmt.Errorf("provider task ID is required for official Ark deletion")
@@ -31,7 +31,7 @@ func (a *TaskAdaptor) DeleteTask(baseURL, key string, task *model.Task, proxy st
 	delete(ctx, "apiKey")
 	delete(ctx, "authHeader")
 	delete(ctx, "auth")
-	descriptor, err := a.requestDescriptor(context.Background(), "buildDeleteRequest", ctx)
+	descriptor, err := a.requestDescriptor(requestCtx, "buildDeleteRequest", ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -44,5 +44,5 @@ func (a *TaskAdaptor) DeleteTask(baseURL, key string, task *model.Task, proxy st
 		}
 		descriptor.Headers["Authorization"] = authHeader
 	}
-	return a.doFetchDescriptor(baseURL, key, proxy, descriptor)
+	return a.doFetchDescriptorWithContext(requestCtx, baseURL, key, proxy, descriptor)
 }

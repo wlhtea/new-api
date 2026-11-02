@@ -1,6 +1,8 @@
 package service
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"time"
 
@@ -15,7 +17,13 @@ import (
 // TaskDeletionAdaptor is deliberately optional: existing task plugins retain
 // their submit/query-only behavior unless they declare buildDeleteRequest.
 type TaskDeletionAdaptor interface {
-	DeleteTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error)
+	DeleteTask(ctx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error)
+}
+
+const taskProviderDeleteOperationTimeout = 30 * time.Second
+
+type taskContextPollingAdaptor interface {
+	FetchTaskContext(ctx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error)
 }
 
 // DeleteDoubaoArkOfficialTask authorizes against the local owner/plugin scope
@@ -47,9 +55,6 @@ func DeleteDoubaoArkOfficialTask(c *gin.Context, pluginKey, providerTaskID strin
 		return &dto.TaskError{Code: "task_not_found", Message: "Task not found", StatusCode: http.StatusNotFound}
 	}
 	task := tasks[0]
-	if task.Status == model.TaskStatusInProgress {
-		return &dto.TaskError{Code: "invalid_request", Message: "Running tasks cannot be deleted", StatusCode: http.StatusBadRequest}
-	}
 	terminal := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if !terminal {
 		action = "task_provider_cancel"
@@ -81,7 +86,43 @@ func DeleteDoubaoArkOfficialTask(c *gin.Context, pluginKey, providerTaskID strin
 			ChannelSetting: channel.GetSetting(), HeadersOverride: channel.GetHeaderOverride(), ApiKey: key,
 		},
 	})
-	response, err := deletion.DeleteTask(baseURL, key, task, channel.GetSetting().Proxy)
+	operationCtx, cancel := context.WithTimeout(c.Request.Context(), taskProviderDeleteOperationTimeout)
+	defer cancel()
+	if !terminal {
+		// Local state can lag a completed provider task. Reconcile through the
+		// same authenticated plugin query machinery as the poller before any
+		// cancellation, rather than trusting that stale snapshot.
+		preflightTask := *task
+		preflightTask.PrivateData.UpstreamTaskID = providerTaskID
+		var preflight *http.Response
+		var fetchErr error
+		if contextual, supported := adaptor.(taskContextPollingAdaptor); supported {
+			preflight, fetchErr = contextual.FetchTaskContext(operationCtx, baseURL, key, &preflightTask, channel.GetSetting().Proxy)
+		} else {
+			preflight, fetchErr = adaptor.FetchTask(baseURL, key, &preflightTask, channel.GetSetting().Proxy)
+		}
+		if fetchErr != nil || preflight == nil {
+			return &dto.TaskError{Code: "upstream_error", Message: "Upstream task state check failed", StatusCode: http.StatusBadGateway}
+		}
+		body, readErr := io.ReadAll(preflight.Body)
+		closeErr := preflight.Body.Close()
+		if readErr != nil || closeErr != nil || preflight.StatusCode < 200 || preflight.StatusCode >= 300 {
+			return &dto.TaskError{Code: "upstream_error", Message: "Upstream task state check failed", StatusCode: http.StatusBadGateway}
+		}
+		providerState, parseErr := adaptor.ParseTaskResult(&preflightTask, preflight, body)
+		if parseErr != nil || providerState == nil || model.TaskStatus(providerState.Status) == model.TaskStatusUnknown || providerState.Status == "" {
+			return &dto.TaskError{Code: "upstream_error", Message: "Upstream task state could not be verified", StatusCode: http.StatusBadGateway}
+		}
+		switch model.TaskStatus(providerState.Status) {
+		case model.TaskStatusQueued:
+			// Only provider-confirmed queued tasks enter queued cancellation.
+		case model.TaskStatusInProgress:
+			return &dto.TaskError{Code: "invalid_request", Message: "Running tasks cannot be deleted", StatusCode: http.StatusBadRequest}
+		default:
+			return &dto.TaskError{Code: "task_state_conflict", Message: "Task state changed; wait for synchronization and retry", StatusCode: http.StatusConflict}
+		}
+	}
+	response, err := deletion.DeleteTask(operationCtx, baseURL, key, task, channel.GetSetting().Proxy)
 	if err != nil {
 		return &dto.TaskError{Code: "upstream_error", Message: "Upstream task mutation failed", StatusCode: http.StatusBadGateway}
 	}
@@ -101,6 +142,11 @@ func DeleteDoubaoArkOfficialTask(c *gin.Context, pluginKey, providerTaskID strin
 		return &dto.TaskError{Code: "upstream_error", Message: "Upstream task mutation failed", StatusCode: http.StatusBadGateway}
 	}
 
+	// Ark's empty 2xx DELETE body does not itself prove cancellation. The
+	// preflight and local CAS close the stale-local and poller-settlement bugs;
+	// a provider transition in the network window between those upstream calls
+	// remains an unavoidable distributed race, so no success state is inferred
+	// from this response.
 	data := make(map[string]any)
 	if len(task.Data) > 0 {
 		_ = common.Unmarshal(task.Data, &data)
@@ -118,6 +164,13 @@ func DeleteDoubaoArkOfficialTask(c *gin.Context, pluginKey, providerTaskID strin
 	}
 	if won {
 		finalizeTerminalTask(c.Request.Context(), adaptor, task, &relaycommon.TaskInfo{Status: string(model.TaskStatusFailure), Progress: "100%"})
+	} else {
+		// The poller settled first and retains sole billing ownership, but the
+		// upstream DELETE still removed the provider record. Hide that record
+		// without changing the poller's terminal state or refunding again.
+		if err := task.MarkProviderDeleted(time.Now().Unix()); err != nil {
+			return &dto.TaskError{Code: "server_error", Message: "Task deletion could not be persisted; retry the operation", StatusCode: http.StatusInternalServerError}
+		}
 	}
 	return nil
 }

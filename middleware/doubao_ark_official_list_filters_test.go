@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -37,6 +38,31 @@ func officialListIDs(body map[string]any) []string {
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+func TestDoubaoArkOfficialNativeListTaskIDsCap(t *testing.T) {
+	setupTaskPluginRouteDB(t)
+	router := newDoubaoArkOfficialListRouter(t, 7)
+	for _, testCase := range []struct {
+		count      int
+		wantStatus int
+	}{
+		{count: 100, wantStatus: http.StatusOK},
+		{count: 101, wantStatus: http.StatusBadRequest},
+	} {
+		t.Run(fmt.Sprintf("ids_%d", testCase.count), func(t *testing.T) {
+			query := url.Values{}
+			for index := 0; index < testCase.count; index++ {
+				query.Add("filter.task_ids", fmt.Sprintf("cgt-filter-%03d", index))
+			}
+			status, body := officialListResponse(t, router, query.Encode())
+			assert.Equal(t, testCase.wantStatus, status, body)
+			if testCase.wantStatus == http.StatusBadRequest {
+				errorObject, _ := body["error"].(map[string]any)
+				assert.Equal(t, "invalid_request", errorObject["code"])
+			}
+		})
+	}
 }
 
 func TestDoubaoArkOfficialNativeListScopesAndFilters(t *testing.T) {

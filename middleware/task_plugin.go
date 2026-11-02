@@ -1246,6 +1246,11 @@ func officialListPagination(query map[string][]string, name string) (int, error)
 }
 
 func renderDoubaoArkOfficialList(c *gin.Context, pinned pluginruntime.PinnedRoute, requestContext pluginruntime.RouteRequestContext) {
+	taskIDs := requestContext.Query["filter.task_ids"]
+	if len(taskIDs) > model.OfficialTaskListMaxTaskIDs {
+		abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, fmt.Sprintf("filter.task_ids accepts at most %d IDs", model.OfficialTaskListMaxTaskIDs))
+		return
+	}
 	pageNum, err := officialListPagination(requestContext.Query, "page_num")
 	if err != nil {
 		abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, err.Error())
@@ -1258,7 +1263,7 @@ func renderDoubaoArkOfficialList(c *gin.Context, pinned pluginruntime.PinnedRout
 	}
 	options := model.OfficialTaskListOptions{
 		PageNum: pageNum, PageSize: pageSize,
-		TaskIDs: requestContext.Query["filter.task_ids"],
+		TaskIDs: taskIDs,
 		Since:   time.Now().Add(-7 * 24 * time.Hour).Unix(),
 	}
 	for _, filter := range []struct {

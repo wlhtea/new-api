@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
@@ -40,7 +41,7 @@ func TestDoubaoArkOfficialDeleteRequiresProviderTaskID(t *testing.T) {
 	adaptor := relay.GetTaskAdaptor(task.Platform)
 	deletion, ok := adaptor.(service.TaskDeletionAdaptor)
 	require.True(t, ok)
-	upstreamResponse, err := deletion.DeleteTask(fixture.upstream.URL, "sk-test", task, "")
+	upstreamResponse, err := deletion.DeleteTask(context.Background(), fixture.upstream.URL, "sk-test", task, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "provider task ID is required")
 	assert.Nil(t, upstreamResponse)
