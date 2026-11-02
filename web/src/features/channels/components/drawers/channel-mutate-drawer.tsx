@@ -304,6 +304,8 @@ const SENSITIVE_FORM_FIELDS = [
   'tls_insecure_skip_verify',
   'pass_through_body_enabled',
   'responses_websocket_enabled',
+  'allow_official_task_list',
+  'allow_official_task_delete',
   'system_prompt',
   'system_prompt_override',
   'allow_service_tier',
@@ -4273,6 +4275,66 @@ export function ChannelMutateDrawer({
                 )}
               />
             )}
+
+            {currentType === CHANNEL_TYPE_TASK_PLUGIN &&
+              currentTaskPluginKey === 'doubao_ark_official' && (
+                <>
+                  <FormField
+                    control={form.control}
+                    name='allow_official_task_list'
+                    render={({ field }) => (
+                      <FormItem className='flex items-center justify-between gap-4 px-4 py-3'>
+                        <div className='space-y-0.5'>
+                          <FormLabel>{t('Allow official task list')}</FormLabel>
+                          <FormDescription>
+                            {t(
+                              'List only official tasks created by users of this site, with each user limited to their own tasks.'
+                            )}
+                          </FormDescription>
+                        </div>
+                        <FormControl>
+                          <Switch
+                            disabled={sensitiveLocked}
+                            checked={field.value === true}
+                            onCheckedChange={field.onChange}
+                            onBlur={field.onBlur}
+                            name={field.name}
+                            ref={field.ref}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name='allow_official_task_delete'
+                    render={({ field }) => (
+                      <FormItem className='flex items-center justify-between gap-4 px-4 py-3'>
+                        <div className='space-y-0.5'>
+                          <FormLabel>
+                            {t('Allow official task deletion')}
+                          </FormLabel>
+                          <FormDescription>
+                            {t(
+                              'Allow users to delete only their own official Doubao Ark tasks on this site.'
+                            )}
+                          </FormDescription>
+                        </div>
+                        <FormControl>
+                          <Switch
+                            disabled={sensitiveLocked}
+                            checked={field.value === true}
+                            onCheckedChange={field.onChange}
+                            onBlur={field.onBlur}
+                            name={field.name}
+                            ref={field.ref}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+                </>
+              )}
 
             {currentType === CHANNEL_TYPE_ADVANCED_CUSTOM && (
               <FormField

@@ -3029,3 +3029,135 @@ test('AWS interface selection is disabled without sensitive channel write permis
     await screen.findByRole('combobox', { name: 'AWS API' })
   ).toBeDisabled()
 })
+
+test('Doubao Ark official permission switches restore, click, and submit explicit values', async () => {
+  editingChannel = {
+    ...editingChannel,
+    type: 61,
+    base_url: 'https://ark.cn-beijing.volces.com',
+    models: 'doubao-seedance-1-0-pro',
+    setting: JSON.stringify({
+      task_plugin_key: 'doubao_ark_official',
+      allow_official_task_list: true,
+      allow_official_task_delete: false,
+    }),
+  }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+
+  const list = await screen.findByRole('switch', {
+    name: 'Allow official task list',
+  })
+  const deletion = screen.getByRole('switch', {
+    name: 'Allow official task deletion',
+  })
+  expect(list).toBeChecked()
+  expect(deletion).not.toBeChecked()
+  expect(
+    screen.getByText(
+      'List only official tasks created by users of this site, with each user limited to their own tasks.'
+    )
+  ).toBeVisible()
+  expect(
+    screen.getByText(
+      'Allow users to delete only their own official Doubao Ark tasks on this site.'
+    )
+  ).toBeVisible()
+
+  await user.click(list)
+  await user.click(deletion)
+  expect(list).not.toBeChecked()
+  expect(deletion).toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  const payload = put.mock.calls[0]?.[1] as { setting: string }
+  expect(JSON.parse(payload.setting)).toMatchObject({
+    task_plugin_key: 'doubao_ark_official',
+    allow_official_task_list: false,
+    allow_official_task_delete: true,
+  })
+})
+
+test.each([
+  { type: 61, taskPluginKey: 'doubao' },
+  { type: 60, taskPluginKey: 'doubao_ark_official' },
+])(
+  'official task permission switches stay excluded for type=$type plugin=$taskPluginKey',
+  async ({ type, taskPluginKey }) => {
+    editingChannel = {
+      ...editingChannel,
+      type,
+      base_url: 'https://ark.cn-beijing.volces.com',
+      models: 'doubao-seedance-1-0-pro',
+      setting: JSON.stringify({
+        task_plugin_key: taskPluginKey,
+        allow_official_task_list: true,
+        allow_official_task_delete: true,
+      }),
+    }
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValue({ data: { success: true } })
+    const user = userEvent.setup()
+    render(<ConfigurationHarness currentRow={editingChannel} />)
+    await screen.findByDisplayValue('Existing channel')
+
+    expect(
+      screen.queryByRole('switch', { name: 'Allow official task list' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('switch', { name: 'Allow official task deletion' })
+    ).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+    await waitFor(() => expect(put).toHaveBeenCalled())
+    const payload = put.mock.calls[0]?.[1] as { setting: string }
+    const setting = JSON.parse(payload.setting)
+    expect(setting).not.toHaveProperty('allow_official_task_list')
+    expect(setting).not.toHaveProperty('allow_official_task_delete')
+  }
+)
+
+test('official task permission switches respect sensitiveLocked', async () => {
+  editingChannel = {
+    ...editingChannel,
+    type: 61,
+    base_url: 'https://ark.cn-beijing.volces.com',
+    models: 'doubao-seedance-1-0-pro',
+    setting: JSON.stringify({
+      task_plugin_key: 'doubao_ark_official',
+      allow_official_task_list: true,
+      allow_official_task_delete: false,
+    }),
+  }
+  useAuthStore.setState({
+    auth: {
+      ...originalAuth,
+      user: {
+        id: 10,
+        username: 'operator',
+        role: ROLE.ADMIN,
+        permissions: {
+          admin_permissions: { channel: { read: true, write: true } },
+        },
+      },
+    },
+  })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+
+  const list = await screen.findByRole('switch', {
+    name: 'Allow official task list',
+  })
+  const deletion = screen.getByRole('switch', {
+    name: 'Allow official task deletion',
+  })
+  expect(list).toHaveAttribute('aria-disabled', 'true')
+  expect(deletion).toHaveAttribute('aria-disabled', 'true')
+  await user.click(list)
+  await user.click(deletion)
+  expect(list).toBeChecked()
+  expect(deletion).not.toBeChecked()
+})
