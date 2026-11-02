@@ -7358,6 +7358,11 @@
     "Zhipu": "智谱",
     "Zhipu GLM": "智谱GLM",
     "Zhipu V4": "智谱 V4",
-    "Zoom": "缩放"
+    "Zoom": "缩放",
+    "Allow official task list": "允许查询官方任务列表",
+    "List only official tasks created by users of this site, with each user limited to their own tasks.": "仅列出本站用户创建的官方任务；每位用户只能查看自己的任务。",
+    "Allow official task deletion": "允许删除官方任务",
+    "Allow users to delete only their own official Doubao Ark tasks on this site.": "仅允许用户删除自己在本站创建的官方 Doubao Ark 任务。",
+    "Official task {{operation}} {{provider_task_id}} returned HTTP {{http_status}}": "官方任务 {{operation}} {{provider_task_id}} 返回 HTTP {{http_status}}"
   }
 }

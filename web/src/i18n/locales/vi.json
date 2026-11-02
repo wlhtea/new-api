@@ -7358,6 +7358,11 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V4",
-    "Zoom": "Zoom"
+    "Zoom": "Zoom",
+    "Allow official task list": "Cho phép danh sách tác vụ chính thức",
+    "List only official tasks created by users of this site, with each user limited to their own tasks.": "Chỉ liệt kê tác vụ chính thức do người dùng của trang này tạo; mỗi người dùng chỉ xem được tác vụ của mình.",
+    "Allow official task deletion": "Cho phép xóa tác vụ chính thức",
+    "Allow users to delete only their own official Doubao Ark tasks on this site.": "Chỉ cho phép người dùng xóa tác vụ Doubao Ark chính thức của chính họ trên trang này.",
+    "Official task {{operation}} {{provider_task_id}} returned HTTP {{http_status}}": "Tác vụ chính thức {{operation}} {{provider_task_id}} trả về HTTP {{http_status}}"
   }
 }

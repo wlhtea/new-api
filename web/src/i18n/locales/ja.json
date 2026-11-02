@@ -7358,6 +7358,11 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V 4",
-    "Zoom": "ズーム"
+    "Zoom": "ズーム",
+    "Allow official task list": "公式タスク一覧の表示を許可",
+    "List only official tasks created by users of this site, with each user limited to their own tasks.": "このサイトのユーザーが作成した公式タスクのみを表示し、各ユーザーは自分のタスクだけを確認できます。",
+    "Allow official task deletion": "公式タスクの削除を許可",
+    "Allow users to delete only their own official Doubao Ark tasks on this site.": "ユーザーがこのサイトで作成した自分の公式 Doubao Ark タスクのみ削除を許可します。",
+    "Official task {{operation}} {{provider_task_id}} returned HTTP {{http_status}}": "公式タスク {{operation}} {{provider_task_id}} は HTTP {{http_status}} を返しました"
   }
 }

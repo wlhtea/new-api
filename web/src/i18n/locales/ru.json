@@ -7358,6 +7358,11 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V4",
-    "Zoom": "Zoom"
+    "Zoom": "Zoom",
+    "Allow official task list": "Разрешить список официальных задач",
+    "List only official tasks created by users of this site, with each user limited to their own tasks.": "Показывать только официальные задачи пользователей этого сайта; каждый пользователь видит лишь свои задачи.",
+    "Allow official task deletion": "Разрешить удаление официальных задач",
+    "Allow users to delete only their own official Doubao Ark tasks on this site.": "Пользователи могут удалять только свои официальные задачи Doubao Ark на этом сайте.",
+    "Official task {{operation}} {{provider_task_id}} returned HTTP {{http_status}}": "Официальная задача {{operation}} {{provider_task_id}} вернула HTTP {{http_status}}"
   }
 }
