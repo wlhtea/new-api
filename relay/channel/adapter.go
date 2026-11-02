@@ -85,6 +85,7 @@ type TaskAdaptor interface {
 // upstream task submission. Parsing must not write to the client response.
 type TaskSubmitResponse struct {
 	UpstreamTaskID string
+	ProviderTaskID string
 	TaskData       []byte
 	ClientResponse any
 	Immediate      *relaycommon.TaskInfo

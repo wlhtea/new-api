@@ -1219,7 +1219,19 @@ func renderTaskPluginQuery(
 	)
 	userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
 	platforms := taskPluginLegacyPlatforms(pinned.Plugin.Meta)
-	tasks, err := model.GetByTaskIdsForPlatforms(userID, platforms, taskIDs)
+	lookupByProviderID := pinned.Plugin.Meta.Key == "doubao_ark_official"
+	if lookupByProviderID {
+		// This plugin has no legacy channel identity: native provider IDs must
+		// stay inside its explicit type-61 plugin scope.
+		platforms = []constant.TaskPlatform{constant.TaskPlatform(pinned.Plugin.Meta.Key)}
+	}
+	var tasks []*model.Task
+	var err error
+	if lookupByProviderID {
+		tasks, err = model.GetByProviderTaskIdsForPlatforms(userID, platforms, taskIDs)
+	} else {
+		tasks, err = model.GetByTaskIdsForPlatforms(userID, platforms, taskIDs)
+	}
 	if err != nil {
 		logger.LogDebug(
 			c,
@@ -1241,7 +1253,11 @@ func renderTaskPluginQuery(
 	)
 	tasksByID := make(map[string]*model.Task, len(tasks))
 	for _, task := range tasks {
-		tasksByID[task.TaskID] = task
+		lookupID := task.TaskID
+		if lookupByProviderID {
+			lookupID = task.ProviderTaskID
+		}
+		tasksByID[lookupID] = task
 	}
 	views := make([]dto.TaskView, 0, len(taskIDs))
 	for _, taskID := range taskIDs {
@@ -1258,7 +1274,7 @@ func renderTaskPluginQuery(
 			abortTaskPluginRouteError(c, http.StatusNotFound)
 			return
 		}
-		view, viewErr := service.BuildTaskPluginView(task)
+		view, viewErr := service.BuildTaskPluginNativeView(task, pinned.Plugin.Meta.Key)
 		if viewErr != nil {
 			abortTaskPluginRouteError(c, http.StatusInternalServerError)
 			return

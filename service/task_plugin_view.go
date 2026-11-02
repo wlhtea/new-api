@@ -9,12 +9,29 @@ import (
 // BuildTaskPluginView converts a persisted task into the deliberately narrow
 // public shape permitted at JavaScript plugin boundaries.
 func BuildTaskPluginView(task *model.Task) (dto.TaskView, error) {
+	return buildTaskPluginView(task, task.TaskID)
+}
+
+// BuildTaskPluginNativeView applies the public identifier contract of one
+// native plugin route without changing generic or OpenAI task presentations.
+func BuildTaskPluginNativeView(task *model.Task, pluginKey string) (dto.TaskView, error) {
+	publicTaskID := task.TaskID
+	if pluginKey == "doubao_ark_official" && task.ProviderTaskID != "" {
+		publicTaskID = task.ProviderTaskID
+	}
+	return buildTaskPluginView(task, publicTaskID)
+}
+
+func buildTaskPluginView(task *model.Task, publicTaskID string) (dto.TaskView, error) {
+	if publicTaskID == "" {
+		publicTaskID = task.TaskID
+	}
 	createdAt := task.CreatedAt
 	if createdAt == 0 {
 		createdAt = task.SubmitTime
 	}
 	view := dto.TaskView{
-		TaskID:     task.TaskID,
+		TaskID:     publicTaskID,
 		Platform:   string(task.Platform),
 		Status:     string(task.Status),
 		Progress:   task.Progress,
@@ -27,7 +44,10 @@ func BuildTaskPluginView(task *model.Task) (dto.TaskView, error) {
 		if err := common.Unmarshal(task.Data, &view.Data); err != nil {
 			return dto.TaskView{}, err
 		}
-		view.Data = replacePrivateTaskID(view.Data, task.PrivateData.UpstreamTaskID, task.TaskID)
+		view.Data = replacePrivateTaskID(view.Data, task.PrivateData.UpstreamTaskID, publicTaskID)
+		if publicTaskID != task.TaskID {
+			view.Data = replacePrivateTaskID(view.Data, task.TaskID, publicTaskID)
+		}
 	}
 	return view, nil
 }

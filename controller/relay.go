@@ -653,6 +653,7 @@ func executeTaskSubmissionWith(
 	task := model.InitTask(result.Platform, relayInfo)
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
+	task.ProviderTaskID = result.ProviderTaskID
 	task.PrivateData.BillingSource = relayInfo.BillingSource
 	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 	task.PrivateData.TokenId = relayInfo.TokenId
@@ -754,7 +755,7 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 	}
 	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedRoute); exists {
 		if pinned, ok := pinnedValue.(pluginruntime.PinnedRoute); ok && pinned.Plugin != nil && pinned.Route.Render != "" {
-			view, err := service.BuildTaskPluginView(outcome.Task)
+			view, err := service.BuildTaskPluginNativeView(outcome.Task, pinned.Plugin.Meta.Key)
 			requestValue, _ := c.Get(pluginruntime.ContextKeyRouteRequest)
 			requestContext, _ := requestValue.(pluginruntime.RouteRequestContext)
 			if err == nil {

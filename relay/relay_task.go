@@ -30,6 +30,7 @@ import (
 
 type TaskSubmitResult struct {
 	UpstreamTaskID string
+	ProviderTaskID string
 	TaskData       []byte
 	ClientResponse any
 	Platform       constant.TaskPlatform
@@ -405,6 +406,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	return &TaskSubmitResult{
 		UpstreamTaskID: parsed.UpstreamTaskID,
+		ProviderTaskID: parsed.ProviderTaskID,
 		TaskData:       parsed.TaskData,
 		ClientResponse: parsed.ClientResponse,
 		Platform:       platform,

@@ -581,6 +581,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	}
 	response := &channel.TaskSubmitResponse{
 		UpstreamTaskID: parsed.TaskID,
+		ProviderTaskID: parsed.TaskID,
 		TaskData:       taskData,
 		PluginState:    pluginState,
 	}

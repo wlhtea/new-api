@@ -357,6 +357,24 @@ func pluginRouteRecovery() gin.HandlerFunc {
 	}
 }
 
+const doubaoArkOfficialNativeTasksPath = "/api/v3/contents/generations/tasks"
+
+// doubaoArkOfficialNativeAlias maps only Ark's official create/retrieve
+// operations onto the independently pinned plugin routes. It deliberately
+// leaves collection list and delete operations unimplemented.
+func doubaoArkOfficialNativeAlias(method, path string) (string, bool) {
+	if method == http.MethodPost && path == doubaoArkOfficialNativeTasksPath {
+		return "/doubao_ark_official" + path, true
+	}
+	if method == http.MethodGet && strings.HasPrefix(path, doubaoArkOfficialNativeTasksPath+"/") {
+		taskID := strings.TrimPrefix(path, doubaoArkOfficialNativeTasksPath+"/")
+		if taskID != "" && !strings.Contains(taskID, "/") {
+			return "/doubao_ark_official" + path, true
+		}
+	}
+	return "", false
+}
+
 func (d *pluginRouteDispatcher) dispatch(c *gin.Context) {
 	generation := d.registry.Generation()
 	if generation == nil || generation.RuntimeHandler() == nil {
@@ -376,7 +394,20 @@ func (d *pluginRouteDispatcher) dispatch(c *gin.Context) {
 	state.writer = gatedWriter
 	c.Request = c.Request.WithContext(context.WithValue(originalContext, pluginDispatchStateKey{}, state))
 
+	originalPath := c.Request.URL.Path
+	originalRawPath := c.Request.URL.RawPath
+	aliasPath, aliased := doubaoArkOfficialNativeAlias(c.Request.Method, originalPath)
+	if aliased {
+		c.Request.URL.Path = aliasPath
+		if originalRawPath != "" {
+			c.Request.URL.RawPath = aliasPath
+		}
+	}
 	generation.RuntimeHandler().ServeHTTP(gatedWriter, c.Request)
+	if aliased {
+		c.Request.URL.Path = originalPath
+		c.Request.URL.RawPath = originalRawPath
+	}
 	if state.hit.Load() {
 		if !c.Writer.Written() {
 			c.Writer.WriteHeaderNow()
