@@ -53,20 +53,12 @@ func validDoubaoArkOfficialProviderTaskID(providerTaskID string) bool {
 		utf8.ValidString(providerTaskID) && !strings.ContainsFunc(providerTaskID, unicode.IsControl)
 }
 
-// doubaoArkOfficialOperationLogger covers every native single-task route
-// attempt, including request decoding failures. The ownership-scoped lookup is
-// only for log metadata and never participates in the API result.
+// doubaoArkOfficialOperationLogger covers every native DELETE attempt,
+// including request decoding failures. The ownership-scoped lookup is only for
+// log metadata and never participates in the API result.
 func doubaoArkOfficialOperationLogger(c *gin.Context, pinned pluginruntime.PinnedRoute) func() {
-	if pinned.Plugin == nil || pinned.Plugin.Meta.Key != "doubao_ark_official" || pinned.Route.TaskIDParam == "" {
-		return nil
-	}
-	operation := ""
-	switch pinned.Route.Method {
-	case http.MethodGet:
-		operation = "query"
-	case http.MethodDelete:
-		operation = "delete"
-	default:
+	if pinned.Plugin == nil || pinned.Plugin.Meta.Key != "doubao_ark_official" || pinned.Route.TaskIDParam == "" ||
+		pinned.Route.Method != http.MethodDelete {
 		return nil
 	}
 	providerTaskID := c.Param(pinned.Route.TaskIDParam)
@@ -83,7 +75,7 @@ func doubaoArkOfficialOperationLogger(c *gin.Context, pinned pluginruntime.Pinne
 		}
 	}
 	return func() {
-		service.RecordTaskPluginOperationLog(c, operation, providerTaskID, c.Writer.Status(), task)
+		service.RecordTaskPluginOperationLog(c, "delete", providerTaskID, c.Writer.Status(), task)
 	}
 }
 

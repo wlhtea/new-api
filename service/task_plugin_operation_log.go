@@ -16,6 +16,7 @@ const (
 	ContextKeyTaskPluginOriginalRequestPath = "task_plugin_original_request_path"
 	maxTaskPluginOperationProviderIDBytes   = 191
 	maxTaskPluginOperationRequestPathBytes  = 256
+	taskPluginDeleteOperationLogModelName   = "删除任务"
 )
 
 func sanitizeTaskPluginOperationLogValue(value string, maxBytes int) string {
@@ -55,6 +56,7 @@ func RecordTaskPluginOperationLog(c *gin.Context, operation, providerTaskID stri
 	}
 	params := model.RecordConsumeLogParams{
 		Quota:          0,
+		ModelName:      taskPluginDeleteOperationLogModelName,
 		SkipDataExport: true,
 		Content: []*common.Message{common.NewMessage(
 			"Official task {{operation}} {{provider_task_id}} returned HTTP {{http_status}}",
@@ -67,13 +69,14 @@ func RecordTaskPluginOperationLog(c *gin.Context, operation, providerTaskID stri
 	}
 	if task != nil {
 		params.ChannelId = task.ChannelId
-		params.ModelName = taskModelName(task)
-		if params.ModelName == "" {
-			params.ModelName = task.OfficialModel
+		taskModel := taskModelName(task)
+		if taskModel == "" {
+			taskModel = task.OfficialModel
 		}
-		if params.ModelName == "" {
-			params.ModelName = task.Properties.UpstreamModelName
+		if taskModel == "" {
+			taskModel = task.Properties.UpstreamModelName
 		}
+		other.SetPublic("task_model", taskModel)
 	}
 	model.RecordConsumeLog(c, common.GetContextKeyInt(c, constant.ContextKeyUserId), params)
 }

@@ -129,7 +129,7 @@ func assertDoubaoOfficialOperationLogSafe(t *testing.T, entry *model.Log, task *
 	assert.Empty(t, entry.ChannelName)
 }
 
-func TestDoubaoArkOfficialNativeQueryWritesZeroQuotaOperationLogs(t *testing.T) {
+func TestDoubaoArkOfficialNativeQueryWritesNoOperationLogs(t *testing.T) {
 	fixture := setupDoubaoNativeFixture(t, "cgt-operation-query-upstream")
 	common.LogConsumeEnabled = true
 	userBefore, channelBefore, tokenBefore := setupDoubaoOfficialOperationIdentity(t, fixture)
@@ -173,48 +173,8 @@ func TestDoubaoArkOfficialNativeQueryWritesZeroQuotaOperationLogs(t *testing.T) 
 
 	logs, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
 	require.NoError(t, err)
-	assert.EqualValues(t, 3, total, "single-task GETs log once each; the list adds no substitute operation log")
-	require.Len(t, logs, 3)
-	byProviderID := make(map[string]*model.Log, len(logs))
-	for _, entry := range logs {
-		assert.Equal(t, model.LogTypeConsume, entry.Type)
-		assert.Zero(t, entry.Quota)
-		assert.Zero(t, entry.PromptTokens)
-		assert.Zero(t, entry.CompletionTokens)
-		assert.Equal(t, 7, entry.UserId)
-		assert.Equal(t, "doubao-native-user", entry.Username)
-		assert.Equal(t, "operation-token", entry.TokenName)
-		assert.Equal(t, 41, entry.TokenId)
-		assert.Equal(t, "operation-group", entry.Group)
-		var metadata map[string]any
-		require.NoError(t, json.Unmarshal([]byte(entry.Other), &metadata))
-		providerID, ok := metadata["provider_task_id"].(string)
-		require.True(t, ok, "operation log must expose the official cgt ID: %s", entry.Other)
-		byProviderID[providerID] = entry
-		assert.Equal(t, "query", metadata["operation"])
-		assert.Equal(t, "/doubao_ark_official/api/v3/contents/generations/tasks/"+providerID, metadata["request_path"])
-		assert.Contains(t, entry.Content, "query")
-		assert.Contains(t, entry.Content, providerID)
-		assertDoubaoOfficialOperationLogSafe(t, entry, owned)
-	}
-	require.Len(t, byProviderID, 3)
-	for providerID, wantStatus := range map[string]int{
-		owned.ProviderTaskID: http.StatusOK, foreign.ProviderTaskID: http.StatusNotFound, "cgt-operation-query-missing": http.StatusNotFound,
-	} {
-		entry := byProviderID[providerID]
-		require.NotNil(t, entry, providerID)
-		var metadata map[string]any
-		require.NoError(t, json.Unmarshal([]byte(entry.Other), &metadata))
-		assert.Equal(t, float64(wantStatus), metadata["http_status"])
-		assert.Equal(t, wantStatus == http.StatusOK, metadata["success"])
-		if providerID == owned.ProviderTaskID {
-			assert.Equal(t, doubaoNativeTestModel, entry.ModelName)
-			assert.Equal(t, fixture.channel.Id, entry.ChannelId)
-		} else {
-			assert.Empty(t, entry.ModelName, "an unowned task must not contribute metadata")
-			assert.Zero(t, entry.ChannelId, "an unowned task must not contribute metadata")
-		}
-	}
+	assert.Zero(t, total, "single-task GETs and list requests must not write operation logs")
+	assert.Empty(t, logs)
 	assertDoubaoOfficialOperationBillingUnchanged(t, fixture, userBefore, channelBefore, tokenBefore)
 
 	require.NoError(t, fixture.database.Migrator().DropTable(&model.Log{}))
@@ -262,6 +222,10 @@ func TestDoubaoArkOfficialNativeSingleTaskValidatesProviderTaskID(t *testing.T) 
 			} else {
 				assert.Zero(t, providerLookupQueries, "invalid provider IDs must be rejected before task lookup")
 			}
+			logs, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
+			require.NoError(t, err)
+			assert.Zero(t, total, "GET validation results must not write operation logs")
+			assert.Empty(t, logs)
 		})
 	}
 }
@@ -308,7 +272,7 @@ func TestDoubaoArkOfficialOperationLogsBoundSanitizedRejectedRequestValues(t *te
 				common.LogWriterMu.Unlock()
 			})
 
-			response := invokeDoubaoOfficialOperationRouteThroughGin(t, fixture, http.MethodGet, testCase.encodedProviderID)
+			response := invokeDoubaoOfficialOperationRouteThroughGin(t, fixture, http.MethodDelete, testCase.encodedProviderID)
 			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 			logs, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
 			require.NoError(t, err)
@@ -316,8 +280,11 @@ func TestDoubaoArkOfficialOperationLogsBoundSanitizedRejectedRequestValues(t *te
 			require.Len(t, logs, 1)
 			entry := logs[0]
 			assert.Zero(t, entry.Quota)
+			assert.Equal(t, "删除任务", entry.ModelName)
 			var metadata map[string]any
 			require.NoError(t, json.Unmarshal([]byte(entry.Other), &metadata))
+			assert.Equal(t, "delete", metadata["operation"])
+			assert.NotContains(t, metadata, "task_model")
 			providerID, ok := metadata["provider_task_id"].(string)
 			require.True(t, ok)
 			requestPath, ok := metadata["request_path"].(string)
@@ -339,6 +306,7 @@ func TestDoubaoArkOfficialOperationLogsBoundSanitizedRejectedRequestValues(t *te
 
 func TestDoubaoArkOfficialNativeOperationLogsDoNotChangeQuotaData(t *testing.T) {
 	fixture := setupDoubaoNativeFixture(t, "cgt-operation-quota-data")
+	require.NoError(t, fixture.database.AutoMigrate(&model.AuditLog{}))
 	common.LogConsumeEnabled = true
 	previousDataExport := common.DataExportEnabled
 	common.DataExportEnabled = true
@@ -354,7 +322,7 @@ func TestDoubaoArkOfficialNativeOperationLogsDoNotChangeQuotaData(t *testing.T) 
 	})
 	setupDoubaoOfficialOperationIdentity(t, fixture)
 
-	response := invokeDoubaoOfficialOperationRoute(t, fixture, http.MethodGet, "cgt-operation-quota-data-missing")
+	response := invokeDoubaoOfficialOperationRoute(t, fixture, http.MethodDelete, "cgt-operation-quota-data-missing")
 	require.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
 
 	logs, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
@@ -362,6 +330,7 @@ func TestDoubaoArkOfficialNativeOperationLogsDoNotChangeQuotaData(t *testing.T) 
 	assert.EqualValues(t, 1, total)
 	require.Len(t, logs, 1)
 	assert.Zero(t, logs[0].Quota)
+	assert.Equal(t, "删除任务", logs[0].ModelName)
 	assert.Contains(t, logs[0].Content, "cgt-operation-quota-data-missing")
 	assert.Contains(t, logs[0].Other, `"provider_task_id"`)
 
@@ -439,6 +408,7 @@ func TestDoubaoArkOfficialNativeDeleteWritesZeroQuotaOperationLogs(t *testing.T)
 	byProviderID := make(map[string]*model.Log, len(logs))
 	for _, entry := range logs {
 		assert.Equal(t, model.LogTypeConsume, entry.Type)
+		assert.Equal(t, "删除任务", entry.ModelName)
 		assert.Zero(t, entry.Quota)
 		assert.Zero(t, entry.PromptTokens)
 		assert.Zero(t, entry.CompletionTokens)
@@ -476,13 +446,13 @@ func TestDoubaoArkOfficialNativeDeleteWritesZeroQuotaOperationLogs(t *testing.T)
 		assert.Equal(t, wantStatus == http.StatusOK, metadata["success"])
 		switch providerID {
 		case owned.ProviderTaskID:
-			assert.Equal(t, doubaoNativeTestModel, entry.ModelName)
+			assert.Equal(t, doubaoNativeTestModel, metadata["task_model"])
 			assert.Equal(t, fixture.channel.Id, entry.ChannelId)
 		case denied.ProviderTaskID:
-			assert.Equal(t, doubaoNativeTestModel, entry.ModelName)
+			assert.Equal(t, doubaoNativeTestModel, metadata["task_model"])
 			assert.Equal(t, deniedChannel.Id, entry.ChannelId)
 		default:
-			assert.Empty(t, entry.ModelName, "an unowned task must not contribute metadata")
+			assert.NotContains(t, metadata, "task_model", "an unowned task must not contribute metadata")
 			assert.Zero(t, entry.ChannelId, "an unowned task must not contribute metadata")
 		}
 	}
