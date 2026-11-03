@@ -339,6 +339,150 @@ func TestDoubaoArkOfficialNativeOperationLogsDoNotChangeQuotaData(t *testing.T) 
 	model.CacheQuotaDataLock.Unlock()
 }
 
+func TestDoubaoArkOfficialNativeRepeatedDeleteRetainsLogMetadata(t *testing.T) {
+	fixture := setupDoubaoNativeFixture(t, "cgt-operation-repeated-delete-owned")
+	require.NoError(t, fixture.database.AutoMigrate(&model.AuditLog{}))
+	common.LogConsumeEnabled = true
+	userBefore, channelBefore, tokenBefore := setupDoubaoOfficialOperationIdentity(t, fixture)
+	pluginSetting := `{"task_plugin_key":"doubao_ark_official","allow_official_task_delete":true}`
+	fixture.channel.Type = constant.ChannelTypeTaskPlugin
+	fixture.channel.Setting = &pluginSetting
+	require.NoError(t, fixture.database.Save(fixture.channel).Error)
+	channelBefore = *fixture.channel
+	useRealDoubaoTaskAdaptors(t)
+
+	now := time.Now().Unix()
+	owned := &model.Task{
+		TaskID: "task-operation-repeated-delete-internal", ProviderTaskID: "cgt-operation-repeated-delete-owned",
+		UserId: 7, ChannelId: fixture.channel.Id, Platform: "doubao_ark_official",
+		Status: model.TaskStatusSuccess, OfficialModel: doubaoNativeTestModel,
+		Properties: model.Properties{OriginModelName: doubaoNativeTestModel}, CreatedAt: now, UpdatedAt: now,
+		Data:        []byte(`{"id":"cgt-operation-repeated-delete-owned","status":"succeeded"}`),
+		PrivateData: model.TaskPrivateData{Key: "sk-task-private", ResultURL: "https://private.example/result.mp4"},
+	}
+	wrongPlugin := &model.Task{
+		TaskID: "task-operation-repeated-delete-wrong-plugin", ProviderTaskID: owned.ProviderTaskID,
+		UserId: 7, ChannelId: 999, Platform: "another_official_plugin", ProviderDeleted: true,
+		Status: model.TaskStatusSuccess, OfficialModel: "wrong-plugin-model-secret", CreatedAt: now, UpdatedAt: now,
+	}
+	foreign := &model.Task{
+		TaskID: "task-operation-repeated-delete-foreign", ProviderTaskID: "cgt-operation-repeated-delete-foreign",
+		UserId: 8, ChannelId: fixture.channel.Id, Platform: "doubao_ark_official", ProviderDeleted: true,
+		Status: model.TaskStatusSuccess, OfficialModel: "foreign-model-secret", CreatedAt: now, UpdatedAt: now,
+	}
+	for _, task := range []*model.Task{owned, wrongPlugin, foreign} {
+		require.NoError(t, fixture.database.Create(task).Error)
+	}
+
+	firstResponse := invokeDoubaoOfficialOperationRoute(t, fixture, http.MethodDelete, owned.ProviderTaskID)
+	require.Equal(t, http.StatusOK, firstResponse.Code, firstResponse.Body.String())
+	var tombstoned model.Task
+	require.NoError(t, fixture.database.First(&tombstoned, owned.ID).Error)
+	require.True(t, tombstoned.ProviderDeleted)
+
+	secondResponse := invokeDoubaoOfficialOperationRoute(t, fixture, http.MethodDelete, owned.ProviderTaskID)
+	require.Equal(t, http.StatusNotFound, secondResponse.Code, secondResponse.Body.String())
+	assert.JSONEq(t, `{"error":{"code":"task_not_found","message":"Task not found"}}`, secondResponse.Body.String())
+	assert.NotContains(t, secondResponse.Body.String(), owned.ProviderTaskID)
+	assert.Equal(t, int32(1), fixture.deleteCalls.Load(), "a tombstoned retry must not reach upstream DELETE")
+
+	getResponse := invokeDoubaoOfficialOperationRoute(t, fixture, http.MethodGet, owned.ProviderTaskID)
+	require.Equal(t, http.StatusNotFound, getResponse.Code, getResponse.Body.String())
+	foreignResponse := invokeDoubaoOfficialOperationRoute(t, fixture, http.MethodDelete, foreign.ProviderTaskID)
+	require.Equal(t, http.StatusNotFound, foreignResponse.Code, foreignResponse.Body.String())
+
+	logs, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, total, "two owned DELETEs plus one foreign DELETE; the tombstoned GET must not log")
+	require.Len(t, logs, 3)
+	ownedStatuses := make(map[int]int)
+	foreignLogs := 0
+	for _, entry := range logs {
+		assert.Equal(t, "删除任务", entry.ModelName)
+		assert.Zero(t, entry.Quota)
+		var metadata map[string]any
+		require.NoError(t, json.Unmarshal([]byte(entry.Other), &metadata))
+		providerID, ok := metadata["provider_task_id"].(string)
+		require.True(t, ok)
+		statusCode, ok := metadata["http_status"].(float64)
+		require.True(t, ok)
+		switch providerID {
+		case owned.ProviderTaskID:
+			ownedStatuses[int(statusCode)]++
+			assert.Equal(t, doubaoNativeTestModel, metadata["task_model"],
+				"both the successful DELETE and the tombstoned retry must retain the original task model")
+			assert.Equal(t, fixture.channel.Id, entry.ChannelId,
+				"both DELETE logs must retain the original channel")
+			assertDoubaoOfficialOperationLogSafe(t, entry, owned)
+			assert.NotContains(t, entry.Content+entry.Other, "wrong-plugin-model-secret")
+		case foreign.ProviderTaskID:
+			foreignLogs++
+			assert.NotContains(t, metadata, "task_model", "a foreign tombstone must not contribute metadata")
+			assert.Zero(t, entry.ChannelId, "a foreign tombstone must not contribute a channel")
+			assert.NotContains(t, entry.Content+entry.Other, "foreign-model-secret")
+		default:
+			t.Fatalf("unexpected operation log provider ID %q", providerID)
+		}
+	}
+	assert.Equal(t, map[int]int{http.StatusOK: 1, http.StatusNotFound: 1}, ownedStatuses,
+		"each DELETE attempt must write exactly one log")
+	assert.Equal(t, 1, foreignLogs)
+	assertDoubaoOfficialOperationBillingUnchanged(t, fixture, userBefore, channelBefore, tokenBefore)
+}
+
+func TestDoubaoArkOfficialDeleteOperationLogsExcludedFromUsageStats(t *testing.T) {
+	fixture := setupDoubaoNativeFixture(t, "cgt-operation-usage-stats")
+	require.NoError(t, fixture.database.AutoMigrate(&model.AuditLog{}))
+	common.LogConsumeEnabled = true
+	userBefore, channelBefore, tokenBefore := setupDoubaoOfficialOperationIdentity(t, fixture)
+
+	now := time.Now().Unix()
+	response := invokeDoubaoOfficialOperationRoute(t, fixture, http.MethodDelete, "cgt-operation-usage-stats-missing")
+	require.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/billing", nil)
+	ctx.Set("username", "doubao-native-user")
+	common.SetContextKey(ctx, constant.ContextKeyTokenId, 41)
+	common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "operation-group")
+	model.RecordConsumeLog(ctx, 7, model.RecordConsumeLogParams{
+		ChannelId: fixture.channel.Id, ModelName: doubaoNativeTestModel,
+		TokenName: "operation-token", TokenId: 41, Group: "operation-group",
+		Quota: 125, PromptTokens: 3, CompletionTokens: 4,
+		Other: model.NewLogOther(), SkipDataExport: true,
+	})
+
+	stat, err := model.SumUsedQuota(model.LogTypeConsume, now-1, now+1, "", "doubao-native-user", "", 0, "")
+	require.NoError(t, err)
+	assert.Equal(t, model.Stat{Quota: 125, Rpm: 1, Tpm: 7}, stat,
+		"delete operation logs must not affect quota, RPM, or TPM; ordinary billing rows remain included")
+
+	hasUsageFlagColumn := fixture.database.Migrator().HasColumn(&model.Log{}, "exclude_from_usage_stats")
+	assert.True(t, hasUsageFlagColumn, "usage exclusion must be persisted rather than inferred from display metadata")
+	if hasUsageFlagColumn {
+		var stored []struct {
+			ModelName             string
+			ExcludeFromUsageStats bool
+		}
+		require.NoError(t, fixture.database.Table("logs").
+			Select("model_name, exclude_from_usage_stats").Order("id").Scan(&stored).Error)
+		require.Len(t, stored, 2)
+		for _, row := range stored {
+			assert.Equal(t, row.ModelName == "删除任务", row.ExcludeFromUsageStats)
+		}
+	}
+
+	logs, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, total)
+	require.Len(t, logs, 2)
+	serialized, err := json.Marshal(logs)
+	require.NoError(t, err)
+	assert.NotContains(t, string(serialized), "exclude_from_usage_stats", "internal usage-stat flags must stay out of log JSON")
+	assertDoubaoOfficialOperationBillingUnchanged(t, fixture, userBefore, channelBefore, tokenBefore)
+}
+
 func TestDoubaoArkOfficialNativeDeleteWritesZeroQuotaOperationLogs(t *testing.T) {
 	fixture := setupDoubaoNativeFixture(t, "cgt-operation-delete-owned")
 	common.LogConsumeEnabled = true

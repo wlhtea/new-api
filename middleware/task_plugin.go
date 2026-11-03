@@ -69,7 +69,7 @@ func doubaoArkOfficialOperationLogger(c *gin.Context, pinned pluginruntime.Pinne
 	if validDoubaoArkOfficialProviderTaskID(providerTaskID) && common.LogConsumeEnabled && model.DB != nil && model.LOG_DB != nil {
 		userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
 		platform := constant.TaskPlatform(pinned.Plugin.Meta.Key)
-		tasks, err := model.GetByProviderTaskIdsForPlatforms(userID, []constant.TaskPlatform{platform}, []string{providerTaskID})
+		tasks, err := model.GetByProviderTaskIdsForPlatformsForLogMetadata(userID, []constant.TaskPlatform{platform}, []string{providerTaskID})
 		if err == nil && len(tasks) == 1 {
 			task = tasks[0]
 		}

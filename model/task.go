@@ -488,6 +488,23 @@ func GetByProviderTaskIdsForPlatforms(userID int, platforms []constant.TaskPlatf
 	return tasks, nil
 }
 
+// GetByProviderTaskIdsForPlatformsForLogMetadata includes provider-deletion
+// tombstones so repeated operation logs retain their original safe metadata.
+// It is owner/plugin scoped and must never be used for public task resolution.
+func GetByProviderTaskIdsForPlatformsForLogMetadata(userID int, platforms []constant.TaskPlatform, providerTaskIDs []string) ([]*Task, error) {
+	if len(platforms) == 0 || len(providerTaskIDs) == 0 {
+		return nil, nil
+	}
+	var tasks []*Task
+	err := DB.
+		Where("user_id = ? AND platform IN ? AND provider_task_id IN ?", userID, platforms, providerTaskIDs).
+		Find(&tasks).Error
+	if err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
 // GetTaskForProtocolObservation reloads one public task through the ownership
 // boundary used by long-lived plugin protocol observers. A missing task,
 // foreign user, and wrong plugin platform are deliberately indistinguishable.

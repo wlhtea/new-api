@@ -55,9 +55,10 @@ func RecordTaskPluginOperationLog(c *gin.Context, operation, providerTaskID stri
 		other.SetPublic("request_path", sanitizeTaskPluginOperationLogValue(requestPath, maxTaskPluginOperationRequestPathBytes))
 	}
 	params := model.RecordConsumeLogParams{
-		Quota:          0,
-		ModelName:      taskPluginDeleteOperationLogModelName,
-		SkipDataExport: true,
+		Quota:                 0,
+		ModelName:             taskPluginDeleteOperationLogModelName,
+		SkipDataExport:        true,
+		ExcludeFromUsageStats: true,
 		Content: []*common.Message{common.NewMessage(
 			"Official task {{operation}} {{provider_task_id}} returned HTTP {{http_status}}",
 			map[string]any{"operation": operation, "provider_task_id": providerTaskID, "http_status": statusCode},
