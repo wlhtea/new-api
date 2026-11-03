@@ -1,7 +1,6 @@
 package router
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,19 +18,12 @@ import (
 	"gorm.io/gorm"
 )
 
-func assertDoubaoOfficialNativeOperationLog(t *testing.T, expectedTotal int, providerTaskID, requestPath string) {
+func assertDoubaoOfficialNativeOperationLogCount(t *testing.T, expectedTotal int) {
 	t.Helper()
 	logs, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
 	require.NoError(t, err)
-	assert.EqualValues(t, expectedTotal, total, "each native single-task request must write exactly one operation log")
+	assert.EqualValues(t, expectedTotal, total, "native GET polling and listing must not write operation logs")
 	require.Len(t, logs, expectedTotal)
-	entry := logs[0]
-	assert.Zero(t, entry.Quota)
-	assert.Equal(t, 7, entry.UserId)
-	var metadata map[string]any
-	require.NoError(t, json.Unmarshal([]byte(entry.Other), &metadata))
-	assert.Equal(t, providerTaskID, metadata["provider_task_id"])
-	assert.Equal(t, requestPath, metadata["request_path"])
 }
 
 func TestDoubaoArkOfficialNativeAliasDispatchesCreateAndQuery(t *testing.T) {
@@ -109,7 +101,7 @@ func TestDoubaoArkOfficialNativeAliasDispatchesCreateAndQuery(t *testing.T) {
 	assert.NotContains(t, query.Body.String(), "task_alias_internal")
 	assert.Equal(t, int32(1), submitCalls.Load(), "query must not enter task submission")
 	aliasPath := "/api/v3/contents/generations/tasks/" + providerTaskID
-	assertDoubaoOfficialNativeOperationLog(t, 1, providerTaskID, aliasPath)
+	assertDoubaoOfficialNativeOperationLogCount(t, 0)
 
 	direct := httptest.NewRecorder()
 	directPath := "/doubao_ark_official" + aliasPath
@@ -117,7 +109,7 @@ func TestDoubaoArkOfficialNativeAliasDispatchesCreateAndQuery(t *testing.T) {
 	require.Equal(t, http.StatusOK, direct.Code, direct.Body.String())
 	assert.JSONEq(t, query.Body.String(), direct.Body.String())
 	assert.Equal(t, int32(1), submitCalls.Load(), "direct query must not enter task submission")
-	assertDoubaoOfficialNativeOperationLog(t, 2, providerTaskID, directPath)
+	assertDoubaoOfficialNativeOperationLogCount(t, 0)
 }
 
 const doubaoArkAliasTestModel = "doubao-seedance-2-0-260128"
